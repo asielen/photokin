@@ -1,5 +1,18 @@
 #!/usr/bin/env python
-"""CLI helper for extracting Lightroom face regions from XMP metadata."""
+"""Extract Lightroom face regions (MWG Regions) from a photo's XMP metadata.
+
+Lightroom stores named face rectangles as MWG Regions, either in a ``.xmp``
+sidecar or embedded in the file. This module reads whichever is available and
+emits a normalized JSON payload of face names + centers/sizes. Invoked per photo
+by the plugin as ``python -m photokin.lightroom.faces_xmp``.
+
+Code map:
+- read_sidecar_xmp                  read a classic ``base.xmp`` sidecar (or None)
+- read_embedded_xmp                 extract an embedded XMP packet from the file
+- _float_attr / _region_name        parse a single region's numbers/name
+- parse_face_regions_from_xmp_bytes PUBLIC: XMP bytes -> FaceRegionsPayload
+- main                              PUBLIC: CLI entry; prints payload as JSON
+"""
 
 from __future__ import annotations
 
@@ -27,6 +40,8 @@ MWG_RS_URI: Final[str] = NS["mwg-rs"]
 
 
 class FaceRegion(TypedDict, total=False):
+    """One named face rectangle: name plus normalized center and size (0..1)."""
+
     name: str | None
     center: dict[str, float]
     width: float
@@ -34,6 +49,8 @@ class FaceRegion(TypedDict, total=False):
 
 
 class FaceRegionsPayload(TypedDict):
+    """The emitted result: the list of faces and their count."""
+
     faces: list[FaceRegion]
     count: int
 
@@ -202,7 +219,7 @@ def parse_face_regions_from_xmp_bytes(blob: bytes) -> FaceRegionsPayload:
 def main(argv: list[str]) -> int:
     """Entry point used by both the CLI wrapper and Lightroom subprocesses."""
     if len(argv) != 2:
-        sys.stderr.write("Usage: mel_faces_xmp.py /path/to/photo.ext\n")
+        sys.stderr.write("Usage: python -m photokin.lightroom.faces_xmp /path/to/photo.ext\n")
         return 1
 
 

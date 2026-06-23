@@ -5,7 +5,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-from photo_archiver import core, utils
+from photokin import core, utils
 
 
 class TestLlmRequestDump(unittest.TestCase):

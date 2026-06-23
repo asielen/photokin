@@ -1,8 +1,8 @@
 import unittest
 
-from photo_archiver import core, utils
-from photo_archiver.api_claude import _data_url_to_image_block
-from photo_archiver.api_openai import ProviderApiError
+from photokin import core, utils
+from photokin.api_claude import _data_url_to_image_block
+from photokin.api_openai import ProviderApiError
 
 
 class _UsageMetadataStub:

@@ -5,10 +5,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from photo_archiver import cli
-from photo_archiver.exiftool import ExiftoolConfig, apply_changeset
-from photo_archiver.exiftool.apply import _normalize_exif_datetime
-from photo_archiver.exiftool.config import parse_fields
+from photokin import cli
+from photokin.exiftool import ExiftoolConfig, apply_changeset
+from photokin.exiftool.apply import _normalize_exif_datetime
+from photokin.exiftool.config import parse_fields
 
 
 class TestExiftoolConfig(unittest.TestCase):
@@ -100,9 +100,9 @@ class TestApplyChangeset(unittest.TestCase):
         )
         cfg = ExiftoolConfig(enabled=True, dry_run=True)
         with patch(
-            "photo_archiver.exiftool.apply.resolve_exiftool_path",
+            "photokin.exiftool.apply.resolve_exiftool_path",
             return_value="/fake/exiftool",
-        ), patch("photo_archiver.exiftool.apply.subprocess.run") as run_mock:
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
             summary = apply_changeset(path, cfg)
         run_mock.assert_not_called()
         self.assertEqual(summary["files_seen"], 2)
@@ -114,7 +114,7 @@ class TestApplyChangeset(unittest.TestCase):
         path = self._write_changeset([])
         cfg = ExiftoolConfig(enabled=True)
         with patch(
-            "photo_archiver.exiftool.apply.resolve_exiftool_path",
+            "photokin.exiftool.apply.resolve_exiftool_path",
             side_effect=FileNotFoundError("ExifTool not found."),
         ):
             summary = apply_changeset(path, cfg)

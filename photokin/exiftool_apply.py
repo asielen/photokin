@@ -1,7 +1,7 @@
-"""Deprecated: moved to photo_archiver.exiftool.apply.
+"""Deprecated: moved to photokin.exiftool.apply.
 
-Note: apply_changeset now takes an ExiftoolConfig (photo_archiver.exiftool)
-instead of the core Config. Use `python -m photo_archiver.exiftool` for the CLI.
+Note: apply_changeset now takes an ExiftoolConfig (photokin.exiftool)
+instead of the core Config. Use `python -m photokin.exiftool` for the CLI.
 """
 
 from .exiftool.apply import apply_changeset, main  # noqa: F401

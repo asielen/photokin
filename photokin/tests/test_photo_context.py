@@ -4,7 +4,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-from photo_archiver import utils
+from photokin import utils
 
 
 class TestPhotoContext(unittest.TestCase):

@@ -1,11 +1,11 @@
-# photo_archiver (core library)
+# photokin (core library)
 
 LLM-based photo analysis: sends scanned photos (front/back) plus forwarded
 metadata to a vision model and returns structured metadata (caption, keywords,
 date/location guesses) as JSON, NDJSON streams, and changesets.
 
 The core has **no ExifTool dependency**. ExifTool read/write lives in the
-[`photo_archiver/exiftool/`](exiftool/README.md) wrapper layer, which the CLI
+[`photokin/exiftool/`](exiftool/README.md) wrapper layer, which the CLI
 composes on top of the core. Embedders who don't want ExifTool can call the
 core directly.
 
@@ -59,7 +59,7 @@ guardrail appended for Gemini, plus Gemini-specific JSON repair in
 ## Error normalization
 
 Provider exceptions are normalized to `ProviderApiError`
-(`photo_archiver.errors`) with stable `error_type` values:
+(`photokin.errors`) with stable `error_type` values:
 
 - `rate_limit` — 429 / resource exhausted
 - `overloaded` — Anthropic 529
@@ -83,7 +83,7 @@ one marker: `<ProviderName> <ResolvedModelName> Analyzed`.
 ## Configuration
 
 `utils.Config` (core fields only — ExifTool settings live in
-`photo_archiver.exiftool.ExiftoolConfig`):
+`photokin.exiftool.ExiftoolConfig`):
 
 - Provider: `provider`, `provider_name`, `model`, `claude_model_name`,
   `gemini_model_name`
@@ -106,13 +106,13 @@ extra warnings.
 
 ```bash
 # Single photo (dev/testing)
-python -m photo_archiver.cli photo.jpg --back photo_back.jpg --provider openai
+python -m photokin.cli photo.jpg --back photo_back.jpg --provider openai
 
 # Folder of images
-python -m photo_archiver.cli --folder ./scans/ --provider anthropic --claude-model sonnet
+python -m photokin.cli --folder ./scans/ --provider anthropic --claude-model sonnet
 
 # Manifest mode (recommended; used by the Lightroom plugin)
-python -m photo_archiver.cli --manifest batch.json \
+python -m photokin.cli --manifest batch.json \
   --output-file results.ndjson --changeset true \
   --exiftool-write true --exiftool-fields EXIF:UserComment
 ```
@@ -141,13 +141,13 @@ ExifTool pipeline flags (manifest mode; precedence **flag > env > default**):
 `core.process_manifest_stream` accepts an optional
 `metadata_hydrator: Callable[[list[dict]], None]` that runs on the manifest
 items after loading and before grouping. The CLI passes
-`photo_archiver.exiftool.make_manifest_hydrator(...)` here; embedders can pass
+`photokin.exiftool.make_manifest_hydrator(...)` here; embedders can pass
 their own callable or omit it entirely — the core itself never touches
 ExifTool.
 
 ## Tests
 
 ```bash
-cd Mel.lrplugin/python
-python -m pytest photo_archiver/tests
+cd python
+python -m pytest photokin/tests
 ```

@@ -1,5 +1,5 @@
 """
-photo_archiver.utils
+photokin.utils
 ====================
 
 Shared utilities and data structures.
@@ -11,6 +11,25 @@ Includes:
 - Image I/O: TIFF→JPEG conversion, data URL creation, archival upload.
 - Prompt assembly for the model.
 - JSON cleanup + retry parser.
+
+This is the shared foundation imported across the package. It is large, so it is
+organized into the sections below (matching the ``# === ... ===`` dividers); jump
+to a section rather than reading top-to-bottom.
+
+Code map (by section):
+- Config              the Config dataclass + environment-variable defaults
+- Path helpers        normalize_path (the canonical path key) + existence checks
+- Vocabulary helpers  load/flatten the keyword TOML, guardrails, vocab inserts
+- Prompt helpers      load static prompt fragment files
+- JSON helpers        thin JSON load wrappers
+- Image helpers       TIFF→JPEG conversion, data-URL encoding, archival upload
+- Prompt assembly     build_prompt_bundle + photo-context resolution
+- JSON parsing        model-output cleanup and the retry-parser (_ParseLogger)
+- Filename parsing    parse_media_filename: base id / part kind / variant / page
+- Folder grouping     group files into front/back/variant/page sets
+- Manifest helpers    load_manifest (shape validation), master selection
+- Metadata merge      small helpers shared by the merge step
+- Response helpers    normalize/inspect provider responses
 """
 
 from __future__ import annotations
@@ -32,11 +51,11 @@ import sys
 import textwrap
 from pathlib import Path
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from json import JSONDecodeError
 from typing import Any, Dict, List, Set, Tuple, Optional
 
-from face_utils import face_tags_to_llm_block
+from photokin.lightroom.face_utils import face_tags_to_llm_block
 
 # === Config ===
 
@@ -46,6 +65,15 @@ _DEFAULT_PROMPTS_DIR = _THIS_DIR / "prompts_photo_ai"
 
 @dataclass
 class Config:
+    """Runtime configuration for an analysis run, with environment-variable defaults.
+
+    One mutable settings object threaded through the whole pipeline: provider/model
+    selection, prompt/vocab paths, image-sizing limits, the confidence thresholds
+    that gate date/location writes, and run flags (dry-run, sidecars, etc.).
+    Defaults read from environment variables so the Lightroom plugin can configure
+    a run purely via the env it sets on the subprocess.
+    """
+
     model: str = os.getenv("OPENAI_MODEL", "gpt-4o")
     provider_name: str = os.getenv("LLM_PROVIDER_NAME", "ChatGPT")
     provider: str = os.getenv("LLM_PROVIDER", "openai")
@@ -149,6 +177,15 @@ DEFAULT_METADATA_FORWARD_FIELDS: tuple[str, ...] = (
 # === Path helpers ===
 
 def normalize_path(p: str | None) -> str | None:
+    """Normalize a path: strip surrounding quotes/space, expand ``~``, normpath.
+
+    This is the canonical path key used throughout the pipeline (manifest items,
+    result keys, exiftool inputs). Note that ``os.path.normpath`` is
+    platform-dependent — it yields backslashes on Windows — so anything compared
+    against these keys must be normalized the *same* way (see the ExifTool
+    ``SourceFile`` handling in ``photokin.exiftool.hydrate``). Returns ``None``
+    only for ``None`` input.
+    """
     if p is None:
         return None
     p = p.strip()
@@ -158,6 +195,11 @@ def normalize_path(p: str | None) -> str | None:
 
 
 def ensure_paths_exist(paths: list[str]) -> None:
+    """Raise ``FileNotFoundError`` for the first path that isn't an existing file.
+
+    The common cause is a user pasting a quoted path, so the error hint calls
+    that out explicitly. Empty entries are skipped.
+    """
     for p in paths:
         if p and not os.path.isfile(p):
             print(f'[ERROR] File not found after normalization: {p}', file=sys.stderr)
@@ -214,6 +256,13 @@ def _validate_toml_file(path: str) -> None:
 
 
 def load_vocab_sections(vocab_path: str) -> Tuple[Dict[str, List[Any]], List[Dict[str, Any]]]:
+    """Load the keyword vocabulary TOML into ``(sections, new_keywords)``.
+
+    ``sections`` maps each known ``SECTION_IDS`` id to its keyword list (empty if
+    absent), and ``new_keywords`` is the running list of model-proposed additions.
+    Missing/malformed sections degrade to empty lists rather than raising, so a
+    partially hand-edited vocab file still loads.
+    """
     data = _load_toml(vocab_path)
     sections: Dict[str, List[Any]] = {}
     for sid in SECTION_IDS:
@@ -228,6 +277,12 @@ def load_vocab_sections(vocab_path: str) -> Tuple[Dict[str, List[Any]], List[Dic
 
 
 def flatten_known_keywords(sections: Dict[str, List[Any]], new_keywords_list: List[Dict[str, Any]]) -> Set[str]:
+    """Collapse vocab sections + pending additions into one set of known keywords.
+
+    Handles both shapes a section list may contain (bare strings and
+    ``{"keyword": ...}`` dicts). Used to decide which model-suggested keywords are
+    genuinely new and worth appending to the vocabulary.
+    """
     known: Set[str] = set()
     for arr in sections.values():
         for item in arr:
@@ -243,6 +298,12 @@ def flatten_known_keywords(sections: Dict[str, List[Any]], new_keywords_list: Li
 
 
 def warn_forbiddenish_keywords(keywords: List[str]) -> List[str]:
+    """Return warning strings for keywords containing forbidden/subjective terms.
+
+    The model is told to avoid subjective or relationship-implying keywords; this
+    is a cheap substring guard that flags (does not remove) any that slip through,
+    so a reviewer can decide. One warning per offending keyword.
+    """
     warnings = []
     for k in keywords:
         low = k.strip().lower()
@@ -265,6 +326,12 @@ _PLACEHOLDER_NOTE_FRAGMENTS = {
 
 
 def note_looks_placeholder(note: str) -> bool:
+    """Return True if a reason/note is empty or obvious filler (n/a, todo, etc.).
+
+    The model is required to justify new keywords; this rejects non-answers so
+    placeholder reasons don't get treated as real provenance. Empty notes count
+    as placeholders.
+    """
     note_clean = (note or "").strip().lower()
     if not note_clean:
         return True
@@ -396,6 +463,12 @@ def insert_keyword_into_vocab_file(
 
 
 def safe_backup(path: str) -> None:
+    """Write a one-time ``<path>.bak`` copy before a file is mutated.
+
+    Best-effort and idempotent: it never overwrites an existing ``.bak`` (so the
+    first backup wins) and only warns on failure rather than raising, so backup
+    trouble never blocks the primary operation.
+    """
     backup_path = path + ".bak"
     try:
         if not os.path.exists(backup_path):
@@ -551,6 +624,14 @@ def build_prompt_bundle(
     forward_fields: Optional[list] = None,
     cfg: Config | None = None,
 ) -> List[Dict[str, str]]:
+    """Assemble the ordered system/instruction prompt pieces sent to the model.
+
+    Stitches the static prompt fragments (system header, rules, vocab examples,
+    output format) together with run-specific context — provider/model name,
+    today's date, and any forwarded original metadata — into the list of
+    role/content blocks the API layer expects. Centralizing assembly here keeps
+    prompt ordering identical across single, group, and batch flows.
+    """
     pieces: List[Dict[str, str]] = []
 
     provider = (provider_name or (cfg.provider_name if cfg else None) or "ChatGPT").strip() or "ChatGPT"
@@ -669,6 +750,13 @@ def resolve_photo_context(
     cli_file: str | None,
     manifest: dict | None,
 ) -> str | None:
+    """Resolve the authoritative photo-context text from the highest-priority source.
+
+    Precedence: ``--photo-context-text`` > ``--photo-context-file`` > the
+    manifest's ``photo_context_text`` / context file. Returns the sanitized text,
+    or ``None`` if no source supplies any. Having one resolver keeps the priority
+    order consistent between CLI and manifest-driven (plugin) runs.
+    """
     if cli_text and cli_text.strip():
         return _sanitize_photo_context_text(cli_text, "CLI --photo-context-text")
     if cli_file and str(cli_file).strip():
@@ -942,7 +1030,7 @@ class _ParseLogger:
         if not self._enabled or self._path is None:
             return
         try:
-            stamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             with open(self._path, "a", encoding="utf-8") as fh:
                 fh.write(f"[{stamp}] {label}\n")
                 fh.write(raw_text or "")
@@ -1054,6 +1142,15 @@ VALID_EXTS = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 
 @dataclass
 class ParsedName:
+    """Structured result of parsing a media filename into its grouping parts.
+
+    ``base_id`` is the shared id that groups variants/sides of the same photo;
+    ``variant_id`` distinguishes versions (e.g. a trailing letter); ``part_kind``
+    says whether the file is a front/back/page/negative/none; ``page_num`` is the
+    page index for multipage docs; ``is_crop`` flags derived crop files. Folder
+    grouping keys off these fields.
+    """
+
     base_id: str
     variant_id: str | None
     part_kind: str  # "front"|"back"|"page"|"negative"|"none"
@@ -1283,6 +1380,13 @@ def ensure_keyword_back(record: dict) -> dict:
 
 # === Manifest helpers ===
 def load_manifest(path: str) -> dict:
+    """Load and shape-validate a manifest JSON file.
+
+    Enforces the minimal contract the rest of the pipeline relies on: an object
+    with an ``items`` array. Raises ``ValueError`` on anything else so a
+    malformed manifest fails fast with a clear message rather than surfacing as a
+    confusing error deep in processing.
+    """
     data = _load_json(path)
     if not isinstance(data, dict) or "items" not in data or not isinstance(data["items"], list):
         raise ValueError("Manifest must be an object with an 'items' array of {path, ...}.")

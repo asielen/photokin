@@ -16,7 +16,7 @@ if _PY not in sys.path:
 # We need to bypass the package __init__ (which pulls in core → openai).
 # Import the module directly via importlib.
 import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location("photo_archiver.utils", os.path.join(_PKG, "utils.py"))
+_spec = _ilu.spec_from_file_location("photokin.utils", os.path.join(_PKG, "utils.py"))
 _mod = _ilu.module_from_spec(_spec)
 sys.modules[_spec.name] = _mod  # required for @dataclass introspection
 _spec.loader.exec_module(_mod)

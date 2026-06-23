@@ -8,13 +8,13 @@ from the CLI or embedded in another tool).
 
 | Layer | Where | What it does |
 |---|---|---|
-| Core library | [`photo_archiver/`](photo_archiver/README.md) | LLM photo analysis: prompts, provider dispatch (OpenAI / Claude / Gemini), JSON parsing/repair, metadata merge, changeset emission. No ExifTool dependency. |
-| ExifTool wrapper | [`photo_archiver/exiftool/`](photo_archiver/exiftool/README.md) | Optional-but-recommended ExifTool integration: reads metadata Lightroom can't supply (hydration) and writes changeset fields Lightroom can't write (apply). |
+| Core library | [`photokin/`](photokin/README.md) | LLM photo analysis: prompts, provider dispatch (OpenAI / Claude / Gemini), JSON parsing/repair, metadata merge, changeset emission. No ExifTool dependency. |
+| ExifTool wrapper | [`photokin/exiftool/`](photokin/exiftool/README.md) | Optional-but-recommended ExifTool integration: reads metadata Lightroom can't supply (hydration) and writes changeset fields Lightroom can't write (apply). |
 | Helper scripts | this directory | Standalone scripts used by specific plugin features (below). |
 | Lua plugin | `Mel.lrplugin/*.lua` | Builds manifests, launches the CLI, tails NDJSON results, applies metadata via the Lightroom SDK. |
 
 Dependency direction: the wrapper imports from the core; the core never
-imports the wrapper. The CLI (`photo_archiver/cli.py`) composes the two into
+imports the wrapper. The CLI (`photokin/cli.py`) composes the two into
 the full pipeline: **hydrate → analyze → apply**.
 
 ## Helper scripts (top level)
@@ -30,13 +30,20 @@ the full pipeline: **hydrate → analyze → apply**.
 - `add_caption_border.py` — adds a Polaroid-style caption border to exported
   JPEGs; called by the Polaroid export filter.
 
-## Setup
+## Install
 
-Python 3.11+ recommended (3.10 needs `pip install toml` for TOML parsing).
+Python 3.11+ required.
 
 ```bash
-cd Mel.lrplugin/python
-pip install -r requirements.txt
+# End users (published package, all provider SDKs):
+pip install "photokin[all]"
+
+# Or install just the provider you need:
+pip install "photokin[openai]"      # or [anthropic] / [gemini]
+
+# Local development from this repo:
+cd python
+pip install -e ".[dev]"
 ```
 
 Only the SDK for the provider you use is required at runtime (`openai`,
@@ -47,7 +54,7 @@ must be installed separately (https://exiftool.org) or pointed to via
 ## How Lightroom invokes it
 
 ```bash
-python -m photo_archiver.cli \
+python -m photokin.cli \
   --manifest BATCH_manifest.json \
   --output-file BATCH_results.ndjson \
   --changeset true \
@@ -56,15 +63,15 @@ python -m photo_archiver.cli \
 
 Provider selection and API keys are passed via environment variables
 (`LLM_PROVIDER`, `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`,
-model vars). See the [core README](photo_archiver/README.md) for the full CLI
+model vars). See the [core README](photokin/README.md) for the full CLI
 and environment reference.
 
 ## Tests
 
 ```bash
-cd Mel.lrplugin/python
+cd python
 python -m pytest
 ```
 
-This runs both `photo_archiver/tests/` (core + wrapper) and `tests/`
+This runs both `photokin/tests/` (core + wrapper) and `tests/`
 (helper-script tests).

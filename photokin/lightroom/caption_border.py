@@ -236,6 +236,13 @@ def wrap_text(text: str, font: ImageFont.ImageFont, max_width: int, draw: ImageD
 
 
 def main() -> int:
+    """CLI entry: add a Polaroid-style caption border to one image.
+
+    Invoked per rendered export by the plugin's Polaroid filter as
+    ``python -m photokin.lightroom.caption_border``. Parses sizing flags
+    (percentage-based so output is resolution-independent) and returns a process
+    exit code (0 on success).
+    """
     parser = argparse.ArgumentParser(
         description='Add Polaroid-style caption border to an image using percentage-based sizing'
     )

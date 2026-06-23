@@ -1,4 +1,4 @@
-# photo_archiver.exiftool (wrapper layer)
+# photokin.exiftool (wrapper layer)
 
 ExifTool integration on top of the core library. It exists because the
 Lightroom SDK cannot reliably read or write some fields — most importantly
@@ -39,7 +39,7 @@ on top (flag > env > default).
 
 1. Configured path (`ExiftoolConfig.path` / `--exiftool-path` /
    `EXIFTOOL_PATH`) — errors if set but missing.
-2. Bundled resource under `photo_archiver/tools/exiftool/<platform>/`
+2. Bundled resource under `photokin/tools/exiftool/<platform>/`
    (not currently shipped in this repo; extraction-to-cache machinery is in
    place for future bundled distribution).
 3. System `PATH` (`which exiftool`).
@@ -73,13 +73,13 @@ runs with `--changeset true`) and for each record:
 ## Standalone CLI
 
 ```bash
-python -m photo_archiver.exiftool --changeset batch_changeset.ndjson \
+python -m photokin.exiftool --changeset batch_changeset.ndjson \
   --enabled [--fields EXIF:UserComment,EXIF:DateTimeOriginal] \
   [--dry-run] [--exiftool-path /usr/local/bin/exiftool] \
   [--no-overwrite-original | --write-sidecar-only] [--output summary.json]
 ```
 
-(`photo_archiver/exiftool_apply.py` remains as a deprecated shim for the old
+(`photokin/exiftool_apply.py` remains as a deprecated shim for the old
 module path.)
 
 ## Relationship to `mel_exiftool_manifest.py`

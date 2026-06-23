@@ -5,8 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from face_utils import faces_to_llm_block, normalize_faces
-from mel_faces_xmp import parse_face_regions_from_xmp_bytes
+from photokin.lightroom.face_utils import faces_to_llm_block, normalize_faces
+from photokin.lightroom.faces_xmp import parse_face_regions_from_xmp_bytes
 
 
 XMP_SAMPLE = b"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>

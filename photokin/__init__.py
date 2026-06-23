@@ -1,5 +1,5 @@
 """
-photo_archiver.__init__
+photokin.__init__
 =======================
 
 Public API surface for the photo archiver library.

@@ -16,7 +16,7 @@ def hydrate_user_comments(items: list[dict], cfg: ExiftoolConfig) -> None:
     so Lightroom-provided values are never overridden.
     """
     try:
-        from mel_exiftool_manifest import run_exiftool_json
+        from photokin.lightroom.exiftool_manifest import run_exiftool_json
     except ImportError:
         return
 
@@ -56,7 +56,11 @@ def hydrate_user_comments(items: list[dict], cfg: ExiftoolConfig) -> None:
         user_comment = (rec.get("EXIF:UserComment") or "").strip()
         if not user_comment or not src:
             continue
-        for raw in item_by_path.get(src, []):
+        # ExifTool emits SourceFile with forward slashes even on Windows, while
+        # item_by_path is keyed by normalize_path() output (os.path.normpath, which
+        # uses backslashes on Windows). Normalize the record path the same way so
+        # the lookup matches on every platform.
+        for raw in item_by_path.get(normalize_path(src), []):
             meta = raw.get("metadata")
             if isinstance(meta, dict):
                 meta["userComment"] = user_comment

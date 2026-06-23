@@ -1,11 +1,27 @@
 """
-photo_archiver.exiftool.apply
+photokin.exiftool.apply
 =============================
 
 Apply a changeset NDJSON to files using ExifTool for limited, archival fields.
 
 This module is intentionally small: it reads changeset records, filters allowed
 tags, normalizes values (especially dates), and invokes ExifTool.
+
+Why this exists separately from the Lightroom SDK: a few archival fields (notably
+``EXIF:UserComment`` and date tags) are either unwritable or awkward via the SDK,
+so the plugin routes them here. Date normalization is the fiddly part — ExifTool
+wants ``YYYY:MM:DD HH:MM:SS``, but changesets carry ISO-ish strings, so most of
+the private helpers below exist to coerce values into ExifTool's expected shape.
+
+Code map:
+- _normalize_exif_datetime    coerce a datetime/ISO value into EXIF date format
+- _looks_like_exif_datetime   cheap check for already-EXIF-formatted strings
+- _normalize_exif_string      strip/clean a scalar string value
+- _parse_fallback_datetime    last-ditch parse of loose date text
+- _normalize_tag_value        dispatch a tag+value to the right normalizer
+- _build_exiftool_command     assemble the ExifTool argv for one file's writes
+- apply_changeset             PUBLIC: read a changeset NDJSON and write via ExifTool
+- main                        PUBLIC: CLI entry (python -m photokin.exiftool)
 """
 
 from __future__ import annotations
@@ -117,6 +133,17 @@ def apply_changeset(
     enabled: bool | None = None,
     fields: Iterable[str] | None = None,
 ) -> dict[str, Any]:
+    """Apply a changeset NDJSON file to photos via ExifTool, returning a summary.
+
+    Each line is one photo's changeset record; only tags in ``allowed_fields``
+    (the explicit ``fields`` arg, else ``cfg.fields``) are written, so this stays
+    a deliberately narrow archival-write path. Failures are collected per-file
+    into ``summary["errors"]`` rather than raised, so one bad file never aborts a
+    batch. Honors ``cfg.dry_run`` (preview without writing).
+
+    Returns a summary dict: ``files_seen``, ``files_written``, ``tags_written``,
+    ``errors``, ``warnings``, ``dry_run``.
+    """
     summary: dict[str, Any] = {
         "files_seen": 0,
         "files_written": 0,
@@ -220,6 +247,12 @@ def apply_changeset(
 
 
 def main() -> None:
+    """CLI entry point: apply a changeset NDJSON from the command line.
+
+    Parses ExifTool-apply flags into an :class:`ExiftoolConfig`, runs
+    :func:`apply_changeset`, and prints the JSON summary. Invoked as
+    ``python -m photokin.exiftool``.
+    """
     defaults = ExiftoolConfig()
     parser = argparse.ArgumentParser(description="Apply an ExifTool changeset NDJSON.")
     parser.add_argument("--changeset", required=True, help="Path to a changeset NDJSON file.")

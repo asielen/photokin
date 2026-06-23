@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 CLI helper for extracting metadata via ExifTool and emitting a lightweight
-manifest compatible with photo_archiver's manifest processor.
+manifest compatible with photokin's manifest processor.
 
 Why this exists:
 - Lightroom SDK doesn't expose many metadata fields reliably.
@@ -27,6 +27,18 @@ Output shape (manifest-like):
 It also tries to map a few common ExifTool tags into the manifest's expected
 top-level metadata keys (e.g. dateTimeOriginal, userComment, caption, title).
 Everything is always preserved under metadata["exiftool"] for debugging/audit.
+
+This module is also imported (not just run) by the ExifTool hydration path
+(``photokin.exiftool.hydrate``), which reuses :func:`run_exiftool_json`.
+
+Code map:
+- _split_fields                       expand comma-separated --field values
+- _normalize_paths                    absolutize/clean input file paths
+- run_exiftool_json                   PUBLIC: run exiftool -j and parse the JSON
+- _first_non_empty                    pick the first present value across tag aliases
+- exiftool_records_to_manifest_items  PUBLIC: ExifTool records -> manifest items
+- build_manifest                      PUBLIC: read + convert in one call -> manifest
+- main                               PUBLIC: CLI entry (python -m ...exiftool_manifest)
 """
 
 from __future__ import annotations
@@ -244,6 +256,12 @@ def build_manifest(
     *,
     include_all_if_no_fields: bool = False,
 ) -> Dict[str, Any]:
+    """Read metadata for ``files`` via ExifTool and return a manifest dict.
+
+    Thin composition of :func:`run_exiftool_json` +
+    :func:`exiftool_records_to_manifest_items`; the result (``{"items": [...]}``)
+    is directly consumable by the manifest processor.
+    """
     records = run_exiftool_json(
         exiftool_path=exiftool_path,
         files=files,
@@ -255,8 +273,13 @@ def build_manifest(
 
 
 def main(argv: List[str]) -> int:
+    """CLI entry: extract metadata for the given files and print a manifest JSON.
+
+    Invoked as ``python -m photokin.lightroom.exiftool_manifest``; writes to
+    ``--out`` if given, else stdout. Returns a process exit code.
+    """
     p = argparse.ArgumentParser(
-        description="Extract metadata with ExifTool and emit a manifest-like JSON for photo_archiver."
+        description="Extract metadata with ExifTool and emit a manifest-like JSON for photokin."
     )
     p.add_argument("files", nargs="+", help="One or more image paths to read metadata from.")
     p.add_argument(

@@ -1,5 +1,5 @@
 """
-photo_archiver.cli
+photokin.cli
 ==================
 
 Thin command-line interface for the photo archiver.
@@ -9,6 +9,18 @@ Responsibilities:
 - Build a Config object.
 - Invoke the library entrypoints.
 - Write outputs per flags (NDJSON/JSON/sidecars) and/or print to stdout.
+
+This is the module the Lightroom plugin launches (``python -m photokin.cli``);
+its flags and the manifest/NDJSON behavior are part of the plugin contract, so
+treat changes here as contract changes.
+
+Code map:
+- load_json                 read a UTF-8 JSON file (matches Lightroom's writes)
+- _interactive_prompt       prompt for image paths when no args are given
+- _apply_common_cfg         apply flags shared across single/folder/manifest modes
+- _resolve_exiftool_config  build ExiftoolConfig (CLI flag > env > default)
+- _apply_exiftool_changeset apply routed fields via ExifTool + append a status line
+- main                      PUBLIC: route to single / folder / manifest flow
 """
 
 import argparse

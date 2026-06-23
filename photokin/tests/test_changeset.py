@@ -1,7 +1,7 @@
 import unittest
 
-from photo_archiver.changeset import diff_canonical_metadata, ordered_group_keys
-from photo_archiver.canonical import CANONICAL_DESCRIPTION_TAG, CANONICAL_KEYWORDS_TAG
+from photokin.changeset import diff_canonical_metadata, ordered_group_keys
+from photokin.canonical import CANONICAL_DESCRIPTION_TAG, CANONICAL_KEYWORDS_TAG
 
 
 class TestChangesetDiffs(unittest.TestCase):

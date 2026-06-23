@@ -1,11 +1,33 @@
 #!/usr/bin/env python3
-"""Utility helpers for enriching metadata based on Lightroom face tags."""
+"""Enrich photo metadata (captions, keywords, summaries) from Lightroom face tags.
+
+Given a photo's face data (names + positions), this builds the various textual
+forms the plugin needs: prompt blocks for the LLM, row-ordered "left-to-right,
+top-to-bottom" people lists, caption insertions, and keyword sets. The
+``get_*_config`` helpers return ready-made option presets; :func:`process_face_tags`
+is the high-level driver that applies a config to a metadata dict.
+
+Code map:
+- _merge_options          merge caller options over a preset's defaults
+- _face_coord             read a face's center coordinate (handles x/y vs centerX)
+- _sorted_faces           order faces top-to-bottom, then left-to-right
+- _face_tags              normalize raw metadata into a FaceTags structure
+- build_authoritative_face_tags_section  authoritative face block for LLM prompts
+- format_faces_in_rows    render names in reading-order rows
+- remove_face_block_from_caption  strip a previously-added face block
+- add_faces_to_caption_rows / add_faces_to_caption  insert names into a caption
+- get_face_keywords       face names as keywords
+- get_face_count_info     count/summary info about faces
+- create_face_summary     human-readable summary sentence
+- process_face_tags       PUBLIC driver: apply a config to a photo's metadata
+- get_*_config            preset option bundles (basic/row/keyword/comprehensive)
+"""
 
 from __future__ import annotations
 
 from typing import Any, Mapping, MutableMapping, Sequence, TypedDict, cast
 
-from face_utils import faces_to_llm_block
+from photokin.lightroom.face_utils import faces_to_llm_block
 
 __all__ = [
     "format_faces_in_rows",
@@ -25,6 +47,9 @@ __all__ = [
 
 
 class Face(TypedDict, total=False):
+    """One face: a name plus position, tolerating both center (centerX/Y) and
+    rect (x/y/w/h) coordinate conventions seen across XMP sources."""
+
     name: str
     centerX: float
     centerY: float
@@ -35,6 +60,9 @@ class Face(TypedDict, total=False):
 
 
 class FaceTags(TypedDict, total=False):
+    """Normalized face data for a photo: presence flag, faces, count, and a
+    pre-formatted display string."""
+
     hasFaces: bool
     faces: list[Face]
     formattedString: str

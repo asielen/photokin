@@ -1,8 +1,25 @@
-"""
-Canonical tag mapping helpers.
+"""Canonical tag mapping: turn a loose metadata dict into authoritative tag keys.
 
-Changesets should rely on these canonical tag keys (XMP/IPTC/EXIF) as the
-authoritative diff surface.
+The rest of the pipeline speaks in fuzzy, model-friendly field names (``caption``,
+``keywords``, ``location_guess``, ``date_guess``). Writers (ExifTool, the
+changeset emitter) need stable industry-standard tag keys (XMP/IPTC/EXIF). This
+module is the single place that maps the former onto the latter, applying the
+confidence thresholds in :class:`~photokin.utils.Config` so low-confidence
+guesses are surfaced as *suggestions* rather than written.
+
+Two output shapes share that mapping logic:
+- a flat ``{tag: value}`` dict (``canonical_values_*``), and
+- a changeset ``{tag: {"op": "set", "value": ...}}`` patch plus a side-channel
+  ``patch_meta`` of below-threshold suggestions (``build_canonical_patch``).
+
+Code map:
+- _clean_str / _clean_str_list           trim/de-dup scalars and string lists
+- _location_components_from_metadata     read location parts straight from metadata
+- _location_components_from_guess        read location parts + confidence from a guess
+- _date_from_metadata                    pick a date (explicit wins over guess)
+- canonical_values_from_patch            PUBLIC: extract set-values from a patch
+- canonical_values_from_metadata         PUBLIC: metadata -> flat {tag: value}
+- build_canonical_patch                  PUBLIC: metadata -> (patch, suggestions)
 """
 
 from __future__ import annotations
@@ -107,6 +124,12 @@ def _date_from_metadata(meta: Dict[str, Any]) -> Tuple[str | None, float | None,
 
 
 def canonical_values_from_patch(patch: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Flatten a changeset patch into ``{tag: value}`` for its applied edits.
+
+    Only ``op == "set"`` entries are real writes; everything else (suggestions,
+    no-ops) is ignored. Used to recover "what would actually be written" from a
+    patch without re-deriving it from metadata.
+    """
     patch = patch or {}
     values: Dict[str, Any] = {}
     for key, payload in patch.items():
@@ -119,6 +142,15 @@ def canonical_values_from_patch(patch: Dict[str, Any] | None) -> Dict[str, Any]:
 
 
 def canonical_values_from_metadata(meta: Dict[str, Any] | None, config: Config) -> Dict[str, Any]:
+    """Map a metadata dict to a flat ``{canonical_tag: value}`` dict.
+
+    Applies the same precedence and confidence gating as
+    :func:`build_canonical_patch` (explicit dates/locations always win;
+    guesses are only included when at or above the configured threshold), but
+    returns plain values rather than changeset ops. Below-threshold guesses are
+    simply omitted here — use ``build_canonical_patch`` when you also need the
+    rejected suggestions.
+    """
     meta = meta or {}
     values: Dict[str, Any] = {}
 
@@ -161,6 +193,19 @@ def canonical_values_from_metadata(meta: Dict[str, Any] | None, config: Config) 
 
 
 def build_canonical_patch(meta: Dict[str, Any] | None, config: Config) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build a canonical changeset patch and a side-channel of suggestions.
+
+    Returns ``(patch, patch_meta)`` where:
+    - ``patch`` maps canonical tags to ``{"op": "set", "value": ...}`` for edits
+      confident enough to write (explicit metadata, or guesses at/above the
+      relevant ``Config`` threshold).
+    - ``patch_meta`` holds below-threshold location/date guesses as
+      ``{"suggested", "confidence", "reason"}`` so the UI can offer them without
+      the writer applying them.
+
+    Splitting confident writes from suggestions is what lets the plugin show
+    "we think this is X" without silently mutating the file.
+    """
     meta = meta or {}
     patch: Dict[str, Any] = {}
     patch_meta: Dict[str, Any] = {}

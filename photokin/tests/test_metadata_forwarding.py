@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from photo_archiver import utils
+from photokin import utils
 
 
 class TestMetadataForwarding(unittest.TestCase):

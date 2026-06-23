@@ -2,15 +2,19 @@ import json
 import unittest
 from unittest.mock import patch
 
-from photo_archiver import core, utils
+from photokin import core, utils
 
 
 class TestDryRunStreaming(unittest.TestCase):
     def test_process_manifest_stream_emits_usage_and_dry_run_flag(self):
+        # process_manifest_stream keys results by utils.normalize_path() output,
+        # which is platform-dependent (backslashes on Windows). Derive the key the
+        # same way so the fixture matches production keying on every OS.
+        photo_path = utils.normalize_path("/photos/family-front.jpg")
         manifest = {
             "items": [
                 {
-                    "path": "/photos/family-front.jpg",
+                    "path": photo_path,
                     "metadata": {"caption": "Existing caption"},
                 }
             ]
@@ -20,7 +24,7 @@ class TestDryRunStreaming(unittest.TestCase):
 
         fake_result = {
             "result": {
-                "/photos/family-front.jpg": {
+                photo_path: {
                     "caption": "Suggested caption",
                     "keywords": ["family", "portrait"],
                     "_usage": {
@@ -32,8 +36,8 @@ class TestDryRunStreaming(unittest.TestCase):
             }
         }
 
-        with patch("photo_archiver.core.analyze_photo", return_value=fake_result), patch(
-            "photo_archiver.core.build_canonical_patch",
+        with patch("photokin.core.analyze_photo", return_value=fake_result), patch(
+            "photokin.core.build_canonical_patch",
             return_value=({}, {}),
         ):
             result = core.process_manifest_stream(
@@ -43,7 +47,7 @@ class TestDryRunStreaming(unittest.TestCase):
                 ndjson_writer=lines.append,
             )
 
-        self.assertIn("/photos/family-front.jpg", result["results"])
+        self.assertIn(photo_path, result["results"])
         self.assertEqual(len(lines), 1)
         record = json.loads(lines[0])
         self.assertTrue(record["dry_run"])

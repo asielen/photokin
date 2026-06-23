@@ -1,5 +1,5 @@
 """
-photo_archiver.core
+photokin.core
 ===================
 
 Library entrypoint and orchestration logic.
@@ -12,6 +12,28 @@ Responsibilities:
 - Assemble prompts, call the model, and parse/clean JSON (with one retry).
 - Post-process: warnings, new keyword appends, optional sidecar JSON.
 - Batch helpers: folder mode, manifest streaming (NDJSON) or aggregate (JSON).
+
+This is the orchestration hub: the single-photo path (:func:`analyze_photo`), the
+group/variant path (:func:`analyze_group_parts`), and the batch path
+(:func:`process_manifest_stream`) all live here and share the same prompt/model/
+parse/merge machinery. ``process_manifest_stream`` is what the Lightroom plugin
+drives; it groups manifest items by photo, analyzes each group, and emits NDJSON
+incrementally while also returning an aggregate snapshot.
+
+Code map (public-facing entry points marked PUBLIC):
+- _build_llm_dump_writer        optional debug dumper for raw LLM requests
+- inject_analysis_date          stamp a date into the '[AI Analysis]:' caption prefix
+- _strip_empty_caption_sections drop empty [Front]/[Back] caption sections
+- _build_provider_client        construct the SDK client for the active provider
+- _ensure_provenance_keyword    guarantee one provider/model provenance keyword
+- _should_run_archival_upload   gate Files-API upload by provider
+- _normalized_error_payload     build a provider-normalized error record
+- analyze_photo                 PUBLIC: full pipeline for one front(+back) photo
+- analyze_group_parts           PUBLIC: analyze ordered parts (front/back/pages)
+- analyze_group_front_back      PUBLIC: convenience wrapper over analyze_group_parts
+- analyze_folder                PUBLIC: batch a whole folder
+- analyze_manifest              PUBLIC: aggregate wrapper over the stream
+- process_manifest_stream       PUBLIC: streaming NDJSON batch (the plugin path)
 """
 
 import json
@@ -786,6 +808,13 @@ def analyze_group_front_back(
     original_meta: dict | None = None,
     write_sidecar: bool = False,
 ) -> Dict[str, Any]:
+    """Analyze a photo from separate front/back path lists.
+
+    Convenience wrapper over :func:`analyze_group_parts` for the common case
+    where parts are already split into fronts and backs (rather than the generic
+    ``(label, paths)`` form). Empty lists are skipped so a front-only or
+    back-only set still works.
+    """
     parts: list[tuple[str, list[str]]] = []
     if front_paths:
         parts.append(("Front", front_paths))

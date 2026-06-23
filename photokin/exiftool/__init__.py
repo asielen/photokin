@@ -1,4 +1,4 @@
-"""ExifTool wrapper layer for photo_archiver.
+"""ExifTool wrapper layer for photokin.
 
 The core package never touches ExifTool; this subpackage provides the optional
 read (manifest hydration) and write (changeset apply) integration plus binary

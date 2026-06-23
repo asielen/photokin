@@ -1,5 +1,5 @@
 """
-photo_archiver.changeset
+photokin.changeset
 ========================
 
 Utilities for emitting a per-photo changeset NDJSON artifact.
@@ -11,6 +11,15 @@ representation rather than a verbatim copy of internal objects.
 
 Canonical tag keys (XMP/IPTC/EXIF) are the authoritative diff surface for the
 changeset; legacy field snapshots are intentionally out of scope here.
+
+Code map:
+- make_run_id                generate a run id (UTC timestamp + random token)
+- make_photo_id             stable id from sha1 of the normalized absolute path
+- select_forwarded_metadata pick which original fields are forwarded to the model
+- _normalize_keyword_list   trim/de-dup a keyword list for diffing
+- diff_canonical_metadata   compact set/keywords_add/keywords_remove diff
+- ordered_group_keys        deterministic ordering of group ids
+- emit_changeset_record     PUBLIC: write one photo's changeset NDJSON record
 """
 
 from __future__ import annotations

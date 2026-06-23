@@ -1,1 +1,2 @@
-recursive-include photo_archiver/tools/exiftool *
+include README.md
+recursive-include photokin/prompts_photo_ai *

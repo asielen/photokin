@@ -1,9 +1,9 @@
 import unittest
 from unittest.mock import patch
 
-from photo_archiver import core, utils
-from photo_archiver.exiftool import ExiftoolConfig
-from photo_archiver.exiftool.hydrate import hydrate_user_comments, make_manifest_hydrator
+from photokin import core, utils
+from photokin.exiftool import ExiftoolConfig
+from photokin.exiftool.hydrate import hydrate_user_comments, make_manifest_hydrator
 
 
 class TestHydratorInjection(unittest.TestCase):
@@ -28,8 +28,8 @@ class TestHydratorInjection(unittest.TestCase):
             }
         }
 
-        with patch("photo_archiver.core.analyze_photo", return_value=fake_result), patch(
-            "photo_archiver.core.build_canonical_patch",
+        with patch("photokin.core.analyze_photo", return_value=fake_result), patch(
+            "photokin.core.build_canonical_patch",
             return_value=({}, {}),
         ):
             core.process_manifest_stream(
@@ -65,22 +65,25 @@ class TestHydrateUserComments(unittest.TestCase):
             {"SourceFile": "/photos/c.jpg", "EXIF:UserComment": "From file C"},
         ]
         with patch(
-            "photo_archiver.exiftool.hydrate.resolve_exiftool_path",
+            "photokin.exiftool.hydrate.resolve_exiftool_path",
             return_value="/fake/exiftool",
-        ), patch("mel_exiftool_manifest.run_exiftool_json", return_value=records) as run_mock:
+        ), patch("photokin.lightroom.exiftool_manifest.run_exiftool_json", return_value=records) as run_mock:
             hydrate_user_comments(items, ExiftoolConfig())
 
         self.assertEqual(items[0]["metadata"]["userComment"], "From file A")
         self.assertEqual(items[1]["metadata"]["userComment"], "Keep me")
         self.assertEqual(items[2]["metadata"]["userComment"], "From file C")
-        # Only the items missing a userComment are queried.
+        # Only the items missing a userComment are queried. ExifTool is given
+        # normalize_path() output, which is platform-dependent, so normalize the
+        # expected paths the same way.
         queried = run_mock.call_args.kwargs["files"]
-        self.assertEqual(sorted(queried), ["/photos/a.jpg", "/photos/c.jpg"])
+        expected = sorted(utils.normalize_path(p) for p in ("/photos/a.jpg", "/photos/c.jpg"))
+        self.assertEqual(sorted(queried), expected)
 
     def test_noop_when_binary_missing(self):
         items = self._items()
         with patch(
-            "photo_archiver.exiftool.hydrate.resolve_exiftool_path",
+            "photokin.exiftool.hydrate.resolve_exiftool_path",
             side_effect=FileNotFoundError("not found"),
         ):
             hydrate_user_comments(items, ExiftoolConfig())
@@ -89,10 +92,10 @@ class TestHydrateUserComments(unittest.TestCase):
     def test_noop_when_exiftool_read_fails(self):
         items = self._items()
         with patch(
-            "photo_archiver.exiftool.hydrate.resolve_exiftool_path",
+            "photokin.exiftool.hydrate.resolve_exiftool_path",
             return_value="/fake/exiftool",
         ), patch(
-            "mel_exiftool_manifest.run_exiftool_json",
+            "photokin.lightroom.exiftool_manifest.run_exiftool_json",
             side_effect=RuntimeError("boom"),
         ):
             hydrate_user_comments(items, ExiftoolConfig())
@@ -102,10 +105,10 @@ class TestHydrateUserComments(unittest.TestCase):
         items = self._items()
         hydrator = make_manifest_hydrator(ExiftoolConfig())
         with patch(
-            "photo_archiver.exiftool.hydrate.resolve_exiftool_path",
+            "photokin.exiftool.hydrate.resolve_exiftool_path",
             return_value="/fake/exiftool",
         ), patch(
-            "mel_exiftool_manifest.run_exiftool_json",
+            "photokin.lightroom.exiftool_manifest.run_exiftool_json",
             return_value=[{"SourceFile": "/photos/a.jpg", "EXIF:UserComment": "Filled"}],
         ):
             hydrator(items)

@@ -1,11 +1,30 @@
 #!/usr/bin/env python3
-"""Reusable Lightroom face-tag processing recipes for quick copy/paste."""
+"""Reusable Lightroom face-tag processing recipes for quick copy/paste.
+
+These are illustrative usage patterns for :mod:`photokin.lightroom.face_processor`,
+not part of the plugin's runtime path. Each ``example_*`` function takes photo
+metadata + config and returns the processor's result, showing one way to shape
+captions/keywords from face data.
+
+Code map:
+- _process_if_faces        run the processor only when the photo has faces
+- example_basic            append face names to the caption
+- example_natural_language natural-language description of who's pictured
+- example_keywords_only    add faces as keywords, leave caption untouched
+- example_comprehensive    caption + keywords + custom summary fields
+- example_before_caption   prepend face names to the existing caption
+- example_conditional      only process photos with certain keywords
+- example_formal           formal documentation-style captions
+- example_event_attendees  document attendees in the caption
+- example_custom_field     store face info in a custom field only
+- example_portrait_detection auto-categorize by face count
+"""
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
-import face_processor
+from photokin.lightroom import face_processor
 
 __all__ = [
     'example_basic',

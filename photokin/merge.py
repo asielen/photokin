@@ -1,4 +1,33 @@
-# photo_archiver/merge.py
+"""Reconcile an AI-generated metadata record with a photo's existing metadata.
+
+This module owns the "should we trust this?" policy that sits between the model's
+proposals and what actually gets written to a file. The model reasons about *what
+it sees* (a date guess, a location guess, transcribed text); this module decides
+*what to keep*, giving human-entered/original metadata priority and applying
+conservative, config-gated heuristics before overriding anything.
+
+The single public entry point is :func:`merge_record_with_original`. Everything
+else is a small, pure helper it composes. The function returns both the merged
+record and a report of what it overrode/unioned, so callers can log decisions.
+
+Key domain rules encoded here:
+- Keywords union (original first), case-insensitive de-dup, spelling preserved.
+- Original title/caption/date/location win when present.
+- A reviewed ``DATE:`` keyword is a human "hands off the date" signal that
+  suppresses the date-correction heuristic.
+
+Code map:
+- _norm_str_set                       order-preserving, case-insensitive de-dup
+- _extract_year                       pull a plausible 4-digit year from free text
+- _has_date_keyword                   detect a human-reviewed ``DATE:`` marker
+- _valid_pattern                      sanity-check a model date pattern (Y!M!D!)
+- _normalize_location_component       trim/empty-to-None a single location field
+- _structured_location_from_original  read location parts from original metadata
+- _render_location_string             join location parts into a display string
+- _standardize_location_guess         normalize the merged location_guess shape
+- merge_record_with_original          PUBLIC: merge record + original -> (merged, report)
+"""
+
 from typing import Dict, Any, Tuple, List
 import os
 import sys
@@ -177,8 +206,6 @@ def merge_record_with_original(
     This keeps the "should we trust this?" logic here, while leaving the
     nuanced "what do we know about the date?" reasoning to the model.
     """
-    print(record)
-    print(original)
     merged = {**record}
     report: Dict[str, Any] = {"overrides": [], "unions": []}
 
@@ -240,7 +267,10 @@ def merge_record_with_original(
             and ai_conf >= config.date_override_precise_confidence_threshold
         ):
             min_year_gap = config.date_override_precise_year_gap
-        print(
+        # Diagnostic for the date-override decision. Kept behind a debug flag and
+        # routed to stderr so it never pollutes the NDJSON result stream.
+        if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
+            print(
                 "[DATE-OVERRIDE-CHECK]",
                 f"path={original.get('path')}",
                 f"dt_orig_raw={dt_orig_raw!r}",
@@ -251,7 +281,8 @@ def merge_record_with_original(
                 f"min_gap={min_year_gap}",
                 f"abs_gap={(abs(ai_year - dt_year) if ai_year and dt_year else None)}",
                 f"has_DATE_keyword={'DATE:' in ' '.join(original.get('keywords', []))}",
-        )
+                file=sys.stderr,
+            )
         if (
             not has_reviewed_date_kw
             and isinstance(ai_conf, (int, float))

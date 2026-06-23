@@ -1,4 +1,12 @@
-# public.py
+"""Stable, forward-compatible public API for embedders (Lightroom scripts, CLIs).
+
+These thin wrappers delegate straight to :mod:`photokin.core` but exist as a
+deliberate stability seam: callers import from here so the core module layout can
+be refactored freely without breaking downstream code. Keep these signatures
+conservative and additive — they are the promise the package makes to outside
+consumers.
+"""
+
 from __future__ import annotations
 from typing import Optional, Dict, Any, Callable
 
@@ -14,7 +22,7 @@ def analyze_photo(
     cfg: Optional[Config] = None,
     log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
-    """Forward-compatible wrapper around :func:`photo_archiver.core.analyze_photo`.
+    """Forward-compatible wrapper around :func:`photokin.core.analyze_photo`.
 
     Keeping this shim thin means Lightroom scripts can upgrade independently of
     the core package while still reusing the shared validation and retries.
@@ -54,7 +62,7 @@ def analyze_manifest(
     # log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
     """
-    Expose the manifest helper implemented in :mod:`photo_archiver.core`.
+    Expose the manifest helper implemented in :mod:`photokin.core`.
 
     The wrapper exists so plug-in builds can continue importing from the public
     surface while we freely refactor the core module layout.

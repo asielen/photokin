@@ -1,4 +1,17 @@
-"""ExifTool binary discovery: configured path, bundled resource, or system PATH."""
+"""ExifTool binary discovery: configured path, bundled resource, or system PATH.
+
+The library does not ship an ExifTool binary; it locates one at runtime. The
+bundled-resource tier exists only so a downstream distribution (e.g. the
+Lightroom plugin) *could* vendor one — in the plain PyPI install it finds
+nothing there and falls through to the system PATH.
+
+Code map:
+- _default_exiftool_cache_dir         writable cache dir for extracted binaries
+- _platform_exiftool_resource_relpath (subdir, filename) for this OS's binary
+- _ensure_executable                  chmod +x an extracted binary (POSIX)
+- _try_clear_macos_quarantine         drop the macOS quarantine xattr
+- resolve_exiftool_path               PUBLIC: config path -> bundled -> system PATH
+"""
 
 from __future__ import annotations
 
@@ -17,7 +30,7 @@ from .config import ExiftoolConfig
 
 def _default_exiftool_cache_dir() -> Path:
     """Return a stable, writable cache location for extracted binaries."""
-    return Path.home() / ".photo_archiver" / "bin"
+    return Path.home() / ".photokin" / "bin"
 
 
 def _platform_exiftool_resource_relpath() -> tuple[str, str]:
@@ -65,7 +78,7 @@ def resolve_exiftool_path(cfg: ExiftoolConfig | None = None) -> str:
 
     Resolution order:
     1) cfg.path (if provided and exists)
-    2) bundled resource under photo_archiver/tools/exiftool/<platform>/
+    2) bundled resource under photokin/tools/exiftool/<platform>/
        - if resource isn't a real file path, extract to cache and run from there
     3) system PATH
     """
@@ -82,7 +95,7 @@ def resolve_exiftool_path(cfg: ExiftoolConfig | None = None) -> str:
     try:
         subdir, fname = _platform_exiftool_resource_relpath()
         rel = Path("tools") / "exiftool" / subdir / fname
-        res = _res.files("photo_archiver") / rel.as_posix()
+        res = _res.files("photokin") / rel.as_posix()
 
     except Exception as exc:
         bundle_resolution_error = exc

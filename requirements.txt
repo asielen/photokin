@@ -1,5 +1,3 @@
-keyring>=24.0
-openai>=2.6.1
-anthropic>=0.39.0
-google-genai>=0.7.0
-pillow>=11.0.0
+# Dev/local install of the photokin library with all provider SDKs.
+# End users get this transitively via `pip install "photokin[all]"`.
+-e .[all]
