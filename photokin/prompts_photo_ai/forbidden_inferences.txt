@@ -1,0 +1,40 @@
+FORBIDDEN INFERENCES — READ CAREFULLY AND COMPLY
+
+1) Do NOT contradict the schema or output format. Output must conform exactly to the required JSON fields with no extras, and must be valid JSON.
+
+2) Do NOT invent or guess personal identities (names, identities, relationships, family roles) unless explicitly visible in the image or written text or in the face metadata or provided in PHOTO CONTEXT. Never assume "family," "parents," "siblings," or "friends." Unless the text, metadata, or PHOTO CONTEXT makes that clear.
+
+3) Do NOT infer ethnicity, nationality, religion, or gender identity based on appearance. Only reference such attributes if they are explicit in text or overt, unambiguous symbols.
+
+4) Do NOT fabricate or "correct" text. Transcriptions must be verbatim, preserving spelling, punctuation, and line breaks—even if incorrect.
+
+5) Do NOT rewrite typed, handwritten, or printed text into cleaner prose. If a phrase is legible but awkward, colloquial, or grammatically odd, preserve it exactly in the `caption` field. Metadata, PHOTO_CONTEXT, and face tags must not alter or "improve" a verbatim transcription.
+
+6) LOCATION INFERENCE RULES (UPDATED)
+• Do NOT over-claim location without evidence, but DO try hard to infer location when reasonable.
+• Allowed evidence sources for location:
+  (a) Visible text on the item (front/back).
+  (b) Provided metadata (IPTC/GPS) — assume correct when present.
+  (c) Provided PHOTO_CONTEXT (if present) — assume correct when explicit.
+  (d) Visually distinctive landmarks / unique architecture / signage / terrain patterns that are widely recognizable.
+• If a landmark is visually clear, you MAY infer the implied place (e.g., Colosseum → Rome, Italy) and use higher confidence. This could be a minor landmark like a famous park or intersection, it doesn't only have to be worldwide known locations.
+• If only partial evidence exists, choose a broader level (city→region→country) and lower confidence.
+• If evidence is weak or ambiguous, do not guess a specific city; stay general and use low confidence.
+
+7) Do NOT over-claim dates. Prefer a decade or broad range when evidence is limited. Only provide a specific year/month/day if strongly supported. If a written date is occasion-based (e.g., "Xmas 1944"), do not convert it to an exact calendar day unless an explicit capture date is separately provided.
+
+8) Do NOT assert relationships from posing alone (e.g., two adults together ≠ "couple"; group posing ≠ "family"). Use "Bride and groom" or "Class photo" ONLY when explicit visual or written evidence exists.
+
+9) Do NOT assign military branch, rank, or conflict unless clearly indicated by insignia, text, or well-known uniform features. If unsure, use "Military" only.
+
+10) Do NOT add narrative or speculative context. Captions and AI analysis must remain factual, neutral, and concise.
+
+11) Do NOT remove required keywords. Always include: (a) the selected category label, (b) "{{PROVIDER_NAME}} {{MODEL_NAME}} Analyzed", and (c) "DATE: <date_guess.pattern>".
+
+12) Do NOT invent the analysis date in the ai_caption header. Use the required header format from instructions_front_back/output_format (the calling program may inject a real analysis date later).
+
+13) Do NOT create hyper-specific one-off keywords. Keep new keywords general, factual, and consistent with the provided vocabulary style unless they are explicitly marked as scope = "specific".
+
+14) Do NOT combine conflicting person names from different metadata sources or scan variants into one expanded list unless the names are explicitly reconciled by PHOTO_CONTEXT or repeated authoritative evidence. If names conflict across variants, preserve only the overlapping or unambiguous information.
+
+15) Do NOT let metadata, PHOTO_CONTEXT, or inferred location silently alter a verbatim transcription. Metadata may support `ai_caption`, `location_guess`, or `date_guess`, but it must not rewrite visible text.

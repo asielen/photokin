@@ -1,0 +1,208 @@
+IMAGE ANALYSIS RULES
+
+Your goal is to annotate each photograph in a manner suitable for long-term archival research, genealogical use, and machine-based retrieval.
+
+KEYWORD RULES
+
+• Minimum of 4 NEW keywords per photo (beyond what already exists in
+  the provided metadata), with a target of 6-10 new keywords when
+  there is enough clear signal.
+• For each photo, actively scan for keywords across MULTIPLE dimensions:
+  – WHAT: objects, vehicles, documents, clothing visible in the scene
+  – WHERE: location names, landmark names, neighborhood, city, region
+    that can be inferred from the image or text
+  – WHO: descriptive terms (not names — those come from metadata/face
+    tags) like "Military Personnel", "Adults", "Children"
+  – WHEN: decade keywords like "1940s" when supported by evidence
+  – CONTEXT: activity or event type like "Family gathering", "Military
+    furlough", "Travel sightseeing"
+  – FORMAT: "Black and white photo", "Scrapbook page", etc.
+• Use the provided preferred vocabulary. Select from it when relevant.
+• You may create new keywords only when necessary, and they must:
+  – Be factual and directly related to visible content
+  – Match the style, granularity, and tone of the provided examples
+  – Not be poetic, subjective, emotional, or speculative
+• If a place name (city, landmark, street, building) is clearly
+  identified in the image text or strongly supported by visual evidence,
+  add it as a keyword even if it also appears in the location_guess.
+
+KEYWORD RECALL (USE KNOWN VOCAB)
+• If a concept clearly applies and it exists in the preferred vocabulary,
+  you MUST include it. Do not leave applicable vocabulary unused.
+• Prefer an existing vocabulary keyword over leaving something untagged.
+• After drafting your keywords, do a second pass: review the vocabulary
+  sections and check whether any clearly-applicable terms were missed.
+• New keywords are the conservative case; known vocabulary keywords are
+  the primary source and must be used aggressively when supported.
+
+STYLE OF CAPTION TRANSCRIPTION (TEXT-HEAVY ITEMS)
+
+The "caption" field is a verbatim transcription of visible text on the photo/document.
+
+For historical or typed captions, fidelity outranks readability. Do not
+replace unusual original wording with a cleaner modern equivalent.
+Preserve strange but legible phrases exactly as written.
+
+ILLEGIBLE TEXT HANDLING
+• Use [?] sparingly — only for a single illegible word in an otherwise
+  readable sentence (e.g., "brought home a big bunch of [?]").
+• For larger illegible sections (3+ consecutive unreadable words), use a
+  single [illegible] marker, NOT individual [?] for every word.
+• Bleed-through text from the reverse side of paper is NOT visible text.
+  Do NOT transcribe bleed-through — simply ignore it entirely.
+• If the entire remainder of a page is illegible, write [remainder illegible]
+  once and stop. NEVER output long runs of repeated [?] markers.
+• Maximum: a caption should contain no more than ~20 [?] markers total.
+  If you find yourself exceeding that, summarize with [illegible] instead.
+
+When there are multiple distinct text regions (common on postcards, letters, forms, scrapbook pages):
+• Split the transcription into clear blocks using bracket labels on their own line, e.g.:
+  [Back]
+  [Letter]
+  <handwritten message>
+  [Address]
+  <recipient line(s)>
+  [Printed text] (or [Bottom text])
+  <printed caption / publisher text>
+  [Publisher]
+  <copyright / series / card number / studio mark>
+• Use labels only when they prevent confusion; keep them short and human-readable.
+• Do not interpret inside the transcription; just transcribe.
+
+(See instructions_front_back.txt for full transcription and labeling rules.)
+
+DOCUMENT SUBTYPES
+• If the primary subject is a document/page (handwritten or typed), include "Document".
+• Also include the most specific known document subtype(s) from the vocabulary when clear:
+  Letter, Postcard, Diary, Journal, Guest book, Certificate, Program, Invitation, Obituary, etc.
+
+
+KEYWORDS
+• Short, general, meaningful terms suitable for search
+• Prefer nouns and noun phrases over adjectives
+• Use singular nouns unless plural is logically required
+• Avoid over-specific, one-off words that are unlikely to be useful elsewhere
+
+MANDATORY KEYWORDS
+Always include:
+• The chosen photo category (exact label)
+• "{{PROVIDER_NAME}} {{MODEL_NAME}} Analyzed"
+• "DATE: <date_guess.pattern>" — this must exactly match the value in date_guess.pattern
+
+PET & ANIMAL TAGGING
+• Family pet clearly shown → use both "Pets" and "Animals"
+• Non-domestic animals (zoo, wild, farm, etc.) → "Animals" only, unless domesticated
+
+SHORT CODES & WRITING ON IMAGE
+• If photo includes a short code or identifier (e.g., "R-123", "L-224", "17B", "186"), include it exactly as a keyword with "PC-" added to the start (e.g., "R-123" → "PC-R-123").
+• Do not alter capitalization or spacing.
+• Any numerical or semi-numerical string that does not appear as part of a caption or a date should be treated as a short code keyword.
+• These code keywords must NOT be proposed as new vocabulary (do not put PC-* in proposed_new_keywords).
+
+TITLE
+• Include a title only if clearly indicated in the text on the image (front or back)
+• If unclear, set title to null
+
+LOCATION GUESS
+• Goal: infer location helpfully but conservatively. Prefer explicit text
+  on the item, explicit PHOTO_CONTEXT, explicit metadata, or unmistakable
+  landmarks.
+• Provide the best-guess location at any reasonable level (country / state or region / city / sublocation).
+• Actively look for:
+  – iconic landmarks and distinctive architecture (e.g., Colosseum → Rome, Italy)
+  – readable signs, storefronts, street names, license plates, transit branding
+  – flags, uniforms, language cues (as supporting evidence only)
+  – terrain/vegetation/climate patterns (as weak evidence; keep confidence lower)
+  – GPS/IPTC fields if provided
+  – PHOTO_CONTEXT if provided (treat explicit statements as authoritative)
+• If a landmark is visually clear, you may infer the implied city/country with higher confidence.
+• Do not convert weak architectural, vegetation, or travel-context clues
+  into a specific hotel, street, or city unless there is additional
+  direct support (visible text, recognizable signage, GPS data).
+• Confidence guidance:
+  – 0.90–1.00: explicit text or GPS/IPTC, or unmistakable landmark
+  – 0.60–0.85: strong but not definitive landmark/signage cues
+  – 0.30–0.55: weak cues (architecture style / terrain) → stay broader
+  – 0.00–0.25: no useful evidence → null fields + very low confidence
+• If insufficient evidence for city, do not "pick one" — return only country/region with lower confidence.
+
+DATE GUESS (CAPTURE DATE)
+• Provide the best possible capture date estimate using an ISO-like format or decade indicator, e.g.:
+  – "1950s"
+  – "1944"
+  – "1983-07"
+  – "1983-07-14"
+• Include a confidence score (0.0–1.0).
+• If little evidence exists, use a decade or broad range with low confidence.
+• Do NOT guess a specific year unless strong evidence supports it.
+• Take into account photo quality and technology. An old building built in the 1500s was not photographed in the 1500s because photography technology didn't exist then.
+
+PREFERRED DATE EVIDENCE ORDER
+When available, prefer evidence in this order:
+1) Explicit written date on the item (handwritten/printed)
+2) Provided metadata capture date (EXIF or supplied by the calling program)
+3) Filename-embedded dates (e.g., PXL_YYYYMMDD_..., IMG_YYYYMMDD_..., YYYY-MM-DD in name/path)
+4) Visual style clues (clothing, cars, film type) — use broader dates and lower confidence
+5) Known event/landmark time bounds (rare, only if clearly supportable by the photo)
+
+If a written date is partial or occasion-based (for example "Xmas 1944"),
+do not convert it to an exact calendar day unless an explicit capture
+date is separately provided in metadata or PHOTO_CONTEXT.
+
+If only #5 or #4 applies, do NOT pick a random year; use a decade like "2020s" and conservative confidence.
+
+DATE GUESS FOR IMPORT (IMPORTABLE DATE)
+• Provide date_guess.import_date as a valid YYYY-MM-DD date suitable for EXIF import.
+• import_date must be consistent with date_guess.iso:
+  – If iso is YYYY-MM-DD, import_date must match it exactly.
+  – If iso is YYYY-MM, choose a reasonable day (e.g., 15) unless evidence supports a specific day.
+  – If iso is YYYY or decade/range, choose a reasonable mid-point date for import, and use a pattern that reflects uncertainty.
+
+DATE PATTERN ENCODING (date_guess.pattern)
+• date_guess.pattern encodes confidence at the YEAR / MONTH / DAY level:
+  ! = Confident
+  ~ = Best Guess
+  ? = Unknown / placeholder (usually omitted by stopping at the last known level)
+
+Only include markers up to the most granular known component. Examples:
+• Full date known (1942-11-25): "Y!M!D!"
+• Year confident, month best guess (1960-05): "Y!M~"
+• Year only confident (1960): "Y!"
+• Decade best guess ("1920s"): "Y~"
+
+If a season can be inferred from the image, the month can be guessed with the M~ tag.
+
+INFERENCES & CONFIDENCE
+• Visually supported inferences are allowed but must be conservative and realistic.
+• Use lower confidence if evidence is limited.
+
+EXISTING CAPTIONS
+
+Captions may contain important human context not visible in the image.
+Use that context when it is plausible and consistent with the image.
+Do not discard useful contextual information.
+
+NEW KEYWORDS — WHEN AND HOW
+
+• Create a NEW keyword only if none of the preferred vocabulary fits.
+• Every NEW keyword must be listed in proposed_new_keywords with:
+  – keyword: exact new term
+  - note: 1–2 sentences explaining why this keyword is useful for search/retrieval (what it captures).
+  – section: which section it belongs to (one of the 12 section IDs used in the TOML)
+  – scope: "general" or "specific"
+    • general = broadly useful for most people doing similar archival/genealogy work
+    • specific = highly personal / proper-noun / narrowly useful (e.g., a person's name)
+• New keywords must be general, reusable, and consistent with the existing vocabulary style unless scope="specific".
+• Do NOT invent relationship terms or emotional terms.
+• Notes must be specific and meaningful. Do NOT write placeholders like:
+  "auto added", "provide a reason", "unknown", "N/A".
+• Examples of good notes:
+  - "Useful for identifying baby furniture in family photos."
+  - "Common travel document; helps group airport/flight-related images."
+  - "Printed publisher mark often found on postcards; helps classify postcard backs."
+
+
+KEYWORD HYGIENE
+• Do NOT propose or add any keyword that starts with "PC-" to proposed_new_keywords.
+  These are photo/box codes and must not be added to the vocabulary file.
+• Do NOT propose any keywords that are "system" keywords such as {{PROVIDER_NAME}} {{MODEL_NAME}} Analyzed

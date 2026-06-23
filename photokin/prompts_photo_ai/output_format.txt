@@ -1,0 +1,93 @@
+OUTPUT FORMAT — STRICT JSON ONLY
+
+You must output valid JSON with no commentary, no markdown, and no additional text.
+
+IMPORTANT JSON STRING RULES
+• All string fields MUST be valid JSON strings.
+• Do NOT include literal line breaks inside JSON strings.
+• If you need line breaks in "caption" or "ai_caption", encode them as the two-character escape sequence \n inside the JSON string.
+• Do NOT use triple quotes (""") anywhere in the JSON output.
+• Captions for multi-page documents may include page-labeled sections like "[Page 1]" / "[Page 2]" inside a single JSON string (with \n for line breaks).
+
+Root structure:
+
+{
+  "result": {
+    "<main_image_path>": {
+      "keywords": [ ... at least 4 strings ... ],
+      "caption": "<verbatim transcription only — see below>",
+      "ai_caption": "<scene description + analysis — see below>",
+      "title": "<string or null>",
+      "category": "<one of the allowed labels (exact match)>",
+      "location_guess": {
+        "country": "<string|null>",
+        "state": "<string|null>",
+        "city": "<string|null>",
+        "sublocation": "<string|null>",
+        "confidence": <0.0–1.0>
+      },
+      "date_guess": {
+        "iso": "<YYYY or YYYY-MM or YYYY-MM-DD or decade/range>",
+        "confidence": <0.0–1.0>,
+        "import_date": "<YYYY-MM-DD>",
+        "pattern": "<string>"
+      },
+      "proposed_new_keywords": []
+    }
+  }
+}
+
+Note: "proposed_new_keywords" entries, when present, must each contain:
+"keyword", "note", "section", and "scope" fields. Include entries ONLY
+if you created a keyword not found in the preferred vocabulary.
+
+REQUIREMENTS
+• Field names must match exactly as specified.
+• "proposed_new_keywords" is OPTIONAL; include ONLY if you created any keyword not found in the preferred vocabulary. Use an empty array [] if none.
+• Do not wrap the JSON in code fences.
+• Do not include comments or explanations outside the JSON.
+
+FIELD DEFINITIONS
+
+caption: ONLY transcribed text visible on the photos (front/back). For
+text-heavy items, separate distinct text blocks with bracket labels like
+[Back], [Front], [Letter], [Address], [Postmark], [Stamp], [Printed text]
+(or [Bottom text]), [Publisher]. Use \n escapes for line breaks. Use ""
+if no text is visible.
+
+ai_caption: "[AI Analysis]: <3–6 sentences of neutral description +
+analysis, ending with an inferred date sentence that includes evidence>".
+
+CAPTION MERGE NOTE: If an existing caption was provided, merge useful
+human context into the caption, remove duplicated or purely visual
+statements, and correct inaccuracies if needed.
+
+KEYWORDS REQUIREMENTS
+• Must include the chosen category label (exact).
+• Must include: "{{PROVIDER_NAME}} {{MODEL_NAME}} Analyzed".
+• Must include: "DATE: <date_guess.pattern>" (exact match to date_guess.pattern).
+• CRITICAL: The "DATE: ..." keyword string must EXACTLY match the
+  date_guess.pattern value. If date_guess.pattern is "Y~", the keyword
+  must be "DATE: Y~", not "DATE: Y!". Verify this before outputting.
+
+ai_caption REQUIREMENTS
+• Must start with "[AI Analysis]:" exactly once.
+• Do NOT invent an analysis date in the header. The calling program may inject a date later.
+• Must end with:
+  "Inferred date: <date_guess.iso> (confidence <0.xx>; evidence: <brief evidence list>)."
+  Evidence must be explicit (handwritten date, provided EXIF, filename timestamp, etc.). Avoid arbitrary years.
+• If evidence is weak, the inferred date may use a decade, broad range,
+  or "unknown", with low confidence. Do not force a specific year,
+  month, or day.
+
+DATE GUESS REQUIREMENTS
+• "date_guess.import_date" MUST be a valid YYYY-MM-DD string suitable for EXIF import.
+• It must be consistent with "date_guess.iso" (same year, and month/day if specified).
+• If only the year is known, choose a reasonable mid-point month/day (e.g., 06-15) and reflect uncertainty in date_guess.pattern.
+• "date_guess.pattern" encodes confidence at YEAR/MONTH/DAY:
+  ! = Confident, ~ = Best Guess, ? = Unknown/placeholder (often omitted by stopping at the last known level).
+  Examples:
+  - 1942-11-25: "Y!M!D!"
+  - 1960-05: "Y!M~"
+  - 1960: "Y!"
+  - 1920s: "Y~"

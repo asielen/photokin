@@ -1,0 +1,185 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "photo_analysis",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "result": {
+          "type": "object",
+          "description": "Analysis results keyed by the original main image path.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "keywords": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 3
+              },
+              "caption": {
+                "type": "string"
+              },
+              "ai_caption": {
+                "type": "string"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "category": {
+                "type": "string",
+                "enum": [
+                  "Portrait",
+                  "Group photo",
+                  "Photo Page",
+                  "Candid",
+                  "Landscape",
+                  "Cityscape",
+                  "Document",
+                  "Postcard",
+                  "Travel Photo",
+                  "Event",
+                  "Art photo"
+                ]
+              },
+              "location_guess": {
+                "type": "object",
+                "properties": {
+                  "country": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "state": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "city": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sublocation": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                  }
+                },
+                "required": [
+                  "country",
+                  "state",
+                  "city",
+                  "sublocation",
+                  "confidence"
+                ],
+                "additionalProperties": false
+              },
+              "date_guess": {
+                "type": "object",
+                "properties": {
+                  "iso": {
+                    "type": "string"
+                  },
+                  "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                  },
+                  "import_date": {
+                    "type": "string",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "iso",
+                  "confidence",
+                  "import_date",
+                  "pattern"
+                ],
+                "additionalProperties": false
+              },
+              "proposed_new_keywords": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "keyword": {
+                      "type": "string"
+                    },
+                    "note": {
+                      "type": "string"
+                    },
+                    "section": {
+                      "type": "string",
+                      "enum": [
+                        "people_subjects",
+                        "clothing_fashion",
+                        "objects_artifacts",
+                        "animals_pets",
+                        "setting_environment",
+                        "architecture_built",
+                        "events_occasions",
+                        "photo_format",
+                        "written_elements_identifiers",
+                        "activities_actions",
+                        "emblems_symbols_context",
+                        "landscape_nature",
+                        "documents_records"
+                      ]
+                    },
+                    "scope": {
+                      "type": "string",
+                      "enum": [
+                        "general",
+                        "specific"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "keyword",
+                    "note",
+                    "section",
+                    "scope"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "keywords",
+              "caption",
+              "ai_caption",
+              "title",
+              "category",
+              "location_guess",
+              "date_guess"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

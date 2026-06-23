@@ -1,0 +1,18 @@
+# Metadata fields forwarded from manifest metadata into the LLM prompt.
+# Face tags are also rendered into a deterministic prompt block sorted by
+# center.x (left→right), then center.y, with compact rounded geometry.
+forward_fields = [
+  "keywords",
+  "title",
+  "caption",
+  "userComment",
+  "dateTimeOriginal",
+  "location",
+  "city",
+  "state",
+  "stateProvince",
+  "country",
+  "locationShown",
+  "gps",
+  "faceTags",
+]
