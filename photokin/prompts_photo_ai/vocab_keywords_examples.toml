@@ -272,6 +272,8 @@ keywords = [
   { keyword = "Polaroid photograph", note = "Instant film format; do not infer year without evidence" },
   { keyword = "World War II", note = "Use only if explicitly indicated or strongly supported" },
   { keyword = "Scrapbook page", note = "Identifies a physical album or scrapbook page containing mounted photographs and typed or handwritten captions, helping distinguish assembled documentary pages from individual loose photographs." },
+  { keyword = "Drone photography", note = "Useful for identifying aerial photographs taken by drones, which have become common in real estate and landscape documentation since the 2010s." },
+  { keyword = "Selfie", note = "Describes a self-portrait photograph taken at arm's length, a common modern photo format useful for categorizing casual travel and personal photos." },
 ]
 
 [written_elements_identifiers]

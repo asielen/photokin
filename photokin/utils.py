@@ -123,7 +123,7 @@ def resolve_model_for_provider(config: Config) -> str:
         return resolve_claude_model(preferred)
     if provider == "gemini":
         return config.gemini_model_name or "gemini-2.5-flash"
-    return config.model
+    return config.model.strip()
 
 
 MAX_PHOTO_CONTEXT_BYTES = 200 * 1024
