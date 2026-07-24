@@ -26,6 +26,7 @@ import hashlib
 import io
 import os
 import platform
+import re
 import shutil
 import sys
 import tempfile
@@ -61,30 +62,39 @@ def _http_get(url: str, *, timeout: int = 120) -> bytes:
         return resp.read()
 
 
-def _published_sha256(filename: str, *, timeout: int = 30) -> Optional[str]:
-    """Return the SHA256 for `filename` from exiftool.org/checksums.txt, or None.
+_SHA256_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
 
-    The file lists lines like ``SHA256(exiftool-13.47_64.zip)= <hex>``.
+
+def _published_sha256(filename: str, version: str = EXIFTOOL_VERSION, *, timeout: int = 30) -> Optional[str]:
+    """Return the published SHA256 for `filename` from exiftool.org, or None.
+
+    ExifTool publishes a per-release checksums file (``checksums-<version>.txt``);
+    the unversioned ``checksums.txt`` only ever covers the *current* release, so a
+    pinned older version won't be listed there. Try the versioned file first, then
+    the unversioned one. Parse robustly: pick the 64-hex token off any line that
+    names the archive (handles both ``SHA256(file)= <hex>`` and ``<hex>  file``
+    layouts; the 64-hex width naturally excludes the SHA1/MD5 lines).
     """
-    try:
-        text = _http_get(f"{_BASE_URL}/checksums.txt", timeout=timeout).decode("utf-8", "replace")
-    except Exception:
-        return None
-    needle = f"SHA256({filename})="
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith(needle):
-            return line[len(needle):].strip().lower()
+    for url in (f"{_BASE_URL}/checksums-{version}.txt", f"{_BASE_URL}/checksums.txt"):
+        try:
+            text = _http_get(url, timeout=timeout).decode("utf-8", "replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            if filename in line:
+                m = _SHA256_RE.search(line)
+                if m:
+                    return m.group(0).lower()
     return None
 
 
-def _verify_sha256(data: bytes, filename: str) -> None:
+def _verify_sha256(data: bytes, filename: str, version: str = EXIFTOOL_VERSION) -> None:
     """Raise if `data` does not match a trusted SHA256 for `filename`.
 
     Prefers the offline KNOWN_SHA256 pin; otherwise uses exiftool.org's published
-    checksums. Fails closed when no trusted checksum is available.
+    per-release checksums. Fails closed when no trusted checksum is available.
     """
-    expected = KNOWN_SHA256.get(filename) or _published_sha256(filename)
+    expected = KNOWN_SHA256.get(filename) or _published_sha256(filename, version)
     if not expected:
         raise RuntimeError(
             f"No trusted SHA256 available for {filename} (checksums.txt unreachable "
@@ -154,7 +164,7 @@ def ensure_exiftool(cache_dir: Optional[str] = None, *, version: str = EXIFTOOL_
     archive = _windows_archive_name(version)
     try:
         data = _http_get(f"{_BASE_URL}/{archive}")
-        _verify_sha256(data, archive)
+        _verify_sha256(data, archive, version)
         return str(_extract_windows_bundle(data, dest_dir))
     except Exception as exc:  # best-effort: never raise into the caller
         print(f"[exiftool-fetch] could not provision bundled ExifTool: {exc}", file=sys.stderr)

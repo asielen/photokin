@@ -190,8 +190,16 @@ def _build_provider_client(config: utils.Config):
         except ImportError as exc:
             raise RuntimeError("OpenRouter provider selected but openai package is not installed.") from exc
         api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+        if not api_key:
+            # Do NOT pass api_key=None here: the OpenAI SDK would fall back to
+            # OPENAI_API_KEY from the environment while still targeting the
+            # OpenRouter base_url, leaking the wrong provider's secret to
+            # OpenRouter. Require the OpenRouter key explicitly instead.
+            raise RuntimeError(
+                "OpenRouter provider selected but OPENROUTER_API_KEY is not set."
+            )
         base_url = (os.getenv("OPENROUTER_BASE_URL") or "").strip() or "https://openrouter.ai/api/v1"
-        return OpenAI(api_key=api_key or None, base_url=base_url)
+        return OpenAI(api_key=api_key, base_url=base_url)
     try:
         from openai import OpenAI
     except ImportError as exc:

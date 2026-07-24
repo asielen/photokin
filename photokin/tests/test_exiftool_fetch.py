@@ -71,6 +71,37 @@ class TestVerifySha256(unittest.TestCase):
                 fetch._verify_sha256(b"payload", "b.zip")
 
 
+class TestPublishedChecksum(unittest.TestCase):
+    def test_prefers_versioned_file_and_parses_openssl_format(self):
+        def fake_get(url, **kw):
+            if url.endswith("checksums-13.47.txt"):
+                return (
+                    "SHA1(exiftool-13.47_64.zip)= " + "a" * 40 + "\n"
+                    "SHA256(exiftool-13.47_64.zip)= " + "b" * 64 + "\n"
+                ).encode()
+            raise OSError("versioned file should be tried first")
+
+        with patch.object(fetch, "_http_get", side_effect=fake_get):
+            got = fetch._published_sha256("exiftool-13.47_64.zip", "13.47")
+        self.assertEqual(got, "b" * 64)
+
+    def test_falls_back_to_unversioned_sha256sum_format(self):
+        def fake_get(url, **kw):
+            if url.endswith("checksums-13.47.txt"):
+                raise OSError("404")
+            if url.endswith("checksums.txt"):
+                return (("c" * 64) + "  exiftool-13.47_64.zip\n").encode()
+            raise OSError("unexpected url")
+
+        with patch.object(fetch, "_http_get", side_effect=fake_get):
+            got = fetch._published_sha256("exiftool-13.47_64.zip", "13.47")
+        self.assertEqual(got, "c" * 64)
+
+    def test_returns_none_when_unreachable(self):
+        with patch.object(fetch, "_http_get", side_effect=OSError("blocked")):
+            self.assertIsNone(fetch._published_sha256("exiftool-13.47_64.zip", "13.47"))
+
+
 class TestEnsureExiftool(unittest.TestCase):
     def test_non_windows_returns_none(self):
         with patch.object(fetch, "_is_windows", return_value=False):

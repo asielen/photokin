@@ -1,9 +1,50 @@
+import os
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 from photokin import core, utils
 from photokin.api_claude import _data_url_to_image_block
 from photokin.api_openai import ProviderApiError
 from photokin.api_openai_compat import extract_openai_compat_output_text
+
+
+class TestOpenRouterKeyIsolation(unittest.TestCase):
+    """OpenRouter uses the OpenAI SDK; passing api_key=None would let it read
+    OPENAI_API_KEY and send the wrong provider's secret to OpenRouter."""
+
+    def _fake_openai_module(self):
+        calls: dict = {}
+
+        class _OpenAI:
+            def __init__(self, **kwargs):
+                calls["kwargs"] = kwargs
+
+        mod = types.ModuleType("openai")
+        mod.OpenAI = _OpenAI
+        return mod, calls
+
+    def test_missing_openrouter_key_raises_without_using_openai_key(self):
+        mod, calls = self._fake_openai_module()
+        cfg = types.SimpleNamespace(provider="openrouter")
+        with patch.dict(sys.modules, {"openai": mod}), patch.dict(
+            os.environ, {"OPENAI_API_KEY": "sk-openai"}, clear=False
+        ):
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            with self.assertRaises(RuntimeError):
+                core._build_provider_client(cfg)
+        # Must not have constructed a client (which would carry the OpenAI key).
+        self.assertNotIn("kwargs", calls)
+
+    def test_uses_openrouter_key_not_openai_key(self):
+        mod, calls = self._fake_openai_module()
+        cfg = types.SimpleNamespace(provider="openrouter")
+        env = {"OPENAI_API_KEY": "sk-openai", "OPENROUTER_API_KEY": "or-secret"}
+        with patch.dict(sys.modules, {"openai": mod}), patch.dict(os.environ, env, clear=False):
+            core._build_provider_client(cfg)
+        self.assertEqual(calls["kwargs"]["api_key"], "or-secret")
+        self.assertIn("openrouter.ai", calls["kwargs"]["base_url"])
 
 
 class _UsageMetadataStub:
