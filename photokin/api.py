@@ -1,4 +1,4 @@
-"""Provider-dispatched LLM API helpers for OpenAI, Anthropic, and Gemini."""
+"""Provider-dispatched LLM API helpers for OpenAI, Anthropic, Gemini, and OpenRouter."""
 
 from __future__ import annotations
 
@@ -42,6 +42,16 @@ def call_model(
             image_data_urls,
             dump_request=dump_request,
         )
+    if normalized_provider == "openrouter":
+        from .api_openai_compat import call_openai_compat_model
+
+        return call_openai_compat_model(
+            client,
+            model,
+            content_items,
+            image_data_urls,
+            dump_request=dump_request,
+        )
     from .api_openai import call_openai_model
 
     return call_openai_model(
@@ -64,6 +74,10 @@ def extract_output_text(resp: Any, *, provider: str = "openai") -> str:
         from .api_gemini import extract_gemini_output_text
 
         return extract_gemini_output_text(resp)
+    if normalized == "openrouter":
+        from .api_openai_compat import extract_openai_compat_output_text
+
+        return extract_openai_compat_output_text(resp)
     from .api_openai import extract_openai_output_text
 
     return extract_openai_output_text(resp)

@@ -2,27 +2,33 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 from ..utils import normalize_path
 from .config import ExiftoolConfig
 from .locate import resolve_exiftool_path
 
+logger = logging.getLogger(__name__)
+
 
 def hydrate_user_comments(items: list[dict], cfg: ExiftoolConfig) -> None:
     """Best-effort: read EXIF:UserComment via ExifTool and merge into manifest items.
 
     Only fills in fields that are missing/null in the existing metadata,
-    so Lightroom-provided values are never overridden.
+    so Lightroom-provided values are never overridden. Non-fatal: if ExifTool
+    can't be found or fails to run, logs a warning and returns rather than
+    raising into the manifest pipeline.
     """
     try:
-        from photokin.lightroom.exiftool_manifest import run_exiftool_json
+        from photokin.lightroom.exiftool_manifest import _find_tag_value, run_exiftool_json
     except ImportError:
         return
 
     try:
         exiftool = resolve_exiftool_path(cfg)
-    except (FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning("Skipping EXIF:UserComment hydration: %s", exc)
         return
 
     paths_needing: list[str] = []
@@ -48,12 +54,15 @@ def hydrate_user_comments(items: list[dict], cfg: ExiftoolConfig) -> None:
             fields=["EXIF:UserComment"],
             timeout_sec=max(60, len(paths_needing) * 2),
         )
-    except (FileNotFoundError, RuntimeError, OSError):
+    except (FileNotFoundError, RuntimeError, OSError) as exc:
+        logger.warning("Skipping EXIF:UserComment hydration: ExifTool read failed: %s", exc)
         return
 
     for rec in records:
         src = rec.get("SourceFile") or ""
-        user_comment = (rec.get("EXIF:UserComment") or "").strip()
+        # run_exiftool_json requests -G1, so EXIF:UserComment comes back keyed as
+        # ExifIFD:UserComment; _find_tag_value matches on the bare tag name.
+        user_comment = str(_find_tag_value(rec, "EXIF:UserComment") or "").strip()
         if not user_comment or not src:
             continue
         # ExifTool emits SourceFile with forward slashes even on Windows, while

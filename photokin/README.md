@@ -16,6 +16,8 @@ core directly.
 - `api.py` — provider dispatch (adapters imported lazily, so only the selected
   provider's SDK must be installed).
 - `api_openai.py` / `api_claude.py` / `api_gemini.py` — provider adapters.
+- `api_openai_compat.py` — generic OpenAI-compatible Chat Completions adapter
+  (used by the OpenRouter provider; works with any compatible gateway).
 - `errors.py` — `ProviderApiError`, the normalized provider error.
 - `utils.py` — `Config`, prompt assembly, image encoding, JSON repair/parse,
   filename grouping, manifest helpers.
@@ -33,6 +35,7 @@ core directly.
 | OpenAI (ChatGPT) | `openai` (default) | `--openai-model` / `OPENAI_MODEL` (default `gpt-4o`) | `OPENAI_API_KEY` |
 | Anthropic (Claude) | `anthropic` (alias: `claude`) | `--claude-model` / `CLAUDE_MODEL`: `sonnet` or `haiku` alias, or full `claude-*` id | `ANTHROPIC_API_KEY` |
 | Google (Gemini) | `gemini` (alias: `google`) | `--gemini-model` / `GEMINI_MODEL` (default `gemini-2.5-flash`) | `GEMINI_API_KEY` |
+| OpenRouter (Kimi, Qwen-VL, GLM, …) | `openrouter` | `--openrouter-model` / `OPENROUTER_MODEL` (default `moonshotai/kimi-k3`) | `OPENROUTER_API_KEY` |
 
 Claude aliases resolve via `CLAUDE_MODELS` in `utils.py`
 (`sonnet` → `claude-sonnet-4-6`, `haiku` → `claude-haiku-4-5-20251001`;
@@ -55,6 +58,13 @@ guardrail appended for Gemini, plus Gemini-specific JSON repair in
   ordered images-first. `stop_reason=max_tokens` raises a `length` error.
 - **Gemini**: `generate_content` with `response_mime_type=application/json`,
   `temperature=0`; images become `inline_data` parts.
+- **OpenRouter**: Chat Completions (`/v1/chat/completions`) via the `openai`
+  SDK with `base_url=https://openrouter.ai/api/v1` (override with
+  `OPENROUTER_BASE_URL` to point at any other OpenAI-compatible gateway).
+  `max_tokens=4096`, `temperature=0`; images become `image_url` data-URL
+  parts, text-first. Any vision-capable model slug works (e.g.
+  `moonshotai/kimi-k3`, `qwen/qwen3-vl-*`). `finish_reason=length` raises a
+  `length` error. Archival file uploads are skipped (OpenAI-only).
 
 ## Error normalization
 

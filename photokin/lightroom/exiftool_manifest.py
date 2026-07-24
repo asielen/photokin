@@ -187,6 +187,36 @@ _TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     "IPTC:ObjectName": "title",
 }
 
+# run_exiftool_json requests -G1, so ExifTool returns fine-grained group names
+# (e.g. "ExifIFD:UserComment", "XMP-dc:Description") that do not match the
+# family-0 keys above. This mirror, keyed by the bare tag name, lets the mapping
+# succeed regardless of the reported group.
+_BARE_TAG_TO_MANIFEST_KEY: Dict[str, str] = {
+    tag.rsplit(":", 1)[-1]: mk for tag, mk in _TAG_TO_MANIFEST_KEY.items()
+}
+
+
+def _bare_tag(tag: str) -> str:
+    """Tag name without its group prefix, e.g. 'ExifIFD:UserComment' -> 'UserComment'."""
+    return tag.rsplit(":", 1)[-1]
+
+
+def _find_tag_value(rec: Dict[str, Any], tag: str) -> Any:
+    """Look up ``tag`` in an ExifTool record, tolerant of group mismatches.
+
+    ``run_exiftool_json`` requests ``-G1`` (fine-grained group names), so a
+    request for e.g. ``EXIF:UserComment`` comes back keyed as
+    ``ExifIFD:UserComment``. Match on the exact key first, then fall back to
+    comparing bare tag names.
+    """
+    if tag in rec:
+        return rec[tag]
+    bare = _bare_tag(tag)
+    for key, value in rec.items():
+        if key != "SourceFile" and _bare_tag(key) == bare:
+            return value
+    return None
+
 
 def _first_non_empty(values: Sequence[Optional[str]]) -> Optional[str]:
     for v in values:
@@ -210,6 +240,10 @@ def exiftool_records_to_manifest_items(
     - If multiple tags map to the same manifest key, the first non-empty wins.
     """
     fields_n = _split_fields(requested_fields)
+    # Records come back from `-G1`, so a requested "EXIF:UserComment" is keyed as
+    # "ExifIFD:UserComment". Compare on bare tag names too so requested fields are
+    # still retained and mapped.
+    requested_bare = {_bare_tag(f) for f in fields_n}
 
     items: List[Dict[str, Any]] = []
     for rec in records:
@@ -221,7 +255,7 @@ def exiftool_records_to_manifest_items(
         for k, v in rec.items():
             if k == "SourceFile":
                 continue
-            if fields_n and k not in fields_n:
+            if fields_n and k not in fields_n and _bare_tag(k) not in requested_bare:
                 continue
             raw_tags[k] = v
 
@@ -230,7 +264,7 @@ def exiftool_records_to_manifest_items(
         candidates_by_key: Dict[str, List[Optional[str]]] = {}
 
         def consider(tag: str, value: Any) -> None:
-            mk = _TAG_TO_MANIFEST_KEY.get(tag)
+            mk = _TAG_TO_MANIFEST_KEY.get(tag) or _BARE_TAG_TO_MANIFEST_KEY.get(_bare_tag(tag))
             if not mk:
                 return
             candidates_by_key.setdefault(mk, []).append(None if value is None else str(value))

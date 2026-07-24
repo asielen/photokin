@@ -58,6 +58,57 @@ def _ensure_executable(path: Path) -> None:
         pass
 
 
+def _bundled_exiftool_is_complete(exe_path: Path, subdir: str) -> bool:
+    """Return True only if the bundled ExifTool has its runtime dependencies alongside it.
+
+    The bundled binaries are not self-contained:
+    - macOS ships the ExifTool Perl script, which loads ``Image::ExifTool`` from a
+      sibling ``lib/`` directory (``lib/Image/ExifTool.pm``).
+    - Windows ships ``exiftool.exe`` next to an ``exiftool_files`` directory.
+
+    If those are missing, running the bundled binary fails, so the caller must fall
+    back to a system ExifTool on PATH instead of returning a broken path.
+    """
+    parent = exe_path.parent
+    if subdir == "mac":
+        return (parent / "lib" / "Image" / "ExifTool.pm").is_file()
+    if subdir == "win":
+        return (parent / "exiftool_files").is_dir()
+    return True
+
+
+def _iter_bundle_files(root):
+    """Yield (relative_posix_path, traversable_file) for every file under `root`.
+
+    Works for both real-directory installs and zip/wheel-backed resources.
+    """
+    stack = [(root, "")]
+    while stack:
+        node, prefix = stack.pop()
+        for child in node.iterdir():
+            rel = f"{prefix}{child.name}"
+            if child.is_dir():
+                stack.append((child, rel + "/"))
+            else:
+                yield rel, child
+
+
+def _materialize_file(data: bytes, dest: Path) -> None:
+    """Write `data` to `dest` atomically, only when missing or changed."""
+    if dest.exists() and dest.stat().st_size == len(data):
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+    if dest.exists():
+        try:
+            dest.unlink()
+        except Exception:
+            pass
+    shutil.move(str(tmp_path), dest)
+
+
 def _try_clear_macos_quarantine(path: Path) -> None:
     """Best-effort removal of macOS quarantine attribute."""
     if sys.platform != "darwin":
@@ -107,13 +158,24 @@ def resolve_exiftool_path(cfg: ExiftoolConfig | None = None) -> str:
         try:
             res_path = Path(str(res))
             if res_path.exists() and res_path.is_file():
-                _ensure_executable(res_path)
-                _try_clear_macos_quarantine(res_path)
-                return str(res_path)
+                # Only use the bundled binary if its runtime dependencies (mac
+                # lib/, win exiftool_files) are actually present; otherwise it
+                # can't run and we must fall back to system PATH below.
+                if _bundled_exiftool_is_complete(res_path, subdir):
+                    _ensure_executable(res_path)
+                    _try_clear_macos_quarantine(res_path)
+                    return str(res_path)
+                bundle_resolution_error = FileNotFoundError(
+                    f"Bundled ExifTool at {res_path} is missing its runtime library; "
+                    "falling back to system PATH."
+                )
         except Exception:
             pass
 
-        # 2b) Extract to a stable cache dir for wheels/zip installs.
+        # 2b) Extract the whole bundle tree to a stable cache dir for wheels/zip
+        # installs. The binaries are not self-contained, so we must copy the
+        # sibling lib/ (mac) or exiftool_files/ (win) alongside the executable,
+        # then verify completeness before returning.
         cache_root: Path
         if cfg is not None:
             override = normalize_path(getattr(cfg, "cache_dir", None))
@@ -122,29 +184,23 @@ def resolve_exiftool_path(cfg: ExiftoolConfig | None = None) -> str:
             cache_root = _default_exiftool_cache_dir()
 
         out_dir = cache_root / "exiftool" / subdir
-        out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / fname
 
         try:
-            data = res.read_bytes()
+            src_dir = _res.files("photokin") / (Path("tools") / "exiftool" / subdir).as_posix()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for relpath, child in _iter_bundle_files(src_dir):
+                _materialize_file(child.read_bytes(), out_dir / relpath)
         except Exception as exc:
             bundle_resolution_error = exc
         else:
-            # Only rewrite if missing or size mismatch.
-            if (not out_path.exists()) or (out_path.stat().st_size != len(data)):
-                with tempfile.NamedTemporaryFile(dir=out_dir, delete=False) as tmp:
-                    tmp.write(data)
-                    tmp_path = Path(tmp.name)
-                if out_path.exists():
-                    try:
-                        out_path.unlink()
-                    except Exception:
-                        pass
-                shutil.move(str(tmp_path), out_path)
-
-            _ensure_executable(out_path)
-            _try_clear_macos_quarantine(out_path)
-            return str(out_path)
+            if out_path.is_file() and _bundled_exiftool_is_complete(out_path, subdir):
+                _ensure_executable(out_path)
+                _try_clear_macos_quarantine(out_path)
+                return str(out_path)
+            bundle_resolution_error = FileNotFoundError(
+                f"Extracted ExifTool at {out_path} is incomplete; falling back to system PATH."
+            )
 
     # 3) Fall back to system PATH.
     system_exiftool = shutil.which("exiftool")

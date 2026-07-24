@@ -79,6 +79,7 @@ class Config:
     provider: str = os.getenv("LLM_PROVIDER", "openai")
     claude_model_name: str = os.getenv("CLAUDE_MODEL", "sonnet")
     gemini_model_name: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    openrouter_model_name: str = os.getenv("OPENROUTER_MODEL", "moonshotai/kimi-k3")
     prompts_dir: str = str(_DEFAULT_PROMPTS_DIR)
     vocab_path: str = str(_DEFAULT_PROMPTS_DIR / "vocab_keywords_examples.toml")
     forbidden_path: str = str(_DEFAULT_PROMPTS_DIR / "forbidden_inferences.txt")
@@ -119,6 +120,8 @@ def normalize_provider(provider: str | None) -> str:
         return "anthropic"
     if raw in {"gemini", "google"}:
         return "gemini"
+    if raw == "openrouter":
+        return "openrouter"
     return "openai"
 
 
@@ -129,6 +132,8 @@ def provider_display_name(provider: str | None) -> str:
         return "Claude"
     if normalized == "gemini":
         return "Gemini"
+    if normalized == "openrouter":
+        return "OpenRouter"
     return "ChatGPT"
 
 
@@ -151,6 +156,8 @@ def resolve_model_for_provider(config: Config) -> str:
         return resolve_claude_model(preferred)
     if provider == "gemini":
         return config.gemini_model_name or "gemini-2.5-flash"
+    if provider == "openrouter":
+        return config.openrouter_model_name or "moonshotai/kimi-k3"
     return config.model.strip()
 
 
@@ -1589,6 +1596,8 @@ def extract_usage(resp) -> dict | None:
             for key in (
                 "input_tokens",
                 "output_tokens",
+                "prompt_tokens",
+                "completion_tokens",
                 "total_tokens",
                 "input_tokens_details",
                 "output_tokens_details",
@@ -1619,8 +1628,14 @@ def extract_usage(resp) -> dict | None:
                 return None
 
         model_name = getattr(resp, "model", None)
+        # Responses API names these input/output_tokens; Chat Completions
+        # (OpenRouter and other compat gateways) names them prompt/completion_tokens.
         prompt_tokens = _as_int(usage_dict.get("input_tokens"))
+        if prompt_tokens is None:
+            prompt_tokens = _as_int(usage_dict.get("prompt_tokens"))
         completion_tokens = _as_int(usage_dict.get("output_tokens"))
+        if completion_tokens is None:
+            completion_tokens = _as_int(usage_dict.get("completion_tokens"))
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,

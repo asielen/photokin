@@ -171,10 +171,27 @@ def _build_provider_client(config: utils.Config):
     if provider == "gemini":
         try:
             from google import genai
+            from google.genai import types as genai_types
         except ImportError as exc:
             raise RuntimeError("Gemini provider selected but google-genai package is not installed.") from exc
         api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-        return genai.Client(api_key=api_key or None)
+        # Unlike the Anthropic/OpenAI SDKs used here, google-genai has no
+        # default request timeout -- observed in practice as a single
+        # generate_content() call hanging indefinitely (over an hour, no
+        # error, no response) with no way to detect or recover from it
+        # short of killing the whole process. 3 minutes comfortably covers
+        # every real per-photo response time seen in this pipeline (even
+        # multi-image groups), while still failing well before a silent
+        # hang can block an entire batch run.
+        return genai.Client(api_key=api_key or None, http_options=genai_types.HttpOptions(timeout=180_000))
+    if provider == "openrouter":
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError("OpenRouter provider selected but openai package is not installed.") from exc
+        api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+        base_url = (os.getenv("OPENROUTER_BASE_URL") or "").strip() or "https://openrouter.ai/api/v1"
+        return OpenAI(api_key=api_key or None, base_url=base_url)
     try:
         from openai import OpenAI
     except ImportError as exc:
@@ -1334,12 +1351,20 @@ def process_manifest_stream(
                 return int(u.get(key)) if (u and isinstance(u.get(key), int)) else 0
             tot_prompt = sum(_tok(rec.get("_usage"), "prompt_tokens") for rec, _, _ in analyses)
             tot_completion = sum(_tok(rec.get("_usage"), "completion_tokens") for rec, _, _ in analyses)
+            # analyses has one entry per API call made for this group (usually
+            # exactly one); take the resolved model string from it -- this
+            # dict otherwise replaces the per-analysis _usage entirely, so
+            # omitting "model" here silently drops it downstream (cost
+            # estimation, provenance) even though the underlying API call did
+            # return one.
+            usage_model = (analyses[0][0].get("_usage") or {}).get("model") if analyses else None
             canonical["_usage"] = {
                 "prompt_tokens": tot_prompt or None,
                 "completion_tokens": tot_completion or None,
                 "input_tokens": tot_prompt or None,
                 "output_tokens": tot_completion or None,
                 "total_tokens": (tot_prompt + tot_completion) or None,
+                "model": usage_model,
             }
 
             canonical["keywords"] = shared_keywords

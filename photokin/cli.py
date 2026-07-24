@@ -43,6 +43,9 @@ examples:
   # Folder of images
   %(prog)s --folder ./scans/ --provider anthropic --claude-model sonnet
 
+  # Any OpenRouter-hosted vision model (Kimi, Qwen-VL, ...) via one API key
+  %(prog)s --folder ./scans/ --provider openrouter --openrouter-model moonshotai/kimi-k3
+
   # Manifest mode (recommended, used by the Lightroom plugin)
   %(prog)s --manifest batch.json --output-file results.ndjson --changeset true
 """
@@ -184,7 +187,7 @@ def main():
 
         ap.add_argument("--update-policy", choices=["master_exact", "merge_per_variant"], default="merge_per_variant",
                         help="How to apply results to each file in a group")
-        ap.add_argument("--provider", choices=["openai", "anthropic", "gemini"], default=defaults.provider,
+        ap.add_argument("--provider", choices=["openai", "anthropic", "gemini", "openrouter"], default=defaults.provider,
                         help="LLM provider backend to use")
         ap.add_argument("--openai-model", default=defaults.model,
                         help="OpenAI model name (default: %(default)s)")
@@ -192,6 +195,8 @@ def main():
                         help="Claude model alias resolved via config mapping (default: %(default)s)")
         ap.add_argument("--gemini-model", default=defaults.gemini_model_name,
                         help="Gemini model name (default: %(default)s)")
+        ap.add_argument("--openrouter-model", default=defaults.openrouter_model_name,
+                        help="OpenRouter model slug, e.g. moonshotai/kimi-k3 or qwen/qwen3-vl-235b-a22b-instruct (default: %(default)s)")
         ap.add_argument("--jpeg-quality", type=int, default=defaults.jpeg_quality,
                         help="JPEG quality 1-100 (default: %(default)s)")
         ap.add_argument("--max-edge", type=int, default=defaults.max_edge,
@@ -265,6 +270,7 @@ def main():
             provider_name=utils.provider_display_name(args.provider),
             claude_model_name=args.claude_model,
             gemini_model_name=args.gemini_model,
+            openrouter_model_name=args.openrouter_model,
             jpeg_quality=args.jpeg_quality,
             no_update_vocab=args.no_update_vocab,
             max_edge=(None if (args.max_edge in (None, 0)) else args.max_edge),

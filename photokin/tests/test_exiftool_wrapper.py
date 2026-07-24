@@ -3,10 +3,12 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from photokin import cli
 from photokin.exiftool import ExiftoolConfig, apply_changeset
+from photokin.exiftool import locate
 from photokin.exiftool.apply import _normalize_exif_datetime
 from photokin.exiftool.config import parse_fields
 
@@ -180,6 +182,61 @@ class TestCliExiftoolConfigResolution(unittest.TestCase):
         self.assertEqual(cfg.fields, ("EXIF:UserComment",))
         self.assertTrue(cfg.dry_run)
         self.assertTrue(cfg.overwrite_original)
+
+
+class TestResolveExiftoolPath(unittest.TestCase):
+    def test_completeness_check_mac(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "exiftool"
+            exe.write_text("#!/usr/bin/env perl\n")
+            # No sibling lib/ => incomplete, must not be used.
+            self.assertFalse(locate._bundled_exiftool_is_complete(exe, "mac"))
+            libpm = Path(d) / "lib" / "Image" / "ExifTool.pm"
+            libpm.parent.mkdir(parents=True)
+            libpm.write_text("package Image::ExifTool;\n")
+            self.assertTrue(locate._bundled_exiftool_is_complete(exe, "mac"))
+
+    def test_completeness_check_win(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "exiftool.exe"
+            exe.write_text("binary")
+            self.assertFalse(locate._bundled_exiftool_is_complete(exe, "win"))
+            (Path(d) / "exiftool_files").mkdir()
+            self.assertTrue(locate._bundled_exiftool_is_complete(exe, "win"))
+
+    def _make_bundle(self, root: str, *, with_lib: bool) -> Path:
+        bundle = Path(root) / "tools" / "exiftool" / "mac"
+        bundle.mkdir(parents=True)
+        (bundle / "exiftool").write_text("#!/usr/bin/env perl\n")
+        if with_lib:
+            libpm = bundle / "lib" / "Image" / "ExifTool.pm"
+            libpm.parent.mkdir(parents=True)
+            libpm.write_text("package Image::ExifTool;\n")
+        return bundle
+
+    def test_incomplete_mac_bundle_falls_back_to_path(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache:
+            self._make_bundle(root, with_lib=False)
+            cfg = ExiftoolConfig(cache_dir=cache)
+            with patch.object(
+                locate, "_platform_exiftool_resource_relpath", return_value=("mac", "exiftool")
+            ), patch.object(locate._res, "files", return_value=Path(root)), patch.object(
+                locate.shutil, "which", return_value="/usr/bin/exiftool"
+            ):
+                result = locate.resolve_exiftool_path(cfg)
+            self.assertEqual(result, "/usr/bin/exiftool")
+
+    def test_complete_mac_bundle_is_used(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache:
+            bundle = self._make_bundle(root, with_lib=True)
+            cfg = ExiftoolConfig(cache_dir=cache)
+            with patch.object(
+                locate, "_platform_exiftool_resource_relpath", return_value=("mac", "exiftool")
+            ), patch.object(locate._res, "files", return_value=Path(root)), patch.object(
+                locate.shutil, "which", return_value=None
+            ):
+                result = locate.resolve_exiftool_path(cfg)
+            self.assertEqual(result, str(bundle / "exiftool"))
 
 
 if __name__ == "__main__":

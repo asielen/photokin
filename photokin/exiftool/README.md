@@ -40,9 +40,19 @@ on top (flag > env > default).
 1. Configured path (`ExiftoolConfig.path` / `--exiftool-path` /
    `EXIFTOOL_PATH`) — errors if set but missing.
 2. Bundled resource under `photokin/tools/exiftool/<platform>/`
-   (not currently shipped in this repo; extraction-to-cache machinery is in
-   place for future bundled distribution).
+   (`win/exiftool.exe`, `mac/exiftool`). Used directly for editable installs,
+   or extracted to a cache dir (`ExiftoolConfig.cache_dir`, default
+   `~/.photokin/bin`) for wheel/zip installs.
 3. System `PATH` (`which exiftool`).
+
+The bundled binaries are **not** self-contained, so `resolve_exiftool_path`
+only uses one when its runtime dependencies sit alongside it: the Windows
+`exiftool.exe` needs its sibling `exiftool_files/` directory, and the macOS
+`exiftool` Perl script needs a sibling `lib/Image/ExifTool.pm` tree. If those
+are missing (e.g. the macOS `lib/` is not bundled), the incomplete bundle is
+skipped and resolution falls back to a system ExifTool on `PATH` rather than
+returning a path that would fail at runtime. Cache extraction copies the whole
+platform subtree (binary + support files), not just the executable.
 
 ## Hydration semantics
 
@@ -50,8 +60,9 @@ on top (flag > env > default).
 
 - only queries files whose manifest metadata lacks a non-empty `userComment`;
 - never overwrites a value Lightroom provided;
-- silently no-ops if ExifTool or the top-level `mel_exiftool_manifest.py`
-  reader is unavailable.
+- non-fatal if ExifTool can't be found or fails to run: logs a `WARNING` via
+  the standard `logging` module and returns without raising, rather than
+  breaking the manifest pipeline.
 
 ## Apply semantics
 
@@ -82,9 +93,13 @@ python -m photokin.exiftool --changeset batch_changeset.ndjson \
 (`photokin/exiftool_apply.py` remains as a deprecated shim for the old
 module path.)
 
-## Relationship to `mel_exiftool_manifest.py`
+## Relationship to `photokin.lightroom.exiftool_manifest`
 
-The top-level `mel_exiftool_manifest.py` script is the standalone
-ExifTool→manifest reader (usable on its own to build a manifest outside
-Lightroom). `hydrate.py` reuses its `run_exiftool_json` primitive rather than
-duplicating the subprocess/JSON handling.
+`photokin/lightroom/exiftool_manifest.py` is the standalone ExifTool→manifest
+reader: it shells out to ExifTool and emits a manifest-like JSON, mapping common
+tags into top-level keys (`dateTimeOriginal`, `userComment`, `caption`, `title`)
+while preserving every raw tag under `metadata["exiftool"]`. Run it with
+`python -m photokin.lightroom.exiftool_manifest FILES... [--field TAG] [--out PATH]`.
+`hydrate.py` reuses its `run_exiftool_json` primitive (and the `_find_tag_value`
+helper, tolerant of ExifTool's `-G1` group names) rather than duplicating the
+subprocess/JSON handling.

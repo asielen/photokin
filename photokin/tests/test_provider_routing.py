@@ -3,6 +3,7 @@ import unittest
 from photokin import core, utils
 from photokin.api_claude import _data_url_to_image_block
 from photokin.api_openai import ProviderApiError
+from photokin.api_openai_compat import extract_openai_compat_output_text
 
 
 class _UsageMetadataStub:
@@ -17,6 +18,31 @@ class _GeminiResponseStub:
         self.usage_metadata = _UsageMetadataStub()
 
 
+class _ChatCompletionUsageStub:
+    def __init__(self):
+        self.prompt_tokens = 321
+        self.completion_tokens = 54
+        self.total_tokens = 375
+
+
+class _ChatCompletionMessageStub:
+    def __init__(self, content):
+        self.content = content
+
+
+class _ChatCompletionChoiceStub:
+    def __init__(self, content, finish_reason):
+        self.message = _ChatCompletionMessageStub(content)
+        self.finish_reason = finish_reason
+
+
+class _ChatCompletionResponseStub:
+    def __init__(self, content, finish_reason="stop"):
+        self.choices = [_ChatCompletionChoiceStub(content, finish_reason)]
+        self.usage = _ChatCompletionUsageStub()
+        self.model = "moonshotai/kimi-k3"
+
+
 
 class TestProviderResolution(unittest.TestCase):
     def test_provider_normalization(self):
@@ -24,6 +50,7 @@ class TestProviderResolution(unittest.TestCase):
         self.assertEqual(utils.normalize_provider("claude"), "anthropic")
         self.assertEqual(utils.normalize_provider("Gemini"), "gemini")
         self.assertEqual(utils.normalize_provider("google"), "gemini")
+        self.assertEqual(utils.normalize_provider("OpenRouter"), "openrouter")
 
     def test_claude_model_resolution_alias_and_default(self):
         self.assertEqual(utils.resolve_claude_model("sonnet"), "claude-sonnet-4-6")
@@ -39,6 +66,12 @@ class TestProviderResolution(unittest.TestCase):
 
         cfg_gemini = utils.Config(provider="gemini", model="gpt-4o", gemini_model_name="gemini-2.5-flash")
         self.assertEqual(utils.resolve_model_for_provider(cfg_gemini), "gemini-2.5-flash")
+
+        cfg_openrouter = utils.Config(provider="openrouter", model="gpt-4o", openrouter_model_name="moonshotai/kimi-k3")
+        self.assertEqual(utils.resolve_model_for_provider(cfg_openrouter), "moonshotai/kimi-k3")
+
+        cfg_openrouter_default = utils.Config(provider="openrouter", openrouter_model_name="")
+        self.assertEqual(utils.resolve_model_for_provider(cfg_openrouter_default), "moonshotai/kimi-k3")
 
 
 class TestClaudeImageBlocks(unittest.TestCase):
@@ -56,6 +89,7 @@ class TestProviderRuntimeBehavior(unittest.TestCase):
         self.assertTrue(core._should_run_archival_upload("openai"))
         self.assertFalse(core._should_run_archival_upload("anthropic"))
         self.assertFalse(core._should_run_archival_upload("gemini"))
+        self.assertFalse(core._should_run_archival_upload("openrouter"))
 
     def test_normalized_error_payload_for_provider_errors(self):
         err = ProviderApiError("rate_limit", "Too many requests", status_code=429)
@@ -63,6 +97,25 @@ class TestProviderRuntimeBehavior(unittest.TestCase):
         self.assertEqual(payload["type"], "rate_limit")
         self.assertEqual(payload["status_code"], 429)
         self.assertEqual(payload["message"], "Too many requests")
+
+    def test_extract_compat_output_text_and_length_error(self):
+        resp = _ChatCompletionResponseStub("  {\"caption\": \"ok\"}  ", finish_reason="stop")
+        self.assertEqual(extract_openai_compat_output_text(resp), "  {\"caption\": \"ok\"}  ")
+
+        truncated = _ChatCompletionResponseStub("partial", finish_reason="length")
+        with self.assertRaises(ProviderApiError) as ctx:
+            extract_openai_compat_output_text(truncated)
+        self.assertEqual(ctx.exception.error_type, "length")
+
+    def test_extract_usage_from_chat_completions_usage(self):
+        usage = utils.extract_usage(_ChatCompletionResponseStub("x"))
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["prompt_tokens"], 321)
+        self.assertEqual(usage["completion_tokens"], 54)
+        self.assertEqual(usage["input_tokens"], 321)
+        self.assertEqual(usage["output_tokens"], 54)
+        self.assertEqual(usage["total_tokens"], 375)
+        self.assertEqual(usage["model"], "moonshotai/kimi-k3")
 
     def test_extract_usage_from_gemini_usage_metadata(self):
         usage = utils.extract_usage(_GeminiResponseStub())

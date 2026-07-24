@@ -85,9 +85,10 @@ class TestHydrateUserComments(unittest.TestCase):
         with patch(
             "photokin.exiftool.hydrate.resolve_exiftool_path",
             side_effect=FileNotFoundError("not found"),
-        ):
+        ), self.assertLogs("photokin.exiftool.hydrate", level="WARNING") as logs:
             hydrate_user_comments(items, ExiftoolConfig())
         self.assertEqual(items[0]["metadata"]["userComment"], "")
+        self.assertIn("not found", logs.output[0])
 
     def test_noop_when_exiftool_read_fails(self):
         items = self._items()
@@ -97,9 +98,10 @@ class TestHydrateUserComments(unittest.TestCase):
         ), patch(
             "photokin.lightroom.exiftool_manifest.run_exiftool_json",
             side_effect=RuntimeError("boom"),
-        ):
+        ), self.assertLogs("photokin.exiftool.hydrate", level="WARNING") as logs:
             hydrate_user_comments(items, ExiftoolConfig())
         self.assertEqual(items[0]["metadata"]["userComment"], "")
+        self.assertIn("boom", logs.output[0])
 
     def test_make_manifest_hydrator_wraps_config(self):
         items = self._items()
