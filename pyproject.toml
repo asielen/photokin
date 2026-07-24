@@ -49,12 +49,11 @@ photokin = [
   "prompts_photo_ai/*.txt",
   "prompts_photo_ai/*.toml",
   "prompts_photo_ai/schema/*.json",
-  # Bundled ExifTool binaries + their runtime support trees (win exiftool_files,
-  # mac lib). resolve_exiftool_path() loads these via importlib.resources, so they
-  # must ship in the wheel; without this the vendored binary is absent at runtime
-  # and resolution falls back to system PATH / "ExifTool not found".
-  "tools/exiftool/**/*",
 ]
+# ExifTool is intentionally NOT vendored in the wheel (it would put a ~34 MB
+# Windows-only Perl distribution into a py3-none-any package installed on every
+# platform). It is downloaded on demand by photokin.exiftool.fetch; see that
+# module and photokin/exiftool/README.md.
 
 [tool.pytest.ini_options]
 testpaths = ["photokin/tests", "tests"]

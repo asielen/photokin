@@ -18,6 +18,8 @@ layer entirely.
 
 - `config.py` — `ExiftoolConfig` dataclass + `ExiftoolConfig.from_env()`.
 - `locate.py` — `resolve_exiftool_path()`: binary discovery.
+- `fetch.py` — `ensure_exiftool()`: download the official ExifTool on demand
+  (Windows) into the cache dir; run via `python -m photokin.exiftool.fetch`.
 - `hydrate.py` — `hydrate_user_comments(items, cfg)` and
   `make_manifest_hydrator(cfg)` (returns a callable for
   `core.process_manifest_stream(metadata_hydrator=...)`).
@@ -37,22 +39,33 @@ on top (flag > env > default).
 
 ## Binary resolution order
 
+ExifTool is **not** vendored in the wheel (that would put a ~34 MB Windows-only
+Perl distribution into a `py3-none-any` package installed on every platform).
+`resolve_exiftool_path` finds one at runtime:
+
 1. Configured path (`ExiftoolConfig.path` / `--exiftool-path` /
    `EXIFTOOL_PATH`) — errors if set but missing.
-2. Bundled resource under `photokin/tools/exiftool/<platform>/`
-   (`win/exiftool.exe`, `mac/exiftool`). Used directly for editable installs,
-   or extracted to a cache dir (`ExiftoolConfig.cache_dir`, default
-   `~/.photokin/bin`) for wheel/zip installs.
+2. A copy previously downloaded by `photokin.exiftool.fetch` into the cache dir
+   (`ExiftoolConfig.cache_dir`, default `~/.photokin/bin/exiftool/<platform>`).
 3. System `PATH` (`which exiftool`).
 
-The bundled binaries are **not** self-contained, so `resolve_exiftool_path`
-only uses one when its runtime dependencies sit alongside it: the Windows
-`exiftool.exe` needs its sibling `exiftool_files/` directory, and the macOS
-`exiftool` Perl script needs a sibling `lib/Image/ExifTool.pm` tree. If those
-are missing (e.g. the macOS `lib/` is not bundled), the incomplete bundle is
-skipped and resolution falls back to a system ExifTool on `PATH` rather than
-returning a path that would fail at runtime. Cache extraction copies the whole
-platform subtree (binary + support files), not just the executable.
+A cached copy is only used when its runtime dependencies sit alongside it (the
+Windows `exiftool.exe` needs its sibling `exiftool_files/` directory; a macOS
+Perl script would need a sibling `lib/Image/ExifTool.pm` tree); otherwise the
+incomplete copy is skipped and resolution falls back to system `PATH` rather
+than returning a path that would fail at runtime.
+
+### Provisioning (`fetch.py`)
+
+The Lightroom plugin's "Install/Update Requirements" flow runs
+`python -m photokin.exiftool.fetch` after installing the package. On **Windows**
+this downloads the official self-contained ExifTool from exiftool.org, verifies
+its SHA256 (against an offline pin in `KNOWN_SHA256` when set, else exiftool.org's
+published `checksums.txt`), and extracts it into the cache as
+`exiftool.exe` + `exiftool_files/`. On **macOS/Linux** it is a no-op — install a
+system ExifTool (`brew install exiftool`, `apt install libimage-exiftool-perl`).
+Provisioning is best-effort: any failure leaves resolution to fall back to
+system `PATH`.
 
 ## Hydration semantics
 

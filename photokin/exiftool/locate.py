@@ -1,27 +1,30 @@
-"""ExifTool binary discovery: configured path, bundled resource, or system PATH.
+"""ExifTool binary discovery: configured path, downloaded cache, or system PATH.
 
-The library does not ship an ExifTool binary; it locates one at runtime. The
-bundled-resource tier exists only so a downstream distribution (e.g. the
-Lightroom plugin) *could* vendor one — in the plain PyPI install it finds
-nothing there and falls through to the system PATH.
+photokin does not vendor an ExifTool binary in its wheel. It locates one at
+runtime in this order:
+
+1. an explicitly configured path (``ExiftoolConfig.path`` / ``EXIFTOOL_PATH``);
+2. a copy previously downloaded by ``photokin.exiftool.fetch`` into the cache
+   dir (``~/.photokin/bin/exiftool/<platform>``) — on Windows the plugin's setup
+   flow provisions this;
+3. a system ExifTool on ``PATH`` (the norm on macOS/Linux).
 
 Code map:
-- _default_exiftool_cache_dir         writable cache dir for extracted binaries
-- _platform_exiftool_resource_relpath (subdir, filename) for this OS's binary
-- _ensure_executable                  chmod +x an extracted binary (POSIX)
-- _try_clear_macos_quarantine         drop the macOS quarantine xattr
-- resolve_exiftool_path               PUBLIC: config path -> bundled -> system PATH
+- _default_exiftool_cache_dir      writable cache dir the downloader targets
+- _platform_exiftool_relpath       (subdir, filename) for this OS's binary
+- _ensure_executable               chmod +x a cached binary (POSIX)
+- _try_clear_macos_quarantine      drop the macOS quarantine xattr
+- _cached_exiftool_is_complete     the cached binary has its runtime deps alongside
+- resolve_exiftool_path            PUBLIC: config path -> cache -> system PATH
 """
 
 from __future__ import annotations
 
-import importlib.resources as _res
 import os
 import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 from ..utils import normalize_path
@@ -29,20 +32,19 @@ from .config import ExiftoolConfig
 
 
 def _default_exiftool_cache_dir() -> Path:
-    """Return a stable, writable cache location for extracted binaries."""
+    """Return a stable, writable cache location for downloaded binaries."""
     return Path.home() / ".photokin" / "bin"
 
 
-def _platform_exiftool_resource_relpath() -> tuple[str, str]:
-    """Return (subdir, filename) for the bundled ExifTool binary."""
+def _platform_exiftool_relpath() -> tuple[str, str] | None:
+    """Return (subdir, filename) for a cached ExifTool on this OS, or None."""
     system = platform.system().lower()
     if os.name == "nt" or system == "windows":
         return ("win", "exiftool.exe")
     if sys.platform == "darwin" or system == "darwin":
         return ("mac", "exiftool")
-    if sys.platform.startswith("linux") or system == "linux":
-        raise RuntimeError("ExifTool is not bundled for Linux; trying system PATH.")
-    raise RuntimeError(f"ExifTool is not bundled for this platform: {platform.system()}.")
+    # Linux (and anything else) is not auto-provisioned; use system PATH.
+    return None
 
 
 def _ensure_executable(path: Path) -> None:
@@ -58,55 +60,22 @@ def _ensure_executable(path: Path) -> None:
         pass
 
 
-def _bundled_exiftool_is_complete(exe_path: Path, subdir: str) -> bool:
-    """Return True only if the bundled ExifTool has its runtime dependencies alongside it.
+def _cached_exiftool_is_complete(exe_path: Path, subdir: str) -> bool:
+    """Return True only if the cached ExifTool has its runtime deps alongside it.
 
-    The bundled binaries are not self-contained:
-    - macOS ships the ExifTool Perl script, which loads ``Image::ExifTool`` from a
-      sibling ``lib/`` directory (``lib/Image/ExifTool.pm``).
-    - Windows ships ``exiftool.exe`` next to an ``exiftool_files`` directory.
+    ExifTool is not a single self-contained file:
+    - Windows ``exiftool.exe`` needs a sibling ``exiftool_files`` directory.
+    - the macOS Perl script needs a sibling ``lib/Image/ExifTool.pm`` tree.
 
-    If those are missing, running the bundled binary fails, so the caller must fall
-    back to a system ExifTool on PATH instead of returning a broken path.
+    If those are missing the binary can't run, so resolution should skip it and
+    fall back to system PATH instead of returning a broken path.
     """
     parent = exe_path.parent
-    if subdir == "mac":
-        return (parent / "lib" / "Image" / "ExifTool.pm").is_file()
     if subdir == "win":
         return (parent / "exiftool_files").is_dir()
+    if subdir == "mac":
+        return (parent / "lib" / "Image" / "ExifTool.pm").is_file()
     return True
-
-
-def _iter_bundle_files(root):
-    """Yield (relative_posix_path, traversable_file) for every file under `root`.
-
-    Works for both real-directory installs and zip/wheel-backed resources.
-    """
-    stack = [(root, "")]
-    while stack:
-        node, prefix = stack.pop()
-        for child in node.iterdir():
-            rel = f"{prefix}{child.name}"
-            if child.is_dir():
-                stack.append((child, rel + "/"))
-            else:
-                yield rel, child
-
-
-def _materialize_file(data: bytes, dest: Path) -> None:
-    """Write `data` to `dest` atomically, only when missing or changed."""
-    if dest.exists() and dest.stat().st_size == len(data):
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = Path(tmp.name)
-    if dest.exists():
-        try:
-            dest.unlink()
-        except Exception:
-            pass
-    shutil.move(str(tmp_path), dest)
 
 
 def _try_clear_macos_quarantine(path: Path) -> None:
@@ -124,13 +93,20 @@ def _try_clear_macos_quarantine(path: Path) -> None:
         pass
 
 
+def _cache_root(cfg: ExiftoolConfig | None) -> Path:
+    if cfg is not None:
+        override = normalize_path(getattr(cfg, "cache_dir", None))
+        if override:
+            return Path(override)
+    return _default_exiftool_cache_dir()
+
+
 def resolve_exiftool_path(cfg: ExiftoolConfig | None = None) -> str:
     """Resolve ExifTool executable path.
 
     Resolution order:
-    1) cfg.path (if provided and exists)
-    2) bundled resource under photokin/tools/exiftool/<platform>/
-       - if resource isn't a real file path, extract to cache and run from there
+    1) cfg.path (if provided; errors if set but missing)
+    2) a downloaded copy in the cache dir (see photokin.exiftool.fetch)
     3) system PATH
     """
     # 1) Explicit override.
@@ -141,75 +117,26 @@ def resolve_exiftool_path(cfg: ExiftoolConfig | None = None) -> str:
                 return p
             raise FileNotFoundError(f"Configured exiftool path not found: {p}")
 
-    # 2) Bundled resource.
-    bundle_resolution_error: Exception | None = None
-    try:
-        subdir, fname = _platform_exiftool_resource_relpath()
-        rel = Path("tools") / "exiftool" / subdir / fname
-        res = _res.files("photokin") / rel.as_posix()
-
-    except Exception as exc:
-        bundle_resolution_error = exc
-        rel = None
-        res = None
-
-    if res is not None and rel is not None:
-        # 2a) Try direct filesystem path first (editable installs).
+    # 2) Downloaded copy in the cache dir.
+    relpath = _platform_exiftool_relpath()
+    if relpath is not None:
+        subdir, fname = relpath
+        cached = _cache_root(cfg) / "exiftool" / subdir / fname
         try:
-            res_path = Path(str(res))
-            if res_path.exists() and res_path.is_file():
-                # Only use the bundled binary if its runtime dependencies (mac
-                # lib/, win exiftool_files) are actually present; otherwise it
-                # can't run and we must fall back to system PATH below.
-                if _bundled_exiftool_is_complete(res_path, subdir):
-                    _ensure_executable(res_path)
-                    _try_clear_macos_quarantine(res_path)
-                    return str(res_path)
-                bundle_resolution_error = FileNotFoundError(
-                    f"Bundled ExifTool at {res_path} is missing its runtime library; "
-                    "falling back to system PATH."
-                )
+            if cached.is_file() and _cached_exiftool_is_complete(cached, subdir):
+                _ensure_executable(cached)
+                _try_clear_macos_quarantine(cached)
+                return str(cached)
         except Exception:
             pass
-
-        # 2b) Extract the whole bundle tree to a stable cache dir for wheels/zip
-        # installs. The binaries are not self-contained, so we must copy the
-        # sibling lib/ (mac) or exiftool_files/ (win) alongside the executable,
-        # then verify completeness before returning.
-        cache_root: Path
-        if cfg is not None:
-            override = normalize_path(getattr(cfg, "cache_dir", None))
-            cache_root = Path(override) if override else _default_exiftool_cache_dir()
-        else:
-            cache_root = _default_exiftool_cache_dir()
-
-        out_dir = cache_root / "exiftool" / subdir
-        out_path = out_dir / fname
-
-        try:
-            src_dir = _res.files("photokin") / (Path("tools") / "exiftool" / subdir).as_posix()
-            out_dir.mkdir(parents=True, exist_ok=True)
-            for relpath, child in _iter_bundle_files(src_dir):
-                _materialize_file(child.read_bytes(), out_dir / relpath)
-        except Exception as exc:
-            bundle_resolution_error = exc
-        else:
-            if out_path.is_file() and _bundled_exiftool_is_complete(out_path, subdir):
-                _ensure_executable(out_path)
-                _try_clear_macos_quarantine(out_path)
-                return str(out_path)
-            bundle_resolution_error = FileNotFoundError(
-                f"Extracted ExifTool at {out_path} is incomplete; falling back to system PATH."
-            )
 
     # 3) Fall back to system PATH.
     system_exiftool = shutil.which("exiftool")
     if system_exiftool:
         return system_exiftool
 
-    error_hint = f" (bundled lookup error: {bundle_resolution_error})" if bundle_resolution_error else ""
     raise FileNotFoundError(
-        "ExifTool not found. Install it or set the ExifTool path in plugin settings.\n"
-        "Download: https://exiftool.org"
-        f"{error_hint}"
+        "ExifTool not found. On Windows, run Install/Update Requirements to download it; "
+        "on macOS/Linux install it (e.g. `brew install exiftool`) or set the ExifTool path "
+        "in plugin settings.\nDownload: https://exiftool.org"
     )

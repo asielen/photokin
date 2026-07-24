@@ -190,53 +190,67 @@ class TestResolveExiftoolPath(unittest.TestCase):
             exe = Path(d) / "exiftool"
             exe.write_text("#!/usr/bin/env perl\n")
             # No sibling lib/ => incomplete, must not be used.
-            self.assertFalse(locate._bundled_exiftool_is_complete(exe, "mac"))
+            self.assertFalse(locate._cached_exiftool_is_complete(exe, "mac"))
             libpm = Path(d) / "lib" / "Image" / "ExifTool.pm"
             libpm.parent.mkdir(parents=True)
             libpm.write_text("package Image::ExifTool;\n")
-            self.assertTrue(locate._bundled_exiftool_is_complete(exe, "mac"))
+            self.assertTrue(locate._cached_exiftool_is_complete(exe, "mac"))
 
     def test_completeness_check_win(self):
         with tempfile.TemporaryDirectory() as d:
             exe = Path(d) / "exiftool.exe"
             exe.write_text("binary")
-            self.assertFalse(locate._bundled_exiftool_is_complete(exe, "win"))
+            self.assertFalse(locate._cached_exiftool_is_complete(exe, "win"))
             (Path(d) / "exiftool_files").mkdir()
-            self.assertTrue(locate._bundled_exiftool_is_complete(exe, "win"))
+            self.assertTrue(locate._cached_exiftool_is_complete(exe, "win"))
 
-    def _make_bundle(self, root: str, *, with_lib: bool) -> Path:
-        bundle = Path(root) / "tools" / "exiftool" / "mac"
-        bundle.mkdir(parents=True)
-        (bundle / "exiftool").write_text("#!/usr/bin/env perl\n")
-        if with_lib:
-            libpm = bundle / "lib" / "Image" / "ExifTool.pm"
-            libpm.parent.mkdir(parents=True)
-            libpm.write_text("package Image::ExifTool;\n")
-        return bundle
+    def _make_cached(self, cache: str, *, complete: bool) -> Path:
+        """Create a downloaded-cache layout: <cache>/exiftool/win/exiftool.exe[+exiftool_files]."""
+        win = Path(cache) / "exiftool" / "win"
+        win.mkdir(parents=True)
+        exe = win / "exiftool.exe"
+        exe.write_text("binary")
+        if complete:
+            (win / "exiftool_files").mkdir()
+        return exe
 
-    def test_incomplete_mac_bundle_falls_back_to_path(self):
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache:
-            self._make_bundle(root, with_lib=False)
+    def test_cached_copy_is_used_when_complete(self):
+        with tempfile.TemporaryDirectory() as cache:
+            exe = self._make_cached(cache, complete=True)
             cfg = ExiftoolConfig(cache_dir=cache)
             with patch.object(
-                locate, "_platform_exiftool_resource_relpath", return_value=("mac", "exiftool")
-            ), patch.object(locate._res, "files", return_value=Path(root)), patch.object(
-                locate.shutil, "which", return_value="/usr/bin/exiftool"
-            ):
+                locate, "_platform_exiftool_relpath", return_value=("win", "exiftool.exe")
+            ), patch.object(locate.shutil, "which", return_value=None):
+                result = locate.resolve_exiftool_path(cfg)
+            self.assertEqual(result, str(exe))
+
+    def test_incomplete_cache_falls_back_to_path(self):
+        with tempfile.TemporaryDirectory() as cache:
+            self._make_cached(cache, complete=False)  # exe but no exiftool_files
+            cfg = ExiftoolConfig(cache_dir=cache)
+            with patch.object(
+                locate, "_platform_exiftool_relpath", return_value=("win", "exiftool.exe")
+            ), patch.object(locate.shutil, "which", return_value="/usr/bin/exiftool"):
                 result = locate.resolve_exiftool_path(cfg)
             self.assertEqual(result, "/usr/bin/exiftool")
 
-    def test_complete_mac_bundle_is_used(self):
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache:
-            bundle = self._make_bundle(root, with_lib=True)
+    def test_no_cache_uses_system_path(self):
+        with tempfile.TemporaryDirectory() as cache:
             cfg = ExiftoolConfig(cache_dir=cache)
             with patch.object(
-                locate, "_platform_exiftool_resource_relpath", return_value=("mac", "exiftool")
-            ), patch.object(locate._res, "files", return_value=Path(root)), patch.object(
-                locate.shutil, "which", return_value=None
-            ):
+                locate, "_platform_exiftool_relpath", return_value=("win", "exiftool.exe")
+            ), patch.object(locate.shutil, "which", return_value="/usr/bin/exiftool"):
                 result = locate.resolve_exiftool_path(cfg)
-            self.assertEqual(result, str(bundle / "exiftool"))
+            self.assertEqual(result, "/usr/bin/exiftool")
+
+    def test_missing_everywhere_raises(self):
+        with tempfile.TemporaryDirectory() as cache:
+            cfg = ExiftoolConfig(cache_dir=cache)
+            with patch.object(
+                locate, "_platform_exiftool_relpath", return_value=None
+            ), patch.object(locate.shutil, "which", return_value=None):
+                with self.assertRaises(FileNotFoundError):
+                    locate.resolve_exiftool_path(cfg)
 
 
 if __name__ == "__main__":
