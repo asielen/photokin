@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "photokin"
-version = "0.1.0"
+version = "0.1.1"
 description = "LLM-based photo metadata analysis and enrichment (provider-agnostic; usable standalone or from the MEL Lightroom plugin)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -49,6 +49,11 @@ photokin = [
   "prompts_photo_ai/*.txt",
   "prompts_photo_ai/*.toml",
   "prompts_photo_ai/schema/*.json",
+  # Bundled ExifTool binaries + their runtime support trees (win exiftool_files,
+  # mac lib). resolve_exiftool_path() loads these via importlib.resources, so they
+  # must ship in the wheel; without this the vendored binary is absent at runtime
+  # and resolution falls back to system PATH / "ExifTool not found".
+  "tools/exiftool/**/*",
 ]
 
 [tool.pytest.ini_options]
