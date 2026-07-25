@@ -19,8 +19,15 @@ def call_model(
     *,
     provider: str = "openai",
     dump_request: Callable[[Dict[str, Any]], None] | None = None,
+    thinking: bool = False,
 ) -> Any:
-    """Dispatch request transport to the configured provider adapter."""
+    """Dispatch request transport to the configured provider adapter.
+
+    ``thinking`` (default off) enables pre-answer reasoning where the
+    provider has an explicit switch -- currently Anthropic. OpenAI
+    reasoning models (o*/gpt-5*) and Gemini 2.5 reason on their own, so
+    the flag is a no-op for those adapters.
+    """
     normalized_provider = utils.normalize_provider(provider)
     if normalized_provider == "anthropic":
         from .api_claude import call_claude_model
@@ -31,6 +38,7 @@ def call_model(
             content_items,
             image_data_urls,
             dump_request=dump_request,
+            thinking=thinking,
         )
     if normalized_provider == "gemini":
         from .api_gemini import call_gemini_model

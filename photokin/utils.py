@@ -230,8 +230,9 @@ except Exception:
 
 SECTION_IDS = [
     "people_subjects","clothing_fashion","objects_artifacts","animals_pets",
-    "setting_environment","architecture_built","events_occasions","photo_format_characteristics",
+    "setting_environment","architecture_built","events_occasions","photo_format",
     "written_elements_identifiers","activities_actions","emblems_symbols_context","landscape_nature",
+    "documents_records","date_refernce",
 ]
 
 FORBIDDEN_KEYWORD_SUBSTRINGS = {
@@ -239,6 +240,51 @@ FORBIDDEN_KEYWORD_SUBSTRINGS = {
     "friends","boyfriend","girlfriend","husband","wife",
     "happy","sad","angry","excited","smiling","serious"
 }
+
+# The model frequently proposes shorthand section names (e.g. "people",
+# "animals") instead of the canonical compound SECTION_IDS used as TOML
+# headers (e.g. "people_subjects", "animals_pets"). Map the common ones so
+# those proposals aren't silently dropped.
+SECTION_ALIASES = {
+    "people": "people_subjects",
+    "subjects": "people_subjects",
+    "clothing": "clothing_fashion",
+    "fashion": "clothing_fashion",
+    "objects": "objects_artifacts",
+    "artifacts": "objects_artifacts",
+    "animals": "animals_pets",
+    "pets": "animals_pets",
+    "setting": "setting_environment",
+    "environment": "setting_environment",
+    "locations": "setting_environment",
+    "location": "setting_environment",
+    "architecture": "architecture_built",
+    "events": "events_occasions",
+    "occasions": "events_occasions",
+    "format": "photo_format",
+    "written": "written_elements_identifiers",
+    "identifiers": "written_elements_identifiers",
+    "activities": "activities_actions",
+    "actions": "activities_actions",
+    "emblems": "emblems_symbols_context",
+    "symbols": "emblems_symbols_context",
+    "landscape": "landscape_nature",
+    "nature": "landscape_nature",
+    "documents": "documents_records",
+    "records": "documents_records",
+    "date": "date_refernce",
+    "dates": "date_refernce",
+    "date_reference": "date_refernce",
+}
+
+
+def normalize_section_id(section: str) -> str:
+    """Map a model-proposed section name to a canonical SECTION_IDS entry, if known."""
+    key = (section or "").strip().lower()
+    if key in SECTION_IDS:
+        return key
+    return SECTION_ALIASES.get(key, key)
+
 
 _LOG_PARSE_INPUTS = True #(os.getenv("MEL_LOG_PARSE_WITH_RETRY") or "").strip().lower()
 _LOG_PARSE_INPUTS_ENABLED = _LOG_PARSE_INPUTS not in {"", "0", "false", "no"}
@@ -313,6 +359,10 @@ def warn_forbiddenish_keywords(keywords: List[str]) -> List[str]:
     """
     warnings = []
     for k in keywords:
+        if k.strip().endswith(" Analyzed"):
+            # Provenance tag (e.g. "Claude claude-sonnet-4-6 Analyzed") auto-added by
+            # this tool; not user/model content, so it's exempt from this check.
+            continue
         low = k.strip().lower()
         for bad in FORBIDDEN_KEYWORD_SUBSTRINGS:
             if bad in low:
@@ -364,7 +414,7 @@ def insert_keyword_into_vocab_file(
     """
     kw_clean = (keyword or "").strip()
     note_clean = (note or "").strip()
-    section_clean = (section or "").strip()
+    section_clean = normalize_section_id(section)
 
     if not kw_clean:
         print("[WARN] Skipping empty keyword insert request.", file=sys.stderr)

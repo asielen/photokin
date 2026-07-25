@@ -167,6 +167,20 @@ class TestProviderRuntimeBehavior(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 45)
         self.assertEqual(usage["total_tokens"], 168)
 
+    def test_gemini_client_has_a_request_timeout_configured(self):
+        # Regression test: google-genai has no default request timeout,
+        # observed in practice as generate_content() hanging indefinitely
+        # (over an hour, no error, no response) on a genuinely bad call,
+        # silently blocking an entire batch run. Anthropic/OpenAI clients
+        # ship with sane SDK defaults; Gemini does not, so it must be set
+        # explicitly at client construction.
+        cfg = utils.Config(provider="gemini")
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+            client = core._build_provider_client(cfg)
+        http_options = client._api_client._http_options
+        self.assertIsNotNone(http_options.timeout)
+        self.assertGreater(http_options.timeout, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
