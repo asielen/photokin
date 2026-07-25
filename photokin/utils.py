@@ -286,7 +286,7 @@ def normalize_section_id(section: str) -> str:
     return SECTION_ALIASES.get(key, key)
 
 
-_LOG_PARSE_INPUTS = True #(os.getenv("MEL_LOG_PARSE_WITH_RETRY") or "").strip().lower()
+_LOG_PARSE_INPUTS = (os.getenv("MEL_LOG_PARSE_WITH_RETRY") or "").strip().lower()
 _LOG_PARSE_INPUTS_ENABLED = _LOG_PARSE_INPUTS not in {"", "0", "false", "no"}
 
 
@@ -628,7 +628,7 @@ def build_data_url_and_size(path: str, jpeg_quality: int, max_edge: int | None =
         im2, resized = _resize_if_needed(im, max_edge)
         raw = _encode_jpeg_bytes(im2, jpeg_quality)
         if resized:
-            print(f"[Convert] Downscaled {os.path.basename(path)} {orig_w}x{orig_h} → {im2.width}x{im2.height} (max_edge={max_edge})")
+            print(f"[Convert] Downscaled {os.path.basename(path)} {orig_w}x{orig_h} -> {im2.width}x{im2.height} (max_edge={max_edge})")
         b64 = base64.b64encode(raw).decode("ascii")
         meta = {"mime": "image/jpeg", "width": im2.width, "height": im2.height, "resized": resized}
         return f"data:image/jpeg;base64,{b64}", len(raw), meta
@@ -656,7 +656,7 @@ def archival_upload(client, path: str, jpeg_quality: int, purpose: str = "user_d
         _ensure_pillow()
         im = _open_image(path)
         raw = _encode_jpeg_bytes(im, jpeg_quality)
-        print(f"[Convert] TIFF → JPEG in-memory ({os.path.basename(path)}, quality={jpeg_quality})")
+        print(f"[Convert] TIFF -> JPEG in-memory ({os.path.basename(path)}, quality={jpeg_quality})")
         bio = io.BytesIO(raw)
         bio.name = os.path.splitext(os.path.basename(path))[0] + "_upload.jpg"  # type: ignore[attr-defined]
         uploaded = client.files.create(file=bio, purpose=purpose)

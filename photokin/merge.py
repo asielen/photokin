@@ -96,19 +96,20 @@ def _valid_pattern(pattern: str) -> bool:
     Basic sanity check for date_guess.pattern coming from the model.
 
     Expected forms, e.g.:
+      "Y~"      (decade best guess -- the most common real output)
       "Y!"
-      "Y@"
-      "Y!M@"
+      "Y!M~"
       "Y!M!D!"
       "Y?M!D!"  (for odd cases where year is unknown but month/day known)
 
-    This is intentionally permissive but rejects obviously bogus strings.
+    Markers per the prompt spec: ! = confident, ~ = best guess, ? = unknown.
+    "@" is also tolerated (an older marker some runs produced). This is
+    intentionally permissive but rejects obviously bogus strings.
     """
     if not isinstance(pattern, str):
         return False
     pattern = pattern.strip().upper()
-    # Y?, Y!, Y@ optionally followed by M?,M!,M@ and D?,D!,D@
-    return bool(re.fullmatch(r"Y[!?@](M[!?@])?(D[!?@])?", pattern))
+    return bool(re.fullmatch(r"Y[!?~@](M[!?~@])?(D[!?~@])?", pattern))
 
 
 def _normalize_location_component(val: Any) -> str | None:
@@ -303,7 +304,7 @@ def merge_record_with_original(
 
             # Add DATE: keyword when:
             #   - we still don't have any DATE: keyword, and
-            #   - the model gave us a plausible pattern (Y!/Y@/Y!M@/Y!M!D!/etc).
+            #   - the model gave us a plausible pattern (Y~/Y!/Y!M~/Y!M!D!/etc).
             if not _has_date_keyword(merged.get("keywords") or []):
                 if _valid_pattern(ai_pattern):
                     new_keywords = _norm_str_set(
