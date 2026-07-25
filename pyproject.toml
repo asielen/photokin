@@ -38,8 +38,8 @@ dev = ["photokin[all]", "pytest>=8", "ruff", "mypy", "build", "twine"]
 photokin = "photokin.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/asielen/MetadataEnrichmentLightroom"
-Repository = "https://github.com/asielen/MetadataEnrichmentLightroom"
+Homepage = "https://github.com/asielen/photokin"
+Repository = "https://github.com/asielen/photokin"
 
 [tool.setuptools.packages.find]
 where = ["."]
