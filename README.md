@@ -1,70 +1,227 @@
-# Python runtime for the MEL Lightroom plugin
+# photokin
 
-This directory contains everything the Lua plugin shells out to, organized in
-layers so the analysis engine can also be used outside Lightroom (directly
-from the CLI or embedded in another tool).
+Run scanned photos and documents through a vision model and gets archival metadata back: a verbatim transcription of whatever is written on the front or back, a scene caption, keywords, and deliberately cautious date/location guesses - as JSON, NDJSON streams, or changesets that ExifTool can write into the files.
 
-## Layers
+Compatible with OpenAI, Anthropic, Gemini, and OpenRouter API keys.
+
+# Why should I use this?
+
+I have inherited thousands of family photos and documents. While I would love to have the time to manually review each one, I realized that having an LLM do a first pass of them could help me manually review them later. So I started experimenting with the capabilities of LLMs and I was pleasantly surprised at the results. This library is my attempt to automate the process and get the key data I need from every photo and document to make my manual review easier.
+
+## Quick start for a single photo
+
+```bash
+pip install "photokin[openai]"          # or [anthropic] / [gemini] / [all]
+export OPENAI_API_KEY=sk-...            # setx on Windows
+
+photokin scan_042.jpg --back scan_042_back.jpg
+```
+
+That prints one JSON result, keyed by the image path. Abridged:
+
+```json
+{
+  "result": {
+    "scan_042.jpg": {
+      "keywords": ["Postcard", "1940s", "Military personnel", "..."],
+      "caption": "[Back]\n27 november 44\nAlthough, I personally did not see this cathedral...",
+      "ai_caption": "[AI Analysis]: A printed postcard showing... Inferred date: 1944-11-27 (confidence 0.95; evidence: handwritten date on back).",
+      "category": "Postcard",
+      "location_guess": {"country": "France", "city": "Le Mans", "confidence": 0.9},
+      "date_guess": {"iso": "1944-11-27", "confidence": 0.95, "pattern": "Y!M!D!"}
+    }
+  }
+}
+```
+
+The transcription (`caption`) and the interpretation (`ai_caption`) are kept strictly separate — the model is not allowed to "improve" what's actually written on the object. That separation is most of the reason this tool exists.
+
+## Folders and batches
+
+Point it at a folder and it works through everything in it (non-recursive). Filename suffixes group scans of the same physical object automatically — `photo-a.jpg` / `photo-b.jpg` are variants, `photo-back.jpg` is the reverse side, `album-page1.jpg` / `album-page2.jpg` are pages of one document — and each group is analyzed together as one object.
+
+> SIDE NOTE ON EXPECTED **Naming conventions.** The full suffix grammar is `name[letter][-front|-back|-negative|-pageN][-crop]`, case-insensitive, applied right to left:
+>
+> | Example | Meaning |
+> |---|---|
+> | `box3_025.jpg` | the photo itself (primary front) |
+> | `box3_025-b.jpg` or `box3_025b.jpg` | another scan of the same object (variant letter, with or without dash after a digit) |
+> | `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
+> | `album-page1.jpg`, `album-page2.jpg` | ordered pages of one document |
+> | `box3_025-back-crop.jpg` | a cropped detail, used as a supporting view of its parent, never as its own object |
+>
+> The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other explicitly numbered pages.
+
+## Folder mode
+
+```bash
+photokin --folder ./scans/ --provider anthropic > results.json
+```
+
+Folder mode prints one aggregate JSON to stdout. For bigger or more repeatable jobs, manifest mode takes a JSON file instead of a folder, and adds `--output-file`: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end.
+
+## Manifest mode
+
+A manifest is a JSON file listing exactly what to process — an `items` array where each entry needs only a `path`. The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. Flags like `is_back` are optional when the filename already says it; they exist so files that don't follow the naming conventions can still be grouped correctly.
+
+batch.json:
+```json
+{
+  "items": [
+    {"path": "scans/box3_017.jpg"},
+    {"path": "scans/box3_017_back.jpg", "is_back": true}
+  ],
+  "photo_context_text": "Church family photos, mostly New Jersey, 1930s-1950s."
+}
+```
+
+```bash
+photokin --manifest batch.json --output-file results.ndjson --changeset true
+```
+
+## Existing metadata aware enrichment
+
+Items may have existing `metadata` (face tags, existing captions and comments) that can be forwarded to the model as context. Additionally, you can supply `photo_context_text` as free-text additional context to a single photo or a folder. Such as "these photos are all part of a wedding album." The model treats it as truth for the whole batch. Both make a real difference on hard photos.
+
+For auditing, `--changeset true` emits a changeset NDJSON alongside the results: a record of proposed field writes that the ExifTool wrapper can apply to the actual files, either in the same run (`--exiftool-write true --exiftool-fields EXIF:UserComment`) or later and separately:
+
+```bash
+python -m photokin.exiftool --changeset batch_changeset.ndjson --enabled [--dry-run]
+```
+
+## API keys
+
+Keys are plain environment variables, one per provider. Photokin reads them when it builds the provider client and nowhere else. They never end up in results, changesets, or debug dumps.
+
+| Provider | Variable |
+|---|---|
+| OpenAI | `OPENAI_API_KEY` |
+| Anthropic | `ANTHROPIC_API_KEY` |
+| Gemini | `GEMINI_API_KEY` |
+| OpenRouter | `OPENROUTER_API_KEY` |
+
+For the current terminal session:
+
+```bash
+export OPENAI_API_KEY=sk-...            # macOS / Linux
+$env:OPENAI_API_KEY = "sk-..."          # Windows PowerShell
+```
+
+To make it stick across sessions, add the `export` line to your shell profile (`~/.bashrc`, `~/.zshrc`), or on Windows run `setx OPENAI_API_KEY sk-...` once (takes effect in new terminals, not the current one). If you keep keys in a file, keep that file out of version control.
+
+You only need the key for the provider you're actually calling. And since a batch run makes one paid API call per photo group, it's worth using a key with a spend cap set in the provider's dashboard — a typo in a folder path is a lot cheaper that way.
+
+## Setting up ExifTool
+
+ExifTool is optional, and can be both used for reading initial values from the photos (so you don't just overwrite everything) and also write to the photos after. Before analysis, it reads fields straight out of the files so metadata already living in an image rides along to the model as context (hydration). After analysis, it writes approved changeset fields back into the files or their sidecars (apply).
+
+Where each result field lands when written:
+
+| Result field | Tag |
+|---|---|
+| `ai_caption` (the AI analysis) | `EXIF:UserComment` |
+| `caption` (the verbatim transcription) | `XMP:dc:Description` |
+| `keywords` | `XMP:dc:Subject` |
+| `title` | `XMP:dc:Title` |
+| `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` |
+| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location` |
+
+**Setup.** On Windows, run `python -m photokin.exiftool.fetch` once — it downloads the official ExifTool from exiftool.org (SHA256-verified) into `~/.photokin/bin`, no system install needed. On macOS/Linux install it yourself: `brew install exiftool` or `apt install libimage-exiftool-perl`. At runtime the binary is found in this order: an explicit `--exiftool-path` / `EXIFTOOL_PATH`, then the downloaded copy in `~/.photokin/bin`, then whatever `exiftool` is on your `PATH`. If none is found, analysis still runs — hydration and apply are skipped with a warning rather than failing the batch.
+
+**Writing during a run.** In manifest mode with `--changeset true`, add `--exiftool-write true --exiftool-fields EXIF:UserComment` and the approved fields are written into the files right after analysis. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults.
+
+**Writing later, with an audit step.** Since the changeset NDJSON is a plain record of proposed writes, you can inspect it first and apply it separately:
+
+```bash
+python -m photokin.exiftool --changeset batch_changeset.ndjson --enabled --dry-run   # counts what would be written
+python -m photokin.exiftool --changeset batch_changeset.ndjson --enabled            # actually writes
+```
+
+The standalone applier also takes `--fields` to narrow which tags may be written, `--write-sidecar-only` to write `.xmp` sidecars instead of touching the originals, `--no-overwrite-original` to keep ExifTool's `_original` backup files, and `--output summary.json` for a machine-readable result. Date tags (`EXIF:DateTimeOriginal`, `EXIF:CreateDate`) are normalized to EXIF's `YYYY:MM:DD HH:MM:SS` format on the way in; unparseable dates become warnings, not writes.
+
+## All flags
+
+### Input modes
+
+| Flag                 | What it does |
+|----------------------|---|
+| `image` (positional) | Path to the main/front image (single-photo mode) |
+| `--back PATH`        | Back-side image for single-photo mode |
+| `--meta PATH`        | Original metadata JSON for single-photo mode |
+| `--folder DIR`       | Process a whole folder (non-recursive) |
+| `--manifest PATH`    | Process a manifest JSON (items + optional metadata/context) |
+
+### Provider and model
+
+| Flag                                              | What it does |
+|---------------------------------------------------|---|
+| `--provider {openai,anthropic,gemini,openrouter}` | Which backend to call (default `openai`) |
+| `--openai-model NAME`                             | OpenAI model (default `gpt-4o`) |
+| `--claude-model NAME`                             | Claude model alias (`sonnet` or `haiku`); resolves to a current model id (default `sonnet`) |
+| `--gemini-model NAME`                             | Gemini model (default `gemini-2.5-flash`) |
+| `--openrouter-model SLUG`                         | Any vision-capable OpenRouter slug (default `moonshotai/kimi-k3`) |
+
+### Image handling
+
+| Flag               | What it does |
+|--------------------|---|
+| `--max-edge N`     | Downscale the longest edge before upload; 0 keeps original size. Smaller is cheaper, larger reads fine print better (default 1024) |
+| `--jpeg-quality N` | JPEG quality 1-100 for the uploaded copy (default 80) |
+
+### Context
+
+| Flag                        | What it does |
+|-----------------------------|---|
+| `--photo-context-text TEXT` | Inline background context, treated as authoritative |
+| `--photo-context-file PATH` | Same, from a UTF-8 text file |
+
+### Grouping and apply behavior
+
+| Flag                                               | What it does |
+|----------------------------------------------------|---|
+| `--update-policy {master_exact,merge_per_variant}` | Whether results apply to just the primary file or to every variant in a group (default `merge_per_variant`) |
+| `--process-all-variants`                           | Also analyze `-b`/`-c` variant scans and fold their outputs together (default off — only the primary scan of each group is analyzed) |
+| `--date-confidence-threshold X`                    | Minimum model confidence before a date guess is applied, 0-1 (default 0.7) |
+| `--location-confidence-threshold X`                | Same, for location guesses (default 0.7) |
+| `--no-update-vocab`                                | Don't append newly proposed keywords to the vocabulary file |
+
+### Output
+
+| Flag                       | What it does |
+|----------------------------|---|
+| `--output-file PATH`       | `.ndjson` streams one record per finished photo; `.json` writes one aggregate object atomically (manifest mode) |
+| `--output-sidecars`        | Also write a per-photo sidecar JSON next to each image (default off) |
+| `--batch-id ID`            | Identifier stored in output metadata and logs |
+| `--changeset {true,false}` | Emit a changeset NDJSON of proposed file writes (manifest mode; default `false`) |
+| `--dry-run`                | Analyze without applying anything downstream; records are marked `dry_run=true` (default off) |
+
+### ExifTool write-back
+
+| Flag                            | What it does |
+|---------------------------------|---|
+| `--exiftool-write {true,false}` | Apply changeset fields to the files after analysis (default true) |
+| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write (default `EXIF:UserComment`) |
+| `--exiftool-path PATH`          | ExifTool binary to use (default: auto-detect) |
+
+### Debug
+
+| Flag                                    | What it does |
+|-----------------------------------------|---|
+| `--debug-dump-llm-request {true,false}` | Save full request payloads to disk before each model call (default `false`) |
+| `--debug-dump-dir DIR`                  | Where those dumps go (default `<output-dir>/debug`) |
+
+## Providers
+
+OpenAI (default), Anthropic, Gemini, and OpenRouter (any vision-capable slug — Kimi, Grok, Qwen, ...). Select with `--provider` or `LLM_PROVIDER`. Only the SDK for the provider you use needs to be installed, and only that provider's key needs to be set.
+
+## Layout
 
 | Layer | Where | What it does |
 |---|---|---|
-| Core library | [`photokin/`](photokin/README.md) | LLM photo analysis: prompts, provider dispatch (OpenAI / Claude / Gemini), JSON parsing/repair, metadata merge, changeset emission. No ExifTool dependency. |
-| ExifTool wrapper | [`photokin/exiftool/`](photokin/exiftool/README.md) | Optional-but-recommended ExifTool integration: reads metadata Lightroom can't supply (hydration) and writes changeset fields Lightroom can't write (apply). |
-| Helper scripts | this directory | Standalone scripts used by specific plugin features (below). |
-| Lua plugin | `Mel.lrplugin/*.lua` | Builds manifests, launches the CLI, tails NDJSON results, applies metadata via the Lightroom SDK. |
+| Core library | `photokin/` | Prompts, provider dispatch, JSON parsing/repair, metadata merge, changeset emission. No ExifTool dependency. |
+| ExifTool wrapper | `photokin/exiftool/` | Hydration (read before analysis) and apply (write after). |
 
-Dependency direction: the wrapper imports from the core; the core never
-imports the wrapper. The CLI (`photokin/cli.py`) composes the two into
-the full pipeline: **hydrate → analyze → apply**.
-
-## Helper scripts (top level)
-
-- `mel_faces_xmp.py` — extracts Lightroom face regions from XMP (sidecar or
-  embedded); called per-photo by the Lua side while building manifests.
-- `face_utils.py` / `face_processor.py` — face-tag normalization and
-  formatting helpers (LLM prompt blocks, captions, keywords).
-- `face_tag_examples.py` — copy-paste recipes for custom face-tag workflows;
-  not invoked by the plugin.
-- `mel_exiftool_manifest.py` — standalone ExifTool→manifest reader; also
-  reused by the wrapper layer for hydration.
-- `add_caption_border.py` — adds a Polaroid-style caption border to exported
-  JPEGs; called by the Polaroid export filter.
-
-## Install
-
-Python 3.11+ required.
-
-```bash
-# End users (published package, all provider SDKs):
-pip install "photokin[all]"
-
-# Or install just the provider you need:
-pip install "photokin[openai]"      # or [anthropic] / [gemini]
-
-# Local development from this repo:
-cd python
-pip install -e ".[dev]"
-```
-
-Only the SDK for the provider you use is required at runtime (`openai`,
-`anthropic`, or `google-genai`); the others can be omitted. ExifTool itself
-must be installed separately (https://exiftool.org) or pointed to via
-`--exiftool-path` / `EXIFTOOL_PATH`.
-
-## How Lightroom invokes it
-
-```bash
-python -m photokin.cli \
-  --manifest BATCH_manifest.json \
-  --output-file BATCH_results.ndjson \
-  --changeset true \
-  --exiftool-write true --exiftool-fields EXIF:UserComment
-```
-
-Provider selection and API keys are passed via environment variables
-(`LLM_PROVIDER`, `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`,
-model vars). See the [core README](photokin/README.md) for the full CLI
-and environment reference.
+Dependency direction: the wrapper imports from the core; the core never imports the wrapper. The CLI (`photokin/cli.py`) composes them into the full pipeline: hydrate, analyze, apply. Embedders who don't want ExifTool can call the core directly — `core.process_manifest_stream` takes any `metadata_hydrator` callable, or none.
 
 ## Tests
 
@@ -73,5 +230,4 @@ cd python
 python -m pytest
 ```
 
-This runs both `photokin/tests/` (core + wrapper) and `tests/`
-(helper-script tests).
+Runs `photokin/tests/` and `tests/`. Python 3.11+.
