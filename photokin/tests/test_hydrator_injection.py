@@ -67,7 +67,7 @@ class TestHydrateUserComments(unittest.TestCase):
         with patch(
             "photokin.exiftool.hydrate.resolve_exiftool_path",
             return_value="/fake/exiftool",
-        ), patch("photokin.lightroom.exiftool_manifest.run_exiftool_json", return_value=records) as run_mock:
+        ), patch("photokin.exiftool.manifest.run_exiftool_json", return_value=records) as run_mock:
             hydrate_user_comments(items, ExiftoolConfig())
 
         self.assertEqual(items[0]["metadata"]["userComment"], "From file A")
@@ -96,7 +96,7 @@ class TestHydrateUserComments(unittest.TestCase):
             "photokin.exiftool.hydrate.resolve_exiftool_path",
             return_value="/fake/exiftool",
         ), patch(
-            "photokin.lightroom.exiftool_manifest.run_exiftool_json",
+            "photokin.exiftool.manifest.run_exiftool_json",
             side_effect=RuntimeError("boom"),
         ), self.assertLogs("photokin.exiftool.hydrate", level="WARNING") as logs:
             hydrate_user_comments(items, ExiftoolConfig())
@@ -110,7 +110,7 @@ class TestHydrateUserComments(unittest.TestCase):
             "photokin.exiftool.hydrate.resolve_exiftool_path",
             return_value="/fake/exiftool",
         ), patch(
-            "photokin.lightroom.exiftool_manifest.run_exiftool_json",
+            "photokin.exiftool.manifest.run_exiftool_json",
             return_value=[{"SourceFile": "/photos/a.jpg", "EXIF:UserComment": "Filled"}],
         ):
             hydrator(items)

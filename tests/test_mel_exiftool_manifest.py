@@ -1,4 +1,4 @@
-from photokin.lightroom.exiftool_manifest import DEFAULT_EXIFTOOL_FIELDS, exiftool_records_to_manifest_items
+from photokin.exiftool.manifest import DEFAULT_EXIFTOOL_FIELDS, exiftool_records_to_manifest_items
 
 
 def test_maps_exif_user_comment_into_user_comment() -> None:

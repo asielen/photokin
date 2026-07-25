@@ -20,6 +20,7 @@ layer entirely.
 - `locate.py` — `resolve_exiftool_path()`: binary discovery.
 - `fetch.py` — `ensure_exiftool()`: download the official ExifTool on demand
   (Windows) into the cache dir; run via `python -m photokin.exiftool.fetch`.
+- `manifest.py` — standalone ExifTool→manifest reader (details below).
 - `hydrate.py` — `hydrate_user_comments(items, cfg)` and
   `make_manifest_hydrator(cfg)` (returns a callable for
   `core.process_manifest_stream(metadata_hydrator=...)`).
@@ -60,8 +61,9 @@ than returning a path that would fail at runtime.
 The Lightroom plugin's "Install/Update Requirements" flow runs
 `python -m photokin.exiftool.fetch` after installing the package. On **Windows**
 this downloads the official self-contained ExifTool from exiftool.org, verifies
-its SHA256 (against an offline pin in `KNOWN_SHA256` when set, else exiftool.org's
-published `checksums.txt`), and extracts it into the cache as
+its SHA256 (against an offline pin in `KNOWN_SHA256` when set, else the
+release's published checksum file — `checksums-<version>.txt` first, then the
+unversioned `checksums.txt`), and extracts it into the cache as
 `exiftool.exe` + `exiftool_files/`. On **macOS/Linux** it is a no-op — install a
 system ExifTool (`brew install exiftool`, `apt install libimage-exiftool-perl`).
 Provisioning is best-effort: any failure leaves resolution to fall back to
@@ -106,13 +108,13 @@ python -m photokin.exiftool --changeset batch_changeset.ndjson \
 (`photokin/exiftool_apply.py` remains as a deprecated shim for the old
 module path.)
 
-## Relationship to `photokin.lightroom.exiftool_manifest`
+## The manifest reader (`manifest.py`)
 
-`photokin/lightroom/exiftool_manifest.py` is the standalone ExifTool→manifest
-reader: it shells out to ExifTool and emits a manifest-like JSON, mapping common
-tags into top-level keys (`dateTimeOriginal`, `userComment`, `caption`, `title`)
-while preserving every raw tag under `metadata["exiftool"]`. Run it with
-`python -m photokin.lightroom.exiftool_manifest FILES... [--field TAG] [--out PATH]`.
+`manifest.py` is the standalone ExifTool→manifest reader: it shells out to
+ExifTool and emits a manifest-like JSON, mapping common tags into top-level
+keys (`dateTimeOriginal`, `userComment`, `caption`, `title`) while preserving
+every raw tag under `metadata["exiftool"]`. Run it with
+`python -m photokin.exiftool.manifest FILES... [--field TAG] [--out PATH]`.
 `hydrate.py` reuses its `run_exiftool_json` primitive (and the `_find_tag_value`
 helper, tolerant of ExifTool's `-G1` group names) rather than duplicating the
 subprocess/JSON handling.

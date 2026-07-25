@@ -31,7 +31,7 @@ def normalize_faces(face_data: Mapping[str, object] | None) -> list[NormalizedFa
     """Normalize extracted face payload into a flattened list.
 
     Args:
-        face_data: Dictionary returned by ``photokin.lightroom.faces_xmp.parse_face_regions_from_xmp_bytes``.
+        face_data: Dictionary returned by ``parse_face_regions_from_xmp_bytes`` (the plugin's faces_xmp.py script, or any equivalent XMP face-region parser).
 
     Returns:
         A list of normalized faces with flattened geometry values.

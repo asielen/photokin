@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from json import JSONDecodeError
 from typing import Any, Dict, List, Set, Tuple, Optional
 
-from photokin.lightroom.face_utils import face_tags_to_llm_block
+from photokin.face_utils import face_tags_to_llm_block
 
 # === Config ===
 

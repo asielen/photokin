@@ -309,7 +309,7 @@ def build_manifest(
 def main(argv: List[str]) -> int:
     """CLI entry: extract metadata for the given files and print a manifest JSON.
 
-    Invoked as ``python -m photokin.lightroom.exiftool_manifest``; writes to
+    Invoked as ``python -m photokin.exiftool.manifest``; writes to
     ``--out`` if given, else stdout. Returns a process exit code.
     """
     p = argparse.ArgumentParser(

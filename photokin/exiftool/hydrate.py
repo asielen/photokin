@@ -21,7 +21,7 @@ def hydrate_user_comments(items: list[dict], cfg: ExiftoolConfig) -> None:
     raising into the manifest pipeline.
     """
     try:
-        from photokin.lightroom.exiftool_manifest import _find_tag_value, run_exiftool_json
+        from photokin.exiftool.manifest import _find_tag_value, run_exiftool_json
     except ImportError:
         return
 

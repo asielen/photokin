@@ -4,9 +4,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# faces_xmp is a plugin-side script, not part of the photokin package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Mel.lrplugin" / "scripts"))
 
-from photokin.lightroom.face_utils import faces_to_llm_block, normalize_faces
-from photokin.lightroom.faces_xmp import parse_face_regions_from_xmp_bytes
+from photokin.face_utils import faces_to_llm_block, normalize_faces
+from faces_xmp import parse_face_regions_from_xmp_bytes
 
 
 XMP_SAMPLE = b"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
