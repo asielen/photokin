@@ -18,6 +18,8 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
   "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
@@ -46,6 +48,7 @@ exclude = ["photokin.tests*", "tests*"]
 
 [tool.setuptools.package-data]
 photokin = [
+  "py.typed",
   "prompts_photo_ai/*.txt",
   "prompts_photo_ai/*.toml",
   "prompts_photo_ai/schema/*.json",

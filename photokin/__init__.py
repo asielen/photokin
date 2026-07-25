@@ -1,12 +1,13 @@
 """
-photokin.__init__
-=======================
+photokin
+========
 
-Public API surface for the photo archiver library.
+Public API surface for the photokin library.
 
 Exports:
 - Config: runtime configuration dataclass.
-- analyze_photo: main library function to run the full pipeline.
+- analyze_photo: run the full pipeline for one photo (front + optional back).
+- analyze_folder: batch mode for a folder of images.
 """
 
 from .utils import Config
