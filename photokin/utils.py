@@ -354,8 +354,8 @@ def warn_forbiddenish_keywords(keywords: List[str]) -> List[str]:
     """Return warning strings for keywords containing forbidden/subjective terms.
 
     The model is told to avoid subjective or relationship-implying keywords; this
-    is a cheap substring guard that flags (does not remove) any that slip through,
-    so a reviewer can decide. One warning per offending keyword.
+    is a word-boundary regex guard that flags (does not remove) any that slip
+    through, so a reviewer can decide. One warning per offending keyword.
     """
     warnings = []
     for k in keywords:
@@ -365,7 +365,7 @@ def warn_forbiddenish_keywords(keywords: List[str]) -> List[str]:
             continue
         low = k.strip().lower()
         for bad in FORBIDDEN_KEYWORD_SUBSTRINGS:
-            if bad in low:
+            if re.search(rf"\b{re.escape(bad)}\b", low):
                 warnings.append(f'Keyword "{k}" appears to contain forbidden/subjective/relationship term: "{bad}".')
                 break
     return warnings
