@@ -188,7 +188,13 @@ NEW KEYWORDS — WHEN AND HOW
 • Every NEW keyword must be listed in proposed_new_keywords with:
   – keyword: exact new term
   - note: 1–2 sentences explaining why this keyword is useful for search/retrieval (what it captures).
-  – section: which section it belongs to (one of the 12 section IDs used in the TOML)
+  – section: which section it belongs to — one of these 13 section IDs from
+    the vocabulary TOML: people_subjects, clothing_fashion, objects_artifacts,
+    animals_pets, setting_environment, architecture_built, events_occasions,
+    photo_format, written_elements_identifiers, activities_actions,
+    emblems_symbols_context, landscape_nature, documents_records.
+    (The date_reference section is reference-only; never propose keywords
+    for it.)
   – scope: "general" or "specific"
     • general = broadly useful for most people doing similar archival/genealogy work
     • specific = highly personal / proper-noun / narrowly useful (e.g., a person's name)

@@ -408,13 +408,16 @@ keywords = [
   { keyword = "Title page", note = "Identifies the cover or title page of a bound or multi-page document, manuscript, or booklet. Useful for grouping cover pages separately from interior pages in document collections." },
 ]
 
-[date_refernce]
+# Reference-only section: examples of the mandatory "DATE: <pattern>" system
+# keyword so it is never treated as a new keyword. Never propose additions here.
+[date_reference]
 keywords = [
-  "Date: Y!",
+  "DATE: Y!",
   "DATE: Y~",
   "DATE: Y?",
   "DATE: Y!M!D!",
   "DATE: Y!M!",
   "DATE: Y!M~",
   "DATE: Y!M!D~",
+  "DATE: Y~M~",
 ]
