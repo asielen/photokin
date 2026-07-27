@@ -108,6 +108,7 @@ keywords = [
   "Religious articles",
   "Souvenirs",
   "Portrait",
+  { keyword = "Vintage monitors", note = "Helps identify photos containing older CRT-style display equipment, useful for dating photos by visible technology." },
  ]
 
 [animals_pets]
@@ -166,6 +167,7 @@ keywords = [
   "Rubble",
   { keyword = "Promenade des Anglais", note = "Iconic seafront boulevard in Nice, France; a specific and historically significant location that aids geographic and cultural retrieval of images taken along this landmark promenade." },
   { keyword = "Residential neighborhood", note = "Use when the setting is clearly a residential street or neighborhood with houses visible. More specific than 'Residential area' when houses are prominent scene elements." },
+  { keyword = "Mission control", note = "Describes a room filled with technical monitoring equipment and consoles, useful for categorizing aerospace or government operations facility photos." },
 ]
 
 [architecture_built]
