@@ -232,8 +232,13 @@ SECTION_IDS = [
     "people_subjects","clothing_fashion","objects_artifacts","animals_pets",
     "setting_environment","architecture_built","events_occasions","photo_format",
     "written_elements_identifiers","activities_actions","emblems_symbols_context","landscape_nature",
-    "documents_records","date_refernce",
+    "documents_records","date_reference",
 ]
+
+# Old canonical spellings still found in user-customized vocab files.
+_LEGACY_SECTION_HEADERS = {
+    "date_reference": "date_refernce",
+}
 
 FORBIDDEN_KEYWORD_SUBSTRINGS = {
     "family","parents","siblings","mother","father","son","daughter",
@@ -272,9 +277,9 @@ SECTION_ALIASES = {
     "nature": "landscape_nature",
     "documents": "documents_records",
     "records": "documents_records",
-    "date": "date_refernce",
-    "dates": "date_refernce",
-    "date_reference": "date_refernce",
+    "date": "date_reference",
+    "dates": "date_reference",
+    "date_refernce": "date_reference",
 }
 
 
@@ -319,8 +324,11 @@ def load_vocab_sections(vocab_path: str) -> Tuple[Dict[str, List[Any]], List[Dic
     data = _load_toml(vocab_path)
     sections: Dict[str, List[Any]] = {}
     for sid in SECTION_IDS:
-        if sid in data and isinstance(data[sid], dict) and "keywords" in data[sid]:
-            sections[sid] = data[sid]["keywords"] or []
+        header = sid
+        if header not in data and sid in _LEGACY_SECTION_HEADERS and _LEGACY_SECTION_HEADERS[sid] in data:
+            header = _LEGACY_SECTION_HEADERS[sid]
+        if header in data and isinstance(data[header], dict) and "keywords" in data[header]:
+            sections[sid] = data[header]["keywords"] or []
         else:
             sections[sid] = []
     new_keywords_list = data.get("new_keywords", [])
@@ -694,18 +702,31 @@ def build_prompt_bundle(
     provider = (provider_name or (cfg.provider_name if cfg else None) or "ChatGPT").strip() or "ChatGPT"
     vars_common = {"MODEL_NAME": model_name, "PROVIDER_NAME": provider}
 
-    def add_txt(name: str, vars: Dict[str, str] | None = None):
-        p = _resolve_prompt_file(name, cfg)
-        text = _read_text(p).strip()
+    def add_text(text: str, vars: Dict[str, str] | None = None):
+        text = text.strip()
         if vars:
             for k, v in vars.items():
                 text = text.replace(f"{{{{{k}}}}}", v)
         pieces.append({"type": "input_text", "text": text})
 
+    def add_txt(name: str, vars: Dict[str, str] | None = None):
+        add_text(_read_text(_resolve_prompt_file(name, cfg)), vars)
+
     add_txt("system_header.txt", vars_common)
     add_txt("instructions_front_back.txt", {"TODAY": today})
     add_txt("image_rules.txt", vars_common)
     add_txt("categories.txt")
+
+    # The rule files above refer to "the provided preferred vocabulary" and the
+    # forbidden-inference guardrails, so both must actually reach the model.
+    # Honor Config overrides for these two paths (they are also used by the
+    # post-run validation/vocab-update steps).
+    forbidden_p = (cfg.forbidden_path if cfg else None) or _resolve_prompt_file("forbidden_inferences.txt", cfg)
+    add_text(_read_text(forbidden_p), vars_common)
+
+    vocab_p = (cfg.vocab_path if cfg else None) or _resolve_prompt_file("vocab_keywords_examples.toml", cfg)
+    add_text("PREFERRED VOCABULARY (TOML)\n\n" + _read_text(vocab_p))
+
     add_txt("output_format.txt", vars_common)
 
     # Optional forwarded metadata block (filtered)

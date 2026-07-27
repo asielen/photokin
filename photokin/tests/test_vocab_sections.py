@@ -36,6 +36,15 @@ class TestLoadVocabSections(unittest.TestCase):
         self.assertEqual(sections["people_subjects"], ["Adults"])
         self.assertEqual(sections["documents_records"], [])  # section absent from this file
 
+    def test_legacy_misspelled_date_header_still_loads(self):
+        # Vocab files written before the rename use "[date_refernce]"; they must
+        # keep loading into the corrected "date_reference" section id.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vocab.toml"
+            path.write_text('[date_refernce]\nkeywords = ["DATE: Y!"]\n', encoding="utf-8")
+            sections, _ = utils.load_vocab_sections(str(path))
+        self.assertEqual(sections["date_reference"], ["DATE: Y!"])
+
     def test_flatten_known_keywords_includes_object_form_and_new_keywords_log(self):
         sections = {
             "people_subjects": ["Adults", {"keyword": "Wedding couple", "note": "..."}],
