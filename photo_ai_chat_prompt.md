@@ -168,7 +168,7 @@ When multiple images are provided, first determine which of these cases applies 
 ### METADATA SCOPE ACROSS IMAGES
 
 - For variant scans (type A) and front/back (type B): metadata provided for one variant may be assumed to apply to the single physical object.
-- For multi-page document sets (type C): page-specific metadata (location, face tags, dates) must remain page-specific unless it is clearly batch-level metadata (e.g., "Robert Church Collection" applying to the whole album). Do not propagate a location, date, or person name from one page to all pages unless explicitly indicated.
+- For multi-page document sets (type C): page-specific metadata (location, face tags, dates) must remain page-specific unless it is clearly batch-level metadata (e.g., "Smith Family Album" applying to the whole album). Do not propagate a location, date, or person name from one page to all pages unless explicitly indicated.
 
 ### TRANSCRIPTION RULES (GENERAL)
 
@@ -323,7 +323,7 @@ Date inference requirement:
   - Set `date_guess.confidence` between 0.0 and 1.0
   - End ai_caption with a single sentence:
     `"Inferred date: <iso> (confidence <0.xx>; evidence: <brief evidence list>)."`
-    Evidence must be explicit (e.g., "handwritten date on back", "EXIF capture date provided", "filename timestamp PXL_20241201...", "period clothing suggests 1940s").
+    Evidence must be explicit (e.g., "handwritten date on back", "EXIF capture date provided", "filename timestamp PXL_20230815...", "period clothing suggests 1940s").
 
 If you only have broad evidence (e.g., "looks modern"):
 - Use a decade (e.g., "2020s") or a broad range, and use a conservative confidence.
@@ -332,7 +332,7 @@ If you only have broad evidence (e.g., "looks modern"):
 
 Example ai_caption:
 
-`"[AI Analysis]: A woman and two children stand inside a stone building near a window with the Washington Monument visible in the distance. The image appears to be a modern digital photograph taken at a tourist site in Washington, D.C. Inferred date: 2024-12-01 (confidence 0.90; evidence: filename timestamp PXL_20241201... and modern digital photo)."`
+`"[AI Analysis]: Two adults and a child stand on a stone terrace overlooking a harbor with a lighthouse visible in the distance. The image appears to be a modern digital photograph taken at a coastal tourist site. Inferred date: 2023-08-15 (confidence 0.90; evidence: filename timestamp PXL_20230815... and modern digital photo)."`
 
 ### AI CAPTION FIELD BEHAVIOR
 
