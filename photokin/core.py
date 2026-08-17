@@ -33,6 +33,12 @@ Code map (public-facing entry points marked PUBLIC):
 - analyze_group_front_back      PUBLIC: convenience wrapper over analyze_group_parts
 - _unanalyzed_group_files       list a folder group's files this path never reads
 - analyze_folder                PUBLIC: batch a whole folder
+- _coerce_manifest_bool         read a tri-state boolean flag off a manifest item
+- _log_manifest_override        warn that an explicit flag beat the filename
+- _manifest_group_override      resolve an item's explicit bucket key
+- _resolve_manifest_entry       build one grouping entry, filename plus overrides
+- _manifest_part_key            the slot an entry competes for in its variant
+- _slot_rank_key                the one ordering every grouping tie-break uses
 - analyze_manifest              PUBLIC: aggregate wrapper over the stream
 - process_manifest_stream       PUBLIC: streaming NDJSON batch (the plugin path)
 """
@@ -1041,6 +1047,240 @@ def analyze_folder(
     return aggregated
 
 
+# === Manifest grouping ===
+
+# One canonical ordering for every grouping tie-break in the manifest path. The
+# crop flag leads it (see ``_slot_rank_key``) so a derivative can never take the
+# slot of the scan it was cropped from, whatever order the manifest listed them in.
+_PART_RANK = {"front": 0, "none": 1, "page": 2, "back": 3, "negative": 4}
+
+# The plug-in writes manifests from Lua, which passes literal true/false strings.
+_MANIFEST_TRUE = frozenset({"true", "1", "yes"})
+_MANIFEST_FALSE = frozenset({"false", "0", "no"})
+
+# Only a separator or a digit may precede the token, so 'feedback.jpg' is never
+# read as the back of 'feed'.
+_EXPLICIT_BACK_SUFFIX_RE = re.compile(r"(?:[-_. ]|(?<=\d))back$", re.IGNORECASE)
+
+
+def _coerce_manifest_bool(raw: dict, key: str, path: str) -> bool | None:
+    """Read a tri-state boolean flag from a manifest item.
+
+    Args:
+        raw: One entry of the manifest's ``items`` array.
+        key: Flag name to read.
+        path: Normalized item path, used only for the warning message.
+
+    Returns:
+        The flag value, or ``None`` when it is absent, null or unreadable -- all
+        of which mean "no override". Note that ``False`` is an override and must
+        therefore never be tested for truthiness by the caller.
+    """
+    value = raw.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _MANIFEST_TRUE:
+            return True
+        if token in _MANIFEST_FALSE:
+            return False
+    logger.warning("Manifest item %s: ignoring unrecognized %s value %r", path, key, value)
+    return None
+
+
+def _log_manifest_override(path: str, key: str, value: object, field: str, derived: object) -> None:
+    """Warn that an explicit manifest flag contradicted, and beat, the filename."""
+    logger.warning(
+        "Manifest item %s: explicit %s=%r overrides filename-derived %s=%r",
+        path,
+        key,
+        value,
+        field,
+        derived,
+    )
+
+
+def _manifest_group_override(raw: dict, path: str) -> str | None:
+    """Resolve an item's explicit bucket key.
+
+    ``group`` is canonical and ``base_id`` an accepted alias; when both are given
+    and disagree, ``group`` wins.
+
+    Args:
+        raw: One entry of the manifest's ``items`` array.
+        path: Normalized item path, used only for warning messages.
+
+    Returns:
+        The explicit bucket key, or ``None`` to fall back to the filename.
+    """
+    resolved: str | None = None
+    for key in ("group", "base_id"):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            logger.warning("Manifest item %s: ignoring unusable %s value %r", path, key, value)
+            continue
+        candidate = value.strip()
+        if resolved is None:
+            resolved = candidate
+        elif candidate != resolved:
+            logger.warning(
+                "Manifest item %s: base_id=%r conflicts with group=%r; using group.",
+                path,
+                candidate,
+                resolved,
+            )
+    return resolved
+
+
+def _resolve_manifest_entry(raw: dict) -> dict | None:
+    """Build one grouping entry from a raw manifest item.
+
+    Everything starts from the filename grammar and is then corrected by whatever
+    the caller stated explicitly. ``is_back``, ``is_crop``, ``version`` and
+    ``group`` (alias ``base_id``) always beat the filename, in both directions:
+    they exist precisely for files whose names do not follow the grammar, so a
+    filename that overruled them would leave them inert exactly where they are
+    needed. Every override that actually changes a derived value is logged.
+
+    Args:
+        raw: One entry of the manifest's ``items`` array.
+
+    Returns:
+        The grouping entry, or ``None`` when the item carries no usable path.
+    """
+    path = utils.normalize_path(raw.get("path") or "")
+    if not path:
+        return None
+
+    parsed = utils.parse_media_filename(path)
+    part_kind = parsed.part_kind
+    page_num = parsed.page_num
+    version = parsed.variant_id
+    is_crop = parsed.is_crop
+
+    explicit_back = _coerce_manifest_bool(raw, "is_back", path)
+    if explicit_back is True and part_kind != "back":
+        _log_manifest_override(path, "is_back", raw.get("is_back"), "part_kind", part_kind)
+        # An item cannot be both a page and a back.
+        part_kind, page_num = "back", None
+    elif explicit_back is False and part_kind == "back":
+        # "front" rather than "none": the caller asserted the front side, and an
+        # untagged file can still be promoted to page 1 in a multipage group.
+        _log_manifest_override(path, "is_back", raw.get("is_back"), "part_kind", part_kind)
+        part_kind = "front"
+
+    explicit_crop = _coerce_manifest_bool(raw, "is_crop", path)
+    if explicit_crop is not None and explicit_crop != is_crop:
+        _log_manifest_override(path, "is_crop", raw.get("is_crop"), "is_crop", is_crop)
+        is_crop = explicit_crop
+
+    if raw.get("version") is not None:
+        explicit_version = str(raw["version"]).strip().lower() or None
+        if explicit_version != version:
+            _log_manifest_override(path, "version", raw.get("version"), "version", version)
+        version = explicit_version
+
+    group_key = _manifest_group_override(raw, path)
+    if group_key is None:
+        group_key = parsed.base_id
+        if explicit_back is True and parsed.part_kind != "back":
+            # The parser reads only the hyphenated '-back', so an explicitly
+            # flagged 'box3_017_back.jpg' would otherwise bucket on its own.
+            repaired = _EXPLICIT_BACK_SUFFIX_RE.sub("", group_key, count=1)
+            if repaired and repaired != group_key:
+                logger.info(
+                    "Manifest item %s: is_back is set, grouping under '%s' rather than '%s'.",
+                    path,
+                    repaired,
+                    group_key,
+                )
+                group_key = repaired
+    elif group_key != parsed.base_id:
+        _log_manifest_override(path, "group", group_key, "group", parsed.base_id)
+
+    return {
+        "path": path,
+        "is_back": part_kind == "back",
+        "version": version,
+        "part_kind": part_kind,
+        "page_num": page_num,
+        "is_crop": is_crop,
+        "group_key": group_key,
+        "preferred": bool(raw.get("preferred")),
+        "metadata": raw.get("metadata"),
+        "metadata_path": raw.get("metadata_path"),
+    }
+
+
+def _manifest_part_key(entry: dict) -> str:
+    """Return the slot an entry competes for within its variant.
+
+    The slot address is the ``(version, part_key)`` pair. Crop-ness deliberately
+    stays out of the address so a crop contends for its parent's slot and loses
+    on rank rather than quietly occupying a slot of its own.
+    """
+    part_kind = entry["part_kind"]
+    if part_kind == "page":
+        # ``or 1`` would be wrong here: '-pageN' accepts any run of digits, so
+        # '-page0' is a legal name whose slot must stay distinct from page 1's.
+        page_num = entry["page_num"]
+        return f"page:{1 if page_num is None else page_num}"
+    if part_kind in ("front", "back", "negative"):
+        return part_kind
+    return "none"
+
+
+def _slot_address_rank(version: str | None, part_key: str) -> tuple[int, int, int, str]:
+    """Rank a ``(version, part_key)`` slot address the way entries are ranked.
+
+    Mirrors the part-kind, page-number and unversioned-first components of
+    :func:`_slot_rank_key`. Used when one path has won more than one address and
+    only its best claim may travel in the payload.
+
+    Args:
+        version: The variant letter the address belongs to, or ``None``.
+        part_key: The slot key, as produced by :func:`_manifest_part_key`.
+
+    Returns:
+        A sort key placing the address a path should keep first.
+    """
+    if part_key.startswith("page:"):
+        kind, page_num = "page", int(part_key.split(":", 1)[1])
+    else:
+        kind, page_num = part_key, 0
+    return (_PART_RANK[kind], page_num, 0 if version is None else 1, version or "")
+
+
+def _slot_rank_key(entry: dict) -> tuple[int, int, int, int, int, str, str, str]:
+    """Order grouping entries so no choice in the bucket loop depends on manifest order.
+
+    Crop-ness leads, so a real scan beats a crop of it unconditionally -- including
+    a crop the caller marked ``preferred``, since a derivative cannot stand in for
+    the original listed beside it. ``preferred`` comes next, so an explicit choice
+    takes any slot it is actually allowed to take. Then part kind, page number,
+    unversioned-before-versioned, and finally the path itself so even two
+    indistinguishable candidates resolve the same way every run.
+    """
+    page_num = entry["page_num"]
+    return (
+        1 if entry["is_crop"] else 0,
+        0 if entry["preferred"] else 1,
+        _PART_RANK[entry["part_kind"]],
+        0 if page_num is None else page_num,
+        0 if entry["version"] is None else 1,
+        entry["version"] or "",
+        entry["path"].lower(),
+        entry["path"],
+    )
+
+
 def analyze_manifest(
     manifest: dict | str,
     config: utils.Config = utils.Config(),
@@ -1112,22 +1352,10 @@ def process_manifest_stream(
         metadata_hydrator(items)
     buckets: dict[str, list[dict]] = {}
     for raw in items:
-        p = utils.normalize_path(raw.get("path") or "")
-        if not p:
+        entry = _resolve_manifest_entry(raw)
+        if entry is None:
             continue
-        parsed = utils.parse_media_filename(p)
-        stem, is_back, version = parsed.base_id, parsed.part_kind == "back", parsed.variant_id
-        entry = {
-            "path": p,
-            "is_back": is_back,
-            "version": version,
-            "part_kind": parsed.part_kind,
-            "page_num": parsed.page_num,
-            "preferred": bool(raw.get("preferred")),
-            "metadata": raw.get("metadata"),
-            "metadata_path": raw.get("metadata_path"),
-        }
-        buckets.setdefault(stem, []).append(entry)
+        buckets.setdefault(entry["group_key"], []).append(entry)
 
     results: dict[str, dict] = {}
     run_id = changeset_run_id or (make_run_id() if changeset_writer else None)
@@ -1146,53 +1374,67 @@ def process_manifest_stream(
     for stem in group_keys:
         group = buckets[stem]
         try:
-            # choose primary (fallback-safe even if only backs are present)
-            primary_idx = utils.pick_master_index(group, update_policy=update_policy)
-            primary_item = group[primary_idx]
-            primary_front = primary_item["path"] if not primary_item["is_back"] else None
-            primary_version = primary_item.get("version")
-            primary_back = None
+            multipage_present = any(it["part_kind"] == "page" for it in group)
+            # Rank order, not arrival order, so the warnings below and the
+            # recorded crop map read the same whatever order the manifest used,
+            # and one entry per resolved path so a manifest that lists the same
+            # crop twice is not described twice as standing in for the object.
+            crops_by_path: dict[str, dict] = {}
+            for it in sorted((c for c in group if c["is_crop"]), key=_slot_rank_key):
+                crops_by_path.setdefault(it["path"], it)
+            crops = list(crops_by_path.values())
 
-            # Prefer a back with the same version as the primary, then any unversioned back
-            primary_back = next(
-                (it["path"] for it in group if it["is_back"] and it.get("version") == primary_version),
-                None,
-            )
-            if primary_back is None:
-                primary_back = next((it["path"] for it in group if it["is_back"] and it.get("version") is None), None)
-            if primary_back is None:
-                primary_back = next((it["path"] for it in group if it["is_back"]), None)
-
-            # Last resort: if no front exists, use any item so we still return a result instead of KeyError
-            if primary_front is None:
-                primary_front = next((it["path"] for it in group if not it["is_back"]), None)
-                primary_version = primary_version or next((it.get("version") for it in group if not it["is_back"]), None)
-            if primary_front is None:
-                primary_front = primary_item["path"]
-                primary_version = primary_version or primary_item.get("version")
-
-            combined_meta = utils.combine_group_metadata(group)
-            sent_to_model_snapshot = select_forwarded_metadata(combined_meta, forward_fields)
-
-            variant_parts: dict[str | None, dict[str, str]] = {}
             variant_order: list[str | None] = []
-            multipage_present = any((it.get("part_kind") == "page") for it in group)
-
+            slot_candidates: dict[tuple[str | None, str], list[dict]] = {}
             for it in group:
-                ver = it.get("version")
+                ver = it["version"]
                 if ver not in variant_order:
                     variant_order.append(ver)
-                part_kind = it.get("part_kind")
-                part_key = "none"
-                if part_kind == "front":
-                    part_key = "front"
-                elif part_kind == "back":
-                    part_key = "back"
-                elif part_kind == "page":
-                    part_key = f"page:{it.get('page_num')}"
-                variant_parts.setdefault(ver, {})
-                variant_parts[ver].setdefault(part_key, it["path"])
+                slot_candidates.setdefault((ver, _manifest_part_key(it)), []).append(it)
 
+            # A crop is a supporting view of its parent, so it yields the slot
+            # whenever the parent is listed -- matching folder mode. That has to
+            # be decided per slot rather than per group: a group holding a
+            # cropped front and an uncropped back has an uncropped file in it,
+            # yet dropping the crop would leave the group with no front at all.
+            orphan_crops: set[str] = set()
+            for address, claimants in slot_candidates.items():
+                uncropped = [c for c in claimants if not c["is_crop"]]
+                if uncropped:
+                    slot_candidates[address] = uncropped
+                else:
+                    orphan_crops.update(c["path"] for c in claimants)
+
+            # One winner per (version, part) address, chosen by rank rather than
+            # by arrival, so the file sent to the model is the same one in every
+            # permutation of the manifest.
+            variant_parts: dict[str | None, dict[str, str]] = {}
+            slot_winners: list[dict] = []
+            for (ver, part_key), claimants in slot_candidates.items():
+                ranked = sorted(claimants, key=_slot_rank_key)
+                winner = ranked[0]
+                # A manifest listing one path twice repeats a file rather than
+                # contesting a slot, so address the claimants by resolved path:
+                # an exact duplicate is not a collision and must not be reported
+                # as one.
+                losers: dict[str, dict] = {}
+                for claimant in ranked[1:]:
+                    if claimant["path"] != winner["path"]:
+                        losers.setdefault(claimant["path"], claimant)
+                if losers:
+                    logger.warning(
+                        "Group '%s': %d file(s) claim the same %s slot; analyzing %s "
+                        "and recording the rest: %s",
+                        stem,
+                        len(losers) + 1,
+                        part_key,
+                        winner["path"],
+                        ", ".join(os.path.basename(c["path"]) for c in losers.values()),
+                    )
+                variant_parts.setdefault(ver, {})[part_key] = winner["path"]
+                slot_winners.append(winner)
+
+            relabelled_versions: set[str | None] = set()
             if multipage_present:
                 # Guardrail: only treat an untagged file as Page 1 when the overall
                 # base_id has explicit -pageN entries, so single unrelated photos
@@ -1200,6 +1442,69 @@ def process_manifest_stream(
                 for ver, parts in variant_parts.items():
                     if "page:1" not in parts and "none" in parts:
                         parts["page:1"] = parts.pop("none")
+                        relabelled_versions.add(ver)
+
+            # Invariant: a listed file is never dropped from the payload in
+            # silence. An untagged file reaches the model through the front side
+            # of its variant -- as Page 1 in a multipage group, as the front
+            # otherwise -- and that role holds exactly one file. When something
+            # more specific already holds it, the untagged file has no part to
+            # travel in, so say so and record it rather than letting a later
+            # assignment overwrite the earlier one and lose it without a word.
+            displaced_slots: dict[str, list[str]] = {}
+            for ver, parts in variant_parts.items():
+                untagged = parts.get("none")
+                if untagged is None:
+                    continue
+                holder = parts.get("page:1" if multipage_present else "front")
+                if holder is None:
+                    continue
+                parts.pop("none")
+                displaced_slots.setdefault(f"{ver or ''}:none", []).append(untagged)
+                logger.warning(
+                    "Group '%s': %s and %s both claim the front side of variant "
+                    "%s; analyzing %s and recording %s without sending it.",
+                    stem,
+                    untagged,
+                    holder,
+                    ver or "(unversioned)",
+                    holder,
+                    os.path.basename(untagged),
+                )
+            if displaced_slots:
+                displaced_paths = {p for paths in displaced_slots.values() for p in paths}
+                slot_winners = [w for w in slot_winners if w["path"] not in displaced_paths]
+
+            # Invariant: one path is never sent under two labels. A manifest
+            # listing the same file twice under contradicting flags wins it two
+            # addresses, and the group payload would then upload, bill and
+            # describe it once per address. Keep its best claim -- it stays a
+            # candidate for the primary, since it is still sent -- and disclose
+            # the rest.
+            carried_as: dict[str, str] = {}
+            for ver, part_key in sorted(
+                (
+                    (ver, part_key)
+                    for ver, parts in variant_parts.items()
+                    for part_key in parts
+                ),
+                key=lambda address: _slot_address_rank(*address),
+            ):
+                path = variant_parts[ver][part_key]
+                if path not in carried_as:
+                    carried_as[path] = part_key
+                    continue
+                del variant_parts[ver][part_key]
+                displaced_slots.setdefault(f"{ver or ''}:{part_key}", []).append(path)
+                logger.warning(
+                    "Group '%s': %s claims the %s slot as well as the %s slot; "
+                    "sending it once, as %s.",
+                    stem,
+                    path,
+                    part_key,
+                    carried_as[path],
+                    carried_as[path],
+                )
 
             variant_pairs: dict[str | None, dict[str, str]] = {}
             for ver, parts in variant_parts.items():
@@ -1228,6 +1533,131 @@ def process_manifest_stream(
                             except (ValueError, TypeError):
                                 continue
                 page_nums_all = sorted(page_set)
+
+            all_negatives: list[str] = []
+            for ver in variant_list_sorted:
+                neg = variant_parts.get(ver, {}).get("negative")
+                if neg and neg not in all_negatives:
+                    all_negatives.append(neg)
+
+            # Primary selection reads the slot map rather than the arrival order,
+            # so the analyzed file is always one the payload actually carries.
+            # ``preferred`` is honored through ``_slot_rank_key``, which lets it
+            # take any slot it contends for; an item that still owns no slot is
+            # never the primary, because the primary is by definition the file
+            # sent. That is what keeps a ``preferred`` crop -- which loses its
+            # parent's slot on crop-ness -- from being named as the analyzed file
+            # of a payload it is not in.
+            candidates: list[dict] = []
+            seen_candidate_paths: set[str] = set()
+            for entry in sorted(slot_winners, key=_slot_rank_key):
+                if entry["path"] not in seen_candidate_paths:
+                    seen_candidate_paths.add(entry["path"])
+                    candidates.append(entry)
+
+            master_pool = candidates
+            if any(c["part_kind"] != "negative" for c in candidates) and not any(
+                c["preferred"] for c in candidates
+            ):
+                # A negative is never the primary while anything else could be:
+                # rank alone would not stop pick_master_index preferring an
+                # unversioned negative over a versioned front. An explicit
+                # ``preferred`` suspends the filter, since explicit beats derived.
+                # It narrows the master pick only: removing negatives from
+                # ``candidates`` outright would hide the sole front-side file of a
+                # negative-plus-back group from the fallback below, which is how
+                # that group came to send its back twice and drop the negative.
+                master_pool = [c for c in candidates if c["part_kind"] != "negative"]
+
+            primary_idx = utils.pick_master_index(master_pool, update_policy=update_policy)
+            primary_item = master_pool[primary_idx]
+            primary_front = primary_item["path"] if not primary_item["is_back"] else None
+            primary_version = primary_item["version"]
+            # A back is only ever chosen here because the caller preferred it or
+            # because the group holds nothing else, and either way it is the back
+            # to send: resolving it from the slot map instead would let the
+            # version lookup below hand the model a different file than the one
+            # the caller named.
+            primary_back = primary_item["path"] if primary_item["is_back"] else None
+            if primary_front is None:
+                # Search the whole candidate list, negatives included: a group
+                # holding only a negative and a back has exactly one front-side
+                # file, and it is the negative. Fallback-safe even when the group
+                # holds nothing but backs.
+                front_entry = next((c for c in candidates if not c["is_back"]), None)
+                if front_entry is None:
+                    primary_front = primary_item["path"]
+                else:
+                    primary_front = front_entry["path"]
+                    # ``primary_version`` addresses the back slot below and scopes
+                    # the analysis's PC* keywords, so it has to describe the file
+                    # actually sent as the front, not the item that won a master
+                    # pick it then lost the front role to.
+                    primary_version = front_entry["version"]
+
+            # Read the back out of the slot map so the back sent to the model is
+            # always the file that owns the slot: same version as the primary
+            # first, then any unversioned back, then the lowest-sorting one.
+            if primary_back is None:
+                primary_back = variant_pairs.get(primary_version, {}).get("back")
+            if primary_back is None:
+                primary_back = variant_pairs.get(None, {}).get("back")
+            if primary_back is None:
+                primary_back = next(
+                    (
+                        variant_pairs[ver]["back"]
+                        for ver in variant_list_sorted
+                        if "back" in variant_pairs.get(ver, {})
+                    ),
+                    None,
+                )
+
+            if primary_back is not None and primary_back == primary_front:
+                # Invariant: one path is never sent under two labels. A group with
+                # no front side resolves both roles to the same file, as does a
+                # manifest listing one path twice under conflicting flags, and
+                # ``analyze_photo`` would then upload it, bill for it and describe
+                # it twice -- once as a side it demonstrably is not.
+                logger.info(
+                    "Group '%s': %s is the only file standing for both sides; "
+                    "sending it once rather than as its own back.",
+                    stem,
+                    primary_front,
+                )
+                primary_back = None
+
+            # Warn only once the file set bound for the model is known, and test
+            # against that set rather than against ``primary_front``: the
+            # group-aware path sends more than the primary, and a crop the caller
+            # marked ``preferred`` can be the primary yet still miss the payload.
+            if cfg.process_all_variants:
+                analyzed_paths = {p for parts in variant_parts.values() for p in parts.values()}
+            else:
+                analyzed_paths = {p for p in (primary_front, primary_back) if p}
+
+            for it in crops:
+                if it["path"] in orphan_crops and it["path"] in analyzed_paths:
+                    # Nothing uncropped claimed this slot, so the crop is all
+                    # that stands for the object -- manifest mode owes every
+                    # listed file a result, so it is analyzed rather than skipped.
+                    logger.warning(
+                        "Group '%s': %s has no uncropped original in the manifest; "
+                        "analyzing the crop as the object itself.",
+                        stem,
+                        it["path"],
+                    )
+
+            unanalyzed_crops = [c for c in crops if c["path"] not in analyzed_paths]
+            if unanalyzed_crops:
+                logger.warning(
+                    "Group '%s': %d crop file(s) are recorded but not analyzed: %s",
+                    stem,
+                    len(unanalyzed_crops),
+                    ", ".join(os.path.basename(c["path"]) for c in unanalyzed_crops),
+                )
+
+            combined_meta = utils.combine_group_metadata(group)
+            sent_to_model_snapshot = select_forwarded_metadata(combined_meta, forward_fields)
 
             # At this point we have:
             #   - ``group``: all manifest entries for this logical photo (same stem)
@@ -1268,6 +1698,7 @@ def process_manifest_stream(
 
                     _collect_part("front", "Front")
                     _collect_part("back", "Back")
+                    _collect_part("negative", "Negative")
 
                     if not parts_for_analysis:
                         raise ValueError(f"No parts collected for multipage group {stem}")
@@ -1290,13 +1721,32 @@ def process_manifest_stream(
                         if b and b not in all_backs:
                             all_backs.append(b)
 
-                    data_group = analyze_group_front_back(
-                        all_fronts,
-                        all_backs,
-                        cfg,
-                        original_meta = combined_meta,
-                        write_sidecar = write_sidecars,
-                    )
+                    if all_negatives:
+                        # A negative is neither a front nor a back, so it needs
+                        # the generic part form. The ordinary front/back call
+                        # site is left exactly as it was.
+                        data_group = analyze_group_parts(
+                            parts=[
+                                (label, paths)
+                                for label, paths in (
+                                    ("Front", all_fronts),
+                                    ("Back", all_backs),
+                                    ("Negative", all_negatives),
+                                )
+                                if paths
+                            ],
+                            config=cfg,
+                            original_meta=combined_meta,
+                            write_sidecar=write_sidecars,
+                        )
+                    else:
+                        data_group = analyze_group_front_back(
+                            all_fronts,
+                            all_backs,
+                            cfg,
+                            original_meta = combined_meta,
+                            write_sidecar = write_sidecars,
+                        )
 
                 # The group helper uses the same JSON shape as ``analyze_photo`` but
                 # we still normalize to ``primary_front`` for consistency with the
@@ -1546,6 +1996,32 @@ def process_manifest_stream(
             }
             if pages_map:
                 canonical["all_variant_files"]["pages"] = pages_map
+            if crops:
+                # Additive, and only for groups that actually hold crops: the
+                # plug-in fans metadata out locally, so it still needs to know
+                # which files are crops and which slot each one sat in. Every
+                # crop is listed, including an orphan that was analyzed for want
+                # of an original. Rank-ordered, unlike the arrival-ordered lists
+                # above, since nothing existing depends on this key's order.
+                crops_map: dict[str, list[str]] = {}
+                for it in crops:
+                    part_key = _manifest_part_key(it)
+                    if part_key == "none" and it["version"] in relabelled_versions:
+                        # The untagged slot of this variant became page 1 above,
+                        # so a crop of it is filed under the label it ended up
+                        # with rather than the one it was parsed into.
+                        part_key = "page:1"
+                    slot = f"{it['version'] or ''}:{part_key}"
+                    crops_map.setdefault(slot, []).append(it["path"])
+                canonical["all_variant_files"]["crops"] = crops_map
+            if all_negatives:
+                canonical["all_variant_files"]["negatives"] = all_negatives
+            if displaced_slots:
+                # Additive, and only for groups that lost a file this way: the
+                # ``front`` list above is every front-side file in the group, so
+                # on its own it reads as though each of them reached the model.
+                # This names the ones that could not.
+                canonical["all_variant_files"]["displaced"] = displaced_slots
 
             canonical_analysis_notes = next(
                 (rec.get("analysis_notes") for rec, _, _ in analyses if rec.get("analysis_notes")),

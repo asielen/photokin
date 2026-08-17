@@ -70,6 +70,12 @@ The sample fails twice over: the `is_back` flag is discarded, and `box3_017_back
 uses an underscore, which the parser does not read as a back - only the hyphenated
 `-back` form is recognized. The back scan is analyzed as a standalone front photo.
 
+**Status after Phase B1:** fixed for manifest mode. `is_back`, `is_crop`, `version`
+and `group` (alias `base_id`) are honored, and an explicit `is_back` also strips a
+trailing separator-preceded `back` token from the derived group key, which is what
+the sample needs. The same sample now forms one group with a front and a back, and
+makes one model call (`core.py:1170-1272`, `README.md:266-296`).
+
 ### HIGH - A crop can silently displace the real scan in manifest mode
 
 Found during Phase A doc reconciliation, not in the original audit. `parse_media_filename`
@@ -90,9 +96,28 @@ manifest lists crop first      : {None: {'none': 'box3_025-crop.jpg'}}
 This is order-dependent silent data loss on the integration surface, and it affects backs
 identically (`box3_025-back.jpg` and `box3_025-back-crop.jpg` both map to `back`). Folder
 mode is unaffected in outcome only because `group_folder_images` keeps crops in their own
-slots and never analyzes them at all. Phase B owns the fix, since reconciling the two
-groupers is where crop handling has to land; until then, do not list a crop ahead of its
-parent in a manifest.
+slots and never analyzes them at all.
+
+**Status after Phase B1:** fixed. Slot occupancy is now decided by rank rather than by
+arrival (`_slot_rank_key`, `core.py:1213-1229`), and crop-ness is the leading component,
+so a crop always loses its parent's slot in either order. The same rewrite covers
+`part_kind == "negative"`, which used to degrade into an untagged front and could be
+promoted to the group's primary; it now has its own slot and its own `Negative` part in
+the model payload. Crops are recorded under `all_variant_files.crops` and warned about
+rather than analyzed, matching folder mode; a crop with no parent is still analyzed,
+because manifest mode owes every listed file a record.
+
+That last exception is decided per slot, not per group. A group can hold a cropped
+front and an uncropped back, and asking "does this group contain anything uncropped"
+answers yes, drops the only front-side file it has, and sends the back to the model
+twice - once labelled `front`. The test is therefore whether anything uncropped claims
+the same `(version, part)` address. Both crop warnings are also emitted against the set
+of files actually bound for the model rather than against `primary_front`, since the
+group-aware path sends more than the primary and a `preferred` crop can be the primary
+yet still miss the payload.
+
+The same reasoning generalizes past crops, and not applying it there was the second
+round of defects: see the two payload invariants under Phase B1 below.
 
 ### Quieter defects found alongside
 
@@ -215,6 +240,94 @@ hydration come along for free.
 **Risk:** medium. The `analyze_folder` return shape changes again - the per-file
 half Phase A did not take - and it is public API.
 
+**B1 shipped - the manifest grouping fixes, ahead of the routing.** Split out and
+landed first because both defects are data loss on the plugin's own contract and
+neither needs the refactor: crop and negative displacement, and the inert `is_back`
+flag. What changed:
+
+- The bucket-loop entry is built by `_resolve_manifest_entry` and carries `is_crop`
+  and `group_key`; `is_back`, `is_crop`, `version` and `group`/`base_id` are honored,
+  explicit always beating the filename, every effective override logged.
+- Slot occupancy is `min(claimants, key=_slot_rank_key)` rather than `setdefault`, and
+  primary selection reads the slot winners rather than the arrival-ordered group. Every
+  grouping output is now invariant under permutation of `items`; emission order and the
+  `front`/`back`/`all`/`variants` lists stay input-ordered on purpose, since
+  canonicalizing them would reorder NDJSON for every existing manifest.
+- Negatives get their own slot and their own `Negative` part, so they are still analyzed
+  (`README.md:254` promises that) but can no longer be handed to the model as the front.
+- Additive record keys `all_variant_files.crops` and `.negatives`, present only for
+  groups that hold such files.
+
+Checked against a pre-change capture over 4296 ordinary manifests - no crops, no
+negatives, no override keys - covering front/back, variant, multipage, back-only,
+explicit-front and preferred cases in both `--process-all-variants` settings and both
+update policies. 187 of them send the model a different file, and all 187 are the
+permutation fix landing: in every one, the pre-change code returns a different answer
+for some reordering of the same items, and the new answer is one the pre-change code
+itself produces for some ordering. Confirmed by re-running all 3384 permutations of
+those cases - the new code gives one answer per case, the old code does not. The
+remaining record differences are the two additive keys.
+
+The first pass at this claimed byte-identical and was wrong. It missed five defects,
+all since fixed and covered by `photokin/tests/test_manifest_grouping.py`: `-page0`
+addressed to the page 1 slot by an `or 1` default, a `preferred` back discarded when
+resolving `primary_back`, crop-ness tested per group rather than per slot, and both
+crop warnings testing `primary_front` instead of the file set actually sent.
+
+**Second pass - the two payload invariants.** Adversarial review found the crop
+reasoning above had been applied to crops and not to anything else, so the same shape
+recurred wherever a role resolved to a file that could not fill it. Both rules are now
+explicit guards rather than properties that happened to hold:
+
+- *No path is sent under two labels.* Each part is uploaded, billed and described
+  separately, so a file handed over as two of them is paid for twice and asserted to be
+  a side it is not. It was reachable three ways: a group holding a negative and a back
+  sent the back as the front as well and dropped the negative, because the rule keeping
+  a negative off the primary removed negatives from the candidate list outright instead
+  of narrowing the master pick; a group with no front side at all did the same with its
+  back, at 525e9a6 too; and one path listed twice under contradicting flags won two
+  addresses and travelled in both.
+- *No listed file leaves the payload in silence.* An untagged file rides the front side
+  of its variant - as `Page 1` in a multipage group, as the front otherwise - and that
+  role holds one file. Where something more specific already held it, the later
+  assignment simply overwrote the earlier one: `is_back: false` beside an untagged file
+  dropped one of the two, and an untagged file beside an explicit `-page1` dropped
+  itself. Both are now warnings naming the file and entries in an additive
+  `all_variant_files.displaced`, since the `front` list is every front-side file in the
+  group and on its own reads as though each of them was sent.
+
+Four narrower fixes came with them. `preferred` moved into `_slot_rank_key` rather than
+being appended to the candidates, so it wins any slot it is allowed to win and a
+`preferred` crop is no longer named as the analyzed file of a payload it is not in -
+which used to fail the whole group with a `KeyError` whenever the payload held more than
+one file. `primary_version` now follows the front actually sent rather than the item that
+won the master pick, so a `preferred` versioned back no longer files the front's `PC*`
+codes against its own variant. Slot claimants are addressed by resolved path, so a
+manifest listing one path twice is not reported as colliding with itself, and a crop
+listed twice does not twice stand in for the object. Crop slot labels are read after the
+multipage relabel rather than before.
+
+Re-checked by differential sweep over 4140 ordinary manifest shapes - no crops, no
+negatives, no override keys, both `--process-all-variants` settings and both update
+policies - against 525e9a6 and against the tree as it stood before this pass. Every
+difference falls in two families and the record set is identical throughout: 909 cases
+are the invariant-(a) collapse, `photo(P, P)` becoming `photo(P, None)` for a group with
+no front side, which halves the payload and stops asserting the falsehood; 159 are the
+untagged-file displacement, and all 159 restore the answer 525e9a6 gives. 76 of the
+divergences from 525e9a6 that the first pass introduced are repaired by this one.
+
+Two carve-outs on `preferred` follow from the above and are now documented at
+`README.md:293`: it chooses among the files a group can send and cannot create a place
+for one, so it does not promote a crop over the original it was cut from, nor an
+untagged file into a front side already claimed.
+
+**Still owed by B2:** folder and single-photo routing through `process_manifest_stream`,
+`--generate-manifest`, the `analyze_folder` return shape, retiring or rewrapping
+`group_folder_images`, and the richer variant map. Note for B2's parity goldens: manifest
+mode addresses negatives per variant, `group_folder_images` bins them at stem level with
+an unconditional assignment (`utils.py:1402-1407`), so two negatives differing only by
+variant letter overwrite each other there. The per-variant form is the one to encode.
+
 ### Phase C - The CLI surface
 
 Everything user-visible, released together as 0.2.0 so there is one breaking version
@@ -313,6 +426,9 @@ by a test.
 | A | A fixture folder with album pages and a negative reports every group rather than skipping silently; a mid-batch exception preserves prior results. |
 | B | Golden-file grouping tests over variants, backs, pages, crops and negatives. Parity test: folder input and an equivalent hand-written manifest produce identical changesets. |
 | B | Explicit `is_back` override groups a non-conforming filename correctly, using the README's own sample as the case. |
+| B1 | Written, `photokin/tests/test_manifest_grouping.py`: permutation test over `itertools.permutations(items)` asserting the model call, the page/crop/negative slot maps and the warning set are invariant, across crop, page-zero, negative, `preferred` and `is_back` groups in both `--process-all-variants` settings. Crop displacement in both listing orders; the cropped-front-plus-uncropped-back and crop-only-back slots; the orphan-crop and dropped-crop warnings naming the right files; `-page0` keeping its own slot and label; a `preferred` back reaching the model whether or not it carries a variant letter. It uses at most one metadata-bearing item per group, since `combine_group_metadata` is still order-dependent. |
+| B1 | Still owed: the four overrides asserted in both directions, and the `feedback.jpg` non-repair for `_EXPLICIT_BACK_SUFFIX_RE`. |
+| B1 | Second pass: `TestPayloadInvariants` asserts both rules over the eight shapes that resolve one file into two roles or none, in both `--process-all-variants` settings. Plus the negative-plus-back group in both listing orders, the front-side role collision in its untagged and multipage forms, the duplicate listing, the `preferred` crop that used to fail its whole group, and the version an analysis is filed under when a `preferred` back wins the master pick. |
 | C | Detection matrix: directory, `.json`, image; deprecated aliases still work; positional plus alias conflicts; `--back` with a folder errors. |
 | C | Every error case asserts exit code and first line. `-w` expands correctly in all modes, explicit flags override the expansion, and the contradictory combination errors. |
 | C | Regression for the default flip: with no write flags, nothing is written in any mode. |
@@ -324,16 +440,28 @@ by a test.
 - **Section 0** - the positional-plus-alias conflict is already handled by an argparse
   mutually exclusive group, so that part is free. Getting the custom message means
   removing the group and validating by hand.
-- **Section 1** - the plan assumes one suffix grammar. There are two implementations
-  sharing a filename parser: the folder grouper bins crops and negatives as
-  first-class slots, the manifest bucket loop does not, and degrades both into
+- **Section 1** - the plan assumes one suffix grammar. There were two implementations
+  sharing a filename parser: the folder grouper binned crops and negatives as
+  first-class slots, the manifest bucket loop did not, and degraded both into
   untagged fronts. Routing folder input at the manifest pipeline without reconciling
-  them trades one silent loss for another.
+  them would have traded one silent loss for another. Phase B1 closed that gap from
+  the manifest side, so the routing in B2 now has a target worth routing to.
 - **Section 1** - the described refactor is far smaller than it reads, because
   `process_manifest_stream` already accepts a dict. The costly duplication sits below
   the entry points and is not mentioned.
 - **Section 3** - "no in-repo caller will break" is accurate, and that is precisely
-  the risk. Nothing here can detect the plugin breaking.
+  the risk. Nothing here can detect the plugin breaking. Sharpened by Phase B1: four
+  manifest keys that were silently ignored (`is_back`, `is_crop`, `version`, `group`)
+  are now load-bearing, so any manifest the plugin already emits carrying them for its
+  own bookkeeping will regroup or re-slot with no error. This repo holds no copy of the
+  plugin and no fixture of its manifests, so it cannot be checked here. Confirm against
+  the plugin's manifest writer before release.
+- **New, from Phase B1** - `utils.combine_group_metadata` (`utils.py:1553-1570`) takes
+  first-non-empty over preferred-then-arrival order, so two items in a group carrying
+  different captions still yield a permutation-dependent `sent_to_model` snapshot. B1
+  left it alone deliberately: it is metadata precedence, not grouping. Worth settling in
+  B2 or C, and the reason B1's permutation tests must use at most one metadata-bearing
+  item per group.
 - **Section 5** - `-w` defaulting the output file into the scanned folder writes two
   artifacts into the user's photo directory and modifies every image. Photo
   directories are frequently cloud-synced, network-mounted or read-only. Worth

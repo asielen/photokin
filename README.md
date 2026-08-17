@@ -247,11 +247,13 @@ Worth knowing before you decide how to run a box of scans: folder mode only anal
 > | `box3_025-b.jpg` or `box3_025b.jpg` | another scan of the same object (variant letter, with or without dash after a digit) |
 > | `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
 > | `album-page1.jpg`, `album-page2.jpg` | ordered pages of one document |
-> | `box3_025-back-crop.jpg` | a cropped detail, used as a supporting view of its parent, never as its own object |
+> | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but never analyzed as an object of its own |
 >
 > The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other explicitly numbered pages.
 >
 > Folder mode reads this whole grammar for grouping, but only ever analyzes each group's primary front and back: page, negative and crop files are sorted into their slots and then left unanalyzed, with a warning naming every file it passed over. The page and negative forms only reach the model in manifest mode today.
+>
+> Manifest mode reads the same grammar and resolves it the same way whatever order the files are listed in: a crop never takes its parent's place, and a negative is analyzed as a negative rather than mistaken for the front. Both are recorded in the group's `all_variant_files` — under `crops` and `negatives` — and crops are named in a warning rather than sent to the model. The exception is a crop with no uncropped original for the same side of the same variant: with nothing else to stand for that side, the crop is analyzed in its place, and says so. That is judged per side, so a group holding `box3_025-crop.jpg` and `box3_025-back.jpg` still gets both a front and a back.
 
 ## Folder mode
 
@@ -263,7 +265,7 @@ Folder mode prints one aggregate JSON to stdout. Groups it cannot analyze — mu
 
 ## Manifest mode
 
-A manifest is a JSON file listing exactly what to process — an `items` array where each entry needs only a `path`. The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. Flags like `is_back` are optional when the filename already says it; they exist so files that don't follow the naming conventions can still be grouped correctly.
+A manifest is a JSON file listing exactly what to process — an `items` array where each entry needs only a `path`. The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. Note the underscore in `box3_017_back.jpg`: the filename grammar reads only the hyphenated `-back`, so it is the `is_back` flag that folds the two files into one group and one model call rather than two unrelated photos.
 
 batch.json:
 ```json
@@ -279,6 +281,20 @@ batch.json:
 ```bash
 photokin --manifest batch.json --output-file results.ndjson --changeset true
 ```
+
+Flags are optional when the filename already says the same thing; they exist so files that don't follow the naming conventions can still be grouped correctly. An explicit flag always beats the filename, in both directions and including when the two contradict each other — anything else would leave the flag inert in exactly the situation it is there for. Every override that changes what the filename implied is logged, so a typo is visible rather than silent.
+
+| Key | Effect |
+|---|---|
+| `is_back` | `true` marks the reverse side, `false` marks the front. `true` also repairs the group key by stripping a trailing `back` token, which is what puts `box3_017_back.jpg` in the same group as `box3_017.jpg`. |
+| `is_crop` | `true` marks a cropped derivative, so the file is recorded with its group but not analyzed; `false` unmarks a file whose name ends in `-crop`. |
+| `version` | The variant id, replacing any letter read off the filename. Any string, not just one letter; empty means no variant. |
+| `group` | The group key outright, for names the grammar cannot parse at all. `base_id` is accepted as an alias and loses to `group` when both are given. |
+| `preferred` | Picks which file of the group is the one analyzed, overriding the usual choice — among the files the group can actually send. It chooses between candidates; it cannot create a place for one. See below. |
+
+Booleans may be written as JSON `true`/`false`, as `0`/`1`, or as the strings `"true"`, `"false"`, `"yes"`, `"no"`. A `null` value means "not specified" and leaves the filename in charge.
+
+Two shapes leave `preferred` with nothing to pick. A crop is a supporting view of its parent, so it yields the parent's place whenever the parent is listed — marking the crop `preferred` does not promote a derivative over the original it was cut from, and the crop is recorded rather than analyzed. Likewise a file that is untagged in a group whose front side is already claimed, such as a plain `album.jpg` beside an explicit `album-page1.jpg`: there is no part left for it to travel in, and `preferred` cannot make one. Both cases are warnings naming the file, and both are listed in the result record — crops under `all_variant_files.crops`, the rest under `all_variant_files.displaced` — so nothing disappears quietly.
 
 ## Existing metadata aware enrichment
 
