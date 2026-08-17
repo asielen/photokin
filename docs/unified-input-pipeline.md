@@ -541,11 +541,62 @@ rather than three.
 - The full error-message set, centralized in one module so wording is testable.
 - A one-line plan summary before the first model call: input, output, changeset,
   write set, provider. `--dry-run` prints it and stops.
+- Replace two grouping knobs with one axis - see below.
 - CHANGELOG, version bump, tag.
 
 **Exit:** all three inputs read identically; nothing is written without an explicit
 opt-in; every error case in the message set has a test asserting exit code and first
 line.
+
+#### One grouping axis: `--group-by {object, pair, none}`
+
+Maintainer decision, taken during B2. Grouping today is not a mode selector but two
+orthogonal knobs - `--process-all-variants` (how many images go in the call) and
+`--update-policy` (which files get written) - whose four combinations include
+incoherent ones, such as analyzing every variant and then writing only to the primary.
+Granularity is really one axis:
+
+| Value | Group key | On `box3_025{,-back,b,b-back,c}.jpg` |
+|---|---|---|
+| `object` (default) | `base_id` | 1 call; every scan of the print shares one analysis |
+| `pair` | `(base_id, variant)` | 3 calls; each rescan judged on its own merits |
+| `none` | the file | 5 calls; every file alone, backs separated from fronts |
+
+`object` is the default because scans of one print are one print: a shared date and
+location is the wanted answer, not three opinions to reconcile. `pair` is cheap to
+keep once granularity is a single axis. `none` is an escape hatch for when filenames
+lie and the grammar mis-groups - it is deliberately the costliest and the lowest
+quality, because a back analyzed alone is handwriting with no photo attached, and the
+caption, date and location inference all lean on seeing the front. Document it as an
+escape hatch, not as a normal mode.
+
+Consequence to state plainly in the CLI help: under `none`, a multipage document is
+split into unrelated pages. Page 2 without page 1 is meaningless, and B2 only just
+made those sets analyzable. That is the accepted cost of "split every file"; it is
+not a carve-out.
+
+**The primary concept retires with it.** `--process-all-variants`, `--update-policy`
+(both values), the `preferred` manifest key and `utils.pick_master_index` all exist to
+serve "analyze one photo per group and fan the result out". Three points against
+keeping it: the saving is images-per-call, not calls, so it only bites on
+multi-variant groups, which are uncommon; it is the origin of one of the two
+order-dependent choices behind the B1 crop bug (`pick_master_index`, the other being
+slot `setdefault`); and it multiplies every code path by a mode almost nobody selects.
+
+`preferred` is the sharp edge. The external Lightroom plugin already sends it - B1's
+differential sweep found 144 cases where it changes emitted output - so retiring it is
+a plugin-contract change and needs the same deprecation cycle as `--folder` and
+`--manifest`, not a silent removal.
+
+**Owed before this can ship: there is no `negative` keyword.** Backs get one from
+`utils.ensure_keyword_back`; negatives get nothing, and the only `negative` reference
+in the pipeline is payload assembly. The rule this axis promises - every file in a
+group shares one analysis except for its own part marker - is therefore half
+implemented. Add the negative marker alongside the grouping work.
+
+Crops need a stated rule per value as well. They are recorded and never analyzed
+today; under `none` a crop would become its own object, which contradicts the README's
+"a supporting view of its parent, never as its own object".
 
 **Risk:** high. This is the breaking release, and the affected consumer is not in
 this repo.
