@@ -301,8 +301,9 @@ being appended to the candidates, so it wins any slot it is allowed to win and a
 `preferred` crop is no longer named as the analyzed file of a payload it is not in -
 which used to fail the whole group with a `KeyError` whenever the payload held more than
 one file. `primary_version` now follows the front actually sent rather than the item that
-won the master pick, so a `preferred` versioned back no longer files the front's `PC*`
-codes against its own variant. Slot claimants are addressed by resolved path, so a
+won the master pick. (That fix has since been superseded for `PC*` specifically - see
+"PC codes belong to the object" below - but it still governs caption variant labels.)
+Slot claimants are addressed by resolved path, so a
 manifest listing one path twice is not reported as colliding with itself, and a crop
 listed twice does not twice stand in for the object. Crop slot labels are read after the
 multipage relabel rather than before.
@@ -369,6 +370,38 @@ forward-fields loader and two copies of the vocab-insert block.
 
 **Order:** independent of A, B and C, but cheapest immediately after B, once there is
 only one caller shape to satisfy.
+
+### PC codes belong to the object, not the scan
+
+Shipped alongside B1, from a maintainer decision rather than the audit.
+
+A `PC*` keyword is a short identifier the model transcribes off the print itself - the
+prompt instructs it to emit any code it can read as `PC-<code>`
+(`prompts_photo_ai/image_rules.txt:97`), and forbids those codes from entering the
+vocabulary file (`image_rules.txt:100`, `:212`). So a PC code describes the physical
+object, not the particular scan the model happened to be shown.
+
+Keywords were scoped to the analyzed file's variant letter, and only one analysis runs
+per group, so only files sharing that letter ever received the codes. A `-b` rescan of
+the same print silently got nothing:
+
+```
+MODEL reads 'PC-R-123' off the scan it is shown
+  before:  obj7.jpg=YES  obj7-back.jpg=YES  obj7b.jpg=no    (all 4 policy/variant modes)
+  after:   obj7.jpg=YES  obj7-back.jpg=YES  obj7b.jpg=YES
+```
+
+The codes are now unioned across the group. The back already received them by sharing
+the front's letter; the change is that sibling variants do too.
+
+Note this is not the same mechanism as a PC code that arrives in a file's *existing*
+metadata - that path is governed by `--update-policy`, is unchanged, and still keeps
+codes on their own file under `master_exact`. Only model-read codes are affected.
+
+Side effect worth recording: this retires the `preferred`-versioned-back symptom rather
+than re-scoping it. A code can no longer be filed against the wrong variant because
+every variant gets it. `primary_version` still governs caption variant labels, so the
+B1 fix is still load-bearing there.
 
 ---
 

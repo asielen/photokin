@@ -1782,13 +1782,13 @@ def process_manifest_stream(
 
             # Variant merge rules:
             # - When analyzing all variants, combine keywords from every photo but keep "back"
-            #   on backs only and keep PC* codes tied to their variant.
+            #   on backs only and share PC* codes across the whole group.
             # - Preserve existing captions, then append generated captions labeled by
             #   front/back and variant letter when multiples exist.
             # - Share AI analysis notes across the set.
             # - Pick the highest-confidence location/date guess across analyses.
             # - When only the master is analyzed, apply its merged metadata to every file,
-            #   still keeping PC* and "back" scoped per variant/back.
+            #   still sharing PC* across the group and keeping "back" on backs.
 
             def _split_keywords_for_merge(keywords: list[str] | None) -> tuple[list[str], list[str]]:
                 base: list[str] = []
@@ -1809,20 +1809,27 @@ def process_manifest_stream(
                 return base, pc_only
 
             keyword_bases: list[list[str]] = []
-            pc_by_version: dict[str | None, list[str]] = {}
+            pc_codes: list[str] = []
             combined_base, _ = _split_keywords_for_merge(combined_meta.get("keywords"))
             if combined_base:
                 keyword_bases.append(combined_base)
-            for rec, _, ver in analyses:
+            for rec, _, _ver in analyses:
                 base_kw, pc_kw = _split_keywords_for_merge(rec.get("keywords"))
                 if base_kw:
                     keyword_bases.append(base_kw)
                 if pc_kw:
-                    pc_by_version.setdefault(ver, []).extend(pc_kw)
-            # Rule 1: union all shared keywords, but PC* stays per-variant and "back"
-            # only applies when we later emit a back record.
+                    pc_codes.extend(pc_kw)
+            # Rule 1: union all shared keywords; "back" only applies when we later
+            # emit a back record.
             shared_keywords = utils.union_keywords(*keyword_bases)
-            pc_by_version = {ver: utils.union_keywords(kws) for ver, kws in pc_by_version.items()}
+            # A PC* code is a short identifier the model transcribes off the object
+            # itself (image_rules.txt:97), so it describes the physical print rather
+            # than the one scan that happened to be legible. Every variant in a group
+            # is another scan of that same print, so the codes are shared across the
+            # group. Scoping them to the analyzed variant meant a -b rescan silently
+            # lost the code its sibling gave up, since only one analysis runs per
+            # group and only files sharing its variant letter ever saw the codes.
+            group_pc_codes = utils.union_keywords(pc_codes) if pc_codes else []
 
             def _best_guess(field: str):
                 best = None
@@ -2038,8 +2045,7 @@ def process_manifest_stream(
                     per_meta = utils.merge_original_sources(per_meta, combined_meta)
 
                 record_for_item = deepcopy(canonical)
-                per_version_pc = pc_by_version.get(it.get("version")) or []
-                keywords_for_item = utils.union_keywords(shared_keywords, per_version_pc)
+                keywords_for_item = utils.union_keywords(shared_keywords, group_pc_codes)
                 if it["is_back"]:
                     # Rule 1 (continued): append "back" only on back items.
                     keywords_for_item = utils.union_keywords(keywords_for_item, ["back"])

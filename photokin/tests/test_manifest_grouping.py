@@ -529,12 +529,15 @@ class TestPreferredBack(ManifestGroupingTestCase):
         calls, _records, _warnings = self.run_manifest(items)
         self.assertEqual(calls, [("photo", _p("s/k1b.jpg"), _p("s/k1b-back.jpg"))])
 
-    def test_the_analysis_is_filed_under_the_version_of_the_front_that_was_sent(self):
-        # A preferred back wins the master pick but cannot be the front, so the
-        # front comes from the fallback -- and the version has to follow it.
-        # ``PC*`` codes are the one keyword class scoped per variant, so leaving
-        # the back's version in place files the code read off the unversioned
-        # front against variant 'b', and it lands on the back instead.
+    def test_a_pc_code_reaches_every_scan_of_the_object(self):
+        # A PC* code is a short identifier the model transcribes off the print
+        # itself (prompts_photo_ai/image_rules.txt:97), so it describes the
+        # physical object, not the one scan the model happened to be shown.
+        # Both files here are scans of the same print, so both must carry it.
+        # This also retires a failure mode rather than re-scoping it: the code
+        # can no longer be filed against the wrong variant, because every
+        # variant gets it. Only one analysis runs per group, so the previous
+        # per-variant scoping meant a rescan silently lost its sibling's code.
         items = [{"path": "s/pv1.jpg"}, {"path": "s/pv1b-back.jpg", "preferred": True}]
         calls, records, _warnings = self.run_manifest(
             items, model_keywords=["PC123", "tree"]
@@ -543,12 +546,37 @@ class TestPreferredBack(ManifestGroupingTestCase):
             calls, [("photo", _p("s/pv1.jpg"), _p("s/pv1b-back.jpg"))]
         )
         keywords = {rec["path"]: rec["result"]["keywords"] for rec in records}
-        self.assertIn(
-            "PC123",
-            keywords[_p("s/pv1.jpg")],
-            "the PC code was read off this file and did not come back to it",
-        )
-        self.assertNotIn("PC123", keywords[_p("s/pv1b-back.jpg")])
+        for path in (_p("s/pv1.jpg"), _p("s/pv1b-back.jpg")):
+            self.assertIn(
+                "PC123",
+                keywords[path],
+                f"{path} is a scan of the same print, so it must carry the code",
+            )
+
+    def test_a_pc_code_reaches_a_variant_rescan_in_every_mode(self):
+        # The case per-variant scoping actually lost: pc3b.jpg is a second scan
+        # of the same print, and only one analysis runs for the group, so under
+        # the old rule the code never reached it in any policy or variant mode.
+        items = [
+            {"path": "s/pc3.jpg"},
+            {"path": "s/pc3b.jpg"},
+            {"path": "s/pc3-back.jpg"},
+        ]
+        for process_all_variants in (False, True):
+            for update_policy in (core.UPDATE_MERGE_PER_VARIANT, core.UPDATE_MASTER_EXACT):
+                with self.subTest(pav=process_all_variants, policy=update_policy):
+                    _calls, records, _warnings = self.run_manifest(
+                        items,
+                        model_keywords=["PC-R-123", "portrait"],
+                        process_all_variants=process_all_variants,
+                        update_policy=update_policy,
+                    )
+                    keywords = {rec["path"]: rec["result"]["keywords"] for rec in records}
+                    self.assertIn(
+                        "PC-R-123",
+                        keywords[_p("s/pc3b.jpg")],
+                        "the variant rescan lost the code read off its sibling",
+                    )
 
     def test_that_scoping_matches_the_same_group_without_the_preferred_flag(self):
         base = [{"path": "s/pv2.jpg"}, {"path": "s/pv2b-back.jpg"}]
