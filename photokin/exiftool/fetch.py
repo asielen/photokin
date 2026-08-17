@@ -5,9 +5,10 @@ Windows-only Perl distribution into a ``py3-none-any`` package installed on
 every platform). Instead the plugin's setup flow downloads it once, on demand:
 
 - **Windows** — where a Lightroom user is least likely to have ExifTool on PATH
-  — downloads the official self-contained ExifTool package from exiftool.org
-  into the photokin cache dir (``~/.photokin/bin/exiftool/win``), verified by
-  SHA256, laid out so ``resolve_exiftool_path`` finds it.
+  — downloads the official self-contained ExifTool package (release archive
+  hosted on SourceForge, checksums published on exiftool.org) into the
+  photokin cache dir (``~/.photokin/bin/exiftool/win``), verified by SHA256,
+  laid out so ``resolve_exiftool_path`` finds it.
 - **macOS / Linux** rely on a system ExifTool (Homebrew / apt / winget), which
   is the norm there; this module is a no-op and returns ``None``.
 
@@ -36,8 +37,12 @@ from typing import Optional
 from urllib.request import Request, urlopen
 
 # Pinned ExifTool release. Bump together with a fresh checksums verification.
-EXIFTOOL_VERSION = "13.47"
+EXIFTOOL_VERSION = "13.59"
 _BASE_URL = "https://exiftool.org"
+# exiftool.org no longer hosts the Windows zip at its own root (only checksums
+# and HTML live there now); the archive itself redirects through SourceForge.
+# urlopen follows the redirect chain transparently, so this is a plain GET.
+_SOURCEFORGE_DOWNLOAD_URL = "https://sourceforge.net/projects/exiftool/files/{archive}/download"
 
 # Optional reproducible pin: map an archive filename to its known SHA256 so the
 # download is verified offline against a value the maintainer vetted. When empty
@@ -163,7 +168,7 @@ def ensure_exiftool(cache_dir: Optional[str] = None, *, version: str = EXIFTOOL_
 
     archive = _windows_archive_name(version)
     try:
-        data = _http_get(f"{_BASE_URL}/{archive}")
+        data = _http_get(_SOURCEFORGE_DOWNLOAD_URL.format(archive=archive))
         _verify_sha256(data, archive, version)
         return str(_extract_windows_bundle(data, dest_dir))
     except Exception as exc:  # best-effort: never raise into the caller
