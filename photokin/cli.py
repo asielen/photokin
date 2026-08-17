@@ -7,33 +7,56 @@ Thin command-line interface for the photo archiver.
 Responsibilities:
 - Collect CLI/interactive parameters.
 - Build a Config object.
+- Install the package-wide stderr log handler.
 - Invoke the library entrypoints.
 - Write outputs per flags (NDJSON/JSON/sidecars) and/or print to stdout.
 
 This is the module the Lightroom plugin launches (``python -m photokin.cli``);
 its flags and the manifest/NDJSON behavior are part of the plugin contract, so
-treat changes here as contract changes.
+treat changes here as contract changes. Analysis results go to stdout; every
+diagnostic goes to stderr through the logger.
 
 Code map:
 - load_json                 read a UTF-8 JSON file (matches Lightroom's writes)
+- _configure_logging        attach the stderr handler to the "photokin" logger
+- _exit_with_usage_error    report a problem/``Try:`` pair and exit 2
 - _interactive_prompt       prompt for image paths when no args are given
 - _apply_common_cfg         apply flags shared across single/folder/manifest modes
 - _resolve_exiftool_config  build ExiftoolConfig (CLI flag > env > default)
+- _preflight_exiftool       stop before the first model call if writes can't run
+- _preflight_output_file    stop before the first model call if an output is unwritable
 - _apply_exiftool_changeset apply routed fields via ExifTool + append a status line
 - main                      PUBLIC: route to single / folder / manifest flow
 """
 
 import argparse
 import json
+import logging
 import os
 import sys
+import tempfile
 import traceback
+from typing import NoReturn
 
 from . import utils
 from .utils import Config, normalize_path
 from .core import analyze_photo, analyze_folder, process_manifest_stream
-from .exiftool import ExiftoolConfig, apply_changeset, make_manifest_hydrator
+from .errors import ProviderApiError, SELF_EXPLANATORY_ERROR_TYPES
+from .exiftool import (
+    ExiftoolConfig,
+    apply_changeset,
+    make_manifest_hydrator,
+    resolve_exiftool_path,
+)
 from .exiftool.config import parse_fields as exiftool_parse_fields
+
+# Named explicitly rather than via __name__: under ``python -m photokin.cli``
+# (how the plugin launches this) __name__ is "__main__", which sits outside the
+# package logger and would never reach the handler installed below.
+logger = logging.getLogger("photokin.cli")
+
+# Tag on the handler this module installs, so repeated main() calls reuse it.
+_LOG_HANDLER_NAME = "photokin-cli-stderr"
 
 _EPILOG = """\
 examples:
@@ -56,6 +79,48 @@ def load_json(p: str):
 
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _configure_logging() -> None:
+    """Install the stderr log handler on the ``photokin`` package logger.
+
+    Every module logs through ``logging.getLogger(__name__)``, so one handler on
+    the package logger surfaces all of them — including the hydration-skip
+    warning in ``exiftool.hydrate``, which had no handler to reach before. The
+    level is INFO unless ``MEL_VERBOSE`` or ``MEL_DEBUG`` is set to a non-empty
+    value, matching how the rest of the package reads those two variables.
+    Calling this more than once reuses the existing handler rather than stacking
+    a second copy, re-pointing it at the current ``sys.stderr``: a handler binds
+    the stream object it was built with, so a second in-process ``main()`` would
+    otherwise keep writing into the stream the first call captured.
+    """
+    level = logging.DEBUG if (os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG")) else logging.INFO
+    package_logger = logging.getLogger("photokin")
+    package_logger.setLevel(level)
+    for existing in package_logger.handlers:
+        if existing.get_name() == _LOG_HANDLER_NAME and isinstance(existing, logging.StreamHandler):
+            existing.setLevel(level)
+            existing.setStream(sys.stderr)
+            return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.set_name(_LOG_HANDLER_NAME)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    package_logger.addHandler(handler)
+
+
+def _exit_with_usage_error(problem: str, remedy: str) -> NoReturn:
+    """Report a usage error as a problem line plus a ``Try:`` line, then exit 2.
+
+    Args:
+        problem: What the CLI saw, stated in a single line.
+        remedy: The corrective action, rendered on a following ``Try:`` line.
+
+    Raises:
+        SystemExit: Always, with exit code 2.
+    """
+    logger.error("%s\nTry: %s", problem, remedy)
+    sys.exit(2)
 
 
 def _interactive_prompt() -> list[str]:
@@ -101,6 +166,87 @@ def _resolve_exiftool_config(args: argparse.Namespace, *, dry_run: bool) -> Exif
     )
 
 
+def _preflight_exiftool(ecfg: ExiftoolConfig, *, changeset_requested: bool) -> None:
+    """Fail before the first model call when a requested ExifTool write cannot run.
+
+    ``apply_changeset`` only looks for the binary once the whole batch has been
+    analyzed and paid for, so the same lookup is done up front here. A dry run
+    is exempt: it reports what it would write without ever invoking the binary,
+    so requiring one would block a preview that needs no ExifTool at all.
+
+    Args:
+        ecfg: The resolved ExifTool configuration for this run.
+        changeset_requested: True when ``--changeset true`` was passed.
+
+    Raises:
+        SystemExit: With code 2 when writes are requested but no binary resolves.
+    """
+    if not (ecfg.enabled and changeset_requested) or ecfg.dry_run:
+        return
+    try:
+        resolve_exiftool_path(ecfg)
+    except OSError as exc:
+        logger.debug("ExifTool resolution failed: %s", exc)
+        configured = f" (configured path: {ecfg.path})" if ecfg.path else ""
+        _exit_with_usage_error(
+            "--changeset true needs ExifTool to write the results, "
+            f"but no ExifTool binary was found{configured}.",
+            "run `python -m photokin.exiftool.fetch` to download one, install ExifTool "
+            "system-wide, or re-run with --exiftool-write false",
+        )
+
+
+def _preflight_output_file(out_path: str, *, role: str = "--output-file") -> None:
+    """Fail before the first model call when an output destination cannot be written.
+
+    Both artifacts a run produces are checked up front: an unwritable aggregate
+    ``.json`` would otherwise discard a paid batch, and the truncate-on-open the
+    streaming paths rely on destroys the previous run's file before it can fail.
+    Probes with a uniquely named temp file in the destination directory, so no
+    pre-existing file is ever opened, truncated, or removed.
+
+    Args:
+        out_path: The resolved destination path.
+        role: The flag the destination came from, quoted back in the error text.
+
+    Raises:
+        SystemExit: With code 2 when the destination cannot be written.
+    """
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if not os.path.isdir(out_dir):
+        _exit_with_usage_error(
+            f"{role} directory does not exist: {out_dir}",
+            "create the directory first, or point --output-file at an existing one",
+        )
+    # Caught here rather than at the write: a directory passes every check below
+    # (it exists, its parent is writable) and would only fail after the batch had
+    # already been analyzed and paid for.
+    if os.path.isdir(out_path):
+        _exit_with_usage_error(
+            f"{role} is a directory, not a file: {out_path}",
+            "name the file itself, such as results.ndjson inside that directory",
+        )
+    # Windows refuses to unlink or rename over a read-only file, so the write
+    # sequence really does need this one. POSIX gates both on the directory,
+    # which the probe below already covers, and would abort a run that works.
+    if os.name == "nt" and os.path.exists(out_path) and not os.access(out_path, os.W_OK):
+        _exit_with_usage_error(
+            f"{role} already exists and is not writable: {out_path}",
+            "clear the read-only flag on that file, or choose a different --output-file",
+        )
+    # A unique probe, not ``out_path + ".tmp"``: that name is the atomic write's
+    # own temp file, and opening it "w" would truncate a real file that happens
+    # to be sitting there before deleting it outright.
+    try:
+        with tempfile.NamedTemporaryFile(dir=out_dir, prefix=".photokin-preflight-", suffix=".tmp"):
+            pass
+    except OSError as exc:
+        _exit_with_usage_error(
+            f"{role} destination is not writable: {out_path} ({exc.strerror or exc})",
+            "point --output-file at a writable directory",
+        )
+
+
 def _apply_exiftool_changeset(
     *,
     ecfg: ExiftoolConfig,
@@ -115,8 +261,11 @@ def _apply_exiftool_changeset(
         return
 
     exiftool_path = ecfg.path or "(auto-detect)"
-    print(
-        f"[ExifTool] Starting apply: binary={exiftool_path} fields={list(ecfg.fields)} changeset={changeset_path}"
+    logger.info(
+        "[ExifTool] Starting apply: binary=%s fields=%s changeset=%s",
+        exiftool_path,
+        list(ecfg.fields),
+        changeset_path,
     )
     try:
         exif_summary = apply_changeset(
@@ -126,25 +275,29 @@ def _apply_exiftool_changeset(
             fields=ecfg.fields,
         )
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
-        print(f"[WARN] ExifTool apply failed: {exc}")
-        print(f"[WARN] ExifTool apply failed: {exc}", file=sys.stderr)
+        logger.warning("ExifTool apply failed: %s", exc)
         return
 
     files_seen = int(exif_summary.get("files_seen") or 0)
     files_written = int(exif_summary.get("files_written") or 0)
     tags_written = int(exif_summary.get("tags_written") or 0)
-    errors = exif_summary.get("errors") if isinstance(exif_summary.get("errors"), list) else []
-    warnings = exif_summary.get("warnings") if isinstance(exif_summary.get("warnings"), list) else []
-    print(
-        "[ExifTool] Apply result: "
-        f"files_seen={files_seen} files_written={files_written} "
-        f"tags_written={tags_written} errors={len(errors)} warnings={len(warnings)}"
+    raw_errors = exif_summary.get("errors")
+    raw_warnings = exif_summary.get("warnings")
+    errors = raw_errors if isinstance(raw_errors, list) else []
+    warnings = raw_warnings if isinstance(raw_warnings, list) else []
+    logger.info(
+        "[ExifTool] Apply result: files_seen=%d files_written=%d "
+        "tags_written=%d errors=%d warnings=%d",
+        files_seen,
+        files_written,
+        tags_written,
+        len(errors),
+        len(warnings),
     )
     if errors:
-        print(f"[ExifTool] Errors: {json.dumps(errors, ensure_ascii=False)}")
-        print(f"[ExifTool] Errors: {json.dumps(errors, ensure_ascii=False)}", file=sys.stderr)
+        logger.error("[ExifTool] Errors: %s", json.dumps(errors, ensure_ascii=False))
     if warnings:
-        print(f"[ExifTool] Warnings: {json.dumps(warnings, ensure_ascii=False)}")
+        logger.warning("[ExifTool] Warnings: %s", json.dumps(warnings, ensure_ascii=False))
 
     status_line = json.dumps(
         {
@@ -157,12 +310,13 @@ def _apply_exiftool_changeset(
         with open(out_path, "a", encoding="utf-8") as file_handle:
             file_handle.write(status_line + "\n")
     else:
-        print(status_line, file=sys.stderr)
+        logger.info("[ExifTool] Apply status: %s", status_line)
 
 
-def main():
+def main() -> None:
     """CLI entry point that routes to single-photo, folder, or manifest flows."""
 
+    _configure_logging()
     try:
         argv = sys.argv[1:]
         if not argv:
@@ -261,8 +415,21 @@ def main():
             ap.error("--jpeg-quality must be between 1 and 100")
 
         if args.changeset == "true" and not args.manifest:
-            print("[ERROR] --changeset is only supported in --manifest mode.", file=sys.stderr)
-            sys.exit(2)
+            _exit_with_usage_error(
+                "--changeset is only supported in --manifest mode.",
+                "photokin --manifest <manifest.json> --changeset true",
+            )
+
+        # Folder and single-photo mode print results to stdout and never read
+        # --output-file; erroring beats writing nothing and exiting 0.
+        if args.output_file and not args.manifest:
+            seen = f"--folder {args.folder}" if args.folder else args.image
+            seen = seen or "single-photo input"
+            _exit_with_usage_error(
+                f"--output-file is only supported in --manifest mode; saw {seen} with "
+                f"--output-file {args.output_file}, which would be ignored.",
+                f"redirect stdout instead: photokin {seen} > {args.output_file}",
+            )
 
         cfg = Config(
             model=args.openai_model,
@@ -285,6 +452,7 @@ def main():
             man = load_json(args.manifest)
             _apply_common_cfg(cfg, args, manifest=man)
             ecfg = _resolve_exiftool_config(args, dry_run=args.dry_run)
+            _preflight_exiftool(ecfg, changeset_requested=args.changeset == "true")
             metadata_hydrator = make_manifest_hydrator(ecfg)
             # Manifest can override debug dump setting
             manifest_debug_dump = bool(man.get("debug_dump_llm_request"))
@@ -310,6 +478,21 @@ def main():
                 else:
                     changeset_name = "changeset.ndjson"
                 changeset_path = os.path.join(base_dir, changeset_name)
+
+            # Every destination is validated before the first truncating open:
+            # those opens destroy the previous run's artifacts, so a later abort
+            # would take the changeset with it.
+            if out_path and not out_path.lower().endswith((".ndjson", ".json")):
+                _exit_with_usage_error(
+                    f"--output-file must end with .ndjson or .json; got {out_path}.",
+                    "use .ndjson to stream one record per finished photo, "
+                    "or .json for a single object written at the end",
+                )
+            if out_path:
+                _preflight_output_file(out_path)
+            if changeset_path:
+                _preflight_output_file(changeset_path, role="--changeset output")
+
             changeset_writer = None
             if changeset_path:
                 open(changeset_path, "w", encoding="utf-8").close()
@@ -341,7 +524,7 @@ def main():
                         metadata_hydrator=metadata_hydrator,
                     )
                     _apply_exiftool_changeset(ecfg=ecfg, changeset_path=changeset_path, out_path=out_path)
-                elif out_ext.endswith(".json"):
+                else:
                     # Aggregate then atomic write (temp → replace)
                     try:
                         data = process_manifest_stream(
@@ -362,9 +545,6 @@ def main():
                     finally:
                         if os.path.exists(tmp_path):
                             os.remove(tmp_path)
-                else:
-                    print("[ERROR] --output-file must end with .ndjson or .json", file=sys.stderr)
-                    sys.exit(2)
             else:
                 # stdout fallback (Lightroom typically won’t use this)
                 data = process_manifest_stream(
@@ -395,13 +575,11 @@ def main():
     except SystemExit:
         raise
     except Exception as e:
-        err = {
-            "level": "FATAL",
-            "type": e.__class__.__name__,
-            "message": str(e),
-            "traceback": traceback.format_exception(e.__class__, e, e.__traceback__),
-        }
-        print(json.dumps(err, ensure_ascii=False), file=sys.stderr)
+        error_type = e.error_type if isinstance(e, ProviderApiError) else e.__class__.__name__
+        err: dict[str, object] = {"level": "FATAL", "type": error_type, "message": str(e)}
+        if error_type not in SELF_EXPLANATORY_ERROR_TYPES:
+            err["traceback"] = traceback.format_exception(e.__class__, e, e.__traceback__)
+        logger.error("%s", json.dumps(err, ensure_ascii=False))
         sys.exit(2)
 
 

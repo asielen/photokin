@@ -31,15 +31,16 @@ Code map (public-facing entry points marked PUBLIC):
 - analyze_photo                 PUBLIC: full pipeline for one front(+back) photo
 - analyze_group_parts           PUBLIC: analyze ordered parts (front/back/pages)
 - analyze_group_front_back      PUBLIC: convenience wrapper over analyze_group_parts
+- _unanalyzed_group_files       list a folder group's files this path never reads
 - analyze_folder                PUBLIC: batch a whole folder
 - analyze_manifest              PUBLIC: aggregate wrapper over the stream
 - process_manifest_stream       PUBLIC: streaming NDJSON batch (the plugin path)
 """
 
 import json
+import logging
 import os
 import re
-import sys
 import traceback
 from pathlib import Path
 from datetime import date
@@ -48,6 +49,7 @@ from copy import deepcopy
 
 from . import utils
 from .api import call_model, extract_output_text, get_response_model
+from .errors import ProviderApiError, SELF_EXPLANATORY_ERROR_TYPES
 from .merge import merge_record_with_original as merge_metadata
 from .canonical import (
     build_canonical_patch,
@@ -62,6 +64,8 @@ from .changeset import (
     emit_changeset_record,
 )
 
+logger = logging.getLogger(__name__)
+
 UPDATE_MASTER_EXACT = "master_exact"
 UPDATE_MERGE_PER_VARIANT = "merge_per_variant"
 _EMPTY_CAPTION_MARKERS = (
@@ -71,6 +75,9 @@ _EMPTY_CAPTION_MARKERS = (
     "empty",
     "n/a",
 )
+# ProviderApiError types that describe the run rather than one photo, so a batch
+# loop must abort on them instead of isolating the same failure per group.
+_RUN_FATAL_ERROR_TYPES = frozenset({"missing_api_key", "missing_dependency"})
 
 
 def _build_llm_dump_writer(
@@ -98,9 +105,9 @@ def _build_llm_dump_writer(
             with open(dump_path, "w", encoding="utf-8") as fh:
                 json.dump(request_payload, fh, ensure_ascii=False, indent=2)
                 fh.write("\n")
-            print(f"Wrote LLM request dump: {dump_path}", file=sys.stderr)
+            logger.info("Wrote LLM request dump: %s", dump_path)
         except OSError as exc:
-            print(f"[WARN] Could not write LLM request dump {dump_path}: {exc}", file=sys.stderr)
+            logger.warning("Could not write LLM request dump %s: %s", dump_path, exc)
 
     return _writer
 
@@ -158,23 +165,48 @@ def _strip_empty_caption_sections(caption: str) -> str:
 
 
 
+def _missing_api_key_message(provider_label: str, env_var: str) -> str:
+    return (
+        f"{provider_label} provider selected but {env_var} is not set. "
+        f'Set it for this terminal session and retry: $env:{env_var} = "..." (PowerShell) '
+        f"or export {env_var}=... (macOS/Linux), then run the command again."
+    )
+
+
 def _build_provider_client(config: utils.Config):
-    """Build provider SDK client using the selected provider and API key env var."""
+    """Build provider SDK client using the selected provider and API key env var.
+
+    Fails fast with a normalized ``missing_api_key``/``missing_dependency``
+    ``ProviderApiError`` rather than letting the underlying SDK raise deep
+    inside the first request -- that's how a bare, unhelpful auth error from
+    the SDK ends up as the top-level failure instead of a clear one naming
+    the exact env var to set.
+    """
     provider = utils.normalize_provider(config.provider)
     if provider == "anthropic":
         try:
             import anthropic
         except ImportError as exc:
-            raise RuntimeError("Anthropic provider selected but anthropic package is not installed.") from exc
+            raise ProviderApiError(
+                "missing_dependency",
+                'Anthropic provider selected but the anthropic package is not installed. Run: pip install "photokin[anthropic]"',
+            ) from exc
         api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
-        return anthropic.Anthropic(api_key=api_key or None)
+        if not api_key:
+            raise ProviderApiError("missing_api_key", _missing_api_key_message("Anthropic", "ANTHROPIC_API_KEY"))
+        return anthropic.Anthropic(api_key=api_key)
     if provider == "gemini":
         try:
             from google import genai
             from google.genai import types as genai_types
         except ImportError as exc:
-            raise RuntimeError("Gemini provider selected but google-genai package is not installed.") from exc
+            raise ProviderApiError(
+                "missing_dependency",
+                'Gemini provider selected but the google-genai package is not installed. Run: pip install "photokin[gemini]"',
+            ) from exc
         api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+        if not api_key:
+            raise ProviderApiError("missing_api_key", _missing_api_key_message("Gemini", "GEMINI_API_KEY"))
         # Unlike the Anthropic/OpenAI SDKs used here, google-genai has no
         # default request timeout -- observed in practice as a single
         # generate_content() call hanging indefinitely (over an hour, no
@@ -183,29 +215,35 @@ def _build_provider_client(config: utils.Config):
         # every real per-photo response time seen in this pipeline (even
         # multi-image groups), while still failing well before a silent
         # hang can block an entire batch run.
-        return genai.Client(api_key=api_key or None, http_options=genai_types.HttpOptions(timeout=180_000))
+        return genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=180_000))
     if provider == "openrouter":
         try:
             from openai import OpenAI
         except ImportError as exc:
-            raise RuntimeError("OpenRouter provider selected but openai package is not installed.") from exc
+            raise ProviderApiError(
+                "missing_dependency",
+                'OpenRouter provider selected but the openai package is not installed. Run: pip install "photokin[openai]"',
+            ) from exc
         api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
         if not api_key:
             # Do NOT pass api_key=None here: the OpenAI SDK would fall back to
             # OPENAI_API_KEY from the environment while still targeting the
             # OpenRouter base_url, leaking the wrong provider's secret to
             # OpenRouter. Require the OpenRouter key explicitly instead.
-            raise RuntimeError(
-                "OpenRouter provider selected but OPENROUTER_API_KEY is not set."
-            )
+            raise ProviderApiError("missing_api_key", _missing_api_key_message("OpenRouter", "OPENROUTER_API_KEY"))
         base_url = (os.getenv("OPENROUTER_BASE_URL") or "").strip() or "https://openrouter.ai/api/v1"
         return OpenAI(api_key=api_key, base_url=base_url)
     try:
         from openai import OpenAI
     except ImportError as exc:
-        raise RuntimeError("OpenAI provider selected but openai package is not installed.") from exc
+        raise ProviderApiError(
+            "missing_dependency",
+            'OpenAI provider selected but the openai package is not installed. Run: pip install "photokin[openai]"',
+        ) from exc
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    return OpenAI(api_key=api_key or None)
+    if not api_key:
+        raise ProviderApiError("missing_api_key", _missing_api_key_message("OpenAI", "OPENAI_API_KEY"))
+    return OpenAI(api_key=api_key)
 
 
 def _ensure_provenance_keyword(record: dict[str, Any], provider_name: str, model_name: str) -> None:
@@ -237,8 +275,6 @@ def _normalized_error_payload(exc: Exception) -> Dict[str, Any]:
     """Build an error payload with provider-normalized types where possible."""
     error_type = exc.__class__.__name__
     status_code = None
-
-    from .errors import ProviderApiError
 
     if isinstance(exc, ProviderApiError):
         error_type = exc.error_type
@@ -296,9 +332,9 @@ def analyze_photo(
                 continue
             fid = utils.archival_upload(client, p, config.jpeg_quality, purpose="user_data")
             label = "front" if idx == 0 else "back"
-            print(f"[Upload] Uploaded {label} image (file_id={fid})")
+            logger.info("Uploaded %s image (file_id=%s)", label, fid)
     else:
-        print(f"[Upload] Skipping archival upload for provider {provider} (Files API unsupported).")
+        logger.info("Skipping archival upload for provider %s (Files API unsupported).", provider)
 
     # Data URLs + sizes (for the multimodal call)
     image_data_urls: List[str] = []
@@ -322,7 +358,13 @@ def analyze_photo(
             continue
         dims = image_meta[i]
         wh = f"{dims.get('width')}x{dims.get('height')}" if dims.get("width") and dims.get("height") else "unknown"
-        print(f"[Convert] Payload bytes for {labels[i]} image sent to model: {sz} bytes ({wh}, {dims.get('mime')})")
+        logger.info(
+            "Payload bytes for %s image sent to model: %d bytes (%s, %s)",
+            labels[i],
+            sz,
+            wh,
+            dims.get("mime"),
+        )
 
     # Prompts (include forwarded metadata if present and allowed by metadata_forward_path)
     forward_fields = None
@@ -333,7 +375,7 @@ def analyze_photo(
             forward_fields = mp.get("forward_fields")
     except (OSError, json.JSONDecodeError) as exc:
         if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
-            print(f"[WARN] Failed to load forwarded metadata: {exc}", file=sys.stderr)
+            logger.warning("Failed to load forwarded metadata: %s", exc)
 
     prompt_items = utils.build_prompt_bundle(
             model_name,
@@ -418,7 +460,7 @@ def analyze_photo(
     warn_list = utils.warn_forbiddenish_keywords(kws)
     if warn_list:
         for w in warn_list:
-            print("[WARN]", w, file=sys.stderr)
+            logger.warning("%s", w)
         if config.fail_on_forbidden:
             raise SystemExit(2)
 
@@ -426,10 +468,7 @@ def analyze_photo(
     new_kws = [k for k in (record.get("keywords") or []) if k not in known_keywords]
     proposed_raw = record.get("proposed_new_keywords")
     if not isinstance(proposed_raw, list):
-        print(
-            '[WARN] "proposed_new_keywords" missing or invalid; skipping vocab updates.',
-            file=sys.stderr,
-        )
+        logger.warning('"proposed_new_keywords" missing or invalid; skipping vocab updates.')
         proposed = []
         skip_vocab_updates = True
     else:
@@ -444,57 +483,50 @@ def analyze_photo(
         try:
             for k in new_kws:
                 if skip_vocab_updates:
-                    print(
-                        f'[WARN] Skipping keyword "{k}" because proposed_new_keywords is missing.',
-                        file=sys.stderr,
+                    logger.warning(
+                        'Skipping keyword "%s" because proposed_new_keywords is missing.', k
                     )
                     continue
                 if not isinstance(k, str):
-                    print('[WARN] Skipping non-string keyword in new keyword list.', file=sys.stderr)
+                    logger.warning("Skipping non-string keyword in new keyword list.")
                     continue
                 if k.upper().startswith("PC-"):
-                    print(
-                        f'[WARN] Skipping keyword "{k}" (PC- prefix not allowed).',
-                        file=sys.stderr,
-                    )
+                    logger.warning('Skipping keyword "%s" (PC- prefix not allowed).', k)
                     continue
 
                 p = proposed_map.get(k)
                 if not p:
-                    print(
-                        f'[WARN] New keyword "{k}" missing from "proposed_new_keywords"; skipping.',
-                        file=sys.stderr,
+                    logger.warning(
+                        'New keyword "%s" missing from "proposed_new_keywords"; skipping.', k
                     )
                     continue
 
                 section = (p.get("section") or "").strip()
                 note = (p.get("note") or "").strip()
                 if not section:
-                    print(
-                        f'[WARN] Skipping keyword "{k}" (missing section in proposed_new_keywords).',
-                        file=sys.stderr,
+                    logger.warning(
+                        'Skipping keyword "%s" (missing section in proposed_new_keywords).', k
                     )
                     continue
                 if utils.note_looks_placeholder(note):
-                    print(
-                        f'[WARN] Skipping keyword "{k}" (note is missing or placeholder).',
-                        file=sys.stderr,
-                    )
+                    logger.warning('Skipping keyword "%s" (note is missing or placeholder).', k)
                     continue
 
                 if utils.insert_keyword_into_vocab_file(config.vocab_path, section, k, note):
                     inserted_count += 1
 
             if inserted_count:
-                print(
-                    f"[Upload] Vocabulary updated ({inserted_count} new keyword(s) inserted into {config.vocab_path})"
+                logger.info(
+                    "Vocabulary updated (%d new keyword(s) inserted into %s)",
+                    inserted_count,
+                    config.vocab_path,
                 )
         except Exception as e:
             msg = (
                 "Vocabulary update failed TOML validation. "
                 f"Review {config.vocab_path} and restore {config.vocab_path}.bak if needed."
             )
-            print(f"[ERROR] {msg} ({e})", file=sys.stderr)
+            logger.error("%s (%s)", msg, e)
             raise RuntimeError(msg) from e
 
     # Optional per-photo sidecar
@@ -504,9 +536,11 @@ def analyze_photo(
         json_path = os.path.join(img_dir, f"{img_base}.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2 if config.pretty_json else None, ensure_ascii=False)
-        print(f"[Done] Analysis completed. JSON saved as {json_path}")
+        logger.info("Analysis completed for %s; JSON saved as %s", os.path.basename(front), json_path)
     else:
-        print(f"[Done] Analysis completed for {os.path.basename(front)} (sidecar disabled)")
+        # Deliberately silent about whether a sidecar exists: batch callers turn
+        # this off so they can write the variant-enriched record themselves.
+        logger.info("Analysis completed for %s", os.path.basename(front))
 
     return data
 
@@ -571,9 +605,9 @@ def analyze_group_parts(
                 continue
             fid = utils.archival_upload(client, p, config.jpeg_quality, purpose="user_data")
             role = path_labels[idx] if idx < len(path_labels) else "part"
-            print(f"[Upload] Uploaded {role} variant image (file_id={fid})")
+            logger.info("Uploaded %s variant image (file_id=%s)", role, fid)
     else:
-        print(f"[Upload] Skipping archival upload for provider {provider} (Files API unsupported).")
+        logger.info("Skipping archival upload for provider %s (Files API unsupported).", provider)
 
     image_data_urls: List[str] = []
     image_byte_sizes: List[int] = []
@@ -595,9 +629,13 @@ def analyze_group_parts(
             else "unknown"
         )
         role = path_labels[idx] if idx < len(path_labels) else "part"
-        print(
-            f"[Convert] Payload bytes for {role} variant {idx + 1} "
-            f"sent to model: {sz} bytes ({wh}, {dims.get('mime')})"
+        logger.info(
+            "Payload bytes for %s variant %d sent to model: %d bytes (%s, %s)",
+            role,
+            idx + 1,
+            sz,
+            wh,
+            dims.get("mime"),
         )
 
     forward_fields = None
@@ -608,7 +646,7 @@ def analyze_group_parts(
             forward_fields = mp.get("forward_fields")
     except (OSError, json.JSONDecodeError) as exc:
         if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
-            print(f"[WARN] Failed to load forwarded metadata: {exc}", file=sys.stderr)
+            logger.warning("Failed to load forwarded metadata: %s", exc)
 
     prompt_items = utils.build_prompt_bundle(
             model_name,
@@ -729,17 +767,14 @@ def analyze_group_parts(
     warn_list = utils.warn_forbiddenish_keywords(kws)
     if warn_list:
         for w in warn_list:
-            print("[WARN]", w, file=sys.stderr)
+            logger.warning("%s", w)
         if config.fail_on_forbidden:
             raise SystemExit(2)
 
     new_kws = [k for k in kws if isinstance(k, str) and k not in known_keywords]
     proposed_raw = record.get("proposed_new_keywords")
     if not isinstance(proposed_raw, list):
-        print(
-            '[WARN] "proposed_new_keywords" missing or invalid; skipping vocab updates.',
-            file=sys.stderr,
-        )
+        logger.warning('"proposed_new_keywords" missing or invalid; skipping vocab updates.')
         proposed = []
         skip_vocab_updates = True
     else:
@@ -757,53 +792,46 @@ def analyze_group_parts(
         try:
             for k in new_kws:
                 if skip_vocab_updates:
-                    print(
-                        f'[WARN] Skipping keyword "{k}" because proposed_new_keywords is missing.',
-                        file=sys.stderr,
+                    logger.warning(
+                        'Skipping keyword "%s" because proposed_new_keywords is missing.', k
                     )
                     continue
                 if not isinstance(k, str):
-                    print('[WARN] Skipping non-string keyword in new keyword list.', file=sys.stderr)
+                    logger.warning("Skipping non-string keyword in new keyword list.")
                     continue
                 if k.upper().startswith("PC-"):
-                    print(
-                        f'[WARN] Skipping keyword "{k}" (PC- prefix not allowed).',
-                        file=sys.stderr,
-                    )
+                    logger.warning('Skipping keyword "%s" (PC- prefix not allowed).', k)
                     continue
 
                 p = proposed_map.get(k)
                 if not p:
-                    print(
-                        f'[WARN] New keyword "{k}" missing from "proposed_new_keywords"; skipping.',
-                        file=sys.stderr,
+                    logger.warning(
+                        'New keyword "%s" missing from "proposed_new_keywords"; skipping.', k
                     )
                     continue
 
                 section = (p.get("section") or "").strip()
                 note = (p.get("note") or "").strip()
                 if not section:
-                    print(
-                        f'[WARN] Skipping keyword "{k}" (missing section in proposed_new_keywords).',
-                        file=sys.stderr,
+                    logger.warning(
+                        'Skipping keyword "%s" (missing section in proposed_new_keywords).', k
                     )
                     continue
                 if utils.note_looks_placeholder(note):
-                    print(
-                        f'[WARN] Skipping keyword "{k}" (note is missing or placeholder).',
-                        file=sys.stderr,
-                    )
+                    logger.warning('Skipping keyword "%s" (note is missing or placeholder).', k)
                     continue
 
                 if utils.insert_keyword_into_vocab_file(config.vocab_path, section, k, note):
                     inserted_count += 1
 
             if inserted_count:
-                print(
-                    f"[Upload] Vocabulary updated ({inserted_count} new keyword(s) inserted into {config.vocab_path})"
+                logger.info(
+                    "Vocabulary updated (%d new keyword(s) inserted into %s)",
+                    inserted_count,
+                    config.vocab_path,
                 )
         except Exception as e:
-            print(f"[ERROR] Failed to insert new keywords: {e}", file=sys.stderr)
+            logger.exception("Failed to insert new keywords: %s", e)
 
     img_dir = os.path.dirname(os.path.abspath(main_key))
     img_base = os.path.splitext(os.path.basename(main_key))[0]
@@ -816,12 +844,13 @@ def analyze_group_parts(
                 indent=2 if config.pretty_json else None,
                 ensure_ascii=False,
             )
-        print(f"[Done] Group analysis completed. JSON saved as {json_path}")
-    else:
-        print(
-            f"[Done] Group analysis completed for {os.path.basename(main_key)} "
-            "(sidecar disabled)"
+        logger.info(
+            "Group analysis completed for %s; JSON saved as %s",
+            os.path.basename(main_key),
+            json_path,
         )
+    else:
+        logger.info("Group analysis completed for %s", os.path.basename(main_key))
 
     return data
 
@@ -853,6 +882,27 @@ def analyze_group_front_back(
     )
 
 
+def _unanalyzed_group_files(entry: Dict[str, Any], *, front_analyzed: bool) -> List[str]:
+    """List the files of one folder group that this path neither analyzes nor reports.
+
+    Args:
+        entry: A single ``utils.group_folder_images`` entry.
+        front_analyzed: True when the group's primary front was analyzed, which
+            also covers the primary back and puts every variant front/back into
+            ``all_variant_files`` for downstream fan-out.
+
+    Returns:
+        Paths that are neither sent to the model nor named in the result record.
+    """
+    dropped = [entry["pages"][num] for num in sorted(entry["pages"])]
+    dropped += [entry["page_crops"][num] for num in sorted(entry["page_crops"])]
+    dropped += [p for p in (entry["negative"], entry["negative_crop"]) if p]
+    slots = ("front_crop", "back_crop") if front_analyzed else ("front", "back", "front_crop", "back_crop")
+    dropped += [entry["primary"][slot] for slot in slots if entry["primary"][slot]]
+    dropped += [v[slot] for v in entry["variants"] for slot in slots if v[slot]]
+    return dropped
+
+
 def analyze_folder(
     folder_path: str,
     config: utils.Config = utils.Config(),
@@ -866,6 +916,21 @@ def analyze_folder(
     OpenAI calls are the expensive part; instead of re-processing every variant,
     we capture the file lists under ``all_variant_files`` so Lightroom can fan
     out metadata locally.  That "why" often gets lost, so it lives here now.
+
+    Pages, negatives and crops fall outside both of those, so every group logs
+    the files it leaves untouched and the completion line carries the total; a
+    group with no primary front cannot be analyzed at all and is logged with its
+    reason.  A group that raises is recorded under ``errors`` and skipped rather
+    than aborting the batch, so the results gathered before it survive -- unless
+    nothing at all succeeded, in which case the first failure is re-raised so a
+    wholly failed run cannot exit 0 with an empty result set.
+
+    Returns:
+        ``{"results": {front_path: record}, "errors": {front_path: payload}}``.
+
+    Raises:
+        NotADirectoryError: If ``folder_path`` is not an existing directory.
+        Exception: The first per-group failure, when no group succeeded.
     """
     folder = utils.normalize_path(folder_path) or ""
     if not os.path.isdir(folder):
@@ -873,30 +938,106 @@ def analyze_folder(
 
     grouped = utils.group_folder_images(folder)
     if not grouped:
-        print("[WARN] No image files found in folder.", file=sys.stderr)
-        return {"results": {}}
+        logger.warning("No image files found in folder: %s", folder)
+        return {"results": {}, "errors": {}}
 
-    aggregated: Dict[str, Any] = {"results": {}}
+    aggregated: Dict[str, Any] = {"results": {}, "errors": {}}
+    skipped_groups = 0
+    unanalyzed_files = 0
+    first_error: Exception | None = None
     for stem, entry in grouped.items():
         primary_front = entry["primary"]["front"]
         primary_back = entry["primary"]["back"]
+        dropped = _unanalyzed_group_files(entry, front_analyzed=bool(primary_front))
+        unanalyzed_files += len(dropped)
+        dropped_names = ", ".join(os.path.basename(p) for p in dropped)
         if not primary_front:
+            if entry["pages"]:
+                reason = "multipage set has no primary front (pages are not analyzed in folder mode)"
+            elif entry["negative"] or entry["negative_crop"]:
+                reason = "negative-only set (negatives are not analyzed in folder mode)"
+            else:
+                reason = "no primary front image"
+            skipped_groups += 1
+            logger.warning(
+                "Skipping group '%s': %s; %d file(s) not analyzed: %s",
+                stem,
+                reason,
+                len(dropped),
+                dropped_names,
+            )
             continue
-        data = analyze_photo(primary_front, primary_back, config, original_meta=None, write_sidecar=write_sidecars)
-        rec = data["result"][primary_front]
-        # augment with variants
-        all_fronts = [entry["primary"]["front"]] + [v["front"] for v in entry["variants"]]
-        all_backs = [entry["primary"]["back"]] + [v["back"] for v in entry["variants"]]
-        rec["all_variant_files"] = {"front": [p for p in all_fronts if p], "back": [p for p in all_backs if p]}
+        if dropped:
+            logger.warning(
+                "Group '%s': folder mode analyzes only the primary front/back, so "
+                "%d file(s) are not analyzed: %s",
+                stem,
+                len(dropped),
+                dropped_names,
+            )
+        try:
+            # write_sidecar stays off here: the enriched record below is the one
+            # that belongs on disk, so the sidecar is written exactly once.
+            data = analyze_photo(primary_front, primary_back, config, original_meta=None, write_sidecar=False)
+            rec = data["result"][primary_front]
+            # augment with variants
+            all_fronts = [entry["primary"]["front"]] + [v["front"] for v in entry["variants"]]
+            all_backs = [entry["primary"]["back"]] + [v["back"] for v in entry["variants"]]
+            rec["all_variant_files"] = {"front": [p for p in all_fronts if p], "back": [p for p in all_backs if p]}
 
-        img_dir = os.path.dirname(os.path.abspath(primary_front))
-        img_base = os.path.splitext(os.path.basename(primary_front))[0]
-        if write_sidecars:
-            json_path = os.path.join(img_dir, f"{img_base}.json")
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2 if config.pretty_json else None, ensure_ascii=False)
-        aggregated["results"][primary_front] = rec
-    print(f"[Done] Batch completed for {len(aggregated['results'])} primary set(s).")
+            # Bank the result before touching the filesystem. The analysis is
+            # already paid for, so a sidecar that cannot be written must not
+            # take the record down with it and get reported as a model failure.
+            aggregated["results"][primary_front] = rec
+
+            if write_sidecars:
+                img_dir = os.path.dirname(os.path.abspath(primary_front))
+                img_base = os.path.splitext(os.path.basename(primary_front))[0]
+                json_path = os.path.join(img_dir, f"{img_base}.json")
+                try:
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2 if config.pretty_json else None, ensure_ascii=False)
+                except OSError as exc:
+                    logger.warning(
+                        "Sidecar not written for %s (%s): the analysis is kept in the results.",
+                        os.path.basename(primary_front),
+                        exc,
+                    )
+                else:
+                    logger.info("Sidecar written for %s: %s", os.path.basename(primary_front), json_path)
+        # Exception (not BaseException) so KeyboardInterrupt/SystemExit still abort.
+        except Exception as e:
+            if isinstance(e, ProviderApiError) and e.error_type in _RUN_FATAL_ERROR_TYPES:
+                # A missing key or SDK is a property of the run, not of one
+                # photo: isolating it would repeat the same error per group.
+                raise
+            error_payload = _normalized_error_payload(e)
+            aggregated["errors"][primary_front] = error_payload
+            if first_error is None:
+                first_error = e
+            logger.error(
+                "Group '%s' failed on %s: %s: %s",
+                stem,
+                os.path.basename(primary_front),
+                error_payload["type"],
+                error_payload["message"],
+                exc_info=error_payload["type"] not in SELF_EXPLANATORY_ERROR_TYPES,
+            )
+    if first_error is not None and not aggregated["results"]:
+        raise first_error
+    # A lossy run reports its total at WARNING: the per-group warnings above are
+    # already at that level, so an INFO-only summary would vanish at exactly the
+    # threshold where the count matters most.
+    lossy = bool(skipped_groups or aggregated["errors"] or unanalyzed_files)
+    logger.log(
+        logging.WARNING if lossy else logging.INFO,
+        "Batch completed for %d primary set(s); %d group(s) skipped, %d group(s) failed, "
+        "%d file(s) not analyzed.",
+        len(aggregated["results"]),
+        skipped_groups,
+        len(aggregated["errors"]),
+        unanalyzed_files,
+    )
     return aggregated
 
 
@@ -963,7 +1104,7 @@ def process_manifest_stream(
             forward_fields = mp.get("forward_fields")
     except (OSError, json.JSONDecodeError) as exc:
         if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
-            print(f"[WARN] Failed to load forwarded metadata: {exc}", file=sys.stderr)
+            logger.warning("Failed to load forwarded metadata: %s", exc)
         forward_fields = None
 
     items = man.get("items", [])
@@ -1464,7 +1605,7 @@ def process_manifest_stream(
 
         except Exception as e:
             error_payload = _normalized_error_payload(e)
-            if error_payload.get("type") not in {"rate_limit", "overloaded", "invalid_input", "invalid_request", "api_status", "length"}:
+            if error_payload.get("type") not in SELF_EXPLANATORY_ERROR_TYPES:
                 error_payload["traceback"] = traceback.format_exception(e.__class__, e, e.__traceback__)
             err_payload = {"error": error_payload}
             for it in group:

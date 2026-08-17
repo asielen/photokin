@@ -8,6 +8,7 @@ from photokin import core, utils
 from photokin.api_claude import _data_url_to_image_block
 from photokin.api_openai import ProviderApiError
 from photokin.api_openai_compat import extract_openai_compat_output_text
+from photokin.errors import SELF_EXPLANATORY_ERROR_TYPES
 
 
 class TestOpenRouterKeyIsolation(unittest.TestCase):
@@ -45,6 +46,69 @@ class TestOpenRouterKeyIsolation(unittest.TestCase):
             core._build_provider_client(cfg)
         self.assertEqual(calls["kwargs"]["api_key"], "or-secret")
         self.assertIn("openrouter.ai", calls["kwargs"]["base_url"])
+
+
+class TestMissingApiKeyErrors(unittest.TestCase):
+    """A missing key must fail fast with a clear, actionable ProviderApiError
+    naming the exact env var -- not a bare SDK auth error surfacing deep
+    inside the first request (what used to happen: client construction
+    accepted api_key=None and let the SDK raise its own opaque error)."""
+
+    def test_missing_anthropic_key(self):
+        mod = types.ModuleType("anthropic")
+        mod.Anthropic = lambda **kw: None
+        cfg = types.SimpleNamespace(provider="anthropic")
+        with patch.dict(sys.modules, {"anthropic": mod}), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            with self.assertRaises(ProviderApiError) as ctx:
+                core._build_provider_client(cfg)
+        self.assertEqual(ctx.exception.error_type, "missing_api_key")
+        self.assertIn("ANTHROPIC_API_KEY", str(ctx.exception))
+
+    def test_missing_gemini_key(self):
+        genai_mod = types.ModuleType("google.genai")
+        genai_mod.Client = lambda **kw: None
+        types_mod = types.ModuleType("google.genai.types")
+        types_mod.HttpOptions = lambda **kw: None
+        google_mod = types.ModuleType("google")
+        google_mod.genai = genai_mod
+        cfg = types.SimpleNamespace(provider="gemini")
+        with patch.dict(
+            sys.modules, {"google": google_mod, "google.genai": genai_mod, "google.genai.types": types_mod}
+        ), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GEMINI_API_KEY", None)
+            with self.assertRaises(ProviderApiError) as ctx:
+                core._build_provider_client(cfg)
+        self.assertEqual(ctx.exception.error_type, "missing_api_key")
+        self.assertIn("GEMINI_API_KEY", str(ctx.exception))
+
+    def test_missing_openai_key_default_provider(self):
+        mod = types.ModuleType("openai")
+        mod.OpenAI = lambda **kw: None
+        cfg = types.SimpleNamespace(provider="openai")
+        with patch.dict(sys.modules, {"openai": mod}), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPENAI_API_KEY", None)
+            with self.assertRaises(ProviderApiError) as ctx:
+                core._build_provider_client(cfg)
+        self.assertEqual(ctx.exception.error_type, "missing_api_key")
+        self.assertIn("OPENAI_API_KEY", str(ctx.exception))
+
+    def test_missing_openrouter_key_error_type(self):
+        mod = types.ModuleType("openai")
+        mod.OpenAI = lambda **kw: None
+        cfg = types.SimpleNamespace(provider="openrouter")
+        with patch.dict(sys.modules, {"openai": mod}), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            with self.assertRaises(ProviderApiError) as ctx:
+                core._build_provider_client(cfg)
+        self.assertEqual(ctx.exception.error_type, "missing_api_key")
+        self.assertIn("OPENROUTER_API_KEY", str(ctx.exception))
+
+    def test_missing_key_and_dependency_types_are_self_explanatory(self):
+        # These carry the full, actionable message already -- a traceback
+        # would just be noise, so callers (cli.py, manifest streaming) skip it.
+        self.assertIn("missing_api_key", SELF_EXPLANATORY_ERROR_TYPES)
+        self.assertIn("missing_dependency", SELF_EXPLANATORY_ERROR_TYPES)
 
 
 class _UsageMetadataStub:

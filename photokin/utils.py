@@ -44,10 +44,10 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import mimetypes
 import os
 import re
-import sys
 import textwrap
 from pathlib import Path
 from dataclasses import dataclass
@@ -56,6 +56,8 @@ from json import JSONDecodeError
 from typing import Any, Dict, List, Set, Tuple, Optional
 
 from photokin.face_utils import face_tags_to_llm_block
+
+logger = logging.getLogger(__name__)
 
 # === Config ===
 
@@ -209,8 +211,11 @@ def ensure_paths_exist(paths: list[str]) -> None:
     """
     for p in paths:
         if p and not os.path.isfile(p):
-            print(f'[ERROR] File not found after normalization: {p}', file=sys.stderr)
-            print('        Tip: Don’t include surrounding quotes in the path.', file=sys.stderr)
+            logger.error(
+                "File not found after normalization: %s\n"
+                "        Tip: Don’t include surrounding quotes in the path.",
+                p,
+            )
             raise FileNotFoundError(p)
 
 
@@ -425,16 +430,16 @@ def insert_keyword_into_vocab_file(
     section_clean = normalize_section_id(section)
 
     if not kw_clean:
-        print("[WARN] Skipping empty keyword insert request.", file=sys.stderr)
+        logger.warning("Skipping empty keyword insert request.")
         return False
     if kw_clean.upper().startswith("PC-"):
-        print(f'[WARN] Skipping keyword "{kw_clean}" (PC- prefix not allowed).', file=sys.stderr)
+        logger.warning('Skipping keyword "%s" (PC- prefix not allowed).', kw_clean)
         return False
     if not section_clean:
-        print(f'[WARN] Skipping keyword "{kw_clean}" (missing section).', file=sys.stderr)
+        logger.warning('Skipping keyword "%s" (missing section).', kw_clean)
         return False
     if not note_clean:
-        print(f'[WARN] Skipping keyword "{kw_clean}" (missing note).', file=sys.stderr)
+        logger.warning('Skipping keyword "%s" (missing note).', kw_clean)
         return False
 
     path = Path(vocab_path)
@@ -444,9 +449,8 @@ def insert_keyword_into_vocab_file(
     header = f"[{section_clean}]"
     header_idx = next((i for i, line in enumerate(lines) if line.strip() == header), None)
     if header_idx is None:
-        print(
-            f'[WARN] Skipping keyword "{kw_clean}" (section "{section_clean}" not found).',
-            file=sys.stderr,
+        logger.warning(
+            'Skipping keyword "%s" (section "%s" not found).', kw_clean, section_clean
         )
         return False
 
@@ -460,9 +464,8 @@ def insert_keyword_into_vocab_file(
             keywords_idx = i
             break
     if keywords_idx is None:
-        print(
-            f'[WARN] Skipping keyword "{kw_clean}" (section "{section_clean}" missing keywords list).',
-            file=sys.stderr,
+        logger.warning(
+            'Skipping keyword "%s" (section "%s" missing keywords list).', kw_clean, section_clean
         )
         return False
 
@@ -474,9 +477,10 @@ def insert_keyword_into_vocab_file(
             closing_idx = i
             break
     if closing_idx is None:
-        print(
-            f'[WARN] Skipping keyword "{kw_clean}" (section "{section_clean}" keywords list not closed).',
-            file=sys.stderr,
+        logger.warning(
+            'Skipping keyword "%s" (section "%s" keywords list not closed).',
+            kw_clean,
+            section_clean,
         )
         return False
 
@@ -523,7 +527,7 @@ def insert_keyword_into_vocab_file(
             f"TOML validation failed after inserting keyword into {vocab_path}: {e}"
         ) from e
 
-    print(f'[INFO] Added keyword "{kw_clean}" to section "{section_clean}".')
+    logger.info('Added keyword "%s" to section "%s".', kw_clean, section_clean)
     return True
 
 
@@ -540,7 +544,7 @@ def safe_backup(path: str) -> None:
             with open(path, "rb") as src, open(backup_path, "wb") as dst:
                 dst.write(src.read())
     except Exception as e:
-        print(f"[WARN] Could not create backup for {path}: {e}", file=sys.stderr)
+        logger.warning("Could not create backup for %s: %s", path, e)
 
 
 # === Prompt helpers ===
@@ -636,7 +640,15 @@ def build_data_url_and_size(path: str, jpeg_quality: int, max_edge: int | None =
         im2, resized = _resize_if_needed(im, max_edge)
         raw = _encode_jpeg_bytes(im2, jpeg_quality)
         if resized:
-            print(f"[Convert] Downscaled {os.path.basename(path)} {orig_w}x{orig_h} -> {im2.width}x{im2.height} (max_edge={max_edge})")
+            logger.info(
+                "Downscaled %s %dx%d -> %dx%d (max_edge=%s)",
+                os.path.basename(path),
+                orig_w,
+                orig_h,
+                im2.width,
+                im2.height,
+                max_edge,
+            )
         b64 = base64.b64encode(raw).decode("ascii")
         meta = {"mime": "image/jpeg", "width": im2.width, "height": im2.height, "resized": resized}
         return f"data:image/jpeg;base64,{b64}", len(raw), meta
@@ -664,7 +676,7 @@ def archival_upload(client, path: str, jpeg_quality: int, purpose: str = "user_d
         _ensure_pillow()
         im = _open_image(path)
         raw = _encode_jpeg_bytes(im, jpeg_quality)
-        print(f"[Convert] TIFF -> JPEG in-memory ({os.path.basename(path)}, quality={jpeg_quality})")
+        logger.info("TIFF -> JPEG in-memory (%s, quality=%d)", os.path.basename(path), jpeg_quality)
         bio = io.BytesIO(raw)
         bio.name = os.path.splitext(os.path.basename(path))[0] + "_upload.jpg"  # type: ignore[attr-defined]
         uploaded = client.files.create(file=bio, purpose=purpose)
@@ -797,15 +809,14 @@ def _sanitize_photo_context_text(text: str | None, source_label: str) -> str | N
     original_bytes = len(text.encode("utf-8"))
     final_bytes = len(truncated.encode("utf-8"))
     if original_bytes > MAX_PHOTO_CONTEXT_BYTES:
-        print(
-            f"[WARN] Photo context from {source_label} exceeded {MAX_PHOTO_CONTEXT_BYTES} bytes and was truncated to {final_bytes} bytes.",
-            file=sys.stderr,
+        logger.warning(
+            "Photo context from %s exceeded %d bytes and was truncated to %d bytes.",
+            source_label,
+            MAX_PHOTO_CONTEXT_BYTES,
+            final_bytes,
         )
     else:
-        print(
-            f"[INFO] Photo context loaded from {source_label} ({final_bytes} bytes).",
-            file=sys.stderr,
-        )
+        logger.info("Photo context loaded from %s (%d bytes).", source_label, final_bytes)
     return truncated
 
 
@@ -817,7 +828,7 @@ def _load_photo_context_file(path: str | None, source_label: str) -> str | None:
         with open(normalized, "r", encoding="utf-8") as fh:
             data = fh.read()
     except OSError as exc:
-        print(f"[WARN] Unable to read photo context file ({normalized}): {exc}", file=sys.stderr)
+        logger.warning("Unable to read photo context file (%s): %s", normalized, exc)
         return None
     return _sanitize_photo_context_text(data, source_label)
 
@@ -1517,7 +1528,7 @@ def load_item_metadata(it: dict) -> dict | None:
             return _load_json(normalize_path(mp))
         except (OSError, JSONDecodeError) as exc:
             if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
-                print(f"[WARN] Failed to load metadata from {mp}: {exc}", file=sys.stderr)
+                logger.warning("Failed to load metadata from %s: %s", mp, exc)
             return None
     return None
 

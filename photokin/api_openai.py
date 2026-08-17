@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, List
 
 from .errors import ProviderApiError
@@ -10,6 +11,8 @@ try:
     import openai
 except ImportError:
     openai = None
+
+logger = logging.getLogger(__name__)
 
 
 def _model_supports_temperature(model: str) -> bool:
@@ -59,7 +62,7 @@ def call_openai_model(
     if dump_request:
         dump_request(request_payload)
 
-    print(f"[Run] Starting analysis with model {model}...")
+    logger.info("Starting analysis with model %s...", model)
     if openai is None:
         raise ProviderApiError("missing_dependency", "openai package is required for ChatGPT provider.")
 

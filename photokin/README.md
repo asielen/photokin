@@ -55,8 +55,13 @@ Four vendors means four exception zoos, so every provider failure is normalized 
 - `length` — output truncated by `max_tokens`
 - `content_filter` — Gemini blocked the response
 - `missing_dependency` — provider selected but its SDK is not installed
+- `missing_api_key` — provider selected but its API key env var is not set
 
-Manifest-stream error payloads carry the normalized type/message and the HTTP status code when available.
+Manifest-stream error payloads carry the normalized type/message and the HTTP status code when available. `missing_dependency` and `missing_api_key` are both raised eagerly in `core._build_provider_client`, before any request is attempted, so neither costs a request.
+
+What happens next differs by mode, and it is worth knowing which you are in. Folder mode treats those two as properties of the run rather than of one photo (`_RUN_FATAL_ERROR_TYPES`): the first group to hit one aborts the batch with a single fatal error. Manifest mode does not — it records one error entry per item and exits 0, so a manifest run with no API key produces a full set of `missing_api_key` records rather than one failure. Read the records, not just the exit status.
+
+For `error_type` values whose message is already the full explanation (`SELF_EXPLANATORY_ERROR_TYPES` in `photokin.errors` — the two above, plus `rate_limit`, `overloaded`, `invalid_input`/`invalid_request`, `api_status`, `length`), both the CLI's top-level fatal error and manifest-stream per-item error records omit the traceback; anything else keeps it, since an unrecognized failure is exactly when a traceback earns its keep.
 
 ## When calls succeed
 

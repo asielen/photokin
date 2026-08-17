@@ -1,10 +1,11 @@
-import io
+import logging
 import tempfile
 import unittest
-from contextlib import redirect_stderr
 from pathlib import Path
 
 from photokin import utils
+
+_UTILS_LOGGER = "photokin.utils"
 
 
 class TestPhotoContext(unittest.TestCase):
@@ -62,8 +63,7 @@ class TestPhotoContext(unittest.TestCase):
         self.assertEqual(resolved, "from-text")
 
     def test_unreadable_file_warns_and_returns_none(self):
-        stderr = io.StringIO()
-        with redirect_stderr(stderr):
+        with self.assertLogs(_UTILS_LOGGER, level=logging.WARNING) as captured:
             resolved = utils.resolve_photo_context(
                 cli_text=None,
                 cli_file="/tmp/definitely_missing_context_file_12345.txt",
@@ -71,12 +71,12 @@ class TestPhotoContext(unittest.TestCase):
             )
 
         self.assertIsNone(resolved)
-        self.assertIn("Unable to read photo context file", stderr.getvalue())
+        self.assertIn("Unable to read photo context file", captured.records[0].getMessage())
 
     def test_truncates_over_limit(self):
         huge_text = "a" * (utils.MAX_PHOTO_CONTEXT_BYTES + 17)
-        stderr = io.StringIO()
-        with redirect_stderr(stderr):
+
+        with self.assertLogs(_UTILS_LOGGER, level=logging.WARNING) as captured:
             resolved = utils.resolve_photo_context(
                 cli_text=huge_text,
                 cli_file=None,
@@ -86,7 +86,7 @@ class TestPhotoContext(unittest.TestCase):
         self.assertIsNotNone(resolved)
         assert resolved is not None
         self.assertEqual(len(resolved.encode("utf-8")), utils.MAX_PHOTO_CONTEXT_BYTES)
-        self.assertIn("was truncated", stderr.getvalue())
+        self.assertIn("was truncated", captured.records[0].getMessage())
 
     def test_prompt_injection_has_authoritative_block(self):
         cfg = utils.Config(photo_context_text="Known family notes")

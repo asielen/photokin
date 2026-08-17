@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import mimetypes
 from typing import Any, Callable, Dict, List
 from urllib.parse import urlparse
@@ -13,6 +14,8 @@ try:
     import anthropic
 except ImportError:
     anthropic = None
+
+logger = logging.getLogger(__name__)
 
 
 MAX_TOKENS = 4096
@@ -141,7 +144,7 @@ def call_claude_model(
     if dump_request:
         dump_request(request_payload)
 
-    print(f"[Run] Starting analysis with model {model}...")
+    logger.info("Starting analysis with model %s...", model)
     if anthropic is None:
         raise ProviderApiError("missing_dependency", "anthropic package is required for Claude provider.")
 

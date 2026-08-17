@@ -1,8 +1,7 @@
-import io
 import json
+import logging
 import tempfile
 import unittest
-from contextlib import redirect_stderr
 from pathlib import Path
 
 from photokin import core, utils
@@ -30,15 +29,15 @@ class TestLlmRequestDump(unittest.TestCase):
                 "temperature": 0,
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
             }
-            stderr = io.StringIO()
-            with redirect_stderr(stderr):
+            with self.assertLogs("photokin.core", level=logging.INFO) as captured:
                 writer(request_payload)
 
             json_path = Path(td) / "batch123_llm_request_front_single.json"
             self.assertTrue(json_path.exists())
             parsed = json.loads(json_path.read_text(encoding="utf-8"))
             self.assertEqual(parsed["model"], "gpt-4o")
-            self.assertIn("Wrote LLM request dump:", stderr.getvalue())
+            messages = [record.getMessage() for record in captured.records]
+            self.assertIn(f"Wrote LLM request dump: {json_path}", messages)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ API.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, List
 
 from .errors import ProviderApiError
@@ -17,6 +18,8 @@ try:
     import openai
 except ImportError:
     openai = None
+
+logger = logging.getLogger(__name__)
 
 
 # Reasoning-capable models (Kimi K3 and others routed through OpenRouter)
@@ -56,7 +59,7 @@ def call_openai_compat_model(
     if dump_request:
         dump_request(request_payload)
 
-    print(f"[Run] Starting analysis with model {model}...")
+    logger.info("Starting analysis with model %s...", model)
     if openai is None:
         raise ProviderApiError("missing_dependency", "openai package is required for OpenAI-compatible providers.")
 

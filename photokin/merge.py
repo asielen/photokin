@@ -29,11 +29,14 @@ Code map:
 """
 
 from typing import Dict, Any, Tuple, List
+import logging
 import os
-import sys
 import re
 
 from .utils import Config
+
+logger = logging.getLogger(__name__)
+
 
 def _norm_str_set(seq) -> List[str]:
     """
@@ -269,20 +272,20 @@ def merge_record_with_original(
         ):
             min_year_gap = config.date_override_precise_year_gap
         # Diagnostic for the date-override decision. Kept behind a debug flag and
-        # routed to stderr so it never pollutes the NDJSON result stream.
+        # routed to the logger so it never pollutes the NDJSON result stream.
         if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
-            print(
-                "[DATE-OVERRIDE-CHECK]",
-                f"path={original.get('path')}",
-                f"dt_orig_raw={dt_orig_raw!r}",
-                f"dt_year={dt_year}",
-                f"ai_year={ai_year}",
-                f"ai_conf={ai_conf}",
-                f"import_date={ai_import!r}",
-                f"min_gap={min_year_gap}",
-                f"abs_gap={(abs(ai_year - dt_year) if ai_year and dt_year else None)}",
-                f"has_DATE_keyword={'DATE:' in ' '.join(original.get('keywords', []))}",
-                file=sys.stderr,
+            logger.debug(
+                "[DATE-OVERRIDE-CHECK] path=%s dt_orig_raw=%r dt_year=%s ai_year=%s "
+                "ai_conf=%s import_date=%r min_gap=%s abs_gap=%s has_DATE_keyword=%s",
+                original.get("path"),
+                dt_orig_raw,
+                dt_year,
+                ai_year,
+                ai_conf,
+                ai_import,
+                min_year_gap,
+                abs(ai_year - dt_year) if ai_year and dt_year else None,
+                "DATE:" in " ".join(original.get("keywords", [])),
             )
         if (
             not has_reviewed_date_kw
@@ -316,7 +319,7 @@ def merge_record_with_original(
         # Never allow heuristics to break the merge step.
         # If anything goes sideways, we skip the date fix-up.
         if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
-            print(f"[WARN] Skipping date override heuristics: {exc}", file=sys.stderr)
+            logger.warning("Skipping date override heuristics: %s", exc)
 
     # --- Title: prefer original -------------------------------------------
     t = (original.get("title") or "").strip()

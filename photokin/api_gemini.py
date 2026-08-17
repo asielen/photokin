@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-import sys
+import logging
 from typing import Any, Callable, Dict, List
 
 from .errors import ProviderApiError
@@ -12,6 +12,8 @@ try:
     from google.api_core import exceptions as google_api_exceptions
 except ImportError:
     google_api_exceptions = None
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_gemini_model(model: str) -> str:
@@ -83,16 +85,16 @@ def call_gemini_model(
     if dump_request:
         dump_request(request_payload)
 
-    debug = dump_request is not None
-    if debug:
+    if dump_request is not None:
         image_count = len([u for u in image_data_urls if u])
-        print(
-            f"[Debug] Gemini API call: model={model!r}, images={image_count},"
-            f" config={api_config}",
-            file=sys.stderr,
+        logger.info(
+            "Gemini API call: model=%r, images=%d, config=%s",
+            model,
+            image_count,
+            api_config,
         )
 
-    print(f"[Run] Starting analysis with model {model}...")
+    logger.info("Starting analysis with model %s...", model)
 
     try:
         return client.models.generate_content(

@@ -99,7 +99,7 @@ runs with `--changeset true`) and for each record:
 ## Standalone CLI
 
 ```bash
-python -m photokin.exiftool --changeset batch_changeset.ndjson \
+python -m photokin.exiftool --changeset results_changeset.ndjson \
   --enabled [--fields EXIF:UserComment,EXIF:DateTimeOriginal] \
   [--dry-run] [--exiftool-path /usr/local/bin/exiftool] \
   [--no-overwrite-original | --write-sidecar-only] [--output summary.json]

@@ -17,7 +17,7 @@ export OPENAI_API_KEY=sk-...            # setx on Windows
 photokin scan_042.jpg --back scan_042_back.jpg
 ```
 
-That prints one JSON result, keyed by the image path. Abridged:
+That's a good first command to confirm everything's wired up correctly: it only reads the image and prints one JSON result to your terminal, keyed by the image path — nothing is written to `scan_042.jpg` or `scan_042_back.jpg` themselves. (Writing metadata into the files is a separate, explicit opt-in step; see [Setting up ExifTool](#setting-up-exiftool) below.) Abridged output:
 
 ```json
 {
@@ -237,6 +237,8 @@ photokin ...
 
 Point it at a folder and it works through everything in it (non-recursive). Filename suffixes group scans of the same physical object automatically — `photo-a.jpg` / `photo-b.jpg` are variants, `photo-back.jpg` is the reverse side, `album-page1.jpg` / `album-page2.jpg` are pages of one document — and each group is analyzed together as one object.
 
+Worth knowing before you decide how to run a box of scans: folder mode only analyzes a group that contains a plain front scan. A set that is nothing but pages (`album-page1.jpg`, `album-page2.jpg`) or nothing but a negative has no front in it, so the group is grouped correctly and then skipped instead of analyzed. It does say so — one warning per group (`Skipping group 'album': multipage set has no primary front (pages are not analyzed in folder mode)`) plus a skipped count in the closing line — so nothing disappears quietly, but those pages really do go unanalyzed. Manifest mode handles them: with `--process-all-variants` it sends every page of a document to the model in one call, and without it, only the group's primary item (the first page listed) is analyzed and its result is applied across the set. Until folder mode is routed through the same pipeline, albums, multi-page documents and negative-only scans belong in a manifest.
+
 > SIDE NOTE ON EXPECTED **Naming conventions.** The full suffix grammar is `name[letter][-front|-back|-negative|-pageN][-crop]`, case-insensitive, applied right to left:
 >
 > | Example | Meaning |
@@ -248,6 +250,8 @@ Point it at a folder and it works through everything in it (non-recursive). File
 > | `box3_025-back-crop.jpg` | a cropped detail, used as a supporting view of its parent, never as its own object |
 >
 > The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other explicitly numbered pages.
+>
+> Folder mode reads this whole grammar for grouping, but only ever analyzes each group's primary front and back: page, negative and crop files are sorted into their slots and then left unanalyzed, with a warning naming every file it passed over. The page and negative forms only reach the model in manifest mode today.
 
 ## Folder mode
 
@@ -255,7 +259,7 @@ Point it at a folder and it works through everything in it (non-recursive). File
 photokin --folder ./scans/ --provider anthropic > results.json
 ```
 
-Folder mode prints one aggregate JSON to stdout. For bigger or more repeatable jobs, manifest mode takes a JSON file instead of a folder, and adds `--output-file`: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end.
+Folder mode prints one aggregate JSON to stdout. Groups it cannot analyze — multipage sets, lone negatives — are absent from that JSON; they surface as warnings on stderr and as a skipped count in the closing line, so read stderr as well as the results. For bigger or more repeatable jobs, manifest mode takes a JSON file instead of a folder, handles the groups folder mode skips, and adds `--output-file`: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end.
 
 ## Manifest mode
 
@@ -280,10 +284,10 @@ photokin --manifest batch.json --output-file results.ndjson --changeset true
 
 Items may have existing `metadata` (face tags, existing captions and comments) that can be forwarded to the model as context. Additionally, you can supply `photo_context_text` as free-text additional context to a single photo or a folder. Such as "these photos are all part of a wedding album." The model treats it as truth for the whole batch. Both make a real difference on hard photos.
 
-For auditing, `--changeset true` emits a changeset NDJSON alongside the results: a record of proposed field writes that the ExifTool wrapper can apply to the actual files, either in the same run (`--exiftool-write true --exiftool-fields EXIF:UserComment`) or later and separately:
+For auditing, `--changeset true` emits a changeset NDJSON alongside the results: a record of proposed field writes that the ExifTool wrapper can apply to the actual files, either in the same run (`--exiftool-write true --exiftool-fields EXIF:UserComment`) or later and separately. The changeset is named after the output file and lands beside it, so the `--output-file results.ndjson` run above writes `results_changeset.ndjson` (a `.json` output path, or none at all, gets a plain `changeset.ndjson` in the same directory instead):
 
 ```bash
-python -m photokin.exiftool --changeset batch_changeset.ndjson --enabled [--dry-run]
+python -m photokin.exiftool --changeset results_changeset.ndjson --enabled [--dry-run]
 ```
 
 ## API keys
@@ -330,8 +334,8 @@ Where each result field lands when written:
 **Writing later, with an audit step.** Since the changeset NDJSON is a plain record of proposed writes, you can inspect it first and apply it separately:
 
 ```bash
-python -m photokin.exiftool --changeset batch_changeset.ndjson --enabled --dry-run   # counts what would be written
-python -m photokin.exiftool --changeset batch_changeset.ndjson --enabled            # actually writes
+python -m photokin.exiftool --changeset results_changeset.ndjson --enabled --dry-run   # counts what would be written
+python -m photokin.exiftool --changeset results_changeset.ndjson --enabled            # actually writes
 ```
 
 The standalone applier also takes `--fields` to narrow which tags may be written, `--write-sidecar-only` to write `.xmp` sidecars instead of touching the originals, `--no-overwrite-original` to keep ExifTool's `_original` backup files, and `--output summary.json` for a machine-readable result. Date tags (`EXIF:DateTimeOriginal`, `EXIF:CreateDate`) are normalized to EXIF's `YYYY:MM:DD HH:MM:SS` format on the way in; unparseable dates become warnings, not writes.
@@ -377,7 +381,7 @@ The standalone applier also takes `--fields` to narrow which tags may be written
 | Flag                                               | What it does |
 |----------------------------------------------------|---|
 | `--update-policy {master_exact,merge_per_variant}` | Whether results apply to just the primary file or to every variant in a group (default `merge_per_variant`) |
-| `--process-all-variants`                           | Also analyze `-b`/`-c` variant scans and fold their outputs together (default off — only the primary scan of each group is analyzed) |
+| `--process-all-variants`                           | Also analyze `-b`/`-c` variant scans and fold their outputs together (default off — only the primary scan of each group is analyzed). Manifest mode only; folder mode ignores it and always analyzes just the primary |
 | `--date-confidence-threshold X`                    | Minimum model confidence before a date guess is applied, 0-1 (default 0.7) |
 | `--location-confidence-threshold X`                | Same, for location guesses (default 0.7) |
 | `--no-update-vocab`                                | Don't append newly proposed keywords to the vocabulary file |
