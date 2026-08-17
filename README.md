@@ -36,6 +36,203 @@ That prints one JSON result, keyed by the image path. Abridged:
 
 The transcription (`caption`) and the interpretation (`ai_caption`) are kept strictly separate — the model is not allowed to "improve" what's actually written on the object. That separation is most of the reason this tool exists.
 
+New to Python, or starting from a completely bare machine? See the full [Windows Quick Start](#windows-quick-start) or [macOS Quick Start](#macos-quick-start) walkthroughs below.
+
+## Windows Quick Start
+
+This walks through a completely fresh Windows machine — nothing installed yet.
+
+### 1. Install Python
+
+Download Python 3.11 or newer from [python.org/downloads](https://www.python.org/downloads/). Photokin requires **Python 3.11+**.
+
+On the first installer screen, check **"Add python.exe to PATH"** before clicking Install — this is the most common thing people miss, and without it `python` won't be recognized in a terminal.
+
+Verify it worked by opening a **new** PowerShell window and running:
+
+```powershell
+python --version
+```
+
+### 2. Create a project folder
+
+Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point `--folder` or `--manifest` at wherever those already live.
+
+```powershell
+mkdir C:\Users\YourName\photokin-work
+cd C:\Users\YourName\photokin-work
+```
+
+### 3. Create and activate a virtual environment
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+Your prompt should now start with `(.venv)`.
+
+**Two common snags:**
+
+- **Double-clicking `Activate.ps1` in File Explorer opens it in a text editor instead of running it.** This is expected — PowerShell scripts aren't meant to be launched by double-click. Always run it as a typed command from an open PowerShell window instead.
+- **"Running scripts is disabled on this system" error.** PowerShell blocks script execution by default. Fix it once with:
+  ```powershell
+  Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+  ```
+  Confirm with `Y` when prompted, then re-run the activation command. If you'd rather not change the execution policy, use Command Prompt instead of PowerShell and run `.venv\Scripts\activate.bat`.
+
+### 4. Install photokin
+
+Install with the extra for whichever provider you're using:
+
+```powershell
+pip install "photokin[anthropic]"
+```
+
+(Swap `anthropic` for `openai`, `gemini`, or `all` as needed.)
+
+### 5. Set your API key
+
+For the current terminal session only:
+
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+```
+
+To make it persist across future terminal sessions:
+
+```powershell
+setx ANTHROPIC_API_KEY "sk-ant-..."
+```
+
+Note that `setx` doesn't affect your *current* window — open a new terminal to pick it up.
+
+### 6. (Optional) Set up ExifTool
+
+Only needed if you want photokin to read/write metadata into the image files themselves:
+
+```powershell
+python -m photokin.exiftool.fetch
+```
+
+This downloads the official ExifTool binary into `~/.photokin/bin` — no separate system install required.
+
+### 7. Run it
+
+```powershell
+photokin scan_042.jpg --back scan_042_back.jpg --provider anthropic
+```
+
+or against a whole folder:
+
+```powershell
+photokin --folder .\scans\ --provider anthropic > results.json
+```
+
+### Coming back later
+
+Each new session, just reactivate the environment before running photokin:
+
+```powershell
+cd C:\Users\YourName\photokin-work
+.venv\Scripts\Activate.ps1
+photokin ...
+```
+
+## macOS Quick Start
+
+This walks through a completely fresh Mac — nothing installed yet.
+
+### 1. Install Python
+
+Macs ship with an old system Python (and often no `python` command at all, only `python3`), so install a current one from [python.org/downloads](https://www.python.org/downloads/) — Photokin requires **Python 3.11+**. If you already use Homebrew, `brew install python@3.12` works just as well.
+
+Verify it worked by opening a **new** Terminal window and running:
+
+```bash
+python3 --version
+```
+
+Use `python3` (not `python`) for every command below — that's normal on macOS, not a sign something's wrong.
+
+### 2. Create a project folder
+
+Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point `--folder` or `--manifest` at wherever those already live.
+
+```bash
+mkdir ~/photokin-work
+cd ~/photokin-work
+```
+
+### 3. Create and activate a virtual environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Your prompt should now start with `(.venv)`.
+
+**One common snag:** if `python3` isn't found anywhere, macOS may prompt you to install the Xcode Command Line Tools (a separate, smaller download triggered the first time a `python3`/`git`/etc. command runs). Either let it install, or just use the python.org installer from step 1, which doesn't depend on it.
+
+### 4. Install photokin
+
+Install with the extra for whichever provider you're using:
+
+```bash
+pip install "photokin[anthropic]"
+```
+
+(Swap `anthropic` for `openai`, `gemini`, or `all` as needed.)
+
+### 5. Set your API key
+
+For the current terminal session only:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+To make it persist across future terminal sessions, add that line to your shell's startup file — `~/.zshrc` on any Mac from the last several years (zsh is the default shell), or `~/.bash_profile` if you're on bash:
+
+```bash
+echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
+```
+
+Open a new terminal window (or run `source ~/.zshrc`) to pick it up.
+
+### 6. (Optional) Set up ExifTool
+
+Only needed if you want photokin to read/write metadata into the image files themselves. Install it with Homebrew:
+
+```bash
+brew install exiftool
+```
+
+No Homebrew? Grab the installer package from exiftool.org instead.
+
+### 7. Run it
+
+```bash
+photokin scan_042.jpg --back scan_042_back.jpg --provider anthropic
+```
+
+or against a whole folder:
+
+```bash
+photokin --folder ./scans/ --provider anthropic > results.json
+```
+
+### Coming back later
+
+Each new session, just reactivate the environment before running photokin:
+
+```bash
+cd ~/photokin-work
+source .venv/bin/activate
+photokin ...
+```
+
 ## Folders and batches
 
 Point it at a folder and it works through everything in it (non-recursive). Filename suffixes group scans of the same physical object automatically — `photo-a.jpg` / `photo-b.jpg` are variants, `photo-back.jpg` is the reverse side, `album-page1.jpg` / `album-page2.jpg` are pages of one document — and each group is analyzed together as one object.

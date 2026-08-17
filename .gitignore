@@ -7,3 +7,5 @@ build/
 venv/
 .idea/
 .pytest_cache/
+photo_ai_chat_prompt.txt
+*.bak
