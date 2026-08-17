@@ -1,0 +1,2 @@
+Not an image. Present so test_folder_routing.py can assert that folder listing
+filters by extension: this file must never appear in a generated manifest.

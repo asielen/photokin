@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "generated_by": "photokin --generate-manifest",
+  "source": {
+    "type": "folder",
+    "path": "<FOLDER>"
+  },
+  "items": [
+    {
+      "path": "<FOLDER>/album-page1.jpg"
+    },
+    {
+      "path": "<FOLDER>/album-page2-crop.jpg"
+    },
+    {
+      "path": "<FOLDER>/album-page2.jpg"
+    },
+    {
+      "path": "<FOLDER>/box3_025-back.jpg"
+    },
+    {
+      "path": "<FOLDER>/box3_025-crop.jpg"
+    },
+    {
+      "path": "<FOLDER>/box3_025.jpg"
+    },
+    {
+      "path": "<FOLDER>/box3_025b-back.jpg"
+    },
+    {
+      "path": "<FOLDER>/box3_025b.jpg"
+    },
+    {
+      "path": "<FOLDER>/box3_026-negative.jpg"
+    },
+    {
+      "path": "<FOLDER>/box3_027.png"
+    }
+  ]
+}

@@ -45,6 +45,16 @@ def analyze_folder(
     ``discover_meta`` used to gate a slow filesystem walk, but the modern core
     always loads metadata when needed.  We keep the parameter to avoid breaking
     callers even though it is ignored.
+
+    Returns:
+        ``{"results": {file_path: record}, "errors": {file_path: payload}}`` --
+        one entry per FILE, not per group, as of 0.2.0. Every image in the
+        folder appears in exactly one of the two, so a caller that iterates
+        ``results`` now sees backs, variant scans, album pages, negatives and
+        crops alongside the fronts it used to see, and records carry ``_merge``,
+        per-file ``keywords``/``caption`` and a fuller ``all_variant_files``.
+        Indexing a known front path is unchanged. See Breaking change #2 in
+        ``docs/unified-input-pipeline.md``.
     """
 
     # ``discover_meta`` is preserved for compatibility with earlier callers, but the

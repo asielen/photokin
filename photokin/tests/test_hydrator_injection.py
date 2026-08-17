@@ -46,7 +46,7 @@ class TestHydratorInjection(unittest.TestCase):
         manifest = {"items": []}
         cfg = utils.Config(dry_run=True)
         result = core.process_manifest_stream(manifest=manifest, cfg=cfg)
-        self.assertEqual(result, {"results": {}})
+        self.assertEqual(result, {"results": {}, "errors": {}})
 
 
 class TestHydrateUserComments(unittest.TestCase):

@@ -31,12 +31,14 @@ Code map (public-facing entry points marked PUBLIC):
 - analyze_photo                 PUBLIC: full pipeline for one front(+back) photo
 - analyze_group_parts           PUBLIC: analyze ordered parts (front/back/pages)
 - analyze_group_front_back      PUBLIC: convenience wrapper over analyze_group_parts
-- _unanalyzed_group_files       list a folder group's files this path never reads
+- build_folder_manifest         PUBLIC: a folder as in-memory manifest items
+- build_single_photo_manifest   PUBLIC: image + --back + --meta as manifest items
 - analyze_folder                PUBLIC: batch a whole folder
 - _coerce_manifest_bool         read a tri-state boolean flag off a manifest item
 - _log_manifest_override        warn that an explicit flag beat the filename
 - _manifest_group_override      resolve an item's explicit bucket key
 - _resolve_manifest_entry       build one grouping entry, filename plus overrides
+- build_manifest_buckets        PUBLIC: group items the way the stream will
 - _manifest_part_key            the slot an entry competes for in its variant
 - _slot_rank_key                the one ordering every grouping tie-break uses
 - analyze_manifest              PUBLIC: aggregate wrapper over the stream
@@ -291,6 +293,45 @@ def _normalized_error_payload(exc: Exception) -> Dict[str, Any]:
         payload["status_code"] = int(status_code)
     return payload
 
+
+def _write_sidecar_document(data: Dict[str, Any], image_path: str, config: utils.Config) -> str | None:
+    """Write an analysis document beside its image, warning instead of raising.
+
+    The analysis is already paid for by the time this runs, so a sidecar that
+    cannot be written must not take the record down with it and be reported as a
+    model failure. An ``OSError`` escaping here reaches the batch loop's
+    per-group handler, which discards the model's output, writes an error
+    payload for every file of the group, and -- under
+    ``strict_run_failures``, once no group has succeeded -- re-raises and loses
+    the whole run. A read-only sidecar left by a previous run, a lock held by a
+    sync client, a path over ``MAX_PATH`` or a full disk is enough to trigger it.
+
+    Args:
+        data: The analysis document to serialize.
+        image_path: Image the sidecar belongs to; it supplies the destination
+            directory and the ``.json`` stem.
+        config: Run configuration, read for ``pretty_json``.
+
+    Returns:
+        The path written, or ``None`` when it could not be written, which has
+        already been logged at WARNING.
+    """
+    img_dir = os.path.dirname(os.path.abspath(image_path))
+    img_base = os.path.splitext(os.path.basename(image_path))[0]
+    json_path = os.path.join(img_dir, f"{img_base}.json")
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2 if config.pretty_json else None, ensure_ascii=False)
+    except OSError as exc:
+        logger.warning(
+            "Sidecar not written for %s (%s): the analysis is kept in the results.",
+            os.path.basename(image_path),
+            exc,
+        )
+        return None
+    return json_path
+
+
 def analyze_photo(
     front_path: str,
     back_path: str | None = None,
@@ -536,16 +577,13 @@ def analyze_photo(
             raise RuntimeError(msg) from e
 
     # Optional per-photo sidecar
-    img_dir = os.path.dirname(os.path.abspath(front))
-    img_base = os.path.splitext(os.path.basename(front))[0]
-    if write_sidecar:
-        json_path = os.path.join(img_dir, f"{img_base}.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2 if config.pretty_json else None, ensure_ascii=False)
+    json_path = _write_sidecar_document(data, front, config) if write_sidecar else None
+    if json_path:
         logger.info("Analysis completed for %s; JSON saved as %s", os.path.basename(front), json_path)
     else:
         # Deliberately silent about whether a sidecar exists: batch callers turn
-        # this off so they can write the variant-enriched record themselves.
+        # this off so they can write the variant-enriched record themselves, and
+        # a write that failed has already said so.
         logger.info("Analysis completed for %s", os.path.basename(front))
 
     return data
@@ -839,17 +877,8 @@ def analyze_group_parts(
         except Exception as e:
             logger.exception("Failed to insert new keywords: %s", e)
 
-    img_dir = os.path.dirname(os.path.abspath(main_key))
-    img_base = os.path.splitext(os.path.basename(main_key))[0]
-    if write_sidecar:
-        json_path = os.path.join(img_dir, f"{img_base}.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(
-                data,
-                f,
-                indent=2 if config.pretty_json else None,
-                ensure_ascii=False,
-            )
+    json_path = _write_sidecar_document(data, main_key, config) if write_sidecar else None
+    if json_path:
         logger.info(
             "Group analysis completed for %s; JSON saved as %s",
             os.path.basename(main_key),
@@ -888,25 +917,92 @@ def analyze_group_front_back(
     )
 
 
-def _unanalyzed_group_files(entry: Dict[str, Any], *, front_analyzed: bool) -> List[str]:
-    """List the files of one folder group that this path neither analyzes nor reports.
+def build_folder_manifest(folder_path: str, *, photo_context_text: str | None = None) -> Dict[str, Any]:
+    """Describe a folder as an in-memory manifest.
+
+    Each item carries ``path`` and nothing else. Folder mode has no source of
+    truth beyond the filename, so an explicit ``is_back``/``version``/``group``
+    would only hand :func:`_resolve_manifest_entry` back the answer it is about
+    to derive from the same parser -- and would then freeze that answer, so any
+    later change to the grammar would be silently overridden and reported as an
+    override on every ordinary folder.
 
     Args:
-        entry: A single ``utils.group_folder_images`` entry.
-        front_analyzed: True when the group's primary front was analyzed, which
-            also covers the primary back and puts every variant front/back into
-            ``all_variant_files`` for downstream fan-out.
+        folder_path: Directory to describe.
+        photo_context_text: Resolved, sanitized photo context, emitted inline so
+            the manifest round-trips through ``utils.resolve_photo_context``.
+            Omitted from the document when empty.
 
     Returns:
-        Paths that are neither sent to the model nor named in the result record.
+        A manifest dict whose ``items`` are exactly what the analysis path
+        processes, in exactly that order.
+
+    Raises:
+        NotADirectoryError: If ``folder_path`` is not an existing directory.
     """
-    dropped = [entry["pages"][num] for num in sorted(entry["pages"])]
-    dropped += [entry["page_crops"][num] for num in sorted(entry["page_crops"])]
-    dropped += [p for p in (entry["negative"], entry["negative_crop"]) if p]
-    slots = ("front_crop", "back_crop") if front_analyzed else ("front", "back", "front_crop", "back_crop")
-    dropped += [entry["primary"][slot] for slot in slots if entry["primary"][slot]]
-    dropped += [v[slot] for v in entry["variants"] for slot in slots if v[slot]]
-    return dropped
+    folder = utils.normalize_path(folder_path) or ""
+    manifest: Dict[str, Any] = {
+        "schema_version": 1,
+        "generated_by": "photokin --generate-manifest",
+        "source": {"type": "folder", "path": folder},
+    }
+    if photo_context_text:
+        manifest["photo_context_text"] = photo_context_text
+    manifest["items"] = [{"path": path} for path in utils.list_folder_images(folder)]
+    return manifest
+
+
+def build_single_photo_manifest(
+    image_path: str,
+    back_path: str | None = None,
+    *,
+    meta: dict | None = None,
+    photo_context_text: str | None = None,
+) -> Dict[str, Any]:
+    """Describe an image plus its optional back and metadata as a manifest.
+
+    Unlike a folder, single-photo input carries real assertions the filename
+    cannot make, so this one does set overrides. ``--back`` says "this file is
+    the reverse of that one" whatever it is called, which is both ``is_back``
+    and a shared ``group`` -- without the group key, ``photo.jpg --back
+    reverse.jpg`` would split into two objects and two model calls. ``--meta``
+    rides inline on the front only, matching the single ``original_meta`` blob
+    the old call site forwarded; the group's other item still receives it
+    through ``merge_original_sources`` under ``merge_per_variant``.
+
+    Args:
+        image_path: The front image.
+        back_path: The reverse side, or ``None``.
+        meta: Already-loaded original metadata, or ``None``. Inline rather than
+            a ``metadata_path`` so a malformed file has already failed loudly at
+            load time and the manifest stays self-contained.
+        photo_context_text: Resolved, sanitized photo context, emitted inline.
+
+    Returns:
+        A manifest dict with the front first and the back, if any, second.
+    """
+    front = utils.normalize_path(image_path) or ""
+    # Empty only for an empty path, which the caller is expected to have refused
+    # already; emitting ``group: ""`` would be an unusable override rather than a
+    # grouping instruction, and would be warned about as one.
+    group_key = utils.parse_media_filename(front).base_id if front else ""
+    shared_group = {"group": group_key} if group_key else {}
+    front_item: Dict[str, Any] = {"path": front, **shared_group}
+    if meta:
+        front_item["metadata"] = meta
+    items = [front_item]
+    if back_path:
+        items.append({"path": utils.normalize_path(back_path), **shared_group, "is_back": True})
+
+    manifest: Dict[str, Any] = {
+        "schema_version": 1,
+        "generated_by": "photokin --generate-manifest",
+        "source": {"type": "single", "path": front},
+    }
+    if photo_context_text:
+        manifest["photo_context_text"] = photo_context_text
+    manifest["items"] = items
+    return manifest
 
 
 def analyze_folder(
@@ -918,133 +1014,43 @@ def analyze_folder(
     """
     Batch mode for entire folders.
 
-    The helper purposely only analyzes the primary front/back images because the
-    OpenAI calls are the expensive part; instead of re-processing every variant,
-    we capture the file lists under ``all_variant_files`` so Lightroom can fan
-    out metadata locally.  That "why" often gets lost, so it lives here now.
-
-    Pages, negatives and crops fall outside both of those, so every group logs
-    the files it leaves untouched and the completion line carries the total; a
-    group with no primary front cannot be analyzed at all and is logged with its
-    reason.  A group that raises is recorded under ``errors`` and skipped rather
-    than aborting the batch, so the results gathered before it survive -- unless
-    nothing at all succeeded, in which case the first failure is re-raised so a
-    wholly failed run cannot exit 0 with an empty result set.
+    The folder is translated into manifest items and handed to
+    :func:`process_manifest_stream`, so folder and manifest input group
+    identically: album pages, negative-only sets, crops and variant scans are
+    all analyzed rather than skipped, and ``config.process_all_variants`` works
+    here for the first time.  ``update_policy`` is fixed at
+    ``UPDATE_MERGE_PER_VARIANT`` -- the CLI default -- because the policy flag is
+    manifest-only until Phase C lifts that gate; this is a decision, not an
+    omission.  Failure handling is folder mode's own: a group that raises is
+    recorded under ``errors`` and the batch carries on, a run-fatal provider
+    error aborts immediately, and a run in which nothing succeeded re-raises its
+    first failure rather than exiting 0 with an empty result set.
 
     Returns:
-        ``{"results": {front_path: record}, "errors": {front_path: payload}}``.
+        ``{"results": {file_path: record}, "errors": {file_path: payload}}`` --
+        one entry per FILE, not per group. Every image the folder holds appears
+        in exactly one of the two. Records carry the merge report under
+        ``_merge``, per-file scoped ``keywords`` and ``caption``, and the full
+        ``all_variant_files`` map (``front``/``back``/``variants``/``all``, plus
+        ``pages``/``crops``/``negatives``/``displaced`` where they apply). See
+        Breaking change #2 in ``docs/unified-input-pipeline.md``.
 
     Raises:
         NotADirectoryError: If ``folder_path`` is not an existing directory.
         Exception: The first per-group failure, when no group succeeded.
     """
-    folder = utils.normalize_path(folder_path) or ""
-    if not os.path.isdir(folder):
-        raise NotADirectoryError(folder)
-
-    grouped = utils.group_folder_images(folder)
-    if not grouped:
-        logger.warning("No image files found in folder: %s", folder)
+    manifest = build_folder_manifest(folder_path, photo_context_text=config.photo_context_text)
+    if not manifest["items"]:
+        logger.warning("No image files found in folder: %s", manifest["source"]["path"])
         return {"results": {}, "errors": {}}
 
-    aggregated: Dict[str, Any] = {"results": {}, "errors": {}}
-    skipped_groups = 0
-    unanalyzed_files = 0
-    first_error: Exception | None = None
-    for stem, entry in grouped.items():
-        primary_front = entry["primary"]["front"]
-        primary_back = entry["primary"]["back"]
-        dropped = _unanalyzed_group_files(entry, front_analyzed=bool(primary_front))
-        unanalyzed_files += len(dropped)
-        dropped_names = ", ".join(os.path.basename(p) for p in dropped)
-        if not primary_front:
-            if entry["pages"]:
-                reason = "multipage set has no primary front (pages are not analyzed in folder mode)"
-            elif entry["negative"] or entry["negative_crop"]:
-                reason = "negative-only set (negatives are not analyzed in folder mode)"
-            else:
-                reason = "no primary front image"
-            skipped_groups += 1
-            logger.warning(
-                "Skipping group '%s': %s; %d file(s) not analyzed: %s",
-                stem,
-                reason,
-                len(dropped),
-                dropped_names,
-            )
-            continue
-        if dropped:
-            logger.warning(
-                "Group '%s': folder mode analyzes only the primary front/back, so "
-                "%d file(s) are not analyzed: %s",
-                stem,
-                len(dropped),
-                dropped_names,
-            )
-        try:
-            # write_sidecar stays off here: the enriched record below is the one
-            # that belongs on disk, so the sidecar is written exactly once.
-            data = analyze_photo(primary_front, primary_back, config, original_meta=None, write_sidecar=False)
-            rec = data["result"][primary_front]
-            # augment with variants
-            all_fronts = [entry["primary"]["front"]] + [v["front"] for v in entry["variants"]]
-            all_backs = [entry["primary"]["back"]] + [v["back"] for v in entry["variants"]]
-            rec["all_variant_files"] = {"front": [p for p in all_fronts if p], "back": [p for p in all_backs if p]}
-
-            # Bank the result before touching the filesystem. The analysis is
-            # already paid for, so a sidecar that cannot be written must not
-            # take the record down with it and get reported as a model failure.
-            aggregated["results"][primary_front] = rec
-
-            if write_sidecars:
-                img_dir = os.path.dirname(os.path.abspath(primary_front))
-                img_base = os.path.splitext(os.path.basename(primary_front))[0]
-                json_path = os.path.join(img_dir, f"{img_base}.json")
-                try:
-                    with open(json_path, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2 if config.pretty_json else None, ensure_ascii=False)
-                except OSError as exc:
-                    logger.warning(
-                        "Sidecar not written for %s (%s): the analysis is kept in the results.",
-                        os.path.basename(primary_front),
-                        exc,
-                    )
-                else:
-                    logger.info("Sidecar written for %s: %s", os.path.basename(primary_front), json_path)
-        # Exception (not BaseException) so KeyboardInterrupt/SystemExit still abort.
-        except Exception as e:
-            if isinstance(e, ProviderApiError) and e.error_type in _RUN_FATAL_ERROR_TYPES:
-                # A missing key or SDK is a property of the run, not of one
-                # photo: isolating it would repeat the same error per group.
-                raise
-            error_payload = _normalized_error_payload(e)
-            aggregated["errors"][primary_front] = error_payload
-            if first_error is None:
-                first_error = e
-            logger.error(
-                "Group '%s' failed on %s: %s: %s",
-                stem,
-                os.path.basename(primary_front),
-                error_payload["type"],
-                error_payload["message"],
-                exc_info=error_payload["type"] not in SELF_EXPLANATORY_ERROR_TYPES,
-            )
-    if first_error is not None and not aggregated["results"]:
-        raise first_error
-    # A lossy run reports its total at WARNING: the per-group warnings above are
-    # already at that level, so an INFO-only summary would vanish at exactly the
-    # threshold where the count matters most.
-    lossy = bool(skipped_groups or aggregated["errors"] or unanalyzed_files)
-    logger.log(
-        logging.WARNING if lossy else logging.INFO,
-        "Batch completed for %d primary set(s); %d group(s) skipped, %d group(s) failed, "
-        "%d file(s) not analyzed.",
-        len(aggregated["results"]),
-        skipped_groups,
-        len(aggregated["errors"]),
-        unanalyzed_files,
+    return process_manifest_stream(
+        manifest=manifest,
+        cfg=config,
+        update_policy=UPDATE_MERGE_PER_VARIANT,
+        write_sidecars=write_sidecars,
+        strict_run_failures=True,
     )
-    return aggregated
 
 
 # === Manifest grouping ===
@@ -1219,6 +1225,31 @@ def _resolve_manifest_entry(raw: dict) -> dict | None:
     }
 
 
+def build_manifest_buckets(items: List[dict]) -> Dict[str, List[dict]]:
+    """Bucket manifest items by resolved group key, dropping items with no usable path.
+
+    The single implementation of the grouping every input mode sees, so a count
+    taken from it -- ``--generate-manifest`` reports one -- cannot drift from the
+    grouping the run actually performs. Resolving the entries here is also what
+    surfaces the explicit-override warnings, which is why the flag can report a
+    disagreeing ``--back`` before it writes the file.
+
+    Args:
+        items: The manifest's ``items`` array.
+
+    Returns:
+        ``{group_key: [entry, ...]}`` in first-seen key order, entries in item
+        order.
+    """
+    buckets: Dict[str, List[dict]] = {}
+    for raw in items:
+        entry = _resolve_manifest_entry(raw)
+        if entry is None:
+            continue
+        buckets.setdefault(entry["group_key"], []).append(entry)
+    return buckets
+
+
 def _manifest_part_key(entry: dict) -> str:
     """Return the slot an entry competes for within its variant.
 
@@ -1321,6 +1352,7 @@ def process_manifest_stream(
     changeset_writer=None,
     changeset_run_id: str | None = None,
     metadata_hydrator: Callable[[List[dict]], None] | None = None,
+    strict_run_failures: bool = False,
 ) -> dict:
     """Stream manifest processing results while still returning a full snapshot.
 
@@ -1328,6 +1360,23 @@ def process_manifest_stream(
     so we stream NDJSON records as soon as each group finishes *and* build the
     aggregate result that older callers expect.  This dual behavior is the core
     design constraint worth documenting.
+
+    Args:
+        strict_run_failures: Folder mode's Phase A failure contract, off by
+            default so manifest mode -- the plug-in contract -- keeps behaving
+            exactly as it did. When on, a ``ProviderApiError`` describing the run
+            rather than one photo aborts immediately instead of being repeated
+            per group, and a run in which every group failed re-raises its first
+            failure rather than returning an empty result the caller exits 0 on.
+            The asymmetry between the two modes is deliberate and owned by
+            Phase C; see ``docs/unified-input-pipeline.md``.
+
+    Returns:
+        ``{"results": {path: record}, "errors": {path: payload}}``, one entry per
+        file, and the two are disjoint. Every file of a failed group carries
+        that group's error payload, bar one already banked when the group raised
+        part-way through its per-file loop: that record is complete and its
+        ``ok`` line is already on the stream, so it stands.
     """
     if isinstance(manifest, str):
         man = utils.load_manifest(utils.normalize_path(manifest))
@@ -1350,14 +1399,10 @@ def process_manifest_stream(
     items = man.get("items", [])
     if metadata_hydrator is not None:
         metadata_hydrator(items)
-    buckets: dict[str, list[dict]] = {}
-    for raw in items:
-        entry = _resolve_manifest_entry(raw)
-        if entry is None:
-            continue
-        buckets.setdefault(entry["group_key"], []).append(entry)
+    buckets = build_manifest_buckets(items)
 
     results: dict[str, dict] = {}
+    errors: dict[str, dict] = {}
     run_id = changeset_run_id or (make_run_id() if changeset_writer else None)
 
     def _emit(path: str, status: str, payload: dict):
@@ -1369,10 +1414,28 @@ def process_manifest_stream(
             ndjson_writer(json.dumps(rec, ensure_ascii=False))
         if status == "ok":
             results[path] = payload.get("result") or payload
+        elif status == "error":
+            errors[path] = payload.get("error") or payload
+
+    failed_groups = 0
+    first_error: Exception | None = None
+    # Files a group listed but could not place in its payload: every one of them
+    # is already the subject of a per-group WARNING, so this is the honest total
+    # for the completion line below. Union, since a crop can be displaced too.
+    unplaced_paths: set[str] = set()
 
     group_keys = ordered_group_keys(buckets)
     for stem in group_keys:
         group = buckets[stem]
+        # Bound before the try so the failure log always has a subject: a group
+        # can fail well before primary selection has run.
+        subject = group[0]["path"] if group else stem
+        # Paths already banked when a group raises part-way through its per-file
+        # emit loop below. Their records are complete and their ``ok`` line is
+        # already on the stream, so re-reporting them in the handler would key
+        # one path under both ``results`` and ``errors`` and contradict a line
+        # the consumer may have acted on.
+        emitted_ok: set[str] = set()
         try:
             multipage_present = any(it["part_kind"] == "page" for it in group)
             # Rank order, not arrival order, so the warnings below and the
@@ -1594,6 +1657,7 @@ def process_manifest_stream(
                     # actually sent as the front, not the item that won a master
                     # pick it then lost the front role to.
                     primary_version = front_entry["version"]
+            subject = primary_front
 
             # Read the back out of the slot map so the back sent to the model is
             # always the file that owns the slot: same version as the primary
@@ -1655,6 +1719,8 @@ def process_manifest_stream(
                     len(unanalyzed_crops),
                     ", ".join(os.path.basename(c["path"]) for c in unanalyzed_crops),
                 )
+            unplaced_paths.update(c["path"] for c in unanalyzed_crops)
+            unplaced_paths.update(p for paths in displaced_slots.values() for p in paths)
 
             combined_meta = utils.combine_group_metadata(group)
             sent_to_model_snapshot = select_forwarded_metadata(combined_meta, forward_fields)
@@ -2084,13 +2150,54 @@ def process_manifest_stream(
 
                 results[it["path"]] = merged
                 _emit(it["path"], "ok", {"result": merged, "patch": patch, "patch_meta": patch_meta, "usage": {"prompt_tokens": (merged.get("_usage") or {}).get("prompt_tokens"), "completion_tokens": (merged.get("_usage") or {}).get("completion_tokens"), "total_tokens": (merged.get("_usage") or {}).get("total_tokens"), "model": (merged.get("_usage") or {}).get("model")}})
+                emitted_ok.add(it["path"])
 
+        # Exception (not BaseException) so KeyboardInterrupt/SystemExit still abort.
         except Exception as e:
+            if (
+                strict_run_failures
+                and isinstance(e, ProviderApiError)
+                and e.error_type in _RUN_FATAL_ERROR_TYPES
+            ):
+                # A missing key or SDK is a property of the run, not of one
+                # photo: isolating it would repeat the same error per group.
+                # Raised before any record is emitted, so a run that cannot work
+                # at all reports one failure rather than a full set of them.
+                raise
             error_payload = _normalized_error_payload(e)
             if error_payload.get("type") not in SELF_EXPLANATORY_ERROR_TYPES:
                 error_payload["traceback"] = traceback.format_exception(e.__class__, e, e.__traceback__)
+            failed_groups += 1
+            if first_error is None:
+                first_error = e
+            logger.error(
+                "Group '%s' failed on %s: %s: %s",
+                stem,
+                os.path.basename(subject),
+                error_payload["type"],
+                error_payload["message"],
+                exc_info=error_payload["type"] not in SELF_EXPLANATORY_ERROR_TYPES,
+            )
             err_payload = {"error": error_payload}
             for it in group:
-                _emit(it["path"], "error", err_payload)
+                if it["path"] not in emitted_ok:
+                    _emit(it["path"], "error", err_payload)
 
-    return {"results": results}
+    if strict_run_failures and first_error is not None and not results:
+        raise first_error
+    # A lossy run reports its total at WARNING: the per-group messages it
+    # summarizes are already at that level, so an INFO-only summary would vanish
+    # at exactly the threshold where the count matters most. A variant recorded
+    # but not sent because ``process_all_variants`` is off is not counted --
+    # that is the documented design, not a loss.
+    lossy = bool(failed_groups or unplaced_paths)
+    logger.log(
+        logging.WARNING if lossy else logging.INFO,
+        "Batch completed for %d group(s); %d file(s) recorded, %d group(s) failed, "
+        "%d file(s) displaced or dropped from their group's payload.",
+        len(group_keys),
+        len(results),
+        failed_groups,
+        len(unplaced_paths),
+    )
+    return {"results": results, "errors": errors}

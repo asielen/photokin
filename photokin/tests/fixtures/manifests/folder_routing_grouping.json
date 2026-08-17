@@ -1,0 +1,92 @@
+[
+  {
+    "group": "album",
+    "files": [
+      {
+        "file": "album-page1.jpg",
+        "part": "page",
+        "page": 1,
+        "version": null,
+        "crop": false
+      },
+      {
+        "file": "album-page2-crop.jpg",
+        "part": "page",
+        "page": 2,
+        "version": null,
+        "crop": true
+      },
+      {
+        "file": "album-page2.jpg",
+        "part": "page",
+        "page": 2,
+        "version": null,
+        "crop": false
+      }
+    ]
+  },
+  {
+    "group": "box3_025",
+    "files": [
+      {
+        "file": "box3_025-back.jpg",
+        "part": "back",
+        "page": null,
+        "version": null,
+        "crop": false
+      },
+      {
+        "file": "box3_025-crop.jpg",
+        "part": "none",
+        "page": null,
+        "version": null,
+        "crop": true
+      },
+      {
+        "file": "box3_025.jpg",
+        "part": "none",
+        "page": null,
+        "version": null,
+        "crop": false
+      },
+      {
+        "file": "box3_025b-back.jpg",
+        "part": "back",
+        "page": null,
+        "version": "b",
+        "crop": false
+      },
+      {
+        "file": "box3_025b.jpg",
+        "part": "none",
+        "page": null,
+        "version": "b",
+        "crop": false
+      }
+    ]
+  },
+  {
+    "group": "box3_026",
+    "files": [
+      {
+        "file": "box3_026-negative.jpg",
+        "part": "negative",
+        "page": null,
+        "version": null,
+        "crop": false
+      }
+    ]
+  },
+  {
+    "group": "box3_027",
+    "files": [
+      {
+        "file": "box3_027.png",
+        "part": "none",
+        "page": null,
+        "version": null,
+        "crop": false
+      }
+    ]
+  }
+]

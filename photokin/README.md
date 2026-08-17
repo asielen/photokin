@@ -6,12 +6,12 @@ One architectural fact frames everything else: the core has no ExifTool dependen
 
 ## The pipeline
 
-Input arrives as a single photo, a folder, or a manifest, and is first grouped into physical objects — fronts matched with backs, variant scans folded together, album pages kept in order. Each group becomes one prompt: the shared prompt files, plus whatever metadata and photo context was forwarded with it. That prompt goes to exactly one provider adapter, and the response comes back as JSON — repaired if the model mangled it, which some reliably do. The parsed result is then merged against the metadata the photo already had, and leaves the pipeline as a result object, an NDJSON stream record, and optionally a changeset of proposed file writes for the ExifTool wrapper to apply.
+Input arrives as a single photo, a folder, or a manifest. All three become the same thing — a list of manifest items — and are grouped into physical objects by one function: fronts matched with backs, variant scans folded together, album pages kept in order, crops recorded beside the scan they were cut from. Each group becomes one prompt: the shared prompt files, plus whatever metadata and photo context was forwarded with it. That prompt goes to exactly one provider adapter, and the response comes back as JSON — repaired if the model mangled it, which some reliably do. The parsed result is then merged against the metadata the photo already had, and leaves the pipeline as a result object, an NDJSON stream record, and optionally a changeset of proposed file writes for the ExifTool wrapper to apply.
 
 That journey maps onto the files like this:
 
-- `core.py` — orchestration: `analyze_photo`, `analyze_folder`, `analyze_manifest`, `process_manifest_stream` (streaming NDJSON + aggregate).
-- `utils.py` — `Config`, prompt assembly, image encoding, JSON repair/parse, filename grouping, manifest helpers.
+- `core.py` — orchestration: `analyze_photo`, `analyze_folder`, `analyze_manifest`, `process_manifest_stream` (streaming NDJSON + aggregate). Folder and single-photo input are translated into manifest items (`build_folder_manifest`, `build_single_photo_manifest`) and run through the stream, so there is one grouper and one batch loop; `build_manifest_buckets` is that grouper's entry point.
+- `utils.py` — `Config`, prompt assembly, image encoding, JSON repair/parse, filename parsing (`parse_media_filename`) and folder listing (`list_folder_images`), manifest helpers.
 - `face_utils.py` — normalizes face tags and renders them as the prompt block the model sees.
 - `api.py` — provider dispatch (adapters imported lazily, so only the selected provider's SDK must be installed).
 - `api_openai.py` / `api_claude.py` / `api_gemini.py` — provider adapters.
@@ -59,7 +59,7 @@ Four vendors means four exception zoos, so every provider failure is normalized 
 
 Manifest-stream error payloads carry the normalized type/message and the HTTP status code when available. `missing_dependency` and `missing_api_key` are both raised eagerly in `core._build_provider_client`, before any request is attempted, so neither costs a request.
 
-What happens next differs by mode, and it is worth knowing which you are in. Folder mode treats those two as properties of the run rather than of one photo (`_RUN_FATAL_ERROR_TYPES`): the first group to hit one aborts the batch with a single fatal error. Manifest mode does not — it records one error entry per item and exits 0, so a manifest run with no API key produces a full set of `missing_api_key` records rather than one failure. Read the records, not just the exit status.
+What happens next differs by mode, and it is worth knowing which you are in. Folder and single-photo mode ask the shared stream for their own failure contract (`process_manifest_stream(..., strict_run_failures=True)`): those two error types are treated as properties of the run rather than of one photo (`_RUN_FATAL_ERROR_TYPES`), so the first group to hit one aborts the batch with a single fatal error, and a run in which no group succeeded re-raises its first failure instead of returning an empty result. Manifest mode keeps the opposite default — it records one error entry per item and exits 0, so a manifest run with no API key produces a full set of `missing_api_key` records rather than one failure. Read the records, not just the exit status. Whether that asymmetry should survive is a Phase C decision.
 
 For `error_type` values whose message is already the full explanation (`SELF_EXPLANATORY_ERROR_TYPES` in `photokin.errors` — the two above, plus `rate_limit`, `overloaded`, `invalid_input`/`invalid_request`, `api_status`, `length`), both the CLI's top-level fatal error and manifest-stream per-item error records omit the traceback; anything else keeps it, since an unrecognized failure is exactly when a traceback earns its keep.
 
@@ -82,7 +82,7 @@ All the knobs mentioned above live on one dataclass, `utils.Config` (core fields
 
 ## Embedding it yourself
 
-If you're calling the library from your own code rather than the CLI, the seam is `core.process_manifest_stream`: it accepts an optional `metadata_hydrator: Callable[[list[dict]], None]` that runs on the manifest items after loading and before grouping. The CLI passes `photokin.exiftool.make_manifest_hydrator(...)` there; you can pass your own callable — pull existing metadata from a database, a sidecar format, anywhere — or omit it entirely. The core itself never touches ExifTool, which is the whole point of the seam.
+If you're calling the library from your own code rather than the CLI, the seam is `core.process_manifest_stream`. It returns `{"results": {path: record}, "errors": {path: payload}}` with one entry per file, the two disjoint — every file of a failed group carries that group's payload, bar one already recorded before the group raised part-way through — and it accepts an optional `metadata_hydrator: Callable[[list[dict]], None]` that runs on the manifest items after loading and before grouping. The CLI passes `photokin.exiftool.make_manifest_hydrator(...)` there; you can pass your own callable — pull existing metadata from a database, a sidecar format, anywhere — or omit it entirely. The core itself never touches ExifTool, which is the whole point of the seam.
 
 ## Tests
 

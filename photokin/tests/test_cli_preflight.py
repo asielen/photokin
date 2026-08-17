@@ -51,7 +51,7 @@ def _analyzer_logging(message: str, payload: dict[str, object]) -> Callable[...,
 
     Args:
         message: Diagnostic text emitted on the ``photokin.core`` logger, standing
-            in for the batch-completion and skipped-group lines the real analyzers
+            in for the per-group and batch-completion lines the real analyzers
             produce.
         payload: The analysis result the stand-in returns.
 
@@ -177,7 +177,11 @@ class TestCliLoggingHandler(_CliTestCase):
     red as well.
     """
 
-    _DIAGNOSTIC = "Skipping group 'album': multipage set has no primary front"
+    # A line the pipeline really does emit. It used to be a skipped-group
+    # warning, which stopped being true when Phase B2 routed folder input
+    # through the manifest grouper and nothing is skipped any more; a fixture
+    # quoting a message the system cannot produce reads as evidence that it can.
+    _DIAGNOSTIC = "Group 'album': 1 crop file(s) are recorded but not analyzed: album-crop.jpg"
 
     def test_handler_lands_on_the_package_logger_and_not_the_root(self) -> None:
         root_handlers_before = list(self.root_logger.handlers)
@@ -249,8 +253,11 @@ class TestOutputFileOutsideManifestMode(_CliTestCase):
 
     def test_folder_input_with_output_file_exits_two_with_its_message(self) -> None:
         analyze_folder = Mock()
+        stream = Mock()
 
-        with patch("photokin.cli.analyze_folder", analyze_folder):
+        with patch("photokin.cli.analyze_folder", analyze_folder), patch(
+            "photokin.cli.process_manifest_stream", stream
+        ):
             code, stdout, stderr = self.run_cli(
                 ["--folder", "./scans/", "--output-file", "results.ndjson"]
             )
@@ -267,12 +274,17 @@ class TestOutputFileOutsideManifestMode(_CliTestCase):
             "Try: redirect stdout instead: photokin --folder ./scans/ > results.ndjson",
         )
         analyze_folder.assert_not_called()
+        stream.assert_not_called()
         self.assertEqual(stdout, "")
 
     def test_single_photo_input_with_output_file_exits_two_with_its_message(self) -> None:
-        analyze_photo = Mock()
+        # The stream is the whole assertion: since B2 single-photo input is
+        # translated into a one- or two-item manifest and handed to
+        # ``process_manifest_stream``, so that mock going uncalled is what says
+        # the guard stopped the run before anything was analyzed.
+        stream = Mock()
 
-        with patch("photokin.cli.analyze_photo", analyze_photo):
+        with patch("photokin.cli.process_manifest_stream", stream):
             code, stdout, stderr = self.run_cli(["box3_025.jpg", "--output-file", "results.json"])
 
         self.assertEqual(code, 2)
@@ -286,11 +298,11 @@ class TestOutputFileOutsideManifestMode(_CliTestCase):
             lines[1],
             "Try: redirect stdout instead: photokin box3_025.jpg > results.json",
         )
-        analyze_photo.assert_not_called()
+        stream.assert_not_called()
         self.assertEqual(stdout, "")
 
     def test_output_file_with_no_input_at_all_names_the_defaulted_mode(self) -> None:
-        with patch("photokin.cli.analyze_photo") as analyze_photo:
+        with patch("photokin.cli.process_manifest_stream") as stream:
             code, _, stderr = self.run_cli(["--output-file", "results.json"])
 
         # Only the problem line is pinned here: with no path to name, the
@@ -301,7 +313,7 @@ class TestOutputFileOutsideManifestMode(_CliTestCase):
             "[ERROR] --output-file is only supported in --manifest mode; saw "
             "single-photo input with --output-file results.json, which would be ignored.",
         )
-        analyze_photo.assert_not_called()
+        stream.assert_not_called()
 
 
 class TestStdoutIsJsonOnly(_CliTestCase):
@@ -323,7 +335,7 @@ class TestStdoutIsJsonOnly(_CliTestCase):
             "results": {"C:/scans/box3_025.jpg": {"keywords": ["portrait"]}},
             "errors": {},
         }
-        diagnostic = "Skipping group 'album': multipage set has no primary front"
+        diagnostic = "Group 'album': 1 crop file(s) are recorded but not analyzed: album-crop.jpg"
 
         with patch(
             "photokin.cli.analyze_folder", _analyzer_logging(diagnostic, payload)
@@ -336,13 +348,18 @@ class TestStdoutIsJsonOnly(_CliTestCase):
         self.assertNotIn(diagnostic, stdout)
 
     def test_single_photo_run_emits_only_json_on_stdout(self) -> None:
+        # Patched at the stream, not at ``analyze_photo``: since B2 the
+        # single-photo branch synthesizes a one- or two-item manifest and routes
+        # it through the same batch path every other mode uses, so its stdout is
+        # the stream's aggregate rather than one photo's ``{"result": ...}``.
         payload: dict[str, object] = {
-            "result": {"C:/scans/box3_025.jpg": {"keywords": ["portrait"]}}
+            "results": {"C:/scans/box3_025.jpg": {"keywords": ["portrait"]}},
+            "errors": {},
         }
         diagnostic = "Skipping archival upload for provider anthropic"
 
         with patch(
-            "photokin.cli.analyze_photo", _analyzer_logging(diagnostic, payload)
+            "photokin.cli.process_manifest_stream", _analyzer_logging(diagnostic, payload)
         ):
             code, stdout, stderr = self.run_cli(["box3_025.jpg", "--provider", "anthropic"])
 
@@ -363,7 +380,7 @@ class TestStdoutIsJsonOnly(_CliTestCase):
         payload: dict[str, object] = {
             "results": {"C:/scans/box3_025.jpg": {"keywords": ["portrait"]}}
         }
-        diagnostic = "Skipping group 'album': multipage set has no primary front"
+        diagnostic = "Group 'album': 1 crop file(s) are recorded but not analyzed: album-crop.jpg"
         summary = {
             "files_seen": 1,
             "files_written": 1,
@@ -667,6 +684,107 @@ class TestChangesetPreflight(_CliTestCase):
             self.assertEqual(stdout, "")
             with open(changeset_path, "r", encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "PREVIOUS RUN CONTENT\n")
+
+
+class TestGenerateManifestInputExists(_CliTestCase):
+    """``--generate-manifest`` describes a run, so it must refuse one that cannot happen.
+
+    The folder form already fails loudly on a directory that is not there,
+    because building the manifest has to list it. The single-photo form builds
+    from the argument alone, so a typo used to write a manifest for a file that
+    does not exist and exit 0 -- while the identical input without the flag
+    exits 2 -- and the file it produced only failed later, fed back through
+    ``--manifest``.
+    """
+
+    def _run_generate(self, argv: list[str]) -> tuple[int | None, str, str, Mock, Mock]:
+        """Run ``--generate-manifest`` with both analysis entry points mocked.
+
+        Args:
+            argv: Arguments after the program name.
+
+        Returns:
+            ``(exit code, stdout, stderr, analyze_folder mock, stream mock)``.
+        """
+        analyze_folder, stream = Mock(), Mock()
+        with patch("photokin.cli.analyze_folder", analyze_folder), patch(
+            "photokin.cli.process_manifest_stream", stream
+        ):
+            code, stdout, stderr = self.run_cli(argv)
+        return code, stdout, stderr, analyze_folder, stream
+
+    def test_a_missing_image_is_refused_and_nothing_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            missing = os.path.join(folder, "nope.jpg")
+            out_path = os.path.join(folder, "out.json")
+
+            code, stdout, stderr, _folder_mock, _stream = self._run_generate(
+                [missing, "--generate-manifest", out_path]
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                stderr.splitlines()[0],
+                f"[ERROR] File not found after normalization: {missing}",
+            )
+            self.assertFalse(
+                os.path.exists(out_path),
+                "a manifest was written describing a run that cannot happen",
+            )
+            self.assertEqual(stdout, "")
+
+    def test_a_missing_back_is_refused_too(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            image = os.path.join(folder, "box3_025.jpg")
+            with open(image, "w", encoding="utf-8") as handle:
+                handle.write("")
+            missing_back = os.path.join(folder, "nope.jpg")
+            out_path = os.path.join(folder, "out.json")
+
+            code, _stdout, stderr, _folder_mock, _stream = self._run_generate(
+                [image, "--back", missing_back, "--generate-manifest", out_path]
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                stderr.splitlines()[0],
+                f"[ERROR] File not found after normalization: {missing_back}",
+            )
+            self.assertFalse(os.path.exists(out_path))
+
+    def test_the_error_matches_the_one_the_same_input_gets_without_the_flag(self) -> None:
+        # The point of the guard: one input, one answer. The flag describing a
+        # grouping for input the analysis path refuses is the mismatch.
+        with tempfile.TemporaryDirectory() as folder:
+            missing = os.path.join(folder, "nope.jpg")
+
+            _code, _stdout, generated, _folder_mock, _stream = self._run_generate(
+                [missing, "--generate-manifest", os.path.join(folder, "out.json")]
+            )
+            analyzed_code, _stdout, analyzed = self.run_cli([missing, "--no-update-vocab"])
+
+            self.assertEqual(analyzed_code, 2)
+            self.assertEqual(generated.splitlines()[0], analyzed.splitlines()[0])
+
+    def test_an_existing_image_still_writes_its_manifest_and_calls_no_model(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            image = os.path.join(folder, "box3_025.jpg")
+            with open(image, "w", encoding="utf-8") as handle:
+                handle.write("")
+            out_path = os.path.join(folder, "out.json")
+
+            code, stdout, stderr, folder_mock, stream = self._run_generate(
+                [image, "--generate-manifest", out_path]
+            )
+
+            self.assertIsNone(code)
+            self.assertEqual(stdout, "")
+            self.assertIn("Wrote manifest for 1 file(s) in 1 group(s)", stderr)
+            with open(out_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            self.assertEqual(manifest["items"], [{"path": image, "group": "box3_025"}])
+            self.assertFalse(folder_mock.called)
+            self.assertFalse(stream.called)
 
 
 if __name__ == "__main__":

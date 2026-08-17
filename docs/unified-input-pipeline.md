@@ -16,30 +16,70 @@ Three defects, each verified by running the real code rather than reading it.
 
 ### CRITICAL - Folder mode silently drops whole groups
 
-Any group whose primary front is absent is skipped with no warning. That is every
-multipage or album set and every negative-only set. The completion line then reports
-only what was processed, so the run looks clean and the count looks plausible.
+Any group whose primary front is absent is skipped with no warning. That is three
+categories: every multipage or album set, every negative-only set, and every
+back-only set - a folder holding the reverse of a print whose front was never
+scanned, or was filed elsewhere. The completion line then reports only what was
+processed, so the run looks clean and the count looks plausible.
+
+The third is the easiest to miss and not the least costly: a back is usually the
+side carrying the handwriting, the dates and the names, which is the text content
+the tool exists to read.
 
 `core.py:913-914` · count at `core.py:929` · album pages documented at `README.md:50`
 
 **Status after Phase A:** the silence is gone, the loss is not. Every skipped group
-now logs its reason and the completion line carries a skipped count
-(`core.py:979-993`, `core.py:1041-1048`), so the run no longer looks clean. The
-groups still go unanalyzed until Phase B routes folder input through the manifest
-pipeline, and the README now carries that caveat at the point where it used to
-promise otherwise (`README.md:240`, `README.md:254`).
+now logs its reason and the completion line carries a skipped count, so the run no
+longer looks clean. The groups still go unanalyzed until Phase B routes folder input
+through the manifest pipeline.
 
-Verification, real grouper against a fixture folder:
+**Status after Phase B2: fixed.** Folder input is translated into manifest items and
+run through `process_manifest_stream`, so nothing is skipped and the reason-selection
+block, its `continue` and the skipped counter are gone. Same fixture, same grouping,
+new outcome — three model calls instead of one, and a record for all four files:
 
 ```
-GROUP 'album': primary.front=None  pages={1: album-page1.jpg, 2: album-page2.jpg}
-GROUP 'box3_025': primary.front=box3_025.jpg
-GROUP 'neg':   primary.front=None  negative=neg-negative.jpg
+before (7bcaf2f):  analyze_photo(box3_025.jpg)
+                   results: ['box3_025.jpg']
 
---- groups analyze_folder would SKIP (primary.front is None) ---
-  SKIPPED: album -> ['album-page1.jpg', 'album-page2.jpg']
-  SKIPPED: neg   -> ['neg-negative.jpg']
+after:             analyze_photo(album-page1.jpg)
+                   analyze_photo(box3_025.jpg)
+                   analyze_photo(neg-negative.jpg)
+                   results: ['album-page1.jpg', 'album-page2.jpg',
+                             'box3_025.jpg', 'neg-negative.jpg']
+                   Batch completed for 3 group(s); 4 file(s) recorded,
+                   0 group(s) failed, 0 file(s) displaced or dropped ... [INFO]
+
+after, --process-all-variants (dead in folder mode until now):
+                   analyze_group_parts(("Page 1", [album-page1.jpg]),
+                                       ("Page 2", [album-page2.jpg]))
+                   analyze_group_parts(("Front",  [box3_025.jpg]))
+                   analyze_group_parts(("Negative", [neg-negative.jpg]))
 ```
+
+The third category is not in that fixture and was verified separately, because it is
+a whole folder rather than one group inside a mixed one:
+
+```
+a folder holding only box3_030-back.jpg
+
+before (7bcaf2f):  Skipping group 'box3_030': no primary front image;
+                   1 file(s) not analyzed: box3_030-back.jpg
+                   results: []                                       exit 0
+
+after:             analyze_photo(box3_030-back.jpg)
+                   results: ['box3_030-back.jpg']
+```
+
+The file is uploaded once, filling the payload's front slot because a one-file group
+has nothing else to put there, and the record still files it as what it is:
+`all_variant_files` comes back `{"front": [], "back": [box3_030-back.jpg], ...}`. It is
+specifically not sent as `photo(P, P)` - that collapse to `photo(P, None)` for a group
+with no front side is the 909-case invariant-(a) family recorded under B1 above, and it
+is what makes analyzing these folders safe rather than a way to pay twice for one image
+and assert it is a side it is not. Manifest mode at 7bcaf2f already analyzed this
+folder, so like the variant-back change recorded under B2 below, this is B1 semantics
+reaching folder mode rather than a new rule.
 
 ### HIGH - No per-group error isolation in folder mode
 
@@ -95,8 +135,8 @@ manifest lists crop first      : {None: {'none': 'box3_025-crop.jpg'}}
 
 This is order-dependent silent data loss on the integration surface, and it affects backs
 identically (`box3_025-back.jpg` and `box3_025-back-crop.jpg` both map to `back`). Folder
-mode is unaffected in outcome only because `group_folder_images` keeps crops in their own
-slots and never analyzes them at all.
+mode is unaffected in outcome only because `group_folder_images` (retired in B2) keeps
+crops in their own slots and never analyzes them at all.
 
 **Status after Phase B1:** fixed. Slot occupancy is now decided by rank rather than by
 arrival (`_slot_rank_key`, `core.py:1213-1229`), and crop-ness is the leading component,
@@ -127,9 +167,10 @@ round of defects: see the two payload invariants under Phase B1 below.
 | `apply.py:166-170` | ExifTool presence is checked only after the entire batch is analyzed and paid for. |
 | `cli.py:357` | A `.json` output path is never pre-flighted, so an unwritable destination fails at the end. The `.ndjson` branch is covered incidentally by its truncate-on-open. |
 | `core.py:924-927` | Folder mode writes each sidecar twice, once inside `analyze_photo` and again with variants attached. |
-| `core.py:915` | `--process-all-variants` is dead in folder mode; the group path is never reached. |
+| `core.py:915` | `--process-all-variants` is dead in folder mode; the group path is never reached. Fixed in B2 — folder runs take the same branch manifest runs do. |
 | `config.py:14-19` | `EXIFTOOL_WRITE_ENABLED=""` silently resolves to false, as does any unrecognized value. |
 | `cli.py:310` | A `.json` output file yields a generic `changeset.ndjson` that collides across runs. |
+| `cli.py:675-677` | The aggregate `.json` write unlinked the destination before `os.replace`, which already overwrites atomically on Windows and POSIX both. The unlink bought nothing and opened a window in which the caller's previous results file was gone; if the replace then failed, the `finally` cleared the temp file and the run ended with neither. Found while fixing the same sequence in B2's `_write_generated_manifest`, which had copied the pattern from here - both are fixed, so the docstring's "matching how the aggregate `.json` output is written" is true again. Not in the original audit; pre-dates the whole plan. |
 | `README.md:89` | Tells the reader to apply `batch_changeset.ndjson`; the file actually produced is `results_changeset.ndjson`. Corrected in the README alongside Phase A (`README.md:287-290`, `README.md:337-338`), which now also states the derivation, and in `photokin/exiftool/README.md:102`. |
 
 ---
@@ -237,6 +278,13 @@ loss is actually repaired rather than merely reported.
 are analyzed; `--process-all-variants` works for folders; error isolation and
 hydration come along for free.
 
+*Met, except the last clause, which was wrong.* Error isolation is free - it is the
+stream's own, extended with folder mode's abort and re-raise behind
+`strict_run_failures`. Hydration is not: it would change every existing folder run's
+prompt and cost, and it needs `{"metadata": {}}` seeded on every synthesized item
+before it does anything at all. Both modes pass `metadata_hydrator=None`; see the
+Phase C note under B2.
+
 **Risk:** medium. The `analyze_folder` return shape changes again - the per-file
 half Phase A did not take - and it is public API.
 
@@ -322,12 +370,159 @@ Two carve-outs on `preferred` follow from the above and are now documented at
 for one, so it does not promote a crop over the original it was cut from, nor an
 untagged file into a front side already claimed.
 
-**Still owed by B2:** folder and single-photo routing through `process_manifest_stream`,
-`--generate-manifest`, the `analyze_folder` return shape, retiring or rewrapping
-`group_folder_images`, and the richer variant map. Note for B2's parity goldens: manifest
-mode addresses negatives per variant, `group_folder_images` bins them at stem level with
-an unconditional assignment (`utils.py:1402-1407`), so two negatives differing only by
-variant letter overwrite each other there. The per-variant form is the one to encode.
+**B2 shipped - the routing.** Folder and single-photo input are now translated into
+in-memory manifest items and handed to `process_manifest_stream`, which is the whole
+of the change; no grouping logic was written for B2, because B1 had already built the
+target. What landed:
+
+- `core.build_folder_manifest` and `core.build_single_photo_manifest` synthesize the
+  items. A folder item carries `path` and nothing else - the filename is folder mode's
+  only source of truth, so an explicit key would hand `_resolve_manifest_entry` back
+  the answer it is about to derive and then freeze it. Single-photo mode is the
+  deliberate exception: `--back` becomes `is_back` plus a shared `group` (without it
+  `photo.jpg --back reverse.jpg` splits into two objects and two calls), and `--meta`
+  rides inline on the front. Listing is `utils.list_folder_images`, sorted by
+  `(basename.lower(), basename)` so the input-ordered outputs - the
+  `all_variant_files` lists, the emission order - do not vary by filesystem.
+- `core.build_manifest_buckets` is the extracted bucket loop, so the group count
+  `--generate-manifest` reports is taken from the same code the run groups with.
+- `process_manifest_stream` gained `strict_run_failures` (folder mode's Phase A
+  failure contract, default off so the plug-in path is byte-identical), an `errors`
+  accumulator in its return, a per-group failure ERROR line, and one completion line.
+- `--generate-manifest PATH` writes the synthesized manifest, atomically and always
+  pretty, and exits without building a provider client. `photo_context_text` is
+  inlined resolved and sanitized so the file round-trips; nothing else about the run
+  is emitted.
+- `utils.group_folder_images` and `core._unanalyzed_group_files` are **deleted**. The
+  first was the second implementation of the suffix grammar and the reason routing had
+  to wait for B1; it carried three data-loss bugs B1 fixed on the manifest side
+  (`-page0` filed as page 1, negatives binned at stem level so two variants overwrote
+  each other, and slot collisions resolved by `os.listdir` order with no warning). Once
+  nothing called it, leaving it in place was strictly worse than removing it. Neither
+  name is on `public.py` or `__init__.py`, so neither gets a breaking-change entry;
+  `list_folder_images` takes over the listing behavior unchanged, so the file set and
+  every path spelling are identical.
+
+Verified by differential run against 7bcaf2f with `process_all_variants` off - the
+default, and the only setting that was reachable in folder mode. An earlier draft of
+this section reported the model calls as identical across the whole fixture set; that
+was wrong, and it was wrong because the fixture set did not cover the shape where they
+differ. The corrected result is that the fixtures split in two.
+
+**Model call unchanged** - identical in callee, front, back and `write_sidecar`:
+front/back, front/back/variant, variant-with-its-own-back, front-only, crop,
+mixed-extension, non-image. The single difference on these is `original_meta`, `None`
+before and `{}` now, which `build_prompt_bundle` tests with `if forwarded_meta:` and
+therefore cannot distinguish. (`results` gains one entry per file on all of them; that
+is Breaking change #2 and is deliberate.)
+
+**Model call changed** - four shapes, three of them the point of the phase. Album
+pages, negative-only sets and back-only sets went from no call at all to one call
+each: that is the CRITICAL finding being fixed, documented in section 1.
+
+The fourth was not planned and is recorded here as an accepted consequence of parity.
+Where a group's primary front has **no back of its own** but a variant scan does, the
+variant's back is now sent as the group's back:
+
+```
+box3_025.jpg / box3_025b.jpg / box3_025b-back.jpg   (no crops, no pages, no negatives)
+
+  7bcaf2f : photo(front=box3_025.jpg, back=None)               <- variant's back never sent
+  B2      : photo(front=box3_025.jpg, back=box3_025b-back.jpg)
+```
+
+This is not something B2 invented. 7bcaf2f's *manifest* mode already made the second
+call for those same three files, so this is B1 grouping arriving in folder mode, which
+is what parity means. Kept deliberately: old folder mode was ignoring an available back
+scan, and the variants are scans of one object, so that back is the object's back.
+
+The cost is bounded and worth stating plainly rather than either hiding or inflating:
+one extra image on one call, and only for groups shaped this way. A group whose primary
+front has its own back is untouched - the primary's own back outranks a variant's for
+the slot, which is why `variant-with-its-own-back` sits in the unchanged list above.
+
+Note the fixture name is the trap the earlier draft fell into: `variant-with-its-own-back`
+covers only the sub-shape where the *primary* also has a back, so a differential over it
+says nothing about the case where the primary has none.
+
+Folder input and the manifest `--generate-manifest` writes for the same folder produce
+identical model calls, identical `results`, identical `errors` and an identical
+diagnostic sequence, in both `process_all_variants` settings.
+
+**Second pass - three defects the routing introduced or exposed.** Adversarial review
+found them after the differential sweep above, which compared the model calls and the
+record set but not the failure paths:
+
+- *A sidecar that cannot be written no longer fails its group.* Phase A banked the
+  record before touching the filesystem and caught `OSError`, on the grounds that the
+  analysis is already paid for. Forwarding `write_sidecars` into the stream moved the
+  write inside `analyze_photo` / `analyze_group_parts`, where it is unguarded, so a
+  read-only `.json` left by a previous run - or a lock held by a sync client, a path
+  over `MAX_PATH`, a read-only share - turned a completed analysis into a group
+  failure typed `PermissionError`, with one error payload per file of the group, and
+  when it hit every group re-raised through `strict_run_failures` and lost the whole
+  batch behind exit 2. Both writes now go through `_write_sidecar_document`, which
+  warns in Phase A's own wording and keeps the record. Manifest mode gains the same
+  protection: it had the failing behavior before, but the reasoning was never
+  folder-specific, and threading a mode flag down to the write site would encode the
+  asymmetry in a third signature.
+- *`results` and `errors` can no longer name the same file.* The per-file emit loop
+  banks one record at a time, so a group raising part-way through it had its
+  already-banked files re-emitted as errors - one path in both maps, and both an `ok`
+  and an `error` line on the stream for it. The handler now skips what the group
+  already banked, which restores the disjointness Breaking change #2 claims. Manifest
+  mode only: folder items carry no inline `metadata`, which is what makes the
+  per-file loop reachable as a failure point.
+- *`--generate-manifest` refuses input the run itself would refuse.* The folder form
+  already failed loudly on a missing directory, because building the manifest has to
+  list it. The single-photo form built from the argument alone, so a typo wrote a
+  manifest for a nonexistent image and exited 0 where the same input without the flag
+  exits 2, and the file it produced only failed later, fed back through `--manifest`.
+  `ensure_paths_exist` now covers the image and `--back`.
+
+**Owed to Phase C - hydration for folder and single-photo input.** B2 passes
+`metadata_hydrator=None` for both, deliberately: hydration would change every existing
+folder user's prompt, cost and output in the phase whose job is routing, and it is not
+free to enable. `hydrate_user_comments` skips any item whose `metadata` is not a dict,
+and B2's folder items carry no `metadata` key at all, so turning it on requires seeding
+`{"metadata": {}}` on every synthesized item - which also makes `load_item_metadata`
+return `{}` instead of `None` for every file and changes the `merge_original_sources`
+inputs for every record. When Phase C lifts the manifest-only gate on the
+`--exiftool-*` flags, that seeding has to come with it.
+
+**B2 open risks.**
+
+- The completion line and the per-group failure ERROR line are new on *manifest* mode's
+  stderr. Both are additive diagnostics, and manifest mode already writes an INFO line
+  per photo there, so a plug-in that treated any stderr output as failure would be
+  failing today - which is why they were not gated on `strict_run_failures`. If that
+  assumption turns out to be wrong, gating them is a one-line change, at the cost of
+  leaving manifest mode's "a lossy run reads as clean" hole open until Phase C.
+- The `errors` key on `process_manifest_stream`'s return changes the aggregate `.json`
+  that `--output-file results.json` writes and the manifest stdout fallback. Additive,
+  but it is the plug-in's own artifact and this repo holds no fixture of its reader.
+  Confirm before release.
+- Folder mode's `--output-sidecars` content narrows: it becomes the raw
+  `{"result": {front: record}}` that `analyze_photo` writes, losing the
+  `all_variant_files` enrichment Phase A's single write added. Accepted for parity -
+  a folder-only sidecar shape would break it outright, the enriched content is present
+  in the returned records, and the alternative (per-file enriched sidecars from the
+  stream) would change manifest mode's sidecars too. Filenames are unchanged, since the
+  front chosen is the same file.
+- `strict_run_failures` encodes the folder/manifest failure asymmetry in a signature
+  rather than resolving it. It is the right seam for B2; Phase C should flip the
+  default or delete the parameter.
+- The `--folder` result-key set has now changed shape in two consecutive phases, for a
+  public re-exported function whose only in-repo consumer is `cli.py`. Neither change
+  can be validated against a real embedder here - the same blind spot the plan already
+  flags for the plug-in's manifest writer.
+- Deleting `utils.group_folder_images` is safe against everything greppable in this
+  repo, but `utils` is an ordinary importable module and an out-of-repo script could
+  import it directly. It is not on the `public.py` / `__init__.py` surface, so it gets
+  no breaking-change entry; that judgment could be wrong if such a consumer exists.
+- `--generate-manifest` inlines `photo_context_text` and never `photo_context_path`, so
+  a large context file is embedded in full (up to `MAX_PHOTO_CONTEXT_BYTES`) in every
+  generated manifest. Judged the right trade for exact round-tripping.
 
 ### Phase C - The CLI surface
 
@@ -433,11 +628,45 @@ it rather than wait for Phase B. The rider is behavioral rather than structural:
 per-group failure is now collected instead of propagated, and the call raises only
 when no group succeeded at all.
 
-**Still owed by Phase B:** unification changes the result from one entry per group
-to one per file, and records gain merge reports, scoped keywords and a richer
-variant map. That is the half no caller can absorb by reading `["results"]`, so this
-entry stays on the list. The function is re-exported from both `public.py` and
-`__init__.py`, so it breaks embedders independently of anything on the CLI.
+**Shipped in Phase B2 - the per-file half.** `analyze_folder` keeps its signature and
+returns:
+
+```python
+{
+    "results": {file_path: merged_record, ...},   # ONE ENTRY PER FILE
+    "errors":  {file_path: error_payload, ...},   # ONE ENTRY PER FILE of a failed group
+}
+```
+
+`set(results) | set(errors)` is exactly the set of files `list_folder_images` returned,
+and the two are disjoint: nothing in the folder is unaccounted for. Keys keep the
+spelling they had, so `results[some_front]` still works; what breaks is iteration -
+backs, variant scans, album pages, negatives and crops each have an entry now, so a
+caller making one downstream write per entry makes several. Records are exactly what
+the stream stores, with no folder-specific post-processing: they gain `_merge`, per-file
+scoped `keywords` and `caption`, `_usage` summed across the group, and the full
+`all_variant_files` map (`front`, `back`, `variants`, `all`, plus `pages`, `crops`,
+`negatives`, `displaced` where they apply) in place of the old `{"front": [...],
+"back": [...]}`. Error payloads are the stream's shape - `{"type", "message"}` plus
+`status_code` and `traceback` where they apply - which is a superset of Phase A's.
+
+Nothing is kept for compatibility: no `groups` key, no primary-front-only view. A shim
+would let an iterating caller stay green while its semantics changed silently, which is
+the failure mode Phase A exists to remove, and a per-group view is derivable from any
+record's `all_variant_files`. There is no runtime deprecation line either - a shape
+change that occurs on every run would be noise on every run.
+
+**Rider: the CLI's single-photo stdout changes too.** `core.analyze_photo` and
+`public.analyze_photo` are untouched - `analyze_photo` is the leaf the stream itself
+calls - but the CLI's single-photo branch now prints the stream's aggregate, so its
+stdout goes from `{"result": {front: record}}` to `{"results": ..., "errors": ...}`
+and gains a record for the `--back` file. Keeping the old shape would need a second
+translation layer and would hide the back's record.
+
+**Also new, and additive:** `process_manifest_stream` returns an `errors` key, so the
+manifest aggregate `.json` and the manifest stdout fallback carry one too; and both
+modes now get a per-group failure ERROR line and one completion line on stderr. See
+the B2 open risks under Phase B.
 
 ### 3. Deprecations
 
@@ -462,6 +691,11 @@ by a test.
 | B1 | Written, `photokin/tests/test_manifest_grouping.py`: permutation test over `itertools.permutations(items)` asserting the model call, the page/crop/negative slot maps and the warning set are invariant, across crop, page-zero, negative, `preferred` and `is_back` groups in both `--process-all-variants` settings. Crop displacement in both listing orders; the cropped-front-plus-uncropped-back and crop-only-back slots; the orphan-crop and dropped-crop warnings naming the right files; `-page0` keeping its own slot and label; a `preferred` back reaching the model whether or not it carries a variant letter. It uses at most one metadata-bearing item per group, since `combine_group_metadata` is still order-dependent. |
 | B1 | Still owed: the four overrides asserted in both directions, and the `feedback.jpg` non-repair for `_EXPLICIT_BACK_SUFFIX_RE`. |
 | B1 | Second pass: `TestPayloadInvariants` asserts both rules over the eight shapes that resolve one file into two roles or none, in both `--process-all-variants` settings. Plus the negative-plus-back group in both listing orders, the front-side role collision in its untagged and multipage forms, the duplicate listing, the `preferred` crop that used to fail its whole group, and the version an analysis is filed under when a `preferred` back wins the master pick. |
+| B2 | Rewritten, `photokin/tests/test_folder_mode.py`: the three tests that pinned the skipping now assert the opposite - every group reaches the model, every file gets a record, and the completion line reports a clean run at INFO. Plus the album-plus-pages group placing every file it can and naming the one it cannot, `--process-all-variants` sending `Page 1`/`Page 2` in one call, a two-file failed group carrying the same payload on both paths, and sidecar writing delegated to the shared analysis call. `TestUnanalyzedGroupFiles` was removed with the helper it exercised. |
+| B2 | Second pass: `TestSidecarWriteFailureKeepsTheAnalysis` (`test_folder_mode.py`) holds the record through an unwritable sidecar, in the one-group and the every-group case, stubbing only the provider boundary so the write really runs and really fails - the mocked-analyzer tests elsewhere in that module cannot see it. `TestPartialGroupFailure` (`test_manifest_grouping.py`) pins `results`/`errors` disjointness, one stream line per path, and no file lost, with the failure injected at a fixed point so it cannot go vacuous. `TestGenerateManifestInputExists` (`test_cli_preflight.py`) pins the missing image, the missing `--back`, the identical first error line with and without the flag, and that a real image still writes its manifest and calls no model. |
+| B2 | Written, `photokin/tests/test_folder_routing.py` (35 tests): the routing itself, where `test_folder_mode.py` covers the folder entry point's own contract. The headline regression - album pages, negative-only sets and back-only sets all reach the model, every file gets a record, and no group is reported skipped. Folder-vs-manifest parity over a fixture folder covering all five suffix forms, asserted on the model calls, the records and the diagnostic sequence in both `--process-all-variants` settings, against a hand-written manifest that spells the same paths differently so the comparison cannot collapse into a builder compared with itself. `--generate-manifest` against checked-in goldens under `photokin/tests/fixtures/manifests/` - both the document it writes and the grouping that document describes - the round trip back through `--manifest`, the file-and-group summary line, and the atomicity of the write. `--process-all-variants` changing what folder input sends, dead in that mode until B2. Single-photo `--back` matching the two-item manifest it is translated into, including a back the filename grammar cannot read. And `TestOrdinaryFolderIsUnchangedFrom7bcaf2f`, pinning call literals captured from that commit so the phase stays additive. |
+| B2 | Third pass, the two shapes the B2 differential missed: `TestBackOnlyGroupsReachTheModel` and `TestAVariantsBackIsPairedWithThePrimaryFront` (`test_folder_routing.py`). Neither is reachable from the checked-in fixture folder, which is why the sweep did not see them - its only multi-file group gives the primary front a back of its own, and it holds no back-only group at all - so both build their own folders. The second also asserts the bound on the change (a primary with its own back still prefers it) and that the same call comes out of the manifest pipeline, so the pairing is pinned as parity rather than as a folder-mode quirk. `TestGeneratedManifestAtomicWrite` covers the overwrite, the temp-file cleanup and a failed write leaving the previous manifest intact; the failure is injected at `os.replace` rather than at serialization, because a serialization failure happens before either write sequence touches the destination and so cannot tell the fixed code from the code that unlinked first. |
+| B2 | Nothing further owed. The two modules an earlier revision listed as outstanding - `test_generate_manifest.py` and `test_folder_manifest_parity.py` - were both written into `test_folder_routing.py` rather than as separate files, and the goldens they wanted are checked in: golden grouping over all five suffix forms and the four-group summary count in `TestGeneratedManifestGolden`, end-to-end parity in both `--process-all-variants` settings in `TestFolderManifestParity`, and the atomic write in `TestGeneratedManifestAtomicWrite`. |
 | C | Detection matrix: directory, `.json`, image; deprecated aliases still work; positional plus alias conflicts; `--back` with a folder errors. |
 | C | Every error case asserts exit code and first line. `-w` expands correctly in all modes, explicit flags override the expansion, and the contradictory combination errors. |
 | C | Regression for the default flip: with no write flags, nothing is written in any mode. |

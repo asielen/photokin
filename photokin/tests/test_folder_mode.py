@@ -1,32 +1,45 @@
-"""Phase A coverage for :func:`photokin.core.analyze_folder`.
+"""Coverage for :func:`photokin.core.analyze_folder`, after Phase B2 routed it
+through the manifest pipeline.
 
-Folder mode used to skip any group without a primary front -- every album page
-set and every negative-only set -- without a word, and then report a completion
-count that only described what it had processed, so a lossy run read as a clean
-one. It also had no per-group try/except, so one bad photo threw away every
-result already gathered, and it wrote each sidecar twice.
+Folder mode used to group album pages and negative-only sets correctly and then
+refuse to analyze them: no group without a plain front scan was ever sent to the
+model. Phase A made that loss loud -- a warning per skipped group and a skipped
+count -- and deliberately left it in place. Phase B2 removes it, so the tests
+that pinned the skipping have been inverted rather than deleted: they now assert
+that those groups are analyzed, that every file in the folder gets a record, and
+that the completion line reports a clean run.
 
-These tests pin the replacement behavior: every dropped file is named in the
-log, the completion line carries the skipped and unanalyzed counts at a level
-that survives an INFO threshold, one failing group costs only itself while a
-wholly failed batch still raises, a run-fatal provider error aborts immediately,
-an interrupt is never swallowed, and the sidecar is written once with the
-enriched record.
+What is pinned here:
 
-The model call is mocked out at ``analyze_photo``, so no provider client is ever
-built. Fixtures are empty placeholder files -- the grouper only reads filenames.
-The exception is ``TestFolderModeStdoutPurity``, which stubs only the provider
-boundary so the real analysis path -- and every diagnostic inside it -- runs.
+* every group reaches the model and every file gets a record, in both
+  ``process_all_variants`` settings -- the album pages travel as ``Page 1`` /
+  ``Page 2`` in one call once the flag is on, which is the flag working in
+  folder mode for the first time;
+* nothing is dropped in silence: a file that cannot be placed in its group's
+  payload is warned about by name and recorded under ``all_variant_files``;
+* one failing group costs one group, every file of it carries the same error
+  payload, a wholly failed batch still raises, a run-fatal provider error still
+  aborts on the first group, and an interrupt is never swallowed;
+* the sidecar is written by the shared analysis call rather than by a
+  folder-only second write, and a destination that cannot be written costs the
+  sidecar alone -- never the paid-for analysis that produced it.
+
+The model call is mocked out at ``analyze_photo`` / ``analyze_group_parts``, so
+no provider client is ever built. Fixtures are empty placeholder files -- the
+grouping only reads filenames. The exception is ``TestFolderModeStdoutPurity``,
+which stubs only the provider boundary so the real analysis path -- and every
+diagnostic inside it -- runs.
 """
 
 import io
 import json
 import logging
 import os
+import stat
 import tempfile
 import unittest
-from collections.abc import Iterable
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -37,19 +50,81 @@ _CORE_LOGGER = "photokin.core"
 _PACKAGE_LOGGER = "photokin"
 _COMPLETION_PREFIX = "Batch completed"
 
+#: A model reply the real parse path accepts, carrying a forbidden keyword and
+#: no "proposed_new_keywords" key so the two vocabulary warnings inside
+#: ``analyze_photo`` both fire. The single "front.jpg" key is remapped onto the
+#: real front path by core, so one constant serves any fixture.
+_MODEL_REPLY_JSON = json.dumps(
+    {
+        "result": {
+            "front.jpg": {
+                "caption": "Two people on a porch",
+                "keywords": ["porch", "family gathering"],
+            }
+        }
+    }
+)
+_MODEL_NAME = "claude-sonnet-4-6"
+
 
 def _fake_analysis(front_path: str) -> dict:
-    """Build the minimal ``analyze_photo`` return shape ``analyze_folder`` reads.
+    """Build the minimal ``analyze_photo`` return shape the stream reads.
 
     Args:
-        front_path: Path the record is keyed by, exactly as ``analyze_folder``
-            passes it in.
+        front_path: Path the record is keyed by, exactly as the stream passes it
+            in.
 
     Returns:
         A ``{"result": {front_path: record}}`` payload that survives a JSON
         round trip, so it can be compared against a written sidecar.
     """
     return {"result": {front_path: {"caption": "A caption", "keywords": ["family"]}}}
+
+
+def _fake_group_analysis(parts: list[tuple[str, list[str]]]) -> dict:
+    """Build the minimal ``analyze_group_parts`` return shape the stream reads.
+
+    Args:
+        parts: The ordered ``(label, paths)`` pairs the stream assembled.
+
+    Returns:
+        A payload keyed by the first path of the first part, which is the file
+        the stream resolves as the group's primary.
+    """
+    return _fake_analysis(parts[0][1][0])
+
+
+@contextmanager
+def _only_the_provider_stubbed() -> Iterator[Mock]:
+    """Replace the provider client and the model call, and nothing else.
+
+    Every other test here replaces the analysis call outright, which skips the
+    code inside it. Stubbing at the provider boundary instead lets the real
+    ``analyze_photo`` run, so what it writes -- and what it does when it cannot
+    write -- is observable.
+
+    Yields:
+        The patched ``call_model`` mock, for asserting on the call count.
+    """
+    response = SimpleNamespace(
+        model=_MODEL_NAME,
+        stop_reason="end_turn",
+        content=[SimpleNamespace(type="text", text=_MODEL_REPLY_JSON)],
+    )
+    with patch("photokin.core._build_provider_client", return_value=object()), patch(
+        "photokin.core.call_model", return_value=response
+    ) as call_model:
+        yield call_model
+
+
+def _real_path_config() -> utils.Config:
+    """Return the config a run that executes the real analysis path uses.
+
+    ``max_edge=None`` keeps the placeholder bytes out of Pillow and the vocab
+    file is the package's own, so updates stay off rather than writing to it.
+    Neither setting touches what these tests assert.
+    """
+    return utils.Config(provider="anthropic", max_edge=None, no_update_vocab=True)
 
 
 def _messages(records: list[logging.LogRecord], level: int) -> list[str]:
@@ -64,7 +139,7 @@ def _group_warnings(records: list[logging.LogRecord]) -> list[str]:
         records: Log records captured for the whole ``analyze_folder`` call.
 
     Returns:
-        One message per group that reported dropped files.
+        One message per group that reported a file it could not place.
     """
     return [m for m in _messages(records, logging.WARNING) if not m.startswith(_COMPLETION_PREFIX)]
 
@@ -112,114 +187,112 @@ class _FolderModeTestCase(unittest.TestCase):
         return sorted(os.path.basename(p) for p in paths)
 
 
-class TestUnanalyzedGroupFiles(unittest.TestCase):
-    """The accounting helper that decides which files go unreported.
-
-    Exercised directly because the crop and variant slots it branches on need a
-    six-file fixture to reach through ``analyze_folder``, and the ordering of
-    its output is what the "N file(s) not analyzed" listings read back.
-    """
-
-    def setUp(self) -> None:
-        self.entry: dict[str, object] = {
-            "primary": {
-                "front": "f.jpg",
-                "back": "f-back.jpg",
-                "front_crop": "f-crop.jpg",
-                "back_crop": None,
-            },
-            "variants": [
-                {
-                    "version": "b",
-                    "front": "fb.jpg",
-                    "back": None,
-                    "front_crop": None,
-                    "back_crop": None,
-                }
-            ],
-            "pages": {1: "p1.jpg"},
-            "page_crops": {},
-            "negative": "neg.jpg",
-            "negative_crop": None,
-        }
-
-    def test_an_analyzed_front_leaves_only_the_pages_negative_and_crops(self) -> None:
-        dropped = core._unanalyzed_group_files(self.entry, front_analyzed=True)
-
-        self.assertEqual(dropped, ["p1.jpg", "neg.jpg", "f-crop.jpg"])
-
-    def test_an_unanalyzed_front_drags_every_front_and_back_in_with_it(self) -> None:
-        dropped = core._unanalyzed_group_files(self.entry, front_analyzed=False)
-
-        self.assertEqual(
-            dropped, ["p1.jpg", "neg.jpg", "f.jpg", "f-back.jpg", "f-crop.jpg", "fb.jpg"]
-        )
-
-
-class TestFolderModeSkippedGroups(_FolderModeTestCase):
-    """A group folder mode cannot analyze has to say so, by name and by file.
+class TestFolderModeGroupCoverage(_FolderModeTestCase):
+    """Every group in the folder is analyzed, and every file gets a record.
 
     The fixture is the one from the audit: an album page set and a
-    negative-only set that folder mode has no path for, next to an ordinary
-    photo that it does. Three of four files go unread; the bug was that the run
-    said nothing about any of them and reported a plausible-looking count.
+    negative-only set, next to an ordinary photo. Folder mode grouped all three
+    correctly and then analyzed only the third, because the other two have no
+    plain front scan in them. Phase A reported the loss; this is the phase that
+    removes it, so the three tests that pinned the skipping now pin its absence.
     """
 
-    def _run_mixed_folder(self) -> tuple[dict, list[logging.LogRecord], Mock]:
-        """Analyze album pages, a negative-only set and one ordinary photo."""
+    def _run_mixed_folder(
+        self, *, process_all_variants: bool = False
+    ) -> tuple[dict, list[logging.LogRecord], list]:
+        """Analyze album pages, a negative-only set and one ordinary photo.
+
+        Args:
+            process_all_variants: When True the group-aware path is taken, so
+                the mocked callee is ``analyze_group_parts`` rather than
+                ``analyze_photo``.
+
+        Returns:
+            ``(result, log records, what each call sent)``, where a sent entry
+            is the front's basename on the legacy path and the call's ordered
+            ``(label, [basenames])`` parts on the group-aware one.
+        """
         self._make_images(
             "album-page1.jpg",
             "album-page2.jpg",
             "neg-negative.jpg",
             "box3_025.jpg",
         )
-        analyze = Mock(side_effect=lambda front, *args, **kwargs: _fake_analysis(front))
+        sent: list = []
 
-        with patch("photokin.core.analyze_photo", analyze):
+        def analyze_photo(front: str, *args: object, **kwargs: object) -> dict:
+            sent.append(os.path.basename(front))
+            return _fake_analysis(front)
+
+        def analyze_group_parts(parts: list, *args: object, **kwargs: object) -> dict:
+            sent.append([(label, [os.path.basename(p) for p in paths]) for label, paths in parts])
+            return _fake_group_analysis(parts)
+
+        if process_all_variants:
+            target, stub = "photokin.core.analyze_group_parts", analyze_group_parts
+        else:
+            target, stub = "photokin.core.analyze_photo", analyze_photo
+
+        with patch(target, side_effect=stub):
             with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
-                result = core.analyze_folder(self.folder, utils.Config())
+                result = core.analyze_folder(
+                    self.folder, utils.Config(process_all_variants=process_all_variants)
+                )
 
-        return result, captured.records, analyze
+        return result, captured.records, sent
 
-    def test_only_the_analyzable_group_reaches_the_model(self) -> None:
-        result, _records, analyze = self._run_mixed_folder()
+    def test_every_group_reaches_the_model_and_every_file_gets_a_record(self) -> None:
+        result, _records, sent = self._run_mixed_folder()
 
-        self.assertEqual(analyze.call_count, 1)
-        self.assertEqual(os.path.basename(analyze.call_args.args[0]), "box3_025.jpg")
-        self.assertEqual(self._basenames(result["results"]), ["box3_025.jpg"])
+        self.assertEqual(len(sent), 3)
+        # One entry per FILE, not per group: the two album pages and the
+        # negative used to have no entry at all.
+        self.assertEqual(
+            self._basenames(result["results"]),
+            ["album-page1.jpg", "album-page2.jpg", "box3_025.jpg", "neg-negative.jpg"],
+        )
         self.assertEqual(result["errors"], {})
 
-    def test_each_skipped_group_is_warned_by_name_with_its_files(self) -> None:
-        _result, records, _analyze = self._run_mixed_folder()
+    def test_album_pages_and_negative_only_sets_are_analyzed_not_skipped(self) -> None:
+        _result, records, sent = self._run_mixed_folder()
 
-        skips = [m for m in _group_warnings(records) if m.startswith("Skipping group")]
-        self.assertEqual(len(skips), 2, f"expected one warning per skipped group, got {skips}")
+        self.assertEqual(
+            [m for m in _group_warnings(records) if m.startswith("Skipping group")],
+            [],
+            "no group is skipped any more; that limitation is what B2 removed",
+        )
+        self.assertEqual(sorted(sent), ["album-page1.jpg", "box3_025.jpg", "neg-negative.jpg"])
 
-        album = next(m for m in skips if "'album'" in m)
-        self.assertIn("multipage set has no primary front", album)
-        self.assertIn("album-page1.jpg", album)
-        self.assertIn("album-page2.jpg", album)
+    def test_process_all_variants_sends_every_album_page_in_one_call(self) -> None:
+        _result, records, sent = self._run_mixed_folder(process_all_variants=True)
 
-        negative = next(m for m in skips if "'neg'" in m)
-        self.assertIn("negative-only set", negative)
-        self.assertIn("neg-negative.jpg", negative)
+        self.assertEqual(
+            [m for m in _group_warnings(records) if m.startswith("Skipping group")], []
+        )
+        # The flag was dead in folder mode before B2: the group-aware path was
+        # unreachable, so both settings analyzed the same single primary file.
+        self.assertIn(
+            [("Page 1", ["album-page1.jpg"]), ("Page 2", ["album-page2.jpg"])], sent
+        )
+        self.assertIn([("Negative", ["neg-negative.jpg"])], sent)
+        self.assertIn([("Front", ["box3_025.jpg"])], sent)
 
-    def test_completion_line_reports_the_skipped_and_unanalyzed_counts(self) -> None:
-        _result, records, _analyze = self._run_mixed_folder()
+    def test_completion_line_reports_a_clean_run_at_info(self) -> None:
+        _result, records, _sent = self._run_mixed_folder()
 
         completion = _completion_record(records)
         self.assertEqual(
             completion.levelno,
-            logging.WARNING,
-            "a run that dropped files must not summarize itself at INFO",
+            logging.INFO,
+            "nothing was lost, so the run must not summarize itself at WARNING",
         )
         message = completion.getMessage()
-        self.assertIn("1 primary set(s)", message)
-        self.assertIn("2 group(s) skipped", message)
+        self.assertIn("3 group(s)", message)
+        self.assertIn("4 file(s) recorded", message)
         self.assertIn("0 group(s) failed", message)
-        self.assertIn("3 file(s) not analyzed", message)
+        self.assertIn("0 file(s) displaced or dropped", message)
 
-    def test_an_analyzed_group_still_reports_the_files_it_leaves_behind(self) -> None:
+    def test_a_group_holding_pages_and_a_negative_places_every_file_it_can(self) -> None:
         self._make_images(
             "album.jpg", "album-page1.jpg", "album-page2.jpg", "album-negative.jpg"
         )
@@ -231,14 +304,29 @@ class TestFolderModeSkippedGroups(_FolderModeTestCase):
             with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
                 result = core.analyze_folder(self.folder, utils.Config())
 
-        self.assertEqual(self._basenames(result["results"]), ["album.jpg"])
+        self.assertEqual(
+            self._basenames(result["results"]),
+            ["album-negative.jpg", "album-page1.jpg", "album-page2.jpg", "album.jpg"],
+        )
+        # The pages and the negative are analyzed and recorded. Only the
+        # untagged album.jpg loses out, because page 1 is the front side of this
+        # variant and album-page1.jpg holds it -- and it is named for that
+        # reason rather than reported as "not analyzed".
         warnings = _group_warnings(captured.records)
-        self.assertEqual(len(warnings), 1)
+        self.assertEqual(len(warnings), 1, warnings)
         self.assertIn("'album'", warnings[0])
-        self.assertIn("3 file(s) are not analyzed", warnings[0])
-        for dropped in ("album-page1.jpg", "album-page2.jpg", "album-negative.jpg"):
-            self.assertIn(dropped, warnings[0])
-        self.assertIn("3 file(s) not analyzed", _completion_record(captured.records).getMessage())
+        self.assertIn("album.jpg", warnings[0])
+        self.assertIn("album-page1.jpg", warnings[0])
+        self.assertIn("both claim the front side", warnings[0])
+
+        album = os.path.join(self.folder, "album.jpg")
+        self.assertEqual(
+            result["results"][album]["all_variant_files"]["displaced"], {":none": [album]}
+        )
+        completion = _completion_record(captured.records)
+        self.assertEqual(completion.levelno, logging.WARNING)
+        self.assertIn("1 file(s) displaced or dropped", completion.getMessage())
+        self.assertIn("4 file(s) recorded", completion.getMessage())
 
 
 class TestFolderModeErrorIsolation(_FolderModeTestCase):
@@ -247,7 +335,9 @@ class TestFolderModeErrorIsolation(_FolderModeTestCase):
     Isolating every failure was the fix for the first problem and the cause of
     two more: a run where every group failed would have returned an
     empty-but-valid result that the CLI exits 0 on, and a run-wide provider
-    error would have been re-reported once per group instead of aborting.
+    error would have been re-reported once per group instead of aborting. All
+    three behaviors are what ``strict_run_failures=True`` carries into the
+    shared stream, so none of them may be relaxed here.
     """
 
     def _run_with_failure_on(self, failing: str) -> tuple[dict, list[logging.LogRecord]]:
@@ -276,6 +366,29 @@ class TestFolderModeErrorIsolation(_FolderModeTestCase):
             result["errors"][failed_path]["message"], "model returned no parsable JSON"
         )
 
+    def test_every_file_of_a_failed_group_carries_the_same_error_payload(self) -> None:
+        # The per-file result shape has a per-file error shape to match: a group
+        # that fails owes an entry to each of its files, not just to the front
+        # the model was called on.
+        self._make_images("box3_025.jpg", "box3_025-back.jpg", "box3_026.jpg")
+
+        def analyze(front: str, *args: object, **kwargs: object) -> dict:
+            if os.path.basename(front) == "box3_025.jpg":
+                raise RuntimeError("model returned no parsable JSON")
+            return _fake_analysis(front)
+
+        with patch("photokin.core.analyze_photo", side_effect=analyze):
+            with self.assertLogs(_CORE_LOGGER, level=logging.INFO):
+                result = core.analyze_folder(self.folder, utils.Config())
+
+        self.assertEqual(
+            self._basenames(result["errors"]), ["box3_025-back.jpg", "box3_025.jpg"]
+        )
+        payloads = list(result["errors"].values())
+        self.assertEqual(payloads[0], payloads[1])
+        self.assertEqual(payloads[0]["type"], "RuntimeError")
+        self.assertEqual(self._basenames(result["results"]), ["box3_026.jpg"])
+
     def test_the_failure_is_logged_and_counted(self) -> None:
         _result, records = self._run_with_failure_on("box3_025.jpg")
 
@@ -287,7 +400,8 @@ class TestFolderModeErrorIsolation(_FolderModeTestCase):
         self.assertIn("model returned no parsable JSON", errors[0])
 
         completion = _completion_record(records).getMessage()
-        self.assertIn("2 primary set(s)", completion)
+        self.assertIn("3 group(s)", completion)
+        self.assertIn("2 file(s) recorded", completion)
         self.assertIn("1 group(s) failed", completion)
 
     def test_a_wholly_failed_batch_raises_instead_of_returning_an_empty_result(self) -> None:
@@ -350,17 +464,19 @@ class TestFolderModeErrorIsolation(_FolderModeTestCase):
 
 
 class TestFolderModeSidecarWrite(_FolderModeTestCase):
-    """The sidecar is written once, by the only caller holding the variant list.
+    """There is exactly one sidecar writer, and folder mode is not it.
 
     Folder mode used to let ``analyze_photo`` write its own sidecar and then
-    overwrite it with the enriched record, so every group paid for two writes
-    and the file briefly held a record missing ``all_variant_files``.
+    overwrite it with a variant-enriched record, so every group paid for two
+    writes. Phase A fixed the double write by keeping ``write_sidecar`` off and
+    doing the enriched write itself; B2 removes the folder-only writer
+    altogether and forwards the flag instead, so folder and manifest input
+    produce the same artifact. The enrichment has not gone anywhere -- it is on
+    the returned record, which is where a caller should read it.
     """
 
-    def _analyze_two_groups(
-        self, *, write_sidecars: bool
-    ) -> tuple[dict, Mock, Mock, list[logging.LogRecord]]:
-        """Analyze a two-group folder, recording every ``open`` core performs."""
+    def _analyze_two_groups(self, *, write_sidecars: bool) -> tuple[dict, Mock, list[logging.LogRecord]]:
+        """Analyze a two-group folder with the analysis call mocked out."""
         self._make_images(
             "box3_025.jpg",
             "box3_025-back.jpg",
@@ -368,52 +484,41 @@ class TestFolderModeSidecarWrite(_FolderModeTestCase):
             "box3_026.jpg",
         )
         analyze = Mock(side_effect=lambda front, *args, **kwargs: _fake_analysis(front))
-        opener = Mock(wraps=open)
 
         with patch("photokin.core.analyze_photo", analyze):
-            with patch("photokin.core.open", opener, create=True):
-                with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
-                    result = core.analyze_folder(
-                        self.folder, utils.Config(), write_sidecars=write_sidecars
-                    )
+            with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
+                result = core.analyze_folder(
+                    self.folder, utils.Config(), write_sidecars=write_sidecars
+                )
 
-        return result, analyze, opener, captured.records
+        return result, analyze, captured.records
 
-    def test_sidecar_is_written_once_per_group_with_the_enriched_record(self) -> None:
-        result, analyze, opener, records = self._analyze_two_groups(write_sidecars=True)
+    def test_sidecar_writing_is_delegated_to_the_shared_analysis_call(self) -> None:
+        result, analyze, _records = self._analyze_two_groups(write_sidecars=True)
 
         self.assertEqual(analyze.call_count, 2)
         for call in analyze.call_args_list:
-            self.assertFalse(
+            self.assertTrue(
                 call.kwargs["write_sidecar"],
-                "analyze_photo must not write its own sidecar; that was the double write",
+                "the analysis call is now the only sidecar writer in any mode",
             )
 
-        written_paths = [call.args[0] for call in opener.call_args_list]
-        self.assertEqual(
-            self._basenames(written_paths), ["box3_025.json", "box3_026.json"]
-        )
-
-        sidecar = os.path.join(self.folder, "box3_025.json")
-        with open(sidecar, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-
         front = os.path.join(self.folder, "box3_025.jpg")
-        record = payload["result"][front]
-        self.assertEqual(record, result["results"][front])
+        variants = result["results"][front]["all_variant_files"]
         self.assertEqual(
-            self._basenames(record["all_variant_files"]["front"]),
-            ["box3_025.jpg", "box3_025b.jpg"],
+            self._basenames(variants["front"]), ["box3_025.jpg", "box3_025b.jpg"]
         )
+        self.assertEqual(self._basenames(variants["back"]), ["box3_025-back.jpg"])
         self.assertEqual(
-            self._basenames(record["all_variant_files"]["back"]), ["box3_025-back.jpg"]
+            self._basenames(variants["all"]),
+            ["box3_025-back.jpg", "box3_025.jpg", "box3_025b.jpg"],
         )
-        self.assertIn(sidecar, "\n".join(_messages(records, logging.INFO)))
 
     def test_no_sidecar_is_written_when_sidecars_are_off(self) -> None:
-        result, _analyze, opener, records = self._analyze_two_groups(write_sidecars=False)
+        result, analyze, records = self._analyze_two_groups(write_sidecars=False)
 
-        opener.assert_not_called()
+        for call in analyze.call_args_list:
+            self.assertFalse(call.kwargs["write_sidecar"])
         self.assertEqual(
             [name for name in os.listdir(self.folder) if name.endswith(".json")], []
         )
@@ -424,10 +529,91 @@ class TestFolderModeSidecarWrite(_FolderModeTestCase):
         )
 
 
+@unittest.skipUnless(os.name == "nt", "read-only files only block writes on Windows")
+class TestSidecarWriteFailureKeepsTheAnalysis(_FolderModeTestCase):
+    """A sidecar that cannot be written must not take its record down with it.
+
+    The analysis is already paid for by the time the sidecar is written, so the
+    two failures are not the same failure. Phase A held that line with a folder-
+    only writer that banked the record first and caught ``OSError``; routing
+    folder mode through the shared stream moved the write inside the analysis
+    call, where an escaping ``OSError`` reaches the stream's per-group handler
+    -- which discards the model's output, writes an error payload typed
+    ``PermissionError`` for every file of the group, and, once no group has
+    succeeded, re-raises under ``strict_run_failures`` and loses the run.
+
+    A read-only ``.json`` left by a previous run is enough to trigger it, as is
+    a lock held by a sync client or a read-only share. These stub only the
+    provider boundary, so the write really runs and really fails.
+    """
+
+    def _block_sidecars_for(self, *stems: str) -> None:
+        """Leave an unwritable ``<stem>.json`` in the scratch folder for each stem."""
+        for stem in stems:
+            blocked = os.path.join(self.folder, f"{stem}.json")
+            with open(blocked, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            os.chmod(blocked, stat.S_IREAD)
+            self.addCleanup(os.chmod, blocked, stat.S_IWRITE | stat.S_IREAD)
+
+    def _analyze_with_sidecars(self) -> tuple[dict, list[logging.LogRecord]]:
+        """Run the real analysis path over two photos with sidecars requested."""
+        with _only_the_provider_stubbed() as call_model:
+            with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
+                result = core.analyze_folder(
+                    self.folder, _real_path_config(), write_sidecars=True
+                )
+
+        self.assertEqual(call_model.call_count, 2, "the real analysis path never ran")
+        return result, captured.records
+
+    def test_one_unwritable_sidecar_costs_the_sidecar_and_nothing_else(self) -> None:
+        self._make_images("box3_025.jpg", "box3_026.jpg")
+        self._block_sidecars_for("box3_025")
+
+        result, records = self._analyze_with_sidecars()
+
+        self.assertEqual(
+            self._basenames(result["results"]), ["box3_025.jpg", "box3_026.jpg"]
+        )
+        self.assertEqual(result["errors"], {})
+        self.assertEqual(
+            _messages(records, logging.ERROR),
+            [],
+            "a failed sidecar write was reported to the caller as a model failure",
+        )
+        self.assertTrue(
+            any(
+                m.startswith("Sidecar not written for box3_025.jpg")
+                and m.endswith("the analysis is kept in the results.")
+                for m in _messages(records, logging.WARNING)
+            ),
+            f"the failed write was not reported at all: {_group_warnings(records)}",
+        )
+        # The write that could succeed still did: one blocked destination must
+        # not become a blanket skip.
+        self.assertTrue(os.path.isfile(os.path.join(self.folder, "box3_026.json")))
+
+    def test_a_wholly_unwritable_folder_still_returns_every_record(self) -> None:
+        # The total-loss case: with every group failing, strict_run_failures
+        # re-raises, so a read-only photo directory used to lose the whole batch
+        # after paying for it -- the CLI exits 2 with nothing on stdout.
+        self._make_images("box3_025.jpg", "box3_026.jpg")
+        self._block_sidecars_for("box3_025", "box3_026")
+
+        result, records = self._analyze_with_sidecars()
+
+        self.assertEqual(
+            self._basenames(result["results"]), ["box3_025.jpg", "box3_026.jpg"]
+        )
+        self.assertEqual(result["errors"], {})
+        self.assertIn("0 group(s) failed", _completion_record(records).getMessage())
+
+
 class TestFolderModeStdoutPurity(_FolderModeTestCase):
     """Folder mode's stdout carries the result JSON and nothing else.
 
-    Every other test in this module replaces ``analyze_photo`` outright, which
+    Every other test in this module replaces the analysis call outright, which
     skips every diagnostic inside it -- and those are the ones that used to be
     ``print(..., file=sys.stderr)``. A single dropped ``file=`` kwarg put a
     diagnostic on stdout, in the middle of the document ``cli.main`` prints for
@@ -445,21 +631,6 @@ class TestFolderModeStdoutPurity(_FolderModeTestCase):
     call, not just the ones converted here.
     """
 
-    # A forbidden keyword and no "proposed_new_keywords" key, so the two
-    # converted warnings in analyze_photo both fire on the real path. The
-    # single-key result is remapped onto the real front path by core.
-    _MODEL_JSON = json.dumps(
-        {
-            "result": {
-                "front.jpg": {
-                    "caption": "Two people on a porch",
-                    "keywords": ["porch", "family gathering"],
-                }
-            }
-        }
-    )
-    _MODEL = "claude-sonnet-4-6"
-
     def _run_real_path(self) -> tuple[dict, list[logging.LogRecord], str, str]:
         """Analyze a real folder with only the provider calls stubbed out.
 
@@ -467,34 +638,28 @@ class TestFolderModeStdoutPurity(_FolderModeTestCase):
             ``(result, log records, stdout text, stderr text)``.
         """
         self._make_images("box3_025.jpg", "album-page1.jpg", "album-page2.jpg")
-        response = SimpleNamespace(
-            model=self._MODEL,
-            stop_reason="end_turn",
-            content=[SimpleNamespace(type="text", text=self._MODEL_JSON)],
-        )
-        # max_edge=None keeps the placeholder bytes out of Pillow; the vocab
-        # file is the package's own, so updates stay off rather than writing to
-        # it. Neither setting touches the message path under test.
-        cfg = utils.Config(provider="anthropic", max_edge=None, no_update_vocab=True)
         stdout, stderr = io.StringIO(), io.StringIO()
 
         with (
-            patch("photokin.core._build_provider_client", return_value=object()),
-            patch("photokin.core.call_model", return_value=response) as call_model,
+            _only_the_provider_stubbed() as call_model,
             redirect_stdout(stdout),
             redirect_stderr(stderr),
             self.assertLogs(_PACKAGE_LOGGER, level=logging.INFO) as captured,
         ):
-            result = core.analyze_folder(self.folder, cfg)
+            result = core.analyze_folder(self.folder, _real_path_config())
 
-        self.assertEqual(call_model.call_count, 1, "the real analysis path never ran")
+        # Two, not one: the album page set is its own group and its own call
+        # now that folder mode no longer skips it.
+        self.assertEqual(call_model.call_count, 2, "the real analysis path never ran")
         return result, captured.records, stdout.getvalue(), stderr.getvalue()
 
     def test_a_real_run_writes_nothing_to_stdout_or_stderr_directly(self) -> None:
         result, _records, stdout, stderr = self._run_real_path()
 
-        front = os.path.join(self.folder, "box3_025.jpg")
-        self.assertEqual(list(result["results"]), [front])
+        self.assertEqual(
+            self._basenames(result["results"]),
+            ["album-page1.jpg", "album-page2.jpg", "box3_025.jpg"],
+        )
         self.assertEqual(
             stdout,
             "",
@@ -517,9 +682,9 @@ class TestFolderModeStdoutPurity(_FolderModeTestCase):
             any('"family gathering"' in message for message in warnings),
             f"the forbidden-keyword warning is missing from {warnings}",
         )
-        self.assertTrue(
-            any(message.startswith("Skipping group 'album'") for message in warnings),
-            f"the skipped-group warning is missing from {warnings}",
+        self.assertFalse(
+            any(message.startswith("Skipping group") for message in warnings),
+            f"no group is skipped any more, yet one was reported: {warnings}",
         )
         self.assertIn(
             "Analysis completed for box3_025.jpg", _messages(records, logging.INFO)

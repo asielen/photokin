@@ -17,11 +17,11 @@ export OPENAI_API_KEY=sk-...            # setx on Windows
 photokin scan_042.jpg --back scan_042_back.jpg
 ```
 
-That's a good first command to confirm everything's wired up correctly: it only reads the image and prints one JSON result to your terminal, keyed by the image path — nothing is written to `scan_042.jpg` or `scan_042_back.jpg` themselves. (Writing metadata into the files is a separate, explicit opt-in step; see [Setting up ExifTool](#setting-up-exiftool) below.) Abridged output:
+That's a good first command to confirm everything's wired up correctly: it only reads the images and prints one JSON document to your terminal, keyed by image path — one entry per file, so the back gets its own record — and nothing is written to `scan_042.jpg` or `scan_042_back.jpg` themselves. (Writing metadata into the files is a separate, explicit opt-in step; see [Setting up ExifTool](#setting-up-exiftool) below.) Abridged output:
 
 ```json
 {
-  "result": {
+  "results": {
     "scan_042.jpg": {
       "keywords": ["Postcard", "1940s", "Military personnel", "..."],
       "caption": "[Back]\n27 november 44\nAlthough, I personally did not see this cathedral...",
@@ -29,8 +29,10 @@ That's a good first command to confirm everything's wired up correctly: it only 
       "category": "Postcard",
       "location_guess": {"country": "France", "city": "Le Mans", "confidence": 0.9},
       "date_guess": {"iso": "1944-11-27", "confidence": 0.95, "pattern": "Y!M!D!"}
-    }
-  }
+    },
+    "scan_042_back.jpg": { "keywords": ["...", "back"], "...": "..." }
+  },
+  "errors": {}
 }
 ```
 
@@ -237,7 +239,7 @@ photokin ...
 
 Point it at a folder and it works through everything in it (non-recursive). Filename suffixes group scans of the same physical object automatically — `photo-a.jpg` / `photo-b.jpg` are variants, `photo-back.jpg` is the reverse side, `album-page1.jpg` / `album-page2.jpg` are pages of one document — and each group is analyzed together as one object.
 
-Worth knowing before you decide how to run a box of scans: folder mode only analyzes a group that contains a plain front scan. A set that is nothing but pages (`album-page1.jpg`, `album-page2.jpg`) or nothing but a negative has no front in it, so the group is grouped correctly and then skipped instead of analyzed. It does say so — one warning per group (`Skipping group 'album': multipage set has no primary front (pages are not analyzed in folder mode)`) plus a skipped count in the closing line — so nothing disappears quietly, but those pages really do go unanalyzed. Manifest mode handles them: with `--process-all-variants` it sends every page of a document to the model in one call, and without it, only the group's primary item (the first page listed) is analyzed and its result is applied across the set. Until folder mode is routed through the same pipeline, albums, multi-page documents and negative-only scans belong in a manifest.
+Folder and manifest input are read by the same grouper, so anything one handles the other handles identically. A set with no plain front scan in it is analyzed like any other object — nothing but pages (`album-page1.jpg`, `album-page2.jpg`), nothing but a negative, or nothing but a back (`box3_030-back.jpg`, where the front was never scanned or lives in another folder). With `--process-all-variants` every page of a document goes to the model in one call, and without it only the group's primary item (the lowest-numbered page) is analyzed and its result is applied across the set. Albums, multi-page documents, negative-only scans and loose backs no longer need a manifest. (Earlier releases grouped those sets correctly and then skipped them, warning per group; that limitation is gone.)
 
 > SIDE NOTE ON EXPECTED **Naming conventions.** The full suffix grammar is `name[letter][-front|-back|-negative|-pageN][-crop]`, case-insensitive, applied right to left:
 >
@@ -251,9 +253,11 @@ Worth knowing before you decide how to run a box of scans: folder mode only anal
 >
 > The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other explicitly numbered pages.
 >
-> Folder mode reads this whole grammar for grouping, but only ever analyzes each group's primary front and back: page, negative and crop files are sorted into their slots and then left unanalyzed, with a warning naming every file it passed over. The page and negative forms only reach the model in manifest mode today.
+> Every input mode reads this whole grammar and resolves it the same way, because they all route through one grouper. Pages and negatives reach the model in folder mode exactly as they do in manifest mode; crops are recorded with their group rather than analyzed, with a warning naming each one. To see how a folder would be grouped before spending anything on it, run `photokin --folder ./scans/ --generate-manifest scans-manifest.json`: it writes the manifest the run would have used and stops.
 >
-> Manifest mode reads the same grammar and resolves it the same way whatever order the files are listed in: a crop never takes its parent's place, and a negative is analyzed as a negative rather than mistaken for the front. Both are recorded in the group's `all_variant_files` — under `crops` and `negatives` — and crops are named in a warning rather than sent to the model. The exception is a crop with no uncropped original for the same side of the same variant: with nothing else to stand for that side, the crop is analyzed in its place, and says so. That is judged per side, so a group holding `box3_025-crop.jpg` and `box3_025-back.jpg` still gets both a front and a back.
+> Resolution does not depend on the order the files are listed in: a crop never takes its parent's place, and a negative is analyzed as a negative rather than mistaken for the front. Both are recorded in the group's `all_variant_files` — under `crops` and `negatives` — and crops are named in a warning rather than sent to the model. The exception is a crop with no uncropped original for the same side of the same variant: with nothing else to stand for that side, the crop is analyzed in its place, and says so. That is judged per side, so a group holding `box3_025-crop.jpg` and `box3_025-back.jpg` still gets both a front and a back.
+>
+> Without `--process-all-variants` a group is sent one front and one back. The back is the primary front's own if it has one, and otherwise a variant's: given `box3_025.jpg`, `box3_025b.jpg` and `box3_025b-back.jpg`, the call is `box3_025.jpg` plus `box3_025b-back.jpg`, because the variants are scans of one object and so that back is the object's back. Only groups shaped that way — a primary front with no back of its own, beside a variant that has one — cost the extra image. Folder mode in earlier releases sent no back at all in that case; manifest mode already sent it.
 
 ## Folder mode
 
@@ -261,7 +265,15 @@ Worth knowing before you decide how to run a box of scans: folder mode only anal
 photokin --folder ./scans/ --provider anthropic > results.json
 ```
 
-Folder mode prints one aggregate JSON to stdout. Groups it cannot analyze — multipage sets, lone negatives — are absent from that JSON; they surface as warnings on stderr and as a skipped count in the closing line, so read stderr as well as the results. For bigger or more repeatable jobs, manifest mode takes a JSON file instead of a folder, handles the groups folder mode skips, and adds `--output-file`: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end.
+Folder mode prints one aggregate JSON to stdout, shaped `{"results": {...}, "errors": {...}}` with **one entry per file** — every image in the folder appears in exactly one of the two, backs, variant scans, album pages, negatives and crops included. A record names the whole group it belongs to under `all_variant_files`, so you can still tell which files were scanned together and which one was sent to the model. Per-group diagnostics and the closing summary go to stderr, so read both.
+
+For bigger or more repeatable jobs, manifest mode takes a JSON file instead of a folder and adds `--output-file`: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end. `--generate-manifest` turns a folder into exactly that file:
+
+```bash
+photokin --folder ./scans/ --generate-manifest scans-manifest.json
+```
+
+It writes the manifest the folder run would have used — same files, same order — and exits without calling the model, so it costs nothing and doubles as a way to check the grouping before committing to a batch. Edit it (add `is_back`, `group`, existing `metadata`) and feed it back with `--manifest`.
 
 ## Manifest mode
 
@@ -397,7 +409,7 @@ The standalone applier also takes `--fields` to narrow which tags may be written
 | Flag                                               | What it does |
 |----------------------------------------------------|---|
 | `--update-policy {master_exact,merge_per_variant}` | Whether results apply to just the primary file or to every variant in a group (default `merge_per_variant`) |
-| `--process-all-variants`                           | Also analyze `-b`/`-c` variant scans and fold their outputs together (default off — only the primary scan of each group is analyzed). Manifest mode only; folder mode ignores it and always analyzes just the primary |
+| `--process-all-variants`                           | Also analyze `-b`/`-c` variant scans, and every page of a multipage set, folding their outputs together (default off — only the primary scan of each group is analyzed). Works in every input mode |
 | `--date-confidence-threshold X`                    | Minimum model confidence before a date guess is applied, 0-1 (default 0.7) |
 | `--location-confidence-threshold X`                | Same, for location guesses (default 0.7) |
 | `--no-update-vocab`                                | Don't append newly proposed keywords to the vocabulary file |
@@ -408,6 +420,7 @@ The standalone applier also takes `--fields` to narrow which tags may be written
 |----------------------------|---|
 | `--output-file PATH`       | `.ndjson` streams one record per finished photo; `.json` writes one aggregate object atomically (manifest mode) |
 | `--output-sidecars`        | Also write a per-photo sidecar JSON next to each image (default off) |
+| `--generate-manifest PATH` | Write the manifest folder or single-photo input would be grouped into, then exit without calling the model (not valid with `--manifest`) |
 | `--batch-id ID`            | Identifier stored in output metadata and logs |
 | `--changeset {true,false}` | Emit a changeset NDJSON of proposed file writes (manifest mode; default `false`) |
 | `--dry-run`                | Analyze without applying anything downstream; records are marked `dry_run=true` (default off) |

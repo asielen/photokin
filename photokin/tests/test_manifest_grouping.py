@@ -801,9 +801,9 @@ class TestNegativeIsNotAnUntaggedFront(ManifestGroupingTestCase):
         )
 
     def test_negatives_are_addressed_per_variant_not_per_stem(self):
-        # ``group_folder_images`` bins negatives at stem level with an
+        # The retired folder grouper binned negatives at stem level with an
         # unconditional assignment, so two that differ only by variant letter
-        # overwrite each other there. The manifest path keeps both.
+        # overwrote each other. This path -- now the only one -- keeps both.
         items = [{"path": "s/n4-negative.jpg"}, {"path": "s/n4b-negative.jpg"}]
         calls, records, _warnings = self.run_manifest(items, process_all_variants=True)
         self.assertEqual(
@@ -1351,6 +1351,69 @@ class TestPluginContractRegression(ManifestGroupingTestCase):
                     [_p(item["path"]) for item in self.TWO_VARIANTS],
                 )
                 self.assertEqual({rec["status"] for rec in records}, {"ok"})
+
+
+class TestPartialGroupFailure(ManifestGroupingTestCase):
+    """A group that fails part-way through its per-file loop keeps what it banked.
+
+    The loop banks one record at a time, so a group can raise with some of its
+    files already recorded and their ``ok`` lines already on the stream. Handing
+    the whole group to the error path then keys those paths under both
+    ``results`` and ``errors`` and puts two contradicting lines on the stream for
+    one file, which a consumer that applies ``results`` and then reports
+    ``errors`` acts on twice.
+
+    The failure is injected at a fixed point rather than provoked, so the test
+    cannot go vacuous; in the wild it is anything the per-file loop touches that
+    grouping does not, inline metadata carrying a non-string caption being the
+    reachable one.
+    """
+
+    ITEMS = ({"path": "s/pf1.jpg"}, {"path": "s/pf1-back.jpg"})
+
+    def _run_failing_on_the_second_file(self) -> tuple[dict, list[dict]]:
+        """Process a two-file group whose second per-file patch build raises.
+
+        Returns:
+            The stream's aggregate and the NDJSON records it emitted.
+        """
+        lines: list[str] = []
+        rec = _RecordingAnalyzers()
+        with self.assertLogs("photokin.core", level="ERROR"):
+            with patch("photokin.core.analyze_photo", rec.photo), patch(
+                "photokin.core.build_canonical_patch",
+                side_effect=[({}, {}), RuntimeError("patch build failed")],
+            ):
+                aggregate = core.process_manifest_stream(
+                    manifest={"items": list(self.ITEMS)},
+                    cfg=utils.Config(dry_run=True),
+                    ndjson_writer=lines.append,
+                )
+        return aggregate, [json.loads(line) for line in lines]
+
+    def test_a_banked_record_is_not_also_reported_as_an_error(self):
+        aggregate, _records = self._run_failing_on_the_second_file()
+        self.assertEqual(sorted(aggregate["results"]), [_p("s/pf1.jpg")])
+        self.assertEqual(sorted(aggregate["errors"]), [_p("s/pf1-back.jpg")])
+        self.assertEqual(
+            sorted(set(aggregate["results"]) & set(aggregate["errors"])),
+            [],
+            "a path was reported as both succeeded and failed",
+        )
+
+    def test_the_stream_carries_exactly_one_line_per_path(self):
+        _aggregate, records = self._run_failing_on_the_second_file()
+        self.assertEqual(
+            [(rec["path"], rec["status"]) for rec in records],
+            [(_p("s/pf1.jpg"), "ok"), (_p("s/pf1-back.jpg"), "error")],
+        )
+
+    def test_every_file_of_the_group_is_still_accounted_for(self):
+        aggregate, _records = self._run_failing_on_the_second_file()
+        self.assertEqual(
+            sorted(set(aggregate["results"]) | set(aggregate["errors"])),
+            sorted(_p(item["path"]) for item in self.ITEMS),
+        )
 
 
 if __name__ == "__main__":

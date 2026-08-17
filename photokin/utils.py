@@ -26,7 +26,7 @@ Code map (by section):
 - Prompt assembly     build_prompt_bundle + photo-context resolution
 - JSON parsing        model-output cleanup and the retry-parser (_ParseLogger)
 - Filename parsing    parse_media_filename: base id / part kind / variant / page
-- Folder grouping     group files into front/back/variant/page sets
+- Folder listing      list_folder_images: the image files a folder run reads
 - Manifest helpers    load_manifest (shape validation), master selection
 - Metadata merge      small helpers shared by the merge step
 - Response helpers    normalize/inspect provider responses
@@ -38,7 +38,7 @@ from __future__ import annotations
 # flatten_known_keywords, warn_forbiddenish_keywords, note_looks_placeholder,
 # insert_keyword_into_vocab_file, safe_backup, resolve_default_paths,
 # build_data_url_and_size, archival_upload, build_prompt_bundle, parse_with_retry,
-# parse_media_filename, group_folder_images, pick_master_index, load_manifest,
+# parse_media_filename, list_folder_images, pick_master_index, load_manifest,
 # load_item_metadata, combine_group_metadata, ensure_keyword_back, union_keywords,
 # merge_original_sources, dedupe_captions_with_source, extract_usage.
 import base64
@@ -1236,8 +1236,9 @@ class ParsedName:
     ``base_id`` is the shared id that groups variants/sides of the same photo;
     ``variant_id`` distinguishes versions (e.g. a trailing letter); ``part_kind``
     says whether the file is a front/back/page/negative/none; ``page_num`` is the
-    page index for multipage docs; ``is_crop`` flags derived crop files. Folder
-    grouping keys off these fields.
+    page index for multipage docs; ``is_crop`` flags derived crop files. The
+    manifest bucket loop -- which every input mode now routes through -- keys off
+    these fields.
     """
 
     base_id: str
@@ -1313,7 +1314,7 @@ def parse_media_filename(path: str) -> ParsedName:
         is_crop=is_crop,
     )
 
-# === Folder grouping ===
+# === Folder listing ===
 _VERSION_RE = re.compile(r"""
     ^
     (?P<stem>.+?)                          # non-greedy base name
@@ -1348,109 +1349,44 @@ def _split_name_version_back(filename_no_ext: str) -> Optional[dict]:
 def _is_image_file(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in VALID_EXTS
 
-def group_folder_images(folder: str) -> dict:
-    """
-    Scan a folder and group files by stem:
-      {
-        "<stem>": {
-          "primary": {
-            "front": <path or None>, "back": <path or None>,
-            "front_crop": <path or None>, "back_crop": <path or None>,
-          },
-          "variants": [
-              {"version": "b", "front": <path or None>, "back": <path or None>,
-               "front_crop": <path or None>, "back_crop": <path or None>},
-          ],
-          "pages":      {1: <path>, 2: <path>, ...},   # keyed by page_num int
-          "page_crops": {1: <path>, ...},               # crop derivatives per page
-          "negative":      <path or None>,
-          "negative_crop": <path or None>,
-          "all_fronts": [primary_front, v1_front, ...],
-          "all_backs":  [primary_back or None, ...]     # aligned index
-        },
-      }
-    For multi-page sets all_fronts is the sorted page list; all_backs is all None.
-    Only files with VALID_EXTS are considered.
+def list_folder_images(folder: str) -> list[str]:
+    """Return the image files directly inside *folder*, in a stable order.
+
+    Listing is all this does: grouping the result into fronts, backs, variants,
+    pages, negatives and crops belongs to the manifest bucket loop, which every
+    input mode now routes through.
+
+    The sort is part of the contract rather than a nicety. ``os.scandir`` order
+    is filesystem-dependent, and while grouping itself is invariant under
+    permutation, the ``all_variant_files`` lists and the per-file emission order
+    are deliberately input-ordered -- so an unsorted listing would make a folder
+    run's output differ between machines. The key mirrors the tie-break used
+    everywhere else in the pipeline.
+
+    Args:
+        folder: Directory to scan. ``~`` is expanded and the path normalized.
+
+    Returns:
+        Paths spelled ``os.path.join(normalized_folder, name)``, sorted by
+        ``(name.lower(), name)``.
+
+    Raises:
+        NotADirectoryError: If *folder* is not an existing directory.
     """
     folder = os.path.normpath(os.path.expanduser(folder))
     if not os.path.isdir(folder):
         raise NotADirectoryError(folder)
 
-    sets: dict = {}
-    for entry in os.listdir(folder):
-        full = os.path.join(folder, entry)
-        if not os.path.isfile(full):
-            continue
-        if not _is_image_file(full):
-            continue
-        parsed = parse_media_filename(full)
-        stem = parsed.base_id
-        version = parsed.variant_id  # None or 'b','c',...
-        is_back = parsed.part_kind == "back"
-        is_negative = parsed.part_kind == "negative"
-        is_crop = parsed.is_crop
-
-        s = sets.setdefault(stem, {
-            "primary": {"front": None, "back": None, "front_crop": None, "back_crop": None},
-            "variants": [],
-            "pages": {},
-            "page_crops": {},
-            "negative": None,
-            "negative_crop": None,
-        })
-
-        if is_negative:
-            # Negatives bin to the stem level regardless of any variant letter
-            if is_crop:
-                s["negative_crop"] = full
-            else:
-                s["negative"] = full
-        elif parsed.part_kind == "page":
-            pn = parsed.page_num or 1
-            if is_crop:
-                s["page_crops"][pn] = full
-            else:
-                s["pages"][pn] = full
-        elif version is None:
-            # Primary scan
-            if is_back:
-                s["primary"]["back_crop" if is_crop else "back"] = full
-            else:
-                s["primary"]["front_crop" if is_crop else "front"] = full
-        else:
-            # Variant: find or create slot
-            slot = None
-            for v in s["variants"]:
-                if v["version"] == version:
-                    slot = v
-                    break
-            if slot is None:
-                slot = {"version": version, "front": None, "back": None,
-                        "front_crop": None, "back_crop": None}
-                s["variants"].append(slot)
-            if is_back:
-                slot["back_crop" if is_crop else "back"] = full
-            else:
-                slot["front_crop" if is_crop else "front"] = full
-
-    # Order variants; build aligned all_fronts / all_backs
-    for s in sets.values():
-        s["variants"].sort(key=lambda v: v["version"] or "a")
-        if s["pages"]:
-            # Multi-page document: all_fronts is the ordered page list
-            s["all_fronts"] = [s["pages"][k] for k in sorted(s["pages"])]
-            s["all_backs"] = [None] * len(s["all_fronts"])
-        else:
-            fronts = [s["primary"]["front"]]
-            backs = [s["primary"]["back"]]
-            for v in s["variants"]:
-                fronts.append(v["front"])
-                backs.append(v["back"])
-            # Nones preserved to keep indices aligned; analysis uses primary only.
-            s["all_fronts"] = fronts
-            s["all_backs"] = backs
-
-    return sets
+    # scandir over listdir: one stat per entry rather than a second one per
+    # candidate path. ``is_file`` follows symlinks, as ``os.path.isfile`` did.
+    with os.scandir(folder) as entries:
+        names = [
+            entry.name
+            for entry in entries
+            if entry.is_file() and _is_image_file(entry.name)
+        ]
+    names.sort(key=lambda name: (name.lower(), name))
+    return [os.path.join(folder, name) for name in names]
 
 def ensure_keyword_back(record: dict) -> dict:
     """

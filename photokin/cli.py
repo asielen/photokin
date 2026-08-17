@@ -25,6 +25,8 @@ Code map:
 - _resolve_exiftool_config  build ExiftoolConfig (CLI flag > env > default)
 - _preflight_exiftool       stop before the first model call if writes can't run
 - _preflight_output_file    stop before the first model call if an output is unwritable
+- _write_generated_manifest atomically write a synthesized manifest, pretty-printed
+- _generate_manifest        --generate-manifest: describe the input's grouping, stop
 - _apply_exiftool_changeset apply routed fields via ExifTool + append a status line
 - main                      PUBLIC: route to single / folder / manifest flow
 """
@@ -40,7 +42,14 @@ from typing import NoReturn
 
 from . import utils
 from .utils import Config, normalize_path
-from .core import analyze_photo, analyze_folder, process_manifest_stream
+from .core import (
+    UPDATE_MERGE_PER_VARIANT,
+    analyze_folder,
+    build_folder_manifest,
+    build_manifest_buckets,
+    build_single_photo_manifest,
+    process_manifest_stream,
+)
 from .errors import ProviderApiError, SELF_EXPLANATORY_ERROR_TYPES
 from .exiftool import (
     ExiftoolConfig,
@@ -71,6 +80,9 @@ examples:
 
   # Manifest mode (recommended, used by the Lightroom plugin)
   %(prog)s --manifest batch.json --output-file results.ndjson --changeset true
+
+  # Check how a folder would be grouped, without calling the model
+  %(prog)s --folder ./scans/ --generate-manifest scans-manifest.json
 """
 
 
@@ -247,6 +259,115 @@ def _preflight_output_file(out_path: str, *, role: str = "--output-file") -> Non
         )
 
 
+def _write_generated_manifest(manifest: dict, out_path: str) -> None:
+    """Write *manifest* to *out_path*, atomically and always pretty-printed.
+
+    Pretty regardless of ``--pretty-json``: this file exists to be read and hand
+    edited. Written through a sibling temp file and ``os.replace`` so an
+    interrupted write never leaves a truncated manifest behind, matching how the
+    aggregate ``.json`` output is written. ``os.replace`` overwrites an existing
+    destination atomically on Windows as well as POSIX, so it is called against
+    the live file rather than after unlinking it: unlinking first would open a
+    window in which neither the old manifest nor the new one exists, which is
+    the very failure the temp file is here to prevent.
+
+    Args:
+        manifest: The synthesized manifest document.
+        out_path: Destination, already pre-flighted.
+    """
+    tmp_path = out_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(tmp_path, out_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _generate_manifest(args: argparse.Namespace, cfg: Config) -> None:
+    """Describe how this run's input would be grouped, then stop.
+
+    The manifest written here holds the very ``items`` list the analysis path
+    would have processed -- same builder, same order, same keys -- so it is a
+    description of the run rather than a separate rendering of it, and re-running
+    it with ``--manifest`` reproduces the run exactly. Only the input is
+    described: provider, model, policy and debug settings are run settings, and
+    baking them in would let a generated file silently override a later run's
+    flags.
+
+    Args:
+        args: Parsed CLI arguments.
+        cfg: The run configuration, with photo context already resolved.
+
+    Raises:
+        SystemExit: With code 2 for every usage error.
+        FileNotFoundError: If the image or ``--back`` path does not exist.
+            Reported by ``main`` as exit 2, as the folder branch's
+            ``NotADirectoryError`` already was.
+    """
+    if args.manifest:
+        _exit_with_usage_error(
+            "--generate-manifest describes how folder or single-photo input would be "
+            "grouped, but --manifest input is already a manifest.",
+            "drop --generate-manifest, or point it at a folder: "
+            "photokin --folder ./scans/ --generate-manifest out.json",
+        )
+    if not args.folder and not args.image:
+        # The interactive prompt only runs for a completely empty argv, so this
+        # flag on its own reaches here with nothing to describe. Writing a
+        # one-item manifest for the empty path and exiting 0 would be exactly the
+        # silent nonsense every other guard in this function exists to refuse.
+        _exit_with_usage_error(
+            "--generate-manifest describes how an input would be grouped, but no "
+            "folder or image was given.",
+            f"name the input: photokin --folder ./scans/ --generate-manifest "
+            f"{args.generate_manifest}",
+        )
+    out_path = args.generate_manifest
+    if not out_path.lower().endswith(".json"):
+        _exit_with_usage_error(
+            f"--generate-manifest must end with .json; got {out_path}.",
+            "name the file itself, such as scans-manifest.json",
+        )
+    _preflight_output_file(out_path, role="--generate-manifest")
+
+    if args.folder:
+        manifest = build_folder_manifest(args.folder, photo_context_text=cfg.photo_context_text)
+    else:
+        # Loaded eagerly, exactly as the analysis path does, so an unreadable or
+        # malformed --meta still exits 2 before anything is written.
+        orig_meta = load_json(args.meta) if args.meta else None
+        # Also exactly as the analysis path does, and for the same reason the
+        # folder branch above refuses a directory that is not there: a manifest
+        # describing how a run that cannot happen would be grouped is the silent
+        # nonsense this function's other guards exist to refuse, and it only
+        # fails later, when the file is fed back through --manifest.
+        front = normalize_path(args.image)
+        back = normalize_path(args.back) if args.back else None
+        utils.ensure_paths_exist([p for p in (front, back) if p])
+        manifest = build_single_photo_manifest(
+            args.image,
+            args.back,
+            meta=orig_meta,
+            photo_context_text=cfg.photo_context_text,
+        )
+
+    # Bucketed before the write, not after: the group count is what the user is
+    # checking when they reach for this flag, and resolving the entries is also
+    # what reports an explicit override that disagrees with a filename -- most
+    # usefully a --back the grammar reads as a front.
+    buckets = build_manifest_buckets(manifest["items"])
+    _write_generated_manifest(manifest, out_path)
+    logger.info(
+        "Wrote manifest for %d file(s) in %d group(s) to %s; no model call was made.",
+        len(manifest["items"]),
+        len(buckets),
+        out_path,
+    )
+
+
 def _apply_exiftool_changeset(
     *,
     ecfg: ExiftoolConfig,
@@ -367,6 +488,13 @@ def main() -> None:
                         help="Path to write results. If ends with .ndjson, writes one JSON object per line as items complete; if .json, writes a single JSON object at the end.")
         ap.add_argument("--output-sidecars", action="store_true",
                         help="Also emit per-photo sidecar JSON next to each image")
+        ap.add_argument(
+            "--generate-manifest",
+            metavar="PATH",
+            default=None,
+            help="Write the manifest folder or single-photo input would be grouped into, "
+                 "then exit without calling the model.",
+        )
         ap.add_argument("--batch-id", help="Optional batch identifier stored in the output metadata/logs")
         # String booleans (not store_true) because Lua passes literal "true"/"false" as args.
         ap.add_argument(
@@ -447,8 +575,14 @@ def main() -> None:
             dry_run=args.dry_run,
         )
 
+        # GENERATE-MANIFEST: describe the input's grouping and stop, before any
+        # provider client can be built.
+        if args.generate_manifest:
+            _apply_common_cfg(cfg, args)
+            _generate_manifest(args, cfg)
+
         # MANIFEST MODE (recommended for Lightroom)
-        if args.manifest:
+        elif args.manifest:
             man = load_json(args.manifest)
             _apply_common_cfg(cfg, args, manifest=man)
             ecfg = _resolve_exiftool_config(args, dry_run=args.dry_run)
@@ -525,7 +659,13 @@ def main() -> None:
                     )
                     _apply_exiftool_changeset(ecfg=ecfg, changeset_path=changeset_path, out_path=out_path)
                 else:
-                    # Aggregate then atomic write (temp → replace)
+                    # Aggregate then atomic write (temp → replace). No unlink
+                    # ahead of the replace: os.replace overwrites atomically on
+                    # Windows as well as POSIX, so removing first only opens a
+                    # window in which the caller's previous results file is gone
+                    # and the new one does not exist yet -- and if the replace
+                    # then fails, the ``finally`` clears the temp file and the
+                    # run ends with neither.
                     try:
                         data = process_manifest_stream(
                             manifest=man,
@@ -538,8 +678,6 @@ def main() -> None:
                         )
                         with open(tmp_path, "w", encoding="utf-8") as f:
                             json.dump(data, f, indent=2 if cfg.pretty_json else None, ensure_ascii=False)
-                        if os.path.exists(out_path):
-                            os.remove(out_path)
                         os.replace(tmp_path, out_path)
                         _apply_exiftool_changeset(ecfg=ecfg, changeset_path=changeset_path, out_path=out_path)
                     finally:
@@ -567,9 +705,23 @@ def main() -> None:
 
         # SINGLE PHOTO MODE
         else:
+            # Loaded here rather than through a manifest ``metadata_path`` so an
+            # unreadable or malformed --meta still raises and exits 2 before any
+            # model call, instead of being swallowed by load_item_metadata.
             orig_meta = load_json(args.meta) if args.meta else None
             _apply_common_cfg(cfg, args)
-            data = analyze_photo(args.image, args.back, cfg, original_meta=orig_meta, write_sidecar=args.output_sidecars)
+            data = process_manifest_stream(
+                manifest=build_single_photo_manifest(
+                    args.image,
+                    args.back,
+                    meta=orig_meta,
+                    photo_context_text=cfg.photo_context_text,
+                ),
+                cfg=cfg,
+                update_policy=UPDATE_MERGE_PER_VARIANT,
+                write_sidecars=args.output_sidecars,
+                strict_run_failures=True,
+            )
             print(json.dumps(data, indent=2 if cfg.pretty_json else None, ensure_ascii=False))
 
     except SystemExit:
