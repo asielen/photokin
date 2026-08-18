@@ -113,6 +113,10 @@ class Config:
     debug_dump_llm_request: bool = False
     debug_dump_dir: str | None = None
     run_batch_id: str | None = None
+    # Library-only: the CLI never sets this. Its ``--dry-run`` prints the plan
+    # and returns before ``process_manifest_stream``, so there is no record to
+    # stamp. An embedder driving the stream directly sets it to mark the NDJSON
+    # of a rehearsal run, which is the one thing it does (``core._emit``).
     dry_run: bool = False
 
 

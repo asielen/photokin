@@ -47,14 +47,16 @@ class ExiftoolConfig:
     def from_env(cls, **overrides: Any) -> "ExiftoolConfig":
         """Build a pipeline config from environment variables.
 
-        Reads ``EXIFTOOL_WRITE_ENABLED`` (default true), ``EXIFTOOL_PATH``,
+        Reads ``EXIFTOOL_WRITE_ENABLED`` (default false), ``EXIFTOOL_PATH``,
         and ``EXIFTOOL_FIELDS`` (comma-separated, default
-        ``("EXIF:UserComment",)``). Explicit keyword overrides win over the
+        ``("EXIF:UserComment",)``). Writing to the user's files requires an
+        explicit opt-in, so the default here agrees with the dataclass rather
+        than quietly overriding it. Explicit keyword overrides win over the
         environment; overrides with value ``None`` are ignored so callers can
         pass through optional CLI flags directly.
         """
         values: dict[str, Any] = {
-            "enabled": _parse_bool_env("EXIFTOOL_WRITE_ENABLED", True),
+            "enabled": _parse_bool_env("EXIFTOOL_WRITE_ENABLED", False),
             "path": os.environ.get("EXIFTOOL_PATH") or None,
             "fields": parse_fields(os.environ.get("EXIFTOOL_FIELDS"))
             or DEFAULT_PIPELINE_FIELDS,

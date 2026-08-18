@@ -6,29 +6,41 @@ Thin command-line interface for the photo archiver.
 
 Responsibilities:
 - Collect CLI/interactive parameters.
+- Detect what the input is, and refuse anything the run cannot use.
 - Build a Config object.
 - Install the package-wide stderr log handler.
 - Invoke the library entrypoints.
 - Write outputs per flags (NDJSON/JSON/sidecars) and/or print to stdout.
 
+One input token, given positionally or through the ``--folder``/``--manifest``
+aliases, becomes a :class:`ResolvedInput`; every mode then runs the same path.
 This is the module the Lightroom plugin launches (``python -m photokin.cli``);
 its flags and the manifest/NDJSON behavior are part of the plugin contract, so
 treat changes here as contract changes. Analysis results go to stdout; every
-diagnostic goes to stderr through the logger.
+diagnostic goes to stderr through the logger. Message wording lives in
+``photokin.cli_messages``; this module decides when each one fires.
 
 Code map:
 - load_json                 read a UTF-8 JSON file (matches Lightroom's writes)
 - _configure_logging        attach the stderr handler to the "photokin" logger
 - _exit_with_usage_error    report a problem/``Try:`` pair and exit 2
 - _interactive_prompt       prompt for image paths when no args are given
-- _apply_common_cfg         apply flags shared across single/folder/manifest modes
+- ResolvedInput             the one input, classified and addressed
+- _resolve_input            pick the input source, classify or assert its type
+- _validate_folder_input    refuse an unreadable or imageless folder
+- _load_manifest_input      read and validate a manifest before anything is paid for
+- _WriteBundleMember        one flag ``-w`` expands to, and how each message names it
+- _flag_spelling            an argparse destination as the user types it
+- _resolve_write_bundle     expand ``-w`` and reject flags that contradict it
+- _derive_changeset_path    ``dirname(--output-file or input)`` plus the stem
+- _apply_common_cfg         apply flags shared across every input type
 - _resolve_exiftool_config  build ExiftoolConfig (CLI flag > env > default)
 - _preflight_exiftool       stop before the first model call if writes can't run
 - _preflight_output_file    stop before the first model call if an output is unwritable
 - _write_generated_manifest atomically write a synthesized manifest, pretty-printed
 - _generate_manifest        --generate-manifest: describe the input's grouping, stop
 - _apply_exiftool_changeset apply routed fields via ExifTool + append a status line
-- main                      PUBLIC: route to single / folder / manifest flow
+- main                      PUBLIC: resolve the input, print the plan, run it
 """
 
 import argparse
@@ -38,12 +50,12 @@ import os
 import sys
 import tempfile
 import traceback
+from dataclasses import dataclass
 from typing import NoReturn
 
-from . import utils
+from . import cli_messages, utils
 from .utils import Config, normalize_path
 from .core import (
-    analyze_folder,
     build_folder_manifest,
     build_manifest_buckets,
     build_single_photo_manifest,
@@ -66,22 +78,76 @@ logger = logging.getLogger("photokin.cli")
 # Tag on the handler this module installs, so repeated main() calls reuse it.
 _LOG_HANDLER_NAME = "photokin-cli-stderr"
 
+#: What each input kind is called in a message. The plan summary uses the same
+#: words without the article, so "what it was detected as" reads identically
+#: wherever it appears.
+_KIND_LABELS: dict[str, str] = {
+    "folder": "a folder",
+    "manifest": "a manifest",
+    "photo": "a single photo",
+}
+
+#: The extensions a folder is searched for, for the error that names them.
+_IMAGE_EXTENSIONS = ", ".join(sorted(utils.VALID_EXTS))
+
+
+@dataclass(frozen=True)
+class _WriteBundleMember:
+    """One flag ``-w`` expands to, with the wording every message about it needs.
+
+    The wording lives beside the value rather than in the functions that report
+    it, so a member cannot be added to the bundle without also saying how it is
+    refused. That is the whole point of the type: the refusal used to restate
+    the membership list, and a restated list is a list that can disagree.
+
+    Attributes:
+        value: What ``-w`` sets the flag to. Every member expands to ``"true"``,
+            so agreement and contradiction are an explicit flag's only outcomes.
+        verb: What the flag would have done, for the ``--generate-manifest``
+            refusal -- ``"record"`` or ``"write"``.
+        replay: How to ask for the same thing once the manifest exists.
+    """
+
+    value: str
+    verb: str
+    replay: str
+
+
+#: The one definition of what ``-w`` means. The expansion, the contradiction
+#: check and the ``--generate-manifest`` refusal all read it, so a third member
+#: is one dict entry rather than three edits in three functions -- and cannot
+#: end up expanded by ``-w`` while staying silently permitted beside a flag that
+#: makes no model call. Keys are argparse destinations; iteration order is the
+#: order the refusal reports them in.
+_WRITE_BUNDLE: dict[str, _WriteBundleMember] = {
+    "changeset": _WriteBundleMember("true", "record", "--changeset true"),
+    "exiftool_write": _WriteBundleMember("true", "write", "-w"),
+}
+
+#: Input tokens that carry no path at all, once ``str.strip`` and the surrounding
+#: quote pair ``utils.normalize_path`` removes are accounted for. It ends by
+#: calling ``os.path.normpath``, which answers ``"."`` for what is left of any of
+#: these -- so ``photokin " "`` would otherwise be classified as the current
+#: working directory and every image in it analyzed, and written to under ``-w``.
+#: ``photokin .`` is a real request and is deliberately not in this set.
+_BLANK_INPUT_TOKENS: frozenset[str] = frozenset({"", '""', "''"})
+
 _EPILOG = """\
 examples:
-  # Single photo (dev/testing)
-  %(prog)s photo.jpg --back photo_back.jpg --provider openai
+  # A folder of scans
+  %(prog)s ./scans/ --provider anthropic --claude-model sonnet
 
-  # Folder of images
-  %(prog)s --folder ./scans/ --provider anthropic --claude-model sonnet
+  # A manifest, streaming results and applying the approved tags
+  %(prog)s batch.json -w --output-file results.ndjson
+
+  # One photo and its reverse (dev/testing)
+  %(prog)s scan_042.jpg --back scan_042-back.jpg --provider openai
 
   # Any OpenRouter-hosted vision model (Kimi, Qwen-VL, ...) via one API key
-  %(prog)s --folder ./scans/ --provider openrouter --openrouter-model moonshotai/kimi-k3
-
-  # Manifest mode (recommended, used by the Lightroom plugin)
-  %(prog)s --manifest batch.json --output-file results.ndjson --changeset true
+  %(prog)s ./scans/ --provider openrouter --openrouter-model moonshotai/kimi-k3
 
   # Check how a folder would be grouped, without calling the model
-  %(prog)s --folder ./scans/ --generate-manifest scans-manifest.json
+  %(prog)s ./scans/ --generate-manifest scans-manifest.json
 """
 
 
@@ -151,6 +217,421 @@ def _interactive_prompt() -> list[str]:
     return extra
 
 
+@dataclass(frozen=True)
+class ResolvedInput:
+    """The run's single input, classified once and addressed from one place.
+
+    Attributes:
+        kind: ``"folder"``, ``"manifest"`` or ``"photo"``.
+        path: The normalized path the builders and loaders receive.
+        display: The token exactly as the user typed it, for every message.
+        directory: The folder itself for folder input, the containing directory
+            for a manifest or a photo. This is the "input's directory" the
+            changeset derivation means -- ``os.path.dirname("./scans")`` is
+            ``"."``, which is not it.
+        stem: The folder's own name for folder input, the filename without its
+            extension otherwise. Empty at a drive root.
+    """
+
+    kind: str
+    path: str
+    display: str
+    directory: str
+    stem: str
+
+
+def _resolved_input(kind: str, path: str, display: str) -> ResolvedInput:
+    """Build a :class:`ResolvedInput`, deriving its directory and stem.
+
+    No ``os.path.realpath`` is taken anywhere: the path the user typed is the
+    path stored, so a changeset derived from it lands beside the symlink rather
+    than beside its target.
+
+    Args:
+        kind: ``"folder"``, ``"manifest"`` or ``"photo"``.
+        path: The normalized path.
+        display: The token exactly as the user typed it.
+
+    Returns:
+        The resolved input.
+    """
+    absolute = os.path.abspath(path)
+    if kind == "folder":
+        return ResolvedInput(kind, path, display, absolute, os.path.basename(absolute))
+    return ResolvedInput(
+        kind,
+        path,
+        display,
+        os.path.dirname(absolute),
+        os.path.splitext(os.path.basename(absolute))[0],
+    )
+
+
+def _input_path(value: str) -> str:
+    """Normalize an input token, refusing one that addresses nothing.
+
+    The single normalization point for all three input spellings, so a blank
+    token cannot be refused by one of them and silently redirected to the
+    current working directory by the other two.
+
+    Args:
+        value: The token exactly as the user typed it.
+
+    Returns:
+        The normalized path.
+
+    Raises:
+        SystemExit: With code 2 when the token names no path at all.
+    """
+    if value.strip() in _BLANK_INPUT_TOKENS:
+        _exit_with_usage_error(*cli_messages.input_names_nothing(value))
+    return normalize_path(value) or ""
+
+
+def _classify_positional(display: str) -> tuple[ResolvedInput, str]:
+    """Decide what a positional input is, from the path alone.
+
+    Directories win over extensions, so a directory named ``batch.json`` is a
+    folder; that is the case the detection line exists to make visible.
+    ``os.path.exists`` and friends follow symlinks, so a link to a folder is a
+    folder and a link to an image is a photo. Only a link that resolves nowhere
+    is special-cased, because "check the spelling" is the wrong remedy for it.
+
+    Args:
+        display: The token exactly as the user typed it.
+
+    Returns:
+        The resolved input and the reason it was classified that way.
+
+    Raises:
+        SystemExit: With code 2 when the path cannot be used as an input.
+    """
+    path = _input_path(display)
+    if not os.path.lexists(path):
+        _exit_with_usage_error(*cli_messages.input_not_found(display))
+    if not os.path.exists(path):
+        # lexists true and exists false is exactly a dangling symlink.
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            logger.debug("Reading the link at %s failed: %s", path, exc)
+            _exit_with_usage_error(*cli_messages.input_not_found(display))
+        _exit_with_usage_error(*cli_messages.input_is_a_broken_symlink(display, target))
+    if os.path.isdir(path):
+        return _resolved_input("folder", path, display), "it is a directory"
+    # ``isfile`` rather than "not a directory": a FIFO, a device or a socket
+    # would otherwise fall through to the extension test below.
+    if not os.path.isfile(path):
+        _exit_with_usage_error(*cli_messages.input_is_not_a_file_or_folder(display))
+    extension = os.path.splitext(path)[1].lower()
+    if extension == ".json":
+        return _resolved_input("manifest", path, display), "it is a .json file"
+    if extension in utils.VALID_EXTS:
+        return _resolved_input("photo", path, display), f"it is a {extension} file"
+    _exit_with_usage_error(*cli_messages.unrecognized_input_extension(display))
+
+
+def _resolve_folder_alias(value: str) -> ResolvedInput:
+    """Resolve ``--folder``, which asserts a directory rather than detecting one.
+
+    Args:
+        value: The value the flag carried.
+
+    Returns:
+        The resolved input.
+
+    Raises:
+        SystemExit: With code 2 when the path is not an existing directory.
+    """
+    path = _input_path(value)
+    if not os.path.exists(path):
+        _exit_with_usage_error(*cli_messages.input_not_found(value))
+    if not os.path.isdir(path):
+        _exit_with_usage_error(*cli_messages.alias_is_not_a_directory(value))
+    return _resolved_input("folder", path, value)
+
+
+def _resolve_manifest_alias(value: str) -> ResolvedInput:
+    """Resolve ``--manifest``, which asserts a ``.json`` file.
+
+    Args:
+        value: The value the flag carried.
+
+    Returns:
+        The resolved input.
+
+    Raises:
+        SystemExit: With code 2 when the path is not an existing ``.json`` file.
+    """
+    path = _input_path(value)
+    if not os.path.exists(path):
+        _exit_with_usage_error(*cli_messages.input_not_found(value))
+    if os.path.isdir(path) or os.path.splitext(path)[1].lower() != ".json":
+        _exit_with_usage_error(*cli_messages.alias_is_not_a_json_file(value))
+    return _resolved_input("manifest", path, value)
+
+
+def _resolve_input(args: argparse.Namespace) -> ResolvedInput:
+    """Pick the run's one input and settle what it is.
+
+    An alias asserts the type and infers nothing, so ``--manifest ./scans/`` is
+    refused rather than silently re-detected as a folder. Only a positional is
+    classified, and only a positional logs what it was taken to be.
+
+    Args:
+        args: The parsed namespace.
+
+    Returns:
+        The resolved input.
+
+    Raises:
+        SystemExit: With code 2 when no input, or more than one, was given.
+    """
+    sources = [
+        ("positional", args.input_path),
+        ("--folder", args.folder),
+        ("--manifest", args.manifest),
+    ]
+    # "Was this source given" is ``is not None``, not truthiness. All three
+    # default to None, so an empty token is a source that was given and names
+    # nothing -- which is ``_input_path``'s job to say. Filtering on truthiness
+    # dropped it instead, and ``photokin ""`` was reported as no input at all
+    # while ``photokin " "`` got the blank-token message.
+    given = [(name, value) for name, value in sources if value is not None]
+    if not given:
+        # The interactive prompt already ran if argv was empty, so reaching here
+        # means flags were passed with nothing to run them against.
+        if args.generate_manifest:
+            _exit_with_usage_error(
+                *cli_messages.generate_manifest_without_input(args.generate_manifest)
+            )
+        _exit_with_usage_error(*cli_messages.no_input_given())
+    if len(given) > 1:
+        # With all three present the two aliases are reported and the positional
+        # is named in neither message: one error per run is the contract.
+        if args.folder and args.manifest:
+            _exit_with_usage_error(*cli_messages.two_aliases(args.folder, args.manifest))
+        alias_flag, alias_value = given[1]
+        _exit_with_usage_error(
+            *cli_messages.positional_and_alias(args.input_path, alias_flag, alias_value)
+        )
+    name, value = given[0]
+    if name == "--folder":
+        return _resolve_folder_alias(value)
+    if name == "--manifest":
+        return _resolve_manifest_alias(value)
+    resolved, reason = _classify_positional(value)
+    logger.info("%s", cli_messages.detected_as(value, _KIND_LABELS[resolved.kind], reason))
+    return resolved
+
+
+def _validate_folder_input(resolved: ResolvedInput) -> None:
+    """Refuse a folder that cannot be listed or holds nothing to analyze.
+
+    An empty folder used to warn and exit 0, which is the "total failure reads
+    as success" shape the rest of this pipeline exists to remove.
+
+    Args:
+        resolved: The folder input.
+
+    Raises:
+        SystemExit: With code 2 when the folder is unreadable or imageless.
+    """
+    try:
+        files = utils.list_folder_images(resolved.path)
+    except OSError as exc:
+        _exit_with_usage_error(
+            *cli_messages.folder_cannot_be_read(resolved.display, exc.strerror or str(exc))
+        )
+    if not files:
+        _exit_with_usage_error(
+            *cli_messages.folder_has_no_images(resolved.display, _IMAGE_EXTENSIONS)
+        )
+
+
+def _load_manifest_input(resolved: ResolvedInput) -> dict:
+    """Read a manifest and refuse one the run cannot process.
+
+    Fatal on the first offending item rather than collecting a report: one
+    problem line and one ``Try:`` line is the house style.
+
+    Args:
+        resolved: The manifest input.
+
+    Returns:
+        The parsed manifest document.
+
+    Raises:
+        SystemExit: With code 2 for an unreadable, misshapen or broken manifest.
+    """
+    try:
+        document = load_json(resolved.path)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        _exit_with_usage_error(*cli_messages.json_is_unreadable(resolved.display, str(exc)))
+    except FileNotFoundError:
+        # Detection proved the file was there, so reaching this means it was
+        # removed in between -- the one OSError for which "not found" is true.
+        _exit_with_usage_error(*cli_messages.input_not_found(resolved.display))
+    except OSError as exc:
+        # A denied ACL, a lock held by a sync client, a handle another process
+        # opened exclusively. "Check the spelling" is actively wrong for these.
+        _exit_with_usage_error(
+            *cli_messages.manifest_cannot_be_read(resolved.display, exc.strerror or str(exc))
+        )
+    if not isinstance(document, dict) or not isinstance(document.get("items"), list):
+        _exit_with_usage_error(*cli_messages.json_is_not_a_manifest(resolved.display))
+    items = document["items"]
+    if not items:
+        _exit_with_usage_error(*cli_messages.manifest_has_no_items(resolved.display))
+    for index, item in enumerate(items):
+        raw_path = item.get("path") if isinstance(item, dict) else None
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            _exit_with_usage_error(
+                *cli_messages.manifest_item_has_no_path(resolved.display, index)
+            )
+        if not os.path.isfile(normalize_path(raw_path) or ""):
+            _exit_with_usage_error(
+                *cli_messages.manifest_item_not_found(resolved.display, index, raw_path)
+            )
+    return document
+
+
+def _validate_single_photo_flags(args: argparse.Namespace, resolved: ResolvedInput) -> None:
+    """Refuse ``--back``/``--meta`` against the wrong input, or a path that is gone.
+
+    Both flags are read only by the single-photo path, so folder and manifest
+    input used to drop them silently. The existence check lives here rather than
+    in ``utils.ensure_paths_exist`` so ``--generate-manifest`` and the analysis
+    path answer identically for one input, in this module's own wording.
+
+    Args:
+        args: The parsed namespace.
+        resolved: The run's input.
+
+    Raises:
+        SystemExit: With code 2 when a flag does not apply or names nothing.
+    """
+    for flag, value in (("--back", args.back), ("--meta", args.meta)):
+        if not value:
+            continue
+        if resolved.kind != "photo":
+            _exit_with_usage_error(
+                *cli_messages.flag_needs_single_photo_input(
+                    flag, value, resolved.display, _KIND_LABELS[resolved.kind]
+                )
+            )
+        if not os.path.isfile(normalize_path(value) or ""):
+            _exit_with_usage_error(*cli_messages.flag_path_not_found(flag, value))
+
+
+def _flag_spelling(dest: str) -> str:
+    """Return the long-flag spelling of an argparse destination.
+
+    Args:
+        dest: The destination name, such as ``"exiftool_write"``.
+
+    Returns:
+        The flag as the user types it, such as ``"--exiftool-write"``.
+    """
+    return "--" + dest.replace("_", "-")
+
+
+def _resolve_write_bundle(args: argparse.Namespace) -> tuple[str, str | None]:
+    """Expand ``-w`` and reject any explicit flag that contradicts it.
+
+    Args:
+        args: The parsed namespace. Every :data:`_WRITE_BUNDLE` destination
+            defaults to ``None`` there so "unset" is distinguishable from an
+            explicit value that happens to agree with the expansion.
+
+    Returns:
+        ``(changeset, exiftool_write)``. ``changeset`` is ``"true"`` or
+        ``"false"``; ``exiftool_write`` is ``"true"``, ``"false"``, or ``None``
+        meaning "defer to EXIFTOOL_WRITE_ENABLED, else the default".
+
+    Raises:
+        SystemExit: With code 2 when ``-w`` is given beside a contradicting flag.
+    """
+    values: dict[str, str | None] = {dest: getattr(args, dest) for dest in _WRITE_BUNDLE}
+    if args.write:
+        for dest, member in _WRITE_BUNDLE.items():
+            given = values[dest]
+            if given is not None and given != member.value:
+                _exit_with_usage_error(
+                    *cli_messages.write_bundle_contradiction(_flag_spelling(dest), given)
+                )
+            values[dest] = member.value if given is None else given
+    return values["changeset"] or "false", values["exiftool_write"]
+
+
+def _refuse_generate_manifest_write_flags(args: argparse.Namespace) -> None:
+    """Refuse write flags beside ``--generate-manifest``, which writes nothing else.
+
+    The flag exits before a model is called, so a write flag beside it is a
+    request that cannot be partly honored.
+
+    Which flags those are is read off :data:`_WRITE_BUNDLE` rather than restated
+    here. Restating it was a leak: the bundle stayed the one definition of what
+    ``-w`` expands to, but a member added to it would have been expanded by
+    ``-w`` and then silently permitted beside ``--generate-manifest``, which is
+    the one place a write flag can never be honored at all.
+
+    Args:
+        args: The parsed namespace, before ``-w``'s expansion is written back.
+
+    Raises:
+        SystemExit: With code 2 for the first conflicting flag found.
+    """
+    if args.output_file:
+        _exit_with_usage_error(
+            *cli_messages.generate_manifest_with_output_file(args.output_file)
+        )
+    # ``-w`` is the bundle's trigger rather than a member of it, so it is named
+    # on its own -- and named first, since a run passing it asked for every
+    # member at once and should be told about the shorthand it actually typed.
+    if args.write:
+        _exit_with_usage_error(
+            *cli_messages.generate_manifest_with_write_flag("-w", "write", "-w")
+        )
+    for dest, member in _WRITE_BUNDLE.items():
+        if getattr(args, dest) == member.value:
+            _exit_with_usage_error(
+                *cli_messages.generate_manifest_with_write_flag(
+                    f"{_flag_spelling(dest)} {member.value}", member.verb, member.replay
+                )
+            )
+
+
+def _derive_changeset_path(resolved: ResolvedInput, out_path: str | None) -> str:
+    """Return where the changeset goes: ``dirname(--output-file or input)``.
+
+    The stem follows the output file when there is one -- ``results.ndjson``
+    yields ``results_changeset.ndjson`` and ``batch_results.ndjson`` yields
+    ``batch_changeset.ndjson`` -- and the input's own stem otherwise, so two
+    runs in one directory no longer collide on a bare ``changeset.ndjson``.
+
+    Args:
+        resolved: The run's input.
+        out_path: The ``--output-file`` value, or ``None``.
+
+    Returns:
+        The absolute or input-relative changeset path.
+    """
+    if out_path:
+        base_dir = os.path.dirname(os.path.abspath(out_path))
+        name = os.path.basename(out_path)
+        lowered = name.lower()
+        for suffix in ("_results.ndjson", "_results.json"):
+            if lowered.endswith(suffix):
+                stem = name[: -len(suffix)]
+                break
+        else:
+            stem = os.path.splitext(name)[0]
+    else:
+        base_dir, stem = resolved.directory, resolved.stem
+    return os.path.join(base_dir, f"{stem}_changeset.ndjson" if stem else "changeset.ndjson")
+
+
 def _apply_common_cfg(cfg: Config, args: argparse.Namespace, *, manifest: dict | None = None) -> None:
     """Apply shared CLI arguments to *cfg* that are identical across all modes."""
 
@@ -164,8 +645,55 @@ def _apply_common_cfg(cfg: Config, args: argparse.Namespace, *, manifest: dict |
     cfg.run_batch_id = args.batch_id
 
 
-def _resolve_exiftool_config(args: argparse.Namespace, *, dry_run: bool) -> ExiftoolConfig:
-    """Build the pipeline ExiftoolConfig with precedence: CLI flag > env var > default."""
+def _apply_manifest_debug_settings(
+    cfg: Config, args: argparse.Namespace, manifest: dict, base_path: str
+) -> None:
+    """Let a manifest document override the debug-dump settings, as it always could.
+
+    Args:
+        cfg: The run configuration, already carrying the shared flags.
+        args: The parsed namespace.
+        manifest: The manifest document.
+        base_path: ``--output-file`` when given, else the manifest itself; its
+            directory is where dumps land unless a flag or the document says
+            otherwise.
+    """
+    cli_debug_dump = (
+        None if args.debug_dump_llm_request is None else (args.debug_dump_llm_request == "true")
+    )
+    cfg.debug_dump_llm_request = (
+        cli_debug_dump
+        if cli_debug_dump is not None
+        else bool(manifest.get("debug_dump_llm_request"))
+    )
+    manifest_dump_dir = manifest.get("debug_dump_dir")
+    if not isinstance(manifest_dump_dir, str):
+        manifest_dump_dir = None
+    cfg.debug_dump_dir = args.debug_dump_dir or manifest_dump_dir or os.path.join(
+        os.path.dirname(base_path), "debug"
+    )
+
+
+def _resolve_exiftool_config(args: argparse.Namespace, *, dry_run: bool = False) -> ExiftoolConfig:
+    """Build the pipeline ExiftoolConfig with precedence: CLI flag > env var > default.
+
+    ``dry_run`` is not wired to any flag of this CLI and takes its default on
+    every run. It is ExifTool's own preview mode -- count the writes, perform
+    none -- which ``--dry-run`` here is not: that flag stops before the first
+    model call, so no changeset exists for the apply step to preview. The two
+    were conflated before C2 separated them. The parameter stays because it is
+    how a direct caller reaches the preview through the same flag/env precedence
+    the CLI uses; the preview's own command line is
+    ``python -m photokin.exiftool.apply --dry-run``.
+
+    Args:
+        args: The parsed namespace, read for the three ``--exiftool-*`` flags.
+        dry_run: Whether ExifTool should count writes instead of performing
+            them. Library-only, as above.
+
+    Returns:
+        The resolved ExifTool configuration for this run.
+    """
     flag_enabled = None if args.exiftool_write is None else (args.exiftool_write == "true")
     flag_fields = exiftool_parse_fields(args.exiftool_fields)
     return ExiftoolConfig.from_env(
@@ -177,34 +705,41 @@ def _resolve_exiftool_config(args: argparse.Namespace, *, dry_run: bool) -> Exif
     )
 
 
+def _writes_are_planned(ecfg: ExiftoolConfig, *, changeset_requested: bool) -> bool:
+    """Report whether this run will really hand fields to ExifTool.
+
+    Args:
+        ecfg: The resolved ExifTool configuration.
+        changeset_requested: True when ``--changeset true`` was resolved.
+
+    Returns:
+        True when the apply step has a changeset, permission and fields.
+    """
+    return changeset_requested and ecfg.enabled and bool(ecfg.fields)
+
+
 def _preflight_exiftool(ecfg: ExiftoolConfig, *, changeset_requested: bool) -> None:
     """Fail before the first model call when a requested ExifTool write cannot run.
 
     ``apply_changeset`` only looks for the binary once the whole batch has been
-    analyzed and paid for, so the same lookup is done up front here. A dry run
-    is exempt: it reports what it would write without ever invoking the binary,
-    so requiring one would block a preview that needs no ExifTool at all.
+    analyzed and paid for, so the same lookup is done up front here. ``--dry-run``
+    is not exempt: it stops after printing the plan, and a plan reporting
+    ``write : ExifTool EXIF:UserComment`` when no binary exists would be a lie.
 
     Args:
         ecfg: The resolved ExifTool configuration for this run.
-        changeset_requested: True when ``--changeset true`` was passed.
+        changeset_requested: True when ``--changeset true`` was resolved.
 
     Raises:
         SystemExit: With code 2 when writes are requested but no binary resolves.
     """
-    if not (ecfg.enabled and changeset_requested) or ecfg.dry_run:
+    if not (ecfg.enabled and changeset_requested):
         return
     try:
         resolve_exiftool_path(ecfg)
     except OSError as exc:
         logger.debug("ExifTool resolution failed: %s", exc)
-        configured = f" (configured path: {ecfg.path})" if ecfg.path else ""
-        _exit_with_usage_error(
-            "--changeset true needs ExifTool to write the results, "
-            f"but no ExifTool binary was found{configured}.",
-            "run `python -m photokin.exiftool.fetch` to download one, install ExifTool "
-            "system-wide, or re-run with --exiftool-write false",
-        )
+        _exit_with_usage_error(*cli_messages.exiftool_not_found(ecfg.path or ""))
 
 
 def _preflight_output_file(out_path: str, *, role: str = "--output-file") -> None:
@@ -225,26 +760,17 @@ def _preflight_output_file(out_path: str, *, role: str = "--output-file") -> Non
     """
     out_dir = os.path.dirname(os.path.abspath(out_path))
     if not os.path.isdir(out_dir):
-        _exit_with_usage_error(
-            f"{role} directory does not exist: {out_dir}",
-            "create the directory first, or point --output-file at an existing one",
-        )
+        _exit_with_usage_error(*cli_messages.output_dir_missing(role, out_dir))
     # Caught here rather than at the write: a directory passes every check below
     # (it exists, its parent is writable) and would only fail after the batch had
     # already been analyzed and paid for.
     if os.path.isdir(out_path):
-        _exit_with_usage_error(
-            f"{role} is a directory, not a file: {out_path}",
-            "name the file itself, such as results.ndjson inside that directory",
-        )
+        _exit_with_usage_error(*cli_messages.output_is_a_directory(role, out_path))
     # Windows refuses to unlink or rename over a read-only file, so the write
     # sequence really does need this one. POSIX gates both on the directory,
     # which the probe below already covers, and would abort a run that works.
     if os.name == "nt" and os.path.exists(out_path) and not os.access(out_path, os.W_OK):
-        _exit_with_usage_error(
-            f"{role} already exists and is not writable: {out_path}",
-            "clear the read-only flag on that file, or choose a different --output-file",
-        )
+        _exit_with_usage_error(*cli_messages.output_not_writable(role, out_path))
     # A unique probe, not ``out_path + ".tmp"``: that name is the atomic write's
     # own temp file, and opening it "w" would truncate a real file that happens
     # to be sitting there before deleting it outright.
@@ -253,16 +779,19 @@ def _preflight_output_file(out_path: str, *, role: str = "--output-file") -> Non
             pass
     except OSError as exc:
         _exit_with_usage_error(
-            f"{role} destination is not writable: {out_path} ({exc.strerror or exc})",
-            "point --output-file at a writable directory",
+            *cli_messages.output_destination_not_writable(
+                role, out_path, exc.strerror or str(exc)
+            )
         )
 
 
 def _write_generated_manifest(manifest: dict, out_path: str) -> None:
     """Write *manifest* to *out_path*, atomically and always pretty-printed.
 
-    Pretty regardless of ``--pretty-json``: this file exists to be read and hand
-    edited. Written through a sibling temp file and ``os.replace`` so an
+    Pretty regardless of ``Config.pretty_json``, which the other two JSON writes
+    honor: this file exists to be read and hand edited. (There is no
+    ``--pretty-json`` flag; the field is library-only.) Written through a
+    sibling temp file and ``os.replace`` so an
     interrupted write never leaves a truncated manifest behind, matching how the
     aggregate ``.json`` output is written. ``os.replace`` overwrites an existing
     destination atomically on Windows as well as POSIX, so it is called against
@@ -285,69 +814,63 @@ def _write_generated_manifest(manifest: dict, out_path: str) -> None:
             os.remove(tmp_path)
 
 
-def _generate_manifest(args: argparse.Namespace, cfg: Config) -> None:
+def _write_aggregate_json(data: dict, out_path: str, *, pretty: bool) -> None:
+    """Write the whole result set to *out_path* through a sibling temp file.
+
+    No unlink ahead of the replace: ``os.replace`` overwrites atomically on
+    Windows as well as POSIX, so removing first only opens a window in which the
+    caller's previous results file is gone and the new one does not exist yet --
+    and if the replace then fails, the ``finally`` clears the temp file and the
+    run ends with neither.
+
+    Args:
+        data: The aggregate the stream returned.
+        out_path: Destination, already pre-flighted.
+        pretty: Whether to indent the document.
+    """
+    tmp_path = out_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2 if pretty else None, ensure_ascii=False)
+        os.replace(tmp_path, out_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _generate_manifest(resolved: ResolvedInput, args: argparse.Namespace, cfg: Config) -> None:
     """Describe how this run's input would be grouped, then stop.
 
     The manifest written here holds the very ``items`` list the analysis path
     would have processed -- same builder, same order, same keys -- so it is a
     description of the run rather than a separate rendering of it, and re-running
-    it with ``--manifest`` reproduces the run exactly. Only the input is
-    described: provider, model, policy and debug settings are run settings, and
-    baking them in would let a generated file silently override a later run's
-    flags.
+    it with the file as the input reproduces the run exactly. Only the input is
+    described: provider, model and debug settings are run settings, and baking
+    them in would let a generated file silently override a later run's flags.
 
     Args:
+        resolved: The run's input, already validated.
         args: Parsed CLI arguments.
         cfg: The run configuration, with photo context already resolved.
 
     Raises:
         SystemExit: With code 2 for every usage error.
-        FileNotFoundError: If the image or ``--back`` path does not exist.
-            Reported by ``main`` as exit 2, as the folder branch's
-            ``NotADirectoryError`` already was.
     """
-    if args.manifest:
-        _exit_with_usage_error(
-            "--generate-manifest describes how folder or single-photo input would be "
-            "grouped, but --manifest input is already a manifest.",
-            "drop --generate-manifest, or point it at a folder: "
-            "photokin --folder ./scans/ --generate-manifest out.json",
-        )
-    if not args.folder and not args.image:
-        # The interactive prompt only runs for a completely empty argv, so this
-        # flag on its own reaches here with nothing to describe. Writing a
-        # one-item manifest for the empty path and exiting 0 would be exactly the
-        # silent nonsense every other guard in this function exists to refuse.
-        _exit_with_usage_error(
-            "--generate-manifest describes how an input would be grouped, but no "
-            "folder or image was given.",
-            f"name the input: photokin --folder ./scans/ --generate-manifest "
-            f"{args.generate_manifest}",
-        )
+    if resolved.kind == "manifest":
+        _exit_with_usage_error(*cli_messages.generate_manifest_with_manifest_input())
     out_path = args.generate_manifest
     if not out_path.lower().endswith(".json"):
-        _exit_with_usage_error(
-            f"--generate-manifest must end with .json; got {out_path}.",
-            "name the file itself, such as scans-manifest.json",
-        )
+        _exit_with_usage_error(*cli_messages.generate_manifest_extension(out_path))
     _preflight_output_file(out_path, role="--generate-manifest")
 
-    if args.folder:
-        manifest = build_folder_manifest(args.folder, photo_context_text=cfg.photo_context_text)
+    if resolved.kind == "folder":
+        manifest = build_folder_manifest(resolved.path, photo_context_text=cfg.photo_context_text)
     else:
         # Loaded eagerly, exactly as the analysis path does, so an unreadable or
         # malformed --meta still exits 2 before anything is written.
         orig_meta = load_json(args.meta) if args.meta else None
-        # Also exactly as the analysis path does, and for the same reason the
-        # folder branch above refuses a directory that is not there: a manifest
-        # describing how a run that cannot happen would be grouped is the silent
-        # nonsense this function's other guards exist to refuse, and it only
-        # fails later, when the file is fed back through --manifest.
-        front = normalize_path(args.image)
-        back = normalize_path(args.back) if args.back else None
-        utils.ensure_paths_exist([p for p in (front, back) if p])
         manifest = build_single_photo_manifest(
-            args.image,
+            resolved.path,
             args.back,
             meta=orig_meta,
             photo_context_text=cfg.photo_context_text,
@@ -358,6 +881,18 @@ def _generate_manifest(args: argparse.Namespace, cfg: Config) -> None:
     # what reports an explicit override that disagrees with a filename -- most
     # usefully a --back the grammar reads as a front.
     buckets = build_manifest_buckets(manifest["items"], group_by=cfg.group_by)
+    if args.dry_run:
+        # The flag promises no destination is touched, and this branch's
+        # destination is a file the user may well have hand edited. The grouping
+        # is still reported, since that is what the flag pair is asking for.
+        logger.info(
+            "--dry-run: would write a manifest for %d file(s) in %d group(s) to %s; "
+            "nothing was written.",
+            len(manifest["items"]),
+            len(buckets),
+            out_path,
+        )
+        return
     _write_generated_manifest(manifest, out_path)
     logger.info(
         "Wrote manifest for %d file(s) in %d group(s) to %s; no model call was made.",
@@ -365,6 +900,57 @@ def _generate_manifest(args: argparse.Namespace, cfg: Config) -> None:
         len(buckets),
         out_path,
     )
+
+
+def _render_output_clause(out_path: str | None) -> str:
+    """Return the plan summary's ``output`` line for this destination.
+
+    Args:
+        out_path: The ``--output-file`` value, or ``None``.
+
+    Returns:
+        The destination and what it will hold, or ``"stdout"``.
+    """
+    if not out_path:
+        return "stdout"
+    absolute = os.path.abspath(out_path)
+    if out_path.lower().endswith(".ndjson"):
+        return f"{absolute} (ndjson, one record per finished photo)"
+    return f"{absolute} (json, one object written at the end)"
+
+
+def _render_write_clause(
+    ecfg: ExiftoolConfig,
+    *,
+    changeset_requested: bool,
+    exiftool_write: str | None,
+    dry_run: bool,
+) -> str:
+    """Return the plan summary's ``write`` line, naming why nothing is written.
+
+    The "defaults to false" spelling is the only place the flipped default is
+    announced, which is deliberate: it is guaranteed to be printed before the
+    run, so it needs no second warning.
+
+    Args:
+        ecfg: The resolved ExifTool configuration.
+        changeset_requested: True when ``--changeset true`` was resolved.
+        exiftool_write: The resolved ``--exiftool-write`` value, or ``None``.
+        dry_run: Whether the run stops after the summary.
+
+    Returns:
+        The write set, or a ``none (...)`` clause stating what turned it off.
+    """
+    planned = _writes_are_planned(ecfg, changeset_requested=changeset_requested)
+    if dry_run and planned:
+        return "none (--dry-run)"
+    if planned:
+        return "ExifTool " + ", ".join(ecfg.fields)
+    if exiftool_write == "false":
+        return "none (--exiftool-write false)"
+    if exiftool_write is None and changeset_requested:
+        return "none (--exiftool-write defaults to false)"
+    return "none"
 
 
 def _apply_exiftool_changeset(
@@ -434,7 +1020,7 @@ def _apply_exiftool_changeset(
 
 
 def main() -> None:
-    """CLI entry point that routes to single-photo, folder, or manifest flows."""
+    """CLI entry point: resolve one input, state the plan, then run it."""
 
     _configure_logging()
     try:
@@ -449,13 +1035,28 @@ def main() -> None:
             formatter_class=argparse.RawDescriptionHelpFormatter,
         )
 
-        group = ap.add_mutually_exclusive_group(required=False)
-        group.add_argument("image", nargs="?", help="Path to the main/front image")
-        group.add_argument("--folder", help="Process an entire folder (batch mode)")
-        group.add_argument("--manifest", help="Process a manifest JSON (flat list of files + optional metadata)")
+        ap.add_argument(
+            "input_path",
+            nargs="?",
+            metavar="INPUT",
+            default=None,
+            help="Folder of scans, .json manifest, or a single image. The type is "
+                 "detected from the path: a directory is a folder, a .json file is a "
+                 "manifest, an image file is a single photo.",
+        )
+        ap.add_argument(
+            "--folder",
+            default=None,
+            help="Alias for a folder INPUT; asserts the path is a directory.",
+        )
+        ap.add_argument(
+            "--manifest",
+            default=None,
+            help="Alias for a manifest INPUT; asserts the path is a .json manifest file.",
+        )
 
-        ap.add_argument("--back", help="Path to the back image (optional for single mode)", default=None)
-        ap.add_argument("--meta", help="Path to original metadata JSON (single-photo mode)", default=None)
+        ap.add_argument("--back", help="Path to the back image (single-photo input only)", default=None)
+        ap.add_argument("--meta", help="Path to original metadata JSON (single-photo input only)", default=None)
         ap.add_argument("--photo-context-file", help="Path to UTF-8 text file containing authoritative photo context", default=None)
         ap.add_argument("--photo-context-text", help="Inline authoritative photo context text", default=None)
 
@@ -501,7 +1102,7 @@ def main() -> None:
         ap.add_argument("--no-update-vocab", action="store_true", help="Do not append new keywords to TOML")
 
         ap.add_argument("--output-file",
-                        help="Path to write results. If ends with .ndjson, writes one JSON object per line as items complete; if .json, writes a single JSON object at the end.")
+                        help="Path to write results, for every input type. If it ends with .ndjson, writes one JSON object per line as items complete; if .json, writes a single JSON object at the end. Without it, results go to stdout.")
         ap.add_argument("--output-sidecars", action="store_true",
                         help="Also emit per-photo sidecar JSON next to each image")
         ap.add_argument(
@@ -513,11 +1114,21 @@ def main() -> None:
         )
         ap.add_argument("--batch-id", help="Optional batch identifier stored in the output metadata/logs")
         # String booleans (not store_true) because Lua passes literal "true"/"false" as args.
+        # The default is None rather than "false" so ``-w`` can tell a value it may
+        # fill in from one it must contradict.
         ap.add_argument(
             "--changeset",
             choices=["true", "false"],
-            default="false",
-            help="Write changeset NDJSON next to the manifest/output artifacts",
+            default=None,
+            help="Write a changeset NDJSON of proposed field writes beside the output "
+                 "file, or beside the input when there is none (default: false)",
+        )
+        ap.add_argument(
+            "-w", "--write",
+            action="store_true",
+            dest="write",
+            help="Shorthand for --changeset true --exiftool-write true: record the "
+                 "proposed writes and apply them to the files.",
         )
         ap.add_argument(
             "--debug-dump-llm-request",
@@ -533,13 +1144,13 @@ def main() -> None:
         ap.add_argument(
             "--dry-run",
             action="store_true",
-            help="Run analysis without applying metadata downstream. NDJSON records are marked with dry_run=true.",
+            help="Print the plan summary and stop, before the first model call.",
         )
         ap.add_argument(
             "--exiftool-write",
             choices=["true", "false"],
             default=None,
-            help="Apply changeset fields to files via ExifTool after analysis (default: env EXIFTOOL_WRITE_ENABLED, else true)",
+            help="Apply changeset fields to files via ExifTool after analysis (default: env EXIFTOOL_WRITE_ENABLED, else false)",
         )
         ap.add_argument(
             "--exiftool-fields",
@@ -570,22 +1181,30 @@ def main() -> None:
         if args.jpeg_quality < 1 or args.jpeg_quality > 100:
             ap.error("--jpeg-quality must be between 1 and 100")
 
-        if args.changeset == "true" and not args.manifest:
-            _exit_with_usage_error(
-                "--changeset is only supported in --manifest mode.",
-                "photokin --manifest <manifest.json> --changeset true",
-            )
+        resolved = _resolve_input(args)
+        loaded_manifest: dict | None = None
+        if resolved.kind == "folder":
+            _validate_folder_input(resolved)
+        elif resolved.kind == "manifest":
+            loaded_manifest = _load_manifest_input(resolved)
+        _validate_single_photo_flags(args, resolved)
 
-        # Folder and single-photo mode print results to stdout and never read
-        # --output-file; erroring beats writing nothing and exiting 0.
-        if args.output_file and not args.manifest:
-            seen = f"--folder {args.folder}" if args.folder else args.image
-            seen = seen or "single-photo input"
-            _exit_with_usage_error(
-                f"--output-file is only supported in --manifest mode; saw {seen} with "
-                f"--output-file {args.output_file}, which would be ignored.",
-                f"redirect stdout instead: photokin {seen} > {args.output_file}",
-            )
+        # Ahead of the write-bundle guards below, not after them: those guards
+        # answer "how do I make this write happen", and for a flag that makes no
+        # model call the answer is that it cannot. Asking them first sent
+        # ``--generate-manifest --exiftool-write true`` to "add --changeset
+        # true", whose own refusal then said to drop it again.
+        if args.generate_manifest:
+            _refuse_generate_manifest_write_flags(args)
+
+        changeset_flag, exiftool_write = _resolve_write_bundle(args)
+        changeset_requested = changeset_flag == "true"
+        if exiftool_write == "true" and not changeset_requested:
+            _exit_with_usage_error(*cli_messages.write_needs_changeset())
+
+        out_path = args.output_file
+        if out_path and not out_path.lower().endswith((".ndjson", ".json")):
+            _exit_with_usage_error(*cli_messages.output_file_extension(out_path))
 
         cfg = Config(
             model=args.openai_model,
@@ -600,153 +1219,131 @@ def main() -> None:
             group_by=args.group_by,
             date_confidence_threshold=args.date_confidence_threshold,
             location_confidence_threshold=args.location_confidence_threshold,
-            dry_run=args.dry_run,
         )
+        _apply_common_cfg(cfg, args, manifest=loaded_manifest)
 
         # GENERATE-MANIFEST: describe the input's grouping and stop, before any
         # provider client can be built.
         if args.generate_manifest:
-            _apply_common_cfg(cfg, args)
-            _generate_manifest(args, cfg)
+            _generate_manifest(resolved, args, cfg)
+            return
 
-        # MANIFEST MODE (recommended for Lightroom)
-        elif args.manifest:
-            man = load_json(args.manifest)
-            _apply_common_cfg(cfg, args, manifest=man)
-            ecfg = _resolve_exiftool_config(args, dry_run=args.dry_run)
-            _preflight_exiftool(ecfg, changeset_requested=args.changeset == "true")
-            metadata_hydrator = make_manifest_hydrator(ecfg)
-            # Manifest can override debug dump setting
-            manifest_debug_dump = bool(man.get("debug_dump_llm_request"))
-            cli_debug_dump = None if args.debug_dump_llm_request is None else (args.debug_dump_llm_request == "true")
-            cfg.debug_dump_llm_request = cli_debug_dump if cli_debug_dump is not None else manifest_debug_dump
-            out_path = args.output_file
-            default_base_dir = os.path.dirname(out_path or args.manifest)
-            default_dump_dir = os.path.join(default_base_dir, "debug")
-            manifest_dump_dir = man.get("debug_dump_dir") if isinstance(man.get("debug_dump_dir"), str) else None
-            cfg.debug_dump_dir = args.debug_dump_dir or manifest_dump_dir or default_dump_dir
-            changeset_path = None
-            if args.changeset == "true":
-                base_dir = os.path.dirname(out_path or args.manifest)
-                if out_path:
-                    out_name = os.path.basename(out_path)
-                    out_lower = out_name.lower()
-                    if out_lower.endswith("_results.ndjson"):
-                        changeset_name = out_name[:-len("_results.ndjson")] + "_changeset.ndjson"
-                    elif out_lower.endswith(".ndjson"):
-                        changeset_name = out_name[:-len(".ndjson")] + "_changeset.ndjson"
-                    else:
-                        changeset_name = "changeset.ndjson"
-                else:
-                    changeset_name = "changeset.ndjson"
-                changeset_path = os.path.join(base_dir, changeset_name)
+        # ``-w``'s expansion is written back so everything downstream reads one
+        # resolved value rather than re-deriving the bundle.
+        args.exiftool_write = exiftool_write
+        ecfg = _resolve_exiftool_config(args)
+        _preflight_exiftool(ecfg, changeset_requested=changeset_requested)
 
-            # Every destination is validated before the first truncating open:
-            # those opens destroy the previous run's artifacts, so a later abort
-            # would take the changeset with it.
-            if out_path and not out_path.lower().endswith((".ndjson", ".json")):
-                _exit_with_usage_error(
-                    f"--output-file must end with .ndjson or .json; got {out_path}.",
-                    "use .ndjson to stream one record per finished photo, "
-                    "or .json for a single object written at the end",
-                )
-            if out_path:
-                _preflight_output_file(out_path)
-            if changeset_path:
-                _preflight_output_file(changeset_path, role="--changeset output")
+        if loaded_manifest is not None:
+            _apply_manifest_debug_settings(
+                cfg, args, loaded_manifest, out_path or resolved.path
+            )
 
-            changeset_writer = None
-            if changeset_path:
-                open(changeset_path, "w", encoding="utf-8").close()
+        # Every destination is validated before the first truncating open:
+        # those opens destroy the previous run's artifacts, so a later abort
+        # would take the changeset with it.
+        changeset_path = _derive_changeset_path(resolved, out_path) if changeset_requested else None
+        if out_path:
+            _preflight_output_file(out_path)
+        if changeset_path:
+            _preflight_output_file(changeset_path, role="--changeset output")
 
-                def changeset_writer(line: str):
-                    with open(changeset_path, "a", encoding="utf-8") as f:
-                        f.write(line + "\n")
-            if out_path:
-                out_ext = out_path.lower()
-                tmp_path = out_path + ".tmp"
-                if out_ext.endswith(".ndjson"):
-                    # Stream one line per finished photo
-                    open(out_path, "w", encoding="utf-8").close()
-
-                    def writer(line: str):
-                        rec = json.loads(line)
-                        if args.batch_id:
-                            rec["batch_id"] = args.batch_id
-                        with open(out_path, "a", encoding="utf-8") as f:
-                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-                    process_manifest_stream(
-                        manifest=man,
-                        cfg=cfg,
-                        write_sidecars=args.output_sidecars,
-                        ndjson_writer=writer,
-                        changeset_writer=changeset_writer,
-                        metadata_hydrator=metadata_hydrator,
-                    )
-                    _apply_exiftool_changeset(ecfg=ecfg, changeset_path=changeset_path, out_path=out_path)
-                else:
-                    # Aggregate then atomic write (temp → replace). No unlink
-                    # ahead of the replace: os.replace overwrites atomically on
-                    # Windows as well as POSIX, so removing first only opens a
-                    # window in which the caller's previous results file is gone
-                    # and the new one does not exist yet -- and if the replace
-                    # then fails, the ``finally`` clears the temp file and the
-                    # run ends with neither.
-                    try:
-                        data = process_manifest_stream(
-                            manifest=man,
-                            cfg=cfg,
-                            write_sidecars=args.output_sidecars,
-                            ndjson_writer=None,
-                            changeset_writer=changeset_writer,
-                            metadata_hydrator=metadata_hydrator,
-                        )
-                        with open(tmp_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, indent=2 if cfg.pretty_json else None, ensure_ascii=False)
-                        os.replace(tmp_path, out_path)
-                        _apply_exiftool_changeset(ecfg=ecfg, changeset_path=changeset_path, out_path=out_path)
-                    finally:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-            else:
-                # stdout fallback (Lightroom typically won’t use this)
-                data = process_manifest_stream(
-                    manifest=man,
-                    cfg=cfg,
-                    write_sidecars=args.output_sidecars,
-                    ndjson_writer=None,
-                    changeset_writer=changeset_writer,
-                    metadata_hydrator=metadata_hydrator,
-                )
-                _apply_exiftool_changeset(ecfg=ecfg, changeset_path=changeset_path, out_path=out_path)
-                print(json.dumps(data, indent=2 if cfg.pretty_json else None, ensure_ascii=False))
-
-        # FOLDER MODE
-        elif args.folder:
-            _apply_common_cfg(cfg, args)
-            data = analyze_folder(args.folder, cfg, write_sidecars=args.output_sidecars)
-            print(json.dumps(data, indent=2 if cfg.pretty_json else None, ensure_ascii=False))
-
-        # SINGLE PHOTO MODE
+        if loaded_manifest is not None:
+            manifest_doc = loaded_manifest
+        elif resolved.kind == "folder":
+            manifest_doc = build_folder_manifest(
+                resolved.path, photo_context_text=cfg.photo_context_text
+            )
         else:
             # Loaded here rather than through a manifest ``metadata_path`` so an
             # unreadable or malformed --meta still raises and exits 2 before any
             # model call, instead of being swallowed by load_item_metadata.
-            orig_meta = load_json(args.meta) if args.meta else None
-            _apply_common_cfg(cfg, args)
-            data = process_manifest_stream(
-                manifest=build_single_photo_manifest(
-                    args.image,
-                    args.back,
-                    meta=orig_meta,
-                    photo_context_text=cfg.photo_context_text,
-                ),
-                cfg=cfg,
-                write_sidecars=args.output_sidecars,
-                strict_run_failures=True,
+            manifest_doc = build_single_photo_manifest(
+                resolved.path,
+                args.back,
+                meta=load_json(args.meta) if args.meta else None,
+                photo_context_text=cfg.photo_context_text,
             )
+
+        if args.exiftool_fields and not _writes_are_planned(
+            ecfg, changeset_requested=changeset_requested
+        ):
+            logger.warning(
+                "%s", cli_messages.exiftool_fields_with_no_write(args.exiftool_fields)
+            )
+
+        # Bucketed with the override logging off: the stream buckets these same
+        # items again, and reporting every explicit override twice would be
+        # guaranteed on any --back run.
+        buckets = build_manifest_buckets(
+            manifest_doc["items"], group_by=cfg.group_by, log_overrides=False
+        )
+        plan = cli_messages.RunPlan(
+            input_location=os.path.abspath(resolved.path),
+            input_kind=_KIND_LABELS[resolved.kind].removeprefix("a "),
+            file_count=len(manifest_doc["items"]),
+            group_count=len(buckets),
+            group_by=cfg.group_by,
+            output=_render_output_clause(out_path),
+            changeset=changeset_path or "none (--changeset false)",
+            write=_render_write_clause(
+                ecfg,
+                changeset_requested=changeset_requested,
+                exiftool_write=exiftool_write,
+                dry_run=args.dry_run,
+            ),
+            provider=cfg.provider_name,
+            model=utils.resolve_model_for_provider(cfg),
+            dry_run=args.dry_run,
+        )
+        logger.info("%s", plan.render())
+        if args.dry_run:
+            # Nothing below this line has run, so no destination has been
+            # truncated and the previous run's artifacts are byte-identical.
+            return
+
+        ndjson_writer = None
+        if out_path and out_path.lower().endswith(".ndjson"):
+            # Stream one line per finished photo.
+            open(out_path, "w", encoding="utf-8").close()
+
+            def ndjson_writer(line: str) -> None:
+                """Append one finished record to the NDJSON output."""
+                record = json.loads(line)
+                if args.batch_id:
+                    record["batch_id"] = args.batch_id
+                with open(out_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        changeset_writer = None
+        if changeset_path:
+            open(changeset_path, "w", encoding="utf-8").close()
+
+            def changeset_writer(line: str) -> None:
+                """Append one proposed-write record to the changeset."""
+                with open(changeset_path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+
+        data = process_manifest_stream(
+            manifest=manifest_doc,
+            cfg=cfg,
+            write_sidecars=args.output_sidecars,
+            ndjson_writer=ndjson_writer,
+            changeset_writer=changeset_writer,
+            # Hydration stays manifest-only: seeding the ``{"metadata": {}}`` a
+            # synthesized item needs would change the merge inputs of every
+            # record of every folder run, which is a data change rather than a
+            # CLI one. See docs/unified-input-pipeline.md.
+            metadata_hydrator=make_manifest_hydrator(ecfg) if resolved.kind == "manifest" else None,
+            # Folder and single-photo input keep Phase A's failure contract;
+            # manifest input keeps the plug-in's.
+            strict_run_failures=resolved.kind != "manifest",
+        )
+        if not out_path:
             print(json.dumps(data, indent=2 if cfg.pretty_json else None, ensure_ascii=False))
+        elif out_path.lower().endswith(".json"):
+            _write_aggregate_json(data, out_path, pretty=cfg.pretty_json)
+        _apply_exiftool_changeset(ecfg=ecfg, changeset_path=changeset_path, out_path=out_path)
 
     except SystemExit:
         raise

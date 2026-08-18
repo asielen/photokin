@@ -1368,7 +1368,7 @@ class TestOrdinaryFolderAgainst7bcaf2f(_FolderRoutingTestCase):
         ]
         self.assertEqual(len(completion), 1)
         self.assertEqual(completion[0].levelno, logging.INFO)
-        self.assertIn("0 file(s) displaced or dropped", completion[0].getMessage())
+        self.assertIn("0 file(s) recorded without being sent", completion[0].getMessage())
 
 
 if __name__ == "__main__":

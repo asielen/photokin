@@ -1090,6 +1090,16 @@ def analyze_folder(
 # slot of the scan it was cropped from, whatever order the manifest listed them in.
 _PART_RANK = {"front": 0, "none": 1, "page": 2, "back": 3, "negative": 4}
 
+# Fidelity order for same-stem files that differ only by extension, e.g. a TIFF
+# master beside the JPEG derivative an archivist keeps for browsing. Only one of
+# them is sent to the model, so send the one that lost the least: lossless first,
+# then PNG, then the lossy formats. Alphabetical order -- the fallback this sits
+# in front of -- picks the opposite, since ".jpg" sorts before ".tif", and the
+# compression artifacts it hands the model are exactly what costs a transcription
+# of faint pencil on the back of a card.
+_FORMAT_RANK = {".tif": 0, ".tiff": 0, ".png": 1, ".jpg": 2, ".jpeg": 2}
+_UNRANKED_FORMAT = 3
+
 _GROUP_BY_VALUES = frozenset(utils.GROUP_BY_VALUES)
 
 # Joins the two halves of a ``pair`` bucket key. Illegal in a Windows filename,
@@ -1107,13 +1117,15 @@ _MANIFEST_FALSE = frozenset({"false", "0", "no"})
 _EXPLICIT_BACK_SUFFIX_RE = re.compile(r"(?:[-_. ]|(?<=\d))back$", re.IGNORECASE)
 
 
-def _coerce_manifest_bool(raw: dict, key: str, path: str) -> bool | None:
+def _coerce_manifest_bool(raw: dict, key: str, path: str, *, log: bool = True) -> bool | None:
     """Read a tri-state boolean flag from a manifest item.
 
     Args:
         raw: One entry of the manifest's ``items`` array.
         key: Flag name to read.
         path: Normalized item path, used only for the warning message.
+        log: Whether to report an unreadable value. Off for a caller that is
+            resolving the same items a second time purely to count them.
 
     Returns:
         The flag value, or ``None`` when it is absent, null or unreadable -- all
@@ -1133,7 +1145,8 @@ def _coerce_manifest_bool(raw: dict, key: str, path: str) -> bool | None:
             return True
         if token in _MANIFEST_FALSE:
             return False
-    logger.warning("Manifest item %s: ignoring unrecognized %s value %r", path, key, value)
+    if log:
+        logger.warning("Manifest item %s: ignoring unrecognized %s value %r", path, key, value)
     return None
 
 
@@ -1149,7 +1162,7 @@ def _log_manifest_override(path: str, key: str, value: object, field: str, deriv
     )
 
 
-def _manifest_group_override(raw: dict, path: str) -> str | None:
+def _manifest_group_override(raw: dict, path: str, *, log: bool = True) -> str | None:
     """Resolve an item's explicit bucket key.
 
     ``group`` is canonical and ``base_id`` an accepted alias; when both are given
@@ -1158,6 +1171,8 @@ def _manifest_group_override(raw: dict, path: str) -> str | None:
     Args:
         raw: One entry of the manifest's ``items`` array.
         path: Normalized item path, used only for warning messages.
+        log: Whether to report an unusable or conflicting value. Off for a
+            caller resolving the same items a second time purely to count them.
 
     Returns:
         The explicit bucket key, or ``None`` to fall back to the filename.
@@ -1168,12 +1183,13 @@ def _manifest_group_override(raw: dict, path: str) -> str | None:
         if value is None:
             continue
         if not isinstance(value, str) or not value.strip():
-            logger.warning("Manifest item %s: ignoring unusable %s value %r", path, key, value)
+            if log:
+                logger.warning("Manifest item %s: ignoring unusable %s value %r", path, key, value)
             continue
         candidate = value.strip()
         if resolved is None:
             resolved = candidate
-        elif candidate != resolved:
+        elif candidate != resolved and log:
             logger.warning(
                 "Manifest item %s: base_id=%r conflicts with group=%r; using group.",
                 path,
@@ -1183,7 +1199,7 @@ def _manifest_group_override(raw: dict, path: str) -> str | None:
     return resolved
 
 
-def _resolve_manifest_entry(raw: dict) -> dict | None:
+def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | None:
     """Build one grouping entry from a raw manifest item.
 
     Everything starts from the filename grammar and is then corrected by whatever
@@ -1195,6 +1211,10 @@ def _resolve_manifest_entry(raw: dict) -> dict | None:
 
     Args:
         raw: One entry of the manifest's ``items`` array.
+        log_overrides: Whether to report the overrides this item applies. The
+            CLI resolves the same items a second time to count the groups for
+            its plan summary, and every override line would otherwise be
+            printed twice.
 
     Returns:
         The grouping entry, or ``None`` when the item carries no usable path.
@@ -1209,29 +1229,32 @@ def _resolve_manifest_entry(raw: dict) -> dict | None:
     version = parsed.variant_id
     is_crop = parsed.is_crop
 
-    explicit_back = _coerce_manifest_bool(raw, "is_back", path)
+    explicit_back = _coerce_manifest_bool(raw, "is_back", path, log=log_overrides)
     if explicit_back is True and part_kind != "back":
-        _log_manifest_override(path, "is_back", raw.get("is_back"), "part_kind", part_kind)
+        if log_overrides:
+            _log_manifest_override(path, "is_back", raw.get("is_back"), "part_kind", part_kind)
         # An item cannot be both a page and a back.
         part_kind, page_num = "back", None
     elif explicit_back is False and part_kind == "back":
         # "front" rather than "none": the caller asserted the front side, and an
         # untagged file can still be promoted to page 1 in a multipage group.
-        _log_manifest_override(path, "is_back", raw.get("is_back"), "part_kind", part_kind)
+        if log_overrides:
+            _log_manifest_override(path, "is_back", raw.get("is_back"), "part_kind", part_kind)
         part_kind = "front"
 
-    explicit_crop = _coerce_manifest_bool(raw, "is_crop", path)
+    explicit_crop = _coerce_manifest_bool(raw, "is_crop", path, log=log_overrides)
     if explicit_crop is not None and explicit_crop != is_crop:
-        _log_manifest_override(path, "is_crop", raw.get("is_crop"), "is_crop", is_crop)
+        if log_overrides:
+            _log_manifest_override(path, "is_crop", raw.get("is_crop"), "is_crop", is_crop)
         is_crop = explicit_crop
 
     if raw.get("version") is not None:
         explicit_version = str(raw["version"]).strip().lower() or None
-        if explicit_version != version:
+        if explicit_version != version and log_overrides:
             _log_manifest_override(path, "version", raw.get("version"), "version", version)
         version = explicit_version
 
-    group_key = _manifest_group_override(raw, path)
+    group_key = _manifest_group_override(raw, path, log=log_overrides)
     if group_key is None:
         group_key = parsed.base_id
         if explicit_back is True and parsed.part_kind != "back":
@@ -1239,14 +1262,15 @@ def _resolve_manifest_entry(raw: dict) -> dict | None:
             # flagged 'box3_017_back.jpg' would otherwise bucket on its own.
             repaired = _EXPLICIT_BACK_SUFFIX_RE.sub("", group_key, count=1)
             if repaired and repaired != group_key:
-                logger.info(
-                    "Manifest item %s: is_back is set, grouping under '%s' rather than '%s'.",
-                    path,
-                    repaired,
-                    group_key,
-                )
+                if log_overrides:
+                    logger.info(
+                        "Manifest item %s: is_back is set, grouping under '%s' rather than '%s'.",
+                        path,
+                        repaired,
+                        group_key,
+                    )
                 group_key = repaired
-    elif group_key != parsed.base_id:
+    elif group_key != parsed.base_id and log_overrides:
         _log_manifest_override(path, "group", group_key, "group", parsed.base_id)
 
     return {
@@ -1340,6 +1364,7 @@ def build_manifest_buckets(
     items: List[dict],
     *,
     group_by: str = utils.GROUP_BY_OBJECT,
+    log_overrides: bool = True,
 ) -> Dict[str, List[dict]]:
     """Bucket manifest items by resolved group key, dropping items with no usable path.
 
@@ -1360,6 +1385,10 @@ def build_manifest_buckets(
         group_by: One of :data:`utils.GROUP_BY_VALUES`. ``object`` keys on the
             resolved group key, ``pair`` on the group key plus the variant
             letter, and ``none`` on the file itself.
+        log_overrides: Whether resolving the entries reports the overrides they
+            apply. The CLI's plan summary buckets the same items a second time
+            purely for a count and passes ``False``, so no diagnostic is
+            printed twice; every other caller keeps the default.
 
     Returns:
         ``{group_key: [entry, ...]}`` in first-seen key order, entries in item
@@ -1374,7 +1403,7 @@ def build_manifest_buckets(
         raise ValueError(f"Unknown group_by value: {group_by!r}")
     buckets: Dict[str, List[dict]] = {}
     for raw in items:
-        entry = _resolve_manifest_entry(raw)
+        entry = _resolve_manifest_entry(raw, log_overrides=log_overrides)
         if entry is None:
             continue
         if group_by == utils.GROUP_BY_OBJECT:
@@ -1426,17 +1455,22 @@ def _slot_address_rank(version: str | None, part_key: str) -> tuple[int, int, in
     return (_PART_RANK[kind], page_num, 0 if version is None else 1, version or "")
 
 
-def _slot_rank_key(entry: dict) -> tuple[int, int, int, int, int, str, str, str]:
+def _slot_rank_key(entry: dict) -> tuple[int, int, int, int, int, str, int, str, str]:
     """Order grouping entries so no choice in the bucket loop depends on manifest order.
 
     Crop-ness leads, so a real scan beats a crop of it unconditionally -- including
     a crop the caller marked ``preferred``, since a derivative cannot stand in for
     the original listed beside it. ``preferred`` comes next, so an explicit choice
-    takes any slot it is actually allowed to take. Then part kind, page number,
-    unversioned-before-versioned, and finally the path itself so even two
+    takes any slot it is actually allowed to take. Then part kind, page number and
+    unversioned-before-versioned.
+
+    Format fidelity comes after those and before the path, so it settles only the
+    case the path would otherwise settle alphabetically: two files of the same
+    stem and part differing by extension. The path itself stays last, so even two
     indistinguishable candidates resolve the same way every run.
     """
     page_num = entry["page_num"]
+    extension = os.path.splitext(entry["path"])[1].lower()
     return (
         1 if entry["is_crop"] else 0,
         0 if entry["preferred"] else 1,
@@ -1444,6 +1478,7 @@ def _slot_rank_key(entry: dict) -> tuple[int, int, int, int, int, str, str, str]
         0 if page_num is None else page_num,
         0 if entry["version"] is None else 1,
         entry["version"] or "",
+        _FORMAT_RANK.get(extension, _UNRANKED_FORMAT),
         entry["path"].lower(),
         entry["path"],
     )
@@ -1558,10 +1593,12 @@ def process_manifest_stream(
 
     failed_groups = 0
     first_error: Exception | None = None
-    # Files a group listed but could not place in its payload: every one of them
-    # is already the subject of a per-group WARNING, so this is the honest total
-    # for the completion line below. Union, since a crop can be displaced too.
-    unplaced_paths: set[str] = set()
+    # Files a group listed that no model call carried. Taken from the payload
+    # rather than accumulated as each displacement rule fires: an accumulator has
+    # to be updated at every site that drops a file, and one of them -- the slot
+    # collision below -- warned without doing so, which is how the completion
+    # line came to report zero directly under a WARNING saying otherwise.
+    unsent_paths: set[str] = set()
 
     group_keys = ordered_group_keys(buckets)
     for stem in group_keys:
@@ -1607,6 +1644,13 @@ def process_manifest_stream(
                 else:
                     orphan_crops.update(c["path"] for c in claimants)
 
+            # Every file that lost a claim on the payload, addressed by the slot
+            # it lost, whichever of the three rules below took it. This is what
+            # the record discloses under ``all_variant_files.displaced``, and the
+            # three rules fill in one map so that two collisions of the same kind
+            # cannot be accounted for differently.
+            displaced_slots: dict[str, list[str]] = {}
+
             # One winner per (version, part) address, chosen by rank rather than
             # by arrival, so the file sent to the model is the same one in every
             # permutation of the manifest.
@@ -1624,6 +1668,12 @@ def process_manifest_stream(
                     if claimant["path"] != winner["path"]:
                         losers.setdefault(claimant["path"], claimant)
                 if losers:
+                    # The commonest shape here is a TIFF master beside its JPEG
+                    # derivative: same stem, same slot, one analysis fanned out
+                    # over both. Sending one of them is the saving, so the loser
+                    # is disclosed rather than sent -- and disclosed the same way
+                    # the two rules below disclose theirs.
+                    displaced_slots.setdefault(f"{ver or ''}:{part_key}", []).extend(losers)
                     logger.warning(
                         "Group '%s': %d file(s) claim the same %s slot; analyzing %s "
                         "and recording the rest: %s",
@@ -1653,7 +1703,7 @@ def process_manifest_stream(
             # more specific already holds it, the untagged file has no part to
             # travel in, so say so and record it rather than letting a later
             # assignment overwrite the earlier one and lose it without a word.
-            displaced_slots: dict[str, list[str]] = {}
+            unseated_fronts: set[str] = set()
             for ver, parts in variant_parts.items():
                 untagged = parts.get("none")
                 if untagged is None:
@@ -1662,6 +1712,7 @@ def process_manifest_stream(
                 if holder is None:
                     continue
                 parts.pop("none")
+                unseated_fronts.add(untagged)
                 displaced_slots.setdefault(f"{ver or ''}:none", []).append(untagged)
                 logger.warning(
                     "Group '%s': %s and %s both claim the front side of variant "
@@ -1673,9 +1724,13 @@ def process_manifest_stream(
                     holder,
                     os.path.basename(untagged),
                 )
-            if displaced_slots:
-                displaced_paths = {p for paths in displaced_slots.values() for p in paths}
-                slot_winners = [w for w in slot_winners if w["path"] not in displaced_paths]
+            if unseated_fronts:
+                # Only what this rule unseated, not the whole of
+                # ``displaced_slots``: a slot-collision loser never entered
+                # ``slot_winners``, and a path that lost one address may still
+                # hold another, so filtering on every displaced path would strike
+                # a file the payload does carry off the candidate list.
+                slot_winners = [w for w in slot_winners if w["path"] not in unseated_fronts]
 
             # Invariant: one path is never sent under two labels. A manifest
             # listing the same file twice under contradicting flags wins it two
@@ -1882,8 +1937,15 @@ def process_manifest_stream(
                     len(unanalyzed_crops),
                     ", ".join(os.path.basename(c["path"]) for c in unanalyzed_crops),
                 )
-            unplaced_paths.update(c["path"] for c in unanalyzed_crops)
-            unplaced_paths.update(p for paths in displaced_slots.values() for p in paths)
+            # The completion line's count, read off the payload the group is
+            # about to send. Every warning above names a file this set holds, and
+            # it holds nothing a warning did not name, so the summary cannot
+            # contradict them. It also leaves out the one file a warning says
+            # *was* sent: a path that won two addresses still travels, under the
+            # better of them.
+            unsent_paths.update(
+                it["path"] for it in group if it["path"] not in analyzed_paths
+            )
 
             combined_meta = utils.combine_group_metadata(group)
             sent_to_model_snapshot = select_forwarded_metadata(combined_meta, forward_fields)
@@ -2342,20 +2404,25 @@ def process_manifest_stream(
 
     if strict_run_failures and first_error is not None and not results:
         raise first_error
-    # A lossy run reports its total at WARNING: the per-group messages it
-    # summarizes are already at that level, so an INFO-only summary would vanish
-    # at exactly the threshold where the count matters most. Every group now
-    # travels whole, so the only files it can count are crops that yielded their
-    # parent's slot and files displaced out of a slot they contested -- both of
-    # which are already the subject of a WARNING naming them.
-    lossy = bool(failed_groups or unplaced_paths)
+    # A run that lost something reports its total at WARNING: the per-group
+    # messages it summarizes are already at that level, so an INFO-only summary
+    # would vanish at exactly the threshold where the count matters most.
+    #
+    # "recorded without being sent" rather than "displaced or dropped": every
+    # group now travels whole, so the only files this can count are ones that
+    # yielded a slot to a sibling -- a crop to its parent, a TIFF master to its
+    # JPEG derivative, an untagged file to an explicit front. Each keeps its
+    # record, taken from the analysis of the file that won the slot, so "dropped"
+    # named a loss that does not occur while the number itself has to stay
+    # visible. Saying what happened settles both.
+    summarize_at_warning = bool(failed_groups or unsent_paths)
     logger.log(
-        logging.WARNING if lossy else logging.INFO,
+        logging.WARNING if summarize_at_warning else logging.INFO,
         "Batch completed for %d group(s); %d file(s) recorded, %d group(s) failed, "
-        "%d file(s) displaced or dropped from their group's payload.",
+        "%d file(s) recorded without being sent to the model.",
         len(group_keys),
         len(results),
         failed_groups,
-        len(unplaced_paths),
+        len(unsent_paths),
     )
     return {"results": results, "errors": errors}

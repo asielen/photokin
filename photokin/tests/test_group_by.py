@@ -511,7 +511,7 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
         ]
         self.assertEqual(len(completion), 1)
         self.assertEqual(completion[0].levelno, logging.INFO)
-        self.assertIn("0 file(s) displaced or dropped", completion[0].getMessage())
+        self.assertIn("0 file(s) recorded without being sent", completion[0].getMessage())
 
 
 class TestEachValueGroupsThePlansTable(_GroupByTestCase):
@@ -815,8 +815,10 @@ class TestTheRetiredFlagsStillParse(_CliTestCase):
         folder = self.make_folder(*self._FOLDER)
         seen: list[str] = []
 
-        def _spy(folder_path: str, config: utils.Config, **kwargs: object) -> dict:
-            seen.append(config.group_by)
+        # C2 collapsed the mode branches, so every input type reaches the model
+        # through ``process_manifest_stream``; ``cli.analyze_folder`` is gone.
+        def _spy(*, cfg: utils.Config, **kwargs: object) -> dict:
+            seen.append(cfg.group_by)
             return {"results": {}, "errors": {}}
 
         for argv, expected in (
@@ -827,7 +829,7 @@ class TestTheRetiredFlagsStillParse(_CliTestCase):
         ):
             with self.subTest(argv=argv):
                 seen.clear()
-                with patch("photokin.cli.analyze_folder", _spy):
+                with patch("photokin.cli.process_manifest_stream", _spy):
                     code, _out, _err, _calls = self.run_cli(["--folder", folder, *argv])
 
                 self.assertIsNone(code)

@@ -300,7 +300,7 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
         self.assertIn("3 group(s)", message)
         self.assertIn("4 file(s) recorded", message)
         self.assertIn("0 group(s) failed", message)
-        self.assertIn("0 file(s) displaced or dropped", message)
+        self.assertIn("0 file(s) recorded without being sent", message)
 
     def test_a_group_holding_pages_and_a_negative_places_every_file_it_can(self) -> None:
         self._make_images(
@@ -338,8 +338,76 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
         )
         completion = _completion_record(captured.records)
         self.assertEqual(completion.levelno, logging.WARNING)
-        self.assertIn("1 file(s) displaced or dropped", completion.getMessage())
+        self.assertIn("1 file(s) recorded without being sent", completion.getMessage())
         self.assertIn("4 file(s) recorded", completion.getMessage())
+
+
+class TestATiffMasterBesideItsJpegDerivative(_FolderModeTestCase):
+    """The archival shape: one scan in two formats, one analysis, two records.
+
+    A TIFF master and the JPEG made from it share a stem, so the grammar reads
+    them as one object and sends one of them. That is a cost saving rather than
+    a loss -- both files come back with the record -- but the run has to say so
+    in both places. It used to say so in one: the per-group warning named the
+    file that never reached the payload while the completion line immediately
+    below it reported nothing displaced at all.
+
+    Folder mode is where this shape actually turns up, so it is pinned here on
+    real files through ``analyze_folder`` as well as on the manifest surface in
+    ``test_manifest_grouping.py``.
+    """
+
+    def test_one_is_sent_and_the_other_is_recorded_named_and_counted(self) -> None:
+        self._make_images("box3_025.tif", "box3_025.jpg")
+        sent: list[str] = []
+
+        def analyze_photo(front: str, *args: object, **kwargs: object) -> dict:
+            sent.append(os.path.basename(front))
+            return _fake_analysis(front)
+
+        with patch("photokin.core.analyze_photo", side_effect=analyze_photo):
+            with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
+                result = core.analyze_folder(self.folder, utils.Config())
+
+        self.assertEqual(
+            sent,
+            ["box3_025.tif"],
+            "the master must be the copy the model reads: only one of the pair is "
+            "sent, and the JPEG's compression artifacts are what cost a "
+            "transcription of faint pencil. Sending exactly one and fanning the "
+            "result out is the whole point of grouping them",
+        )
+        self.assertEqual(
+            self._basenames(result["results"]), ["box3_025.jpg", "box3_025.tif"]
+        )
+        self.assertEqual(result["errors"], {})
+
+        warnings = _group_warnings(captured.records)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("claim the same none slot", warnings[0])
+        self.assertIn("box3_025.jpg", warnings[0])
+
+        jpg = os.path.join(self.folder, "box3_025.jpg")
+        for record in result["results"].values():
+            self.assertEqual(
+                record["all_variant_files"]["displaced"],
+                {":none": [jpg]},
+                "the warning named a file the record does not disclose",
+            )
+
+        completion = _completion_record(captured.records)
+        self.assertEqual(
+            completion.levelno,
+            logging.WARNING,
+            "a file did not reach the payload, so the summary must not read as clean",
+        )
+        self.assertIn("2 file(s) recorded", completion.getMessage())
+        self.assertIn(
+            "1 file(s) recorded without being sent to the model",
+            completion.getMessage(),
+            "the completion line reported zero directly under a warning saying "
+            "a file never reached the payload",
+        )
 
 
 class TestFolderModeErrorIsolation(_FolderModeTestCase):

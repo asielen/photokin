@@ -19,9 +19,24 @@ That journey maps onto the files like this:
 - `errors.py` — `ProviderApiError`, the normalized provider error.
 - `merge.py` — merges model output with original metadata.
 - `canonical.py` / `changeset.py` — canonical tag mapping and changeset NDJSON records (consumed by the ExifTool wrapper).
-- `cli.py` — command-line interface; composes core + ExifTool wrapper.
+- `cli.py` — command-line interface; composes core + ExifTool wrapper. One input token — positional, or through the `--folder`/`--manifest` aliases — is classified into a `ResolvedInput` and every kind then runs the same path, so `--output-file`, `--changeset` and the ExifTool write flags mean the same thing whatever was passed. It states its plan on stderr before the first model call, and `--dry-run` stops there.
+- `cli_messages.py` — the wording of every user-facing CLI message, and the `RunPlan` summary. Pure and dependency-free, so the text is testable without importing the pipeline; `cli.py` decides when each one fires.
 - `public.py` — stable wrappers for embedding in other tools.
 - `prompts_photo_ai/` — shared prompt files (used by all providers).
+
+## Grouping
+
+Granularity is a single axis — `Config.group_by`, one of `utils.GROUP_BY_VALUES` — and `core.build_manifest_buckets` is what turns it into groups. Almost all of the difference between the three values is the key that function derives for each item:
+
+- **`object`** (`GROUP_BY_OBJECT`, the default) keys on the entry's resolved group key — a manifest item's `group`/`base_id` when it gives one, else the `base_id` the filename grammar parses out. Every scan of one print — its front, its back, its variant letters, its pages, its negatives, its crops — lands in one bucket and shares one analysis.
+- **`pair`** keys on that same group key plus the variant letter, so each rescan is judged on its own merits. The two halves are escaped before they are joined (`_escape_pair_half`, `_pair_bucket_key`); an explicit `group` is a free-form string, so an unescaped join let two unrelated objects spell one bucket and receive one caption, date and location between them.
+- **`none`** keys on the file's own normalized path. It is the escape hatch for when filenames lie, and deliberately the most expensive and the lowest quality — a back analyzed alone is handwriting with no photo attached, and a multipage document becomes a set of unrelated pages.
+
+An unrecognized value raises `ValueError` before the first group: argparse guards the CLI's `--group-by`, and nothing guards a library caller. `process_manifest_stream` reads the value once more for the one behavior that is not a key — under `none` it suppresses the orphan-crop warning, whose condition is true for every crop on every run once each file is its own group. Which analyzer a group reaches is decided by the group's own contents rather than by the axis: `analyze_photo` for anything a single front/back pair fully describes, the group form for a group holding a page, a negative, a second front-side scan or a second back.
+
+**There is no primary scan any more.** Nothing gets analyzed on the group's behalf and has its answer copied onto its siblings. `utils.pick_master_index` is gone, `Config.process_all_variants` is replaced by `group_by`, and `update_policy` is dropped from `core.analyze_manifest`, `core.process_manifest_stream` and `public.analyze_manifest` along with the `UPDATE_MASTER_EXACT` / `UPDATE_MERGE_PER_VARIANT` constants — an embedder still passing that keyword gets a `TypeError` and wants `cfg.group_by` instead. What survives of the machinery is the manifest's `preferred` key, which no longer names the one analyzed file, there being no such file, but still breaks a tie between two files claiming the same `(version, part)` slot.
+
+**Part markers.** One analysis per group means one set of keywords merged onto every file in it, so the two keywords that say *which part of the object a file is* have to be reasserted per file afterwards. `utils.PART_MARKER_KEYWORDS` is `{"back", "negative"}`; `core._item_part_marker` decides which one an item earns, and `utils.apply_part_keyword(record, marker, leaked)` appends that one and takes back the markers that leaked onto the record from its siblings. `leaked` is the set the group applied less the set the file itself carried before the merge (`utils.part_markers_in`, read off the pre-merge metadata), so the strip undoes the merge and nothing else: a print hand-tagged `Negative` in the user's catalog keeps that keyword even when a real negative sits beside it in the group. Both markers are kept out of the vocabulary file too, since the model starts proposing "Negative" the moment it is told a `Negative` part is present — approving it there would teach the model to emit a token this same code defines as not being a keyword.
 
 ## Providers
 
@@ -50,7 +65,7 @@ Four vendors means four exception zoos, so every provider failure is normalized 
 - `rate_limit` — 429 / resource exhausted
 - `overloaded` — Anthropic 529
 - `invalid_input` — bad request / unusable input (all providers; `invalid_request` is a legacy alias still accepted downstream)
-- `api_status` — other non-2xx from OpenAI/Anthropic
+- `api_status` — other non-2xx from OpenAI, Anthropic or OpenRouter
 - `api_error` — other Gemini failures
 - `length` — output truncated by `max_tokens`
 - `content_filter` — Gemini blocked the response
@@ -59,7 +74,7 @@ Four vendors means four exception zoos, so every provider failure is normalized 
 
 Manifest-stream error payloads carry the normalized type/message and the HTTP status code when available. `missing_dependency` and `missing_api_key` are both raised eagerly in `core._build_provider_client`, before any request is attempted, so neither costs a request.
 
-What happens next differs by mode, and it is worth knowing which you are in. Folder and single-photo mode ask the shared stream for their own failure contract (`process_manifest_stream(..., strict_run_failures=True)`): those two error types are treated as properties of the run rather than of one photo (`_RUN_FATAL_ERROR_TYPES`), so the first group to hit one aborts the batch with a single fatal error, and a run in which no group succeeded re-raises its first failure instead of returning an empty result. Manifest mode keeps the opposite default — it records one error entry per item and exits 0, so a manifest run with no API key produces a full set of `missing_api_key` records rather than one failure. Read the records, not just the exit status. Whether that asymmetry should survive is a Phase C decision.
+What happens next differs by mode, and it is worth knowing which you are in. Folder and single-photo mode ask the shared stream for their own failure contract (`process_manifest_stream(..., strict_run_failures=True)`): those two error types are treated as properties of the run rather than of one photo (`_RUN_FATAL_ERROR_TYPES`), so the first group to hit one aborts the batch with a single fatal error, and a run in which no group succeeded re-raises its first failure instead of returning an empty result. Manifest mode keeps the opposite default — it records one error entry per item and exits 0, so a manifest run with no API key produces a full set of `missing_api_key` records rather than one failure. Read the records, not just the exit status. The asymmetry was weighed in Phase C and kept: manifest mode is the Lightroom plugin's contract, and the plugin reads the per-item records, so failing the batch would tell it less than the records already do.
 
 For `error_type` values whose message is already the full explanation (`SELF_EXPLANATORY_ERROR_TYPES` in `photokin.errors` — the two above, plus `rate_limit`, `overloaded`, `invalid_input`/`invalid_request`, `api_status`, `length`), both the CLI's top-level fatal error and manifest-stream per-item error records omit the traceback; anything else keeps it, since an unrecognized failure is exactly when a traceback earns its keep.
 
@@ -73,10 +88,16 @@ All the knobs mentioned above live on one dataclass, `utils.Config` (core fields
 
 - Provider: `provider`, `provider_name`, `model`, `claude_model_name`, `gemini_model_name`, `openrouter_model_name`
 - Prompts/vocab: `prompts_dir`, `vocab_path`, `forbidden_path`, `metadata_forward_path`, `no_update_vocab`, `fail_on_forbidden`
+- Grouping: `group_by` (default `object`; see [Grouping](#grouping) above)
 - Imaging: `jpeg_quality` (default 80), `max_edge` (default 1024)
 - Thresholds: `date_confidence_threshold`, `location_confidence_threshold` (both default 0.7), plus `date_override_*` policies used by `merge.py`
 - Context: `photo_context_text`, `photo_context_file` (authoritative context forwarded to the model, capped at 200 KB)
+- Output: `pretty_json`
 - Debug: `debug_dump_llm_request`, `debug_dump_dir`, `run_batch_id`, `dry_run`
+
+Two of those are library-only, with no flag behind them. `pretty_json` indents the aggregate `.json` output and the stdout result document; the CLI never sets it, so both are compact unless an embedder asks otherwise (a generated manifest is always indented regardless, since it exists to be hand edited).
+
+`dry_run` is the other, and it is not the CLI's `--dry-run`. That flag prints the plan summary and returns before the stream is entered, so there is no record for it to mark; the field exists for an embedder driving `process_manifest_stream` directly, where it stamps `dry_run: true` onto each NDJSON record of a rehearsal run. ExifTool's own preview — count the writes, perform none — is a third, separate thing, and lives on `ExiftoolConfig.dry_run`.
 
 `Config` also picks up environment defaults so the CLI and embedders behave identically: `LLM_PROVIDER`, `LLM_PROVIDER_NAME`, `OPENAI_MODEL`, `CLAUDE_MODEL`, `GEMINI_MODEL`, `OPENROUTER_MODEL`. API keys are read when building the provider client: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`. Set `MEL_VERBOSE`/`MEL_DEBUG` for extra warnings.
 
@@ -86,7 +107,8 @@ If you're calling the library from your own code rather than the CLI, the seam i
 
 ## Tests
 
+From the repository root:
+
 ```bash
-cd python
-python -m pytest photokin/tests
+python -m pytest photokin/tests tests
 ```

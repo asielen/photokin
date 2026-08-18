@@ -48,7 +48,10 @@ after:             analyze_photo(album-page1.jpg)
                    results: ['album-page1.jpg', 'album-page2.jpg',
                              'box3_025.jpg', 'neg-negative.jpg']
                    Batch completed for 3 group(s); 4 file(s) recorded,
-                   0 group(s) failed, 0 file(s) displaced or dropped ... [INFO]
+                   0 group(s) failed, 0 file(s) recorded without being
+                   sent to the model.                                 [INFO]
+                   (the last clause read "0 file(s) displaced or dropped
+                    from their group's payload." until C2's fourth pass)
 
 after, --process-all-variants (dead in folder mode until now):
                    analyze_group_parts(("Page 1", [album-page1.jpg]),
@@ -787,6 +790,277 @@ analysis except its own part marker" is not true until negatives have a marker.
   scoped rather than contradicted. One guard was required: the orphan-crop WARNING is
   suppressed under `none`, where its condition is true for every crop on every run.
 
+**C2 shipped - the CLI surface.** One input token, one path through `main`, and
+nothing written without an explicit opt-in.
+
+- **Positional input with detection.** `photokin ./scans/` / `photokin batch.json` /
+  `photokin scan_042.jpg`. The argparse mutually exclusive group is gone, replaced by
+  hand validation, which is what buys the custom messages. The rule is evaluated in one
+  place (`cli._classify_positional`): `lexists`, then a dangling-symlink case, then
+  directory, then "is it a regular file at all", then `.json`, then `utils.VALID_EXTS`.
+  A directory called `batch.json` is a folder, because step 3 precedes step 5 - which is
+  exactly why the run logs `Treating \`batch.json\` as a folder (it is a directory).` at
+  INFO before it validates anything. `--folder` and `--manifest` survive as **aliases
+  that assert** rather than detect, so `--folder notes.txt` is refused instead of being
+  re-detected as a photo; only a positional is ever inferred, and only a positional logs.
+  Deviation from the plan bullet at :533, which called for deprecating them with a
+  one-time note: the brief forbids ceremony, an alias that asserts a type still has a
+  job no positional does, and nothing is scheduled for removal. Section 4.3 records the
+  same. All three input spellings normalize through one function, so a token that names
+  nothing - `" "`, a quoted empty string - is refused rather than resolving to `"."` and
+  quietly analyzing the working directory.
+- **Content validation before the first model call.** An empty folder, an unreadable
+  folder, a `.json` that is not a manifest, an empty `items`, an item with no `path` and
+  an item whose path does not exist are all exit 2 with a two-line message. The first two
+  replace `analyze_folder`'s warn-and-exit-0; the rest replace a `FATAL` JSON blob or a
+  per-item error record. Fatal on the first offending item, not a collected report.
+- **The gates are lifted.** `--output-file`, `--changeset` and the `--exiftool-*` write
+  flags work for every input type. Phase A's "only supported in --manifest mode" stopgap
+  is deleted, and its test class now pins the writes instead of the refusal. The changeset
+  path is Q1 generalized into one function: `dirname(--output-file or input)` plus
+  `<stem>_changeset.ndjson`. Two spellings change - a `.json` output and no output file
+  both used to give a bare `changeset.ndjson`, which collided across runs in one directory.
+- **`-w` / `--write`,** defined once in `cli._WRITE_BUNDLE` and expanded by one loop, so
+  the expansion and the contradiction check cannot disagree. An explicit flag overrides
+  the expansion; `-w --exiftool-write false` and `-w --changeset false` are errors rather
+  than guesses. `--exiftool-write true` without a changeset is refused too, since there
+  would be nothing to apply. `--changeset` stays a value flag per Q5.
+- **The write default is flipped,** at `exiftool/config.py:57` and nowhere else. That one
+  literal was the whole behavioral change: the dataclass already declared `False` and the
+  CLI never reached it. `--changeset true` alone now records without applying. Five doc
+  sites and two tests updated; see Breaking change #1 below.
+- **The message set is centralized** in `photokin/cli_messages.py` - pure, no logging, no
+  I/O, importing nothing but `dataclasses`, so the wording is testable without dragging
+  the pipeline in. `cli._exit_with_usage_error` is untouched and every call site is a
+  splat of a message tuple. The five Phase A pre-flight strings moved verbatim and are
+  named in `_VERBATIM_FROM_PHASE_A`, because their problem lines predate the
+  backticks-first style and are pinned by existing tests.
+- **The plan summary** is one INFO record naming input (with what it was detected as, its
+  file and group counts), output, changeset, write set, provider and model, emitted
+  immediately before `process_manifest_stream` - the only call that can reach a provider,
+  now that the folder branch no longer calls `analyze_folder`. The group count needs a
+  second bucketing pass, so `build_manifest_buckets` and `_resolve_manifest_entry` gained
+  `log_overrides` (and the two item-level readers a `log` keyword) to stop every override
+  diagnostic printing twice.
+- **`--dry-run` stops after the summary.** This resolves the brief's own contradiction in
+  favour of "the cheapest guard before spending money": nothing is analyzed, no
+  destination is truncated, and both pre-flights still run, so a missing ExifTool or an
+  unwritable output still exits 2 and the summary is never printed. `cfg.dry_run` is no
+  longer set from the CLI and survives as library API; the `or ecfg.dry_run` exemption in
+  `_preflight_exiftool` is removed, because a plan claiming a write set while no binary
+  exists would be a lie.
+
+**Second pass - six defects adversarial review found.** Two of them are the guards C2
+added having no test at all, which is the failure mode this phase exists to remove:
+
+- *A blank input token analyzed the working directory.* `utils.normalize_path` strips
+  whitespace and one surrounding quote pair and then calls `os.path.normpath`, which
+  answers `"."` for what is left, so `photokin " "` - a wrapper interpolating an unset
+  variable - was classified as a folder and every image in the cwd was analyzed, and
+  under `-w` written to. An empty string was already refused, so blanks looked caught.
+  All three spellings now normalize through `_input_path`; `--folder " "` was identical
+  and did not even log a detection line. `photokin .` is untouched: the test is on the
+  token, not on the normalized result.
+- *The plan summary named the token rather than the directory.* Its `output` and
+  `changeset` lines were already absolute; the `input` line echoed `resolved.display`,
+  leaving the one value the "wrong folder" guard is about as the only unresolved thing
+  in it. `RunPlan.input_display` became `input_location` and carries
+  `os.path.abspath`. Error messages still quote what the user typed - that is the token
+  they have to fix.
+- *`--dry-run` truncated a destination.* `main` dispatched to `_generate_manifest` and
+  returned above the `--dry-run` check, so previewing the flag over a hand-edited
+  manifest replaced it and printed nothing, against the flag's own help text and
+  `README.md:449`. It now reports the grouping it would have written and writes nothing.
+  The analysis plan block is deliberately not printed there: that branch reaches no
+  provider and has no output, changeset or write set to describe.
+- *A remedy led back to the error it came from.* `write_needs_changeset` ran before
+  `_refuse_generate_manifest_write_flags`, so `--generate-manifest --exiftool-write
+  true` was told to add `--changeset true`, whose own refusal then said to drop it. The
+  refusal now runs first, which also makes the branch written for that case reachable -
+  it never could execute before, since `-w` and `--changeset true` each won an earlier
+  branch and the bare flag exited above.
+- *An unreadable manifest was reported as missing.* Every `OSError` from the read mapped
+  to `input_not_found`, whose "check the spelling" remedy is wrong for the reachable
+  case - a denied ACL, a lock held by a sync client - and contradicts the detection line
+  printed immediately above it. Split: `FileNotFoundError` keeps that message, since a
+  file removed after detection really is gone, and everything else takes
+  `manifest_cannot_be_read`, the counterpart of the folder branch's existing message.
+- *The two write guards and the flipped default had no working test.* Collapsing
+  `_resolve_write_bundle`'s contradiction branch to an unconditional assignment, or
+  deleting the needs-a-changeset guard, both left the suite green while `-w
+  --exiftool-write false` silently became a write. `TestNothingIsWrittenWithoutAnOptIn`
+  could not see the default flip either: every CLI test ran with
+  `EXIFTOOL_WRITE_ENABLED=""`, and `_parse_bool_env` reaches its `default` argument only
+  when the variable is *absent*, so the class passed unchanged against a tree with the
+  pre-C2 `True` restored. `run_cli` gained an `env` parameter that can remove a
+  variable rather than blank it. All three mutations now fail.
+
+**Third pass - two leaks and the doc alignment C1 still owed.** Independent verification
+passed every C2 objective; these are what it left behind.
+
+- *The `-w` bundle was defined once and checked twice.* `_WRITE_BUNDLE` really was the
+  only definition of the expansion and of the contradiction check, but
+  `_refuse_generate_manifest_write_flags` restated the same membership by hand, so a
+  member added to the bundle would have been expanded by `-w` and then silently permitted
+  beside `--generate-manifest` - the one flag that can never honor a write, since it stops
+  before any model call. The refusal now iterates the bundle. Carrying the wording is what
+  made that possible: `_WriteBundleMember` holds the value, the verb and the replay
+  spelling beside each other, so a member cannot join the bundle without saying how it is
+  refused, and the four existing messages are unchanged. `-w` itself keeps its own branch
+  and is still reported first, being the bundle's trigger rather than a member of it.
+  `_resolve_write_bundle` builds its `values` map from the bundle too, which is what stops
+  a third member raising `KeyError` there instead of being expanded.
+  `TestTheWriteBundleIsDefinedOnce` drives all four cases off `cli._WRITE_BUNDLE` rather
+  than off its current contents; two of them inject a member the CLI does not ship and
+  fail against the restated implementation (the refusal exits 0 and writes the manifest;
+  the contradiction check raises `KeyError` into the FATAL handler).
+- *A genuinely empty input token was reported as no input at all.* `photokin ""` answered
+  "no input was given." while `photokin " "` and the quoted spellings answered with the
+  blank-token message. Argparse stores `""` like any other token; `_resolve_input` picked
+  its source by truthiness, so the one spelling a wrapper produces most easily - an unset
+  variable interpolated bare, which is the case the blank guard exists for - never reached
+  `_input_path` and was told to supply an argument it had already supplied. The filter is
+  now `is not None`, which is what "was this source given" actually means, and both
+  aliases were identical and are fixed with it. `photokin` with flags but no input still
+  says "no input was given.", pinned as the non-vacuity counterpart.
+- *Dead `--dry-run` plumbing, decided per item rather than swept.* Both survivors are
+  legitimate library API and both are kept, now saying so. `Config.dry_run` is live -
+  `core._emit` stamps `dry_run: true` on each NDJSON record, and five test modules set it
+  - and is simply not a CLI knob any more, since `--dry-run` returns before the stream is
+  entered and there is no record to stamp. `cli._resolve_exiftool_config`'s `dry_run`
+  parameter was required keyword-only and passed `False` by its one caller, which is
+  exactly the shape that reads as flag-wired; it now defaults and `main` does not pass it.
+  It is ExifTool's own preview - count the writes, perform none - which the CLI has no
+  flag for and which `python -m photokin.exiftool.apply --dry-run` still reaches. Three
+  words on which of the three `dry_run`s is which, at each site.
+- *The doc alignment C1 owed, narrowed by what was already there.* Two of the four claims
+  in the brief did not reproduce. `photokin/README.md` does not describe the pre-C1
+  grouping model - C1 updated it, and it holds no `process_all_variants`, `update_policy`,
+  `pick_master_index`, `primary` or `master`; and the part-marker keywords are not
+  undocumented - `README.md` names both, their per-file scope and the strip. What was
+  really missing: the core README never said what the three axis values *are* or what key
+  each derives, never recorded the primary's retirement, and its Configuration list
+  claimed to enumerate every knob while omitting two - `group_by`, and `pretty_json`,
+  which has no flag behind it at all and so is reachable from nowhere else. The list is
+  now complete, checked field by field against the dataclass rather than by eye, and the
+  axis and the retirement are a `## Grouping`
+  section, which also carries the part-marker mechanism the core README had nothing on.
+  And one part-marker sentence in `README.md` was narrower than what shipped: it scoped
+  the hand-tagged-marker rescue to "a group holding no negative", where C1's second pass
+  moved the test per file, so a print hand-tagged `Negative` keeps the keyword even beside
+  a real negative. Corrected, and the Quick Start now says where the `back` in its own
+  sample output came from. Both READMEs told the reader to `cd python`, a directory the
+  repo has not had since the restructure, and the core README still called the
+  folder/manifest failure asymmetry an open Phase C decision after Phase C kept it.
+- *And six more the same sweep found, once both READMEs were checked claim by claim
+  against the tree rather than only for the four items above.* The sharpest is a data one:
+  `README.md` documented `"true"/"false"/"yes"/"no"/0/1` and "null means not specified" as
+  covering every manifest boolean, but only `is_back` and `is_crop` go through
+  `_coerce_manifest_bool`. `preferred` is read as `bool(raw.get("preferred"))`, so
+  `"preferred": "false"` and `"preferred": "no"` both mean **true** - a plug-in author
+  following the documented grammar would silently pin the wrong file into a contested
+  slot. Scoped, with `preferred`'s real rule stated beside it. Then: "hydration and apply
+  are skipped with a warning rather than failing the batch" survived C2's own pre-flight,
+  which exits 2 on a requested write with no binary; hydration was described as reading
+  "fields" for any input when it reads one tag, `EXIF:UserComment`, for manifest input
+  only, and only where the item already carries a `metadata` object (the omission at
+  :483-491, undocumented until now); `--debug-dump-dir`'s default was given as
+  `<output-dir>/debug` when that holds for manifest input alone and folder and
+  single-photo runs dump into the working directory; `--batch-id` was "stored in output
+  metadata and logs" when it reaches the `.ndjson` records and the dump filenames and
+  neither the aggregate `.json` nor stdout; and the fetcher downloads from the project's
+  SourceForge host, exiftool.org supplying the checksum. In the core README, `api_status`
+  is raised by the OpenRouter adapter too, and the sentence this pass had just written
+  claiming `build_manifest_buckets` is the only reader of `group_by` was itself wrong -
+  `process_manifest_stream` reads it to suppress the orphan-crop warning under `none`.
+
+  **Reported here, fixed in the pass below.** The loser of a `(version, part)` slot
+  collision was warned about but added to neither `displaced_slots` nor the batch
+  counter, so it was absent from `all_variant_files.displaced` and the completion line
+  reported `0 file(s) displaced or dropped` for a run that dropped one.
+
+**Fourth pass - the completion line stops contradicting its own warning.** The gap
+reported directly above, taken as a maintainer decision rather than left visible.
+
+The sharpest reproduction is not the override case the report used but the one an
+archive hits on every folder: a TIFF master beside its JPEG derivative. Same stem, same
+`(version, part)` address, so one is sent and the analysis is fanned out over both -
+which is right, and cheaper, and is now documented as such at `README.md`. What was
+wrong is that the same loss was accounted for two different ways depending on how the
+two files reached the slot:
+
+```
+box3_025.tif + box3_025.jpg          two filenames parsing into one slot
+  WARNING  2 file(s) claim the same none slot; analyzing box3_025.jpg
+           and recording the rest: box3_025.tif
+  INFO     ... 0 file(s) displaced or dropped ...        all_variant_files.displaced absent
+
+ov1.jpg + ov1-back.jpg {is_back: false}   an override steering one onto the other's role
+  WARNING  ov1.jpg and ov1-back.jpg both claim the front side ...
+  WARNING  ... 1 file(s) displaced or dropped ...        displaced = {":none": [ov1.jpg]}
+```
+
+- **One map, filled by all three rules.** `displaced_slots` moves above the slot-winner
+  loop and that loop registers its losers in it, so the record discloses a collision
+  loser exactly as it already disclosed a displaced front. The `slot_winners` filter that
+  followed the front-side rule is narrowed to the paths *that* rule unseated
+  (`unseated_fronts`): a collision loser was never a winner, and a path that loses one
+  address may still hold another, so filtering on the whole map would have struck a file
+  the payload does carry off the candidate list.
+- **The count is derived, not accumulated.** `unplaced_paths` becomes `unsent_paths` and
+  is filled once per group from `{it["path"] for it in group} - analyzed_paths` rather
+  than by each rule remembering to register itself - which is the bug's actual mechanism,
+  and the reason it could recur at the next rule added. Two consequences, both wanted:
+  every warning names a file the set holds, and the set holds nothing no warning named;
+  and a path that won two addresses is no longer counted, because it *is* sent, under the
+  better of them. Its surrendered address is still listed in `displaced`, which is
+  slot-addressed and describes the slot rather than the file.
+- **The wording changes once**, from `%d file(s) displaced or dropped from their group's
+  payload.` to `%d file(s) recorded without being sent to the model.` Nothing this counts
+  is dropped: every one of them keeps a full record taken from the analysis of the file
+  that won the slot, and `process_manifest_stream`'s own contract is that
+  `set(results) | set(errors)` is the input set. "Dropped" named a loss that does not
+  occur, and it mattered more after the fix than before it - the commonest shape the
+  count now reaches is the archival TIFF/JPEG pair, so the old wording would have told
+  every archivist that a clean run dropped half their files. The level rule is unchanged:
+  nonzero still summarizes at WARNING, matching the per-group messages. Four test
+  assertions carried the old string and are updated with it; no README quoted it.
+- **Coverage.** `TestSlotCollisionAccounting` (`test_manifest_grouping.py`, 6 tests) pins
+  both shapes and pins them against each other, and carries the invariant in both
+  directions over six shapes: the count equals the listed files no recorded model call
+  carried, and every file it counts is named in a warning. `TestATiffMasterBesideIts
+  JpegDerivative` (`test_folder_mode.py`) takes the archival shape through
+  `analyze_folder` on real files. `ManifestGroupingTestCase.run_manifest_records` captures
+  from INFO so a case can assert the completion line's *level*, which the WARNING-only
+  runner could not see; `run_manifest_source` is now a filter over it, and its
+  assertLogs-can-not-be-empty sentinel is gone, since every run logs a completion line.
+
+**Fifth pass - the master goes to the model, not the export.** Fixing the accounting
+exposed the tie-break underneath it. `_slot_rank_key` ended in the path, so among files of
+one stem the alphabetically first won, and every archival pairing resolved the wrong way:
+`.jpg` over `.tif`, `.jpeg` over `.tiff`, `.png` over `.tif`. Only one of a pair is ever
+read, so the run was handing the model the compressed copy of every scan in the archive -
+and folder mode could not override it, because folder items carry nothing but `path`.
+
+`_FORMAT_RANK` (lossless, then PNG, then lossy) now sits between the version and the path.
+Its position is the whole design: it settles only the case the path would otherwise settle
+alphabetically, so nothing above it moves, and the path stays last so two genuinely
+indistinguishable candidates still resolve identically every run. `preferred` outranks it,
+being higher in the key, so an explicit choice still wins. Two tests written in the fourth
+pass asserted the JPEG was sent; they encoded the old tie-break and are inverted, not
+deleted. `README.md:273` said so too and is corrected.
+
+Maintainer decision, taken with the alternatives on the table: a flag was offered and
+declined as surface area for a case with one right answer. The cost is read time on a large
+master, not upload size - `--max-edge` downscales and re-encodes before anything is sent,
+so the bytes on the wire are unchanged.
+
+Left open deliberately, each one recorded where it belongs: hydration stays off for folder
+and single-photo input (the `{"metadata": {}}` seeding at :483-491 is a data change, not a
+CLI one); `strict_run_failures` keeps its split (:514); the debug-dump directory stays
+split between manifest and folder input; and the write-default transition is announced by
+the plan summary line rather than by a separate warning (:539-540).
+
 **Risk:** high. This is the breaking release, and the affected consumer is not in
 this repo.
 
@@ -859,6 +1133,30 @@ here that could catch the change. Mitigation is a loud stderr warning for one mi
 version. Five documentation sites and two tests assert the current value and must be
 updated deliberately.
 
+**Status: shipped in C2.** One literal: `_parse_bool_env("EXIFTOOL_WRITE_ENABLED",
+True)` became `False` at `config.py:57`. Nothing else moved, because nothing else
+had to - `from_env` has exactly one caller (`cli._resolve_exiftool_config`), and every
+other construction is a direct `ExiftoolConfig(...)` that already reached the
+dataclass's `False`. `config.py:36` and `config.py:57` now agree, so
+`photokin/exiftool/README.md`'s "`enabled` (default False)" is true rather than
+misleading. Precedence is unchanged (flag > env > default), and the only runs whose
+behavior changes are those passing `--changeset true` with no `--exiftool-write` flag
+and no `EXIFTOOL_WRITE_ENABLED` in the environment.
+
+The five doc sites are updated (`config.py`'s docstring, the `--exiftool-write` help,
+`photokin/exiftool/README.md`, and the flag table plus the "Writing during a run"
+paragraph in `README.md`), along with the rider that the Q1 changeset generalization
+falsified. The two tests asserting the old default now assert the new one, and the
+regression the plan asked for - with no write flags, `apply_changeset` is never called
+for folder, photo or manifest input, with a resolvable binary and `--changeset true` -
+is `test_cli_preflight.py::TestNothingIsWrittenWithoutAnOptIn`.
+
+The transition notice is **not** a separate warning. It is the plan summary's
+`write : none (--exiftool-write defaults to false)` line, which is printed before the
+run on exactly the affected runs. Deviation from the "loud stderr warning for one minor
+version" above, taken because the brief forbids ceremony and the summary is guaranteed
+to be seen; the louder form is one `logger.warning()` on the same condition.
+
 ### 2. `analyze_folder` return shape
 
 Split across two phases, because half of it has already shipped.
@@ -912,8 +1210,14 @@ the B2 open risks under Phase B.
 
 ### 3. Deprecations
 
-`--folder` and `--manifest` keep working until 1.0 and emit a one-time note. No
-removal in this release.
+None. `--folder` and `--manifest` are **not** deprecated: C2 kept them as permanent
+aliases that assert a type where a positional infers one, they emit no note, and no
+removal is planned. The plan bullet at :533 called for a deprecation cycle with a
+one-time note; that was dropped during C2 and section 3 above records why. Anyone
+writing release notes from this section should say the aliases are unchanged.
+
+The only flags carrying a retirement notice are C1's `--process-all-variants` and
+`--update-policy`, which are accepted, do nothing, and warn once each.
 
 ---
 
@@ -945,6 +1249,9 @@ by a test.
 | C | Detection matrix: directory, `.json`, image; deprecated aliases still work; positional plus alias conflicts; `--back` with a folder errors. |
 | C | Every error case asserts exit code and first line. `-w` expands correctly in all modes, explicit flags override the expansion, and the contradictory combination errors. |
 | C | Regression for the default flip: with no write flags, nothing is written in any mode. |
+| C2 | Third pass, both in `photokin/tests/test_cli_preflight.py`. `TestTheWriteBundleIsDefinedOnce` reads `cli._WRITE_BUNDLE` rather than restating it, so a member added to the bundle is covered the day it is added: every member is refused beside `--generate-manifest` with its own verb and replay wording, `-w` is still answered about itself, and two cases inject a member the CLI does not ship - against the restated refusal the first exits 0 and writes the manifest, and the contradiction check raises `KeyError` into the FATAL handler instead of reporting a usage error. `TestABlankInputTokenIsRefused` folds the bare empty string into its blank-token sweep and into the alias sweep, adds `test_a_genuinely_empty_token_takes_the_same_path`, and gains `test_no_input_at_all_still_says_so` so widening the source filter cannot start describing a run with no input as a blank one; four of those fail against the truthiness filter. |
+| C2 | Second pass, in `photokin/tests/test_cli_preflight.py`, every case re-run against the implementation it replaces so none of it is decorative. `TestWriteBundleGuards` covers the two guards that had none - the `-w` contradiction in both its spellings and `--exiftool-write true` without a changeset - over all three input types, asserting the stream and the apply step are never entered rather than only the exit code, since a regression that runs the batch and then fails also exits 2. `TestNothingIsWrittenWithoutAnOptIn` now removes `EXIFTOOL_WRITE_ENABLED` instead of blanking it, and gains a non-vacuity case holding everything constant but that variable, so a fixture that could never reach `apply_changeset` fails loudly instead of passing quietly. `TestABlankInputTokenIsRefused` takes five blank spellings and both aliases from inside a scratch folder, and pins that `photokin .` and the empty-string message both still answer as before. Plus `TestThePlanNamesTheResolvedInput`, `TestGenerateManifestHonorsDryRun`, `TestGenerateManifestRemediesTerminate` (including that each of the four write flags keeps its own wording after the reorder) and `TestAnUnreadableManifestIsNotReportedAsMissing` in both of its branches. |
+| C2 | Fourth pass, the completion line's accounting. `TestSlotCollisionAccounting` (`photokin/tests/test_manifest_grouping.py`) takes both collision shapes -- two filenames parsing into one `(version, part)` slot, and an override steering one file onto the front side another holds -- and asserts the warning, `all_variant_files.displaced` and the completion line's count and level as one story, then asserts the two shapes are reported identically, which is the asymmetry the fix removes. The invariant is carried in both directions over six shapes including two that lose nothing: the count equals the listed files no recorded model call carried, and every file it counts is named in a warning. Plus the decision that a path winning two addresses is not counted, since it is sent. `TestATiffMasterBesideItsJpegDerivative` (`test_folder_mode.py`) runs the archival shape through `analyze_folder` on real files, because that is where it actually turns up. Both halves of the change were mutated separately in a scratch copy. Reverting the accounting and keeping the wording: 6 failures over 4 of the 7 new tests, the two survivors being exactly the ones that should survive -- the override shape was always counted, and the every-count-has-a-warning direction was never broken. Reverting the wording and keeping the accounting: 15 failures, the 4 pre-existing assertions elsewhere included, which is what pins the string to one definition.  |
 
 ---
 

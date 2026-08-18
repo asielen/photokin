@@ -1,0 +1,1326 @@
+"""Phase C2: the input surface -- one token, one path through ``main``, no accidental write.
+
+Four claims, none of which had coverage before this module:
+
+* **detection is a rule, not a guess.** A directory is a folder even when it is
+  called ``batch.json``, a ``.JSON`` in capitals is still a manifest, and the run
+  says out loud which rule fired -- that INFO line is the only thing standing
+  between a mis-detection and a confidently wrong run. The aliases assert the
+  type where a positional infers it, so ``photokin X`` and ``photokin --folder X``
+  must otherwise produce the same run;
+* **every refusal is two lines the user can act on.** The matrix below asserts
+  exit code 2 and the exact problem line for each one, plus the two properties
+  the house style is really about: no argparse flag dump, and no traceback. A
+  new case is one row;
+* **nothing writes without an explicit opt-in.** Asserted against the bytes of
+  real files rather than against the flags that were parsed, because the
+  regression being guarded is precisely a flag that stopped meaning what it
+  said. ``ExiftoolConfig.enabled`` used to default to true by a route that never
+  reached the dataclass, so ``--changeset true`` alone rewrote the user's scans;
+* **the plan is printed before the money is spent.** Asserted as an ordering
+  against a marker the analysis stand-in logs on entry, not as mere presence.
+
+Nothing here reaches a provider or an ExifTool binary. ``process_manifest_stream``
+-- the only call in ``main`` that can build a provider client -- is replaced by
+:class:`_StreamSpy`, and the ExifTool subprocess by :class:`_FakeExifTool`. The
+fake binary is deliberately *not* inert: it appends to the file it is pointed at,
+exactly as a real write would, so "the photo was not modified" is a claim about
+the filesystem and can fail. Everything is created inside a
+``TemporaryDirectory``; nothing here writes into the repository tree.
+
+One divergence from the C2 brief is pinned here as shipped rather than as
+written: ``-w --dry-run`` does not emit a changeset marked ``dry_run``. C2
+resolved that contradiction in favour of stopping at the plan summary, so the
+combination writes nothing at all -- see ``docs/unified-input-pipeline.md``
+("``--dry-run`` stops after the summary").
+"""
+
+import io
+import json
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
+from typing import Any, ClassVar
+from unittest.mock import patch
+
+from photokin import cli, utils
+
+#: Blanked rather than removed: each of these is read through a falsy-default
+#: lookup, so an empty value pins the documented default whatever the developer's
+#: shell exports. ``EXIFTOOL_WRITE_ENABLED`` is the exception and is removed by
+#: name wherever the flipped default is the thing under test -- ``_parse_bool_env``
+#: reaches its ``default`` argument only when the variable is absent, so blanking
+#: it pins "empty is falsy" rather than "the default is false".
+_NEUTRAL_ENV: dict[str, str] = {
+    "MEL_VERBOSE": "",
+    "MEL_DEBUG": "",
+    "EXIFTOOL_PATH": "",
+    "EXIFTOOL_WRITE_ENABLED": "",
+    "EXIFTOOL_FIELDS": "",
+}
+
+#: The variable whose absence is the only way to observe the flipped default.
+_WRITE_ENABLED = "EXIFTOOL_WRITE_ENABLED"
+
+#: First line of the plan summary block.
+_PLAN_HEADER = "Plan for this run:"
+
+#: Placeholder image content. Real bytes rather than an empty file so a write
+#: that happens anyway is visible as a change rather than as a file that was
+#: empty before and after.
+_IMAGE_BYTES = b"\xff\xd8PLACEHOLDER SCAN CONTENT\xff\xd9"
+
+#: The extensions the folder-is-empty message names, in the order it names them.
+_IMAGE_EXTENSIONS = ", ".join(sorted(utils.VALID_EXTS))
+
+
+def _write_bytes(path: str, data: bytes = _IMAGE_BYTES) -> str:
+    """Write *data* to *path* and return the path.
+
+    Args:
+        path: Destination file.
+        data: Content to write.
+
+    Returns:
+        The path that was written.
+    """
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return path
+
+
+def _write_manifest(folder: str, items: list[dict[str, Any]], name: str = "batch.json") -> str:
+    """Write a manifest naming *items* into *folder* and return its path.
+
+    Args:
+        folder: Directory to write into.
+        items: The ``items`` list, verbatim.
+        name: The manifest's filename, so the capitalized-extension case can
+            spell it differently.
+
+    Returns:
+        The manifest path.
+    """
+    manifest_path = os.path.join(folder, name)
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump({"items": items}, handle)
+    return manifest_path
+
+
+class _StreamSpy:
+    """Stand in for ``process_manifest_stream``, the only call that can reach a provider.
+
+    Records the keyword arguments of every call, so a test can ask what the run
+    decided rather than re-deriving it, and drives both injected writers so the
+    artifacts a real run would leave behind really exist by the time ``main``
+    reaches the ExifTool apply step.
+
+    Attributes:
+        calls: One dict of keyword arguments per invocation.
+    """
+
+    #: What the stand-in proposes for every file. Two tags, so
+    #: ``--exiftool-fields`` has something to select between and a test can tell
+    #: selection from "everything was written".
+    _PROPOSED: ClassVar[dict[str, str]] = {
+        "EXIF:UserComment": "a barn in winter",
+        "XMP:Description": "a barn in winter",
+    }
+
+    def __init__(self, *, marker: str | None = None) -> None:
+        """Build the stand-in.
+
+        Args:
+            marker: Text logged on the ``photokin.core`` logger as the first
+                thing the call does, standing in for the first model call. Its
+                position in stderr is what makes "the plan comes first" an
+                ordering assertion rather than a presence one.
+        """
+        self.calls: list[dict[str, Any]] = []
+        self._marker = marker
+
+    def __call__(self, **kwargs: Any) -> dict[str, Any]:
+        """Record the call, drive the writers, and return a plausible aggregate.
+
+        Args:
+            kwargs: Whatever ``main`` passed; every argument is keyword-only at
+                the call site.
+
+        Returns:
+            The ``{"results": ..., "errors": ...}`` aggregate the real stream
+            returns, with one record per manifest item.
+        """
+        self.calls.append(kwargs)
+        if self._marker is not None:
+            logging.getLogger("photokin.core").info(self._marker)
+        items = kwargs["manifest"]["items"]
+        changeset_writer: Callable[[str], None] | None = kwargs.get("changeset_writer")
+        ndjson_writer: Callable[[str], None] | None = kwargs.get("ndjson_writer")
+        for item in items:
+            if changeset_writer is not None:
+                changeset_writer(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "path": item["path"],
+                            "proposed_changes": {"set": dict(self._PROPOSED)},
+                        }
+                    )
+                )
+            if ndjson_writer is not None:
+                ndjson_writer(json.dumps({"path": item["path"], "status": "ok"}))
+        return {
+            "results": {item["path"]: {"keywords": ["portrait"]} for item in items},
+            "errors": {},
+        }
+
+    @property
+    def called(self) -> bool:
+        """Whether the analysis stream was entered at all."""
+        return bool(self.calls)
+
+    @property
+    def manifest(self) -> dict[str, Any]:
+        """The manifest document the first call was handed."""
+        return self.calls[0]["manifest"]
+
+    def item_paths(self) -> list[str]:
+        """Return the ``path`` of every item in the first call's manifest."""
+        return [item["path"] for item in self.manifest["items"]]
+
+    def kwargs_without_hydrator(self) -> dict[str, Any]:
+        """Return the first call's arguments minus the one that cannot compare.
+
+        ``make_manifest_hydrator`` returns a fresh closure per run, so two runs
+        that are otherwise identical differ on that object's identity alone.
+
+        Returns:
+            The keyword arguments, with ``metadata_hydrator`` removed.
+        """
+        return {k: v for k, v in self.calls[0].items() if k != "metadata_hydrator"}
+
+
+class _FakeExifTool:
+    """Stand in for the ExifTool subprocess, with the one effect that matters kept.
+
+    A binary mocked away entirely would make "the photo was not modified" true by
+    construction, which is the failure mode the write-default regression needs
+    ruled out. This one appends a marker to the file ExifTool was pointed at --
+    the last argument of the command it builds -- so an unwanted write shows up
+    as changed bytes on disk.
+
+    Attributes:
+        commands: The argv of every invocation, in order.
+    """
+
+    _MARKER = b"EXIFTOOL WROTE HERE"
+
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+
+    def __call__(self, cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess:
+        """Record *cmd* and append the marker to the file it names.
+
+        Args:
+            cmd: The ExifTool argv; its last element is the target file.
+            _kwargs: ``capture_output``/``text``/``check``, ignored.
+
+        Returns:
+            A successful :class:`subprocess.CompletedProcess`.
+        """
+        self.commands.append(list(cmd))
+        with open(cmd[-1], "ab") as handle:
+            handle.write(self._MARKER)
+        return subprocess.CompletedProcess(list(cmd), 0, "", "")
+
+
+class _CliTestCase(unittest.TestCase):
+    """Base for tests that execute ``cli.main`` in-process.
+
+    ``main`` installs a handler on a module-level logger, so process state is
+    both an input and an output of every test here: the slate is cleared going in
+    and the package logger restored coming out.
+    """
+
+    def setUp(self) -> None:
+        self.package_logger = logging.getLogger("photokin")
+        self.root_logger = logging.getLogger()
+        self._original_level = self.package_logger.level
+        self._remove_cli_handlers()
+
+    def tearDown(self) -> None:
+        self._remove_cli_handlers()
+        self.package_logger.setLevel(self._original_level)
+
+    def _remove_cli_handlers(self) -> None:
+        """Detach every handler this CLI installs, from both logger scopes."""
+        for logger in (self.package_logger, self.root_logger):
+            for handler in list(logger.handlers):
+                if handler.get_name() == cli._LOG_HANDLER_NAME:
+                    logger.removeHandler(handler)
+                    handler.close()
+
+    def scratch(self) -> str:
+        """Return a fresh temporary directory, removed when the test ends."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        return holder.name
+
+    def make_folder(self, *names: str) -> str:
+        """Create a scratch folder holding placeholder images.
+
+        Args:
+            names: Filenames to create inside it; defaults to one image.
+
+        Returns:
+            The folder path.
+        """
+        folder = self.scratch()
+        for name in names or ("box3_025.jpg",):
+            _write_bytes(os.path.join(folder, name))
+        return folder
+
+    def run_cli(
+        self, argv: list[str], *, env: dict[str, str | None] | None = None
+    ) -> tuple[int | None, str, str]:
+        """Run ``cli.main`` with *argv*, returning its exit code, stdout and stderr.
+
+        Args:
+            argv: Arguments after the program name.
+            env: Environment changes layered on top of ``_NEUTRAL_ENV``, where a
+                value of None *removes* the variable rather than blanking it.
+                Applied inside the ``patch.dict`` so both edits are restored.
+
+        Returns:
+            ``(exit_code, stdout, stderr)``, where the exit code is None when
+            ``main`` returned without raising ``SystemExit``.
+        """
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code: int | None = None
+        with patch.dict(os.environ, _NEUTRAL_ENV), patch.object(sys, "argv", ["photokin", *argv]):
+            for name, value in (env or {}).items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                try:
+                    cli.main()
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else 1
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def usage_error(self, stderr: str) -> list[str]:
+        """Return the two-line usage error a failed run ends with.
+
+        Taken from the end rather than the start: a positional input logs what it
+        was detected as before anything can go wrong with it, and that line is
+        the point of the detection contract.
+
+        Args:
+            stderr: The whole stderr capture.
+
+        Returns:
+            The problem line and the ``Try:`` line.
+        """
+        return stderr.splitlines()[-2:]
+
+    def plan_block(self, stderr: str) -> list[str]:
+        """Return the plan summary as its own list of lines.
+
+        The block is emitted as one log record, so the formatter prefixes only
+        its header and every following line begins with the label indent.
+
+        Args:
+            stderr: The whole stderr capture.
+
+        Returns:
+            The header line followed by the label lines, or an empty list when
+            no plan was printed.
+        """
+        lines = stderr.splitlines()
+        start = next((i for i, line in enumerate(lines) if _PLAN_HEADER in line), None)
+        if start is None:
+            return []
+        block = [lines[start]]
+        for line in lines[start + 1:]:
+            if not line.startswith("  "):
+                break
+            block.append(line)
+        return block
+
+    def assert_refused(self, argv: list[str], problem: str) -> str:
+        """Run *argv*, assert it is refused with *problem*, and return stderr.
+
+        Asserts the whole house style, not just the exit code: two lines, the
+        second a remedy, no argparse flag dump, no traceback, nothing on stdout,
+        and -- the load-bearing part -- neither the analysis stream nor the
+        ExifTool apply step entered, since a regression that runs the batch and
+        then fails also exits 2.
+
+        Args:
+            argv: Arguments after the program name.
+            problem: The expected problem line, without the level prefix.
+
+        Returns:
+            The stderr capture, for any further assertion.
+        """
+        stream = _StreamSpy()
+        exiftool = _FakeExifTool()
+        with patch("photokin.cli.process_manifest_stream", stream), patch(
+            "photokin.exiftool.apply.subprocess.run", exiftool
+        ):
+            code, stdout, stderr = self.run_cli(argv)
+
+        self.assertFalse(stream.called, "the batch was analyzed before the run was refused")
+        self.assertEqual(exiftool.commands, [])
+        self.assertEqual(code, 2)
+        reported, remedy = self.usage_error(stderr)
+        self.assertEqual(reported, f"[ERROR] {problem}")
+        self.assertTrue(remedy.startswith("Try: "), f"the remedy line is missing: {stderr!r}")
+        self.assertNotIn("usage: ", stderr, "argparse boilerplate leaked into a usage error")
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(stdout, "")
+        return stderr
+
+
+class TestInputDetectionMatrix(_CliTestCase):
+    """What a positional input is taken to be, and the line that says so.
+
+    The rule is evaluated in one place and ordered so a directory wins over an
+    extension. That ordering is invisible without the INFO line, which is why
+    every case here asserts the inference as well as the outcome: a folder called
+    ``batch.json`` analyzed as a folder is correct, and silently doing it is not.
+    """
+
+    def _run(self, argv: list[str]) -> tuple[int | None, str, _StreamSpy]:
+        """Run *argv* with the analysis stream replaced.
+
+        Args:
+            argv: Arguments after the program name.
+
+        Returns:
+            ``(exit code, stderr, stream spy)``.
+        """
+        stream = _StreamSpy()
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, stderr = self.run_cli(argv)
+        return code, stderr, stream
+
+    def test_a_directory_is_a_folder(self) -> None:
+        folder = self.make_folder("box3_025.jpg", "box3_026.jpg")
+
+        code, stderr, stream = self._run([folder])
+
+        self.assertIsNone(code)
+        self.assertIn(f"[INFO] Treating `{folder}` as a folder (it is a directory).", stderr)
+        self.assertEqual(stream.manifest["source"]["type"], "folder")
+        self.assertEqual(
+            stream.item_paths(),
+            [os.path.join(folder, "box3_025.jpg"), os.path.join(folder, "box3_026.jpg")],
+        )
+
+    def test_a_json_file_is_a_manifest(self) -> None:
+        folder = self.make_folder()
+        image = os.path.join(folder, "box3_025.jpg")
+        manifest_path = _write_manifest(folder, [{"path": image, "is_back": False}])
+
+        code, stderr, stream = self._run([manifest_path])
+
+        self.assertIsNone(code)
+        self.assertIn(
+            f"[INFO] Treating `{manifest_path}` as a manifest (it is a .json file).", stderr
+        )
+        # The document reaches the stream verbatim: no ``source``, no
+        # ``generated_by``, and the item's own keys intact. A manifest silently
+        # rebuilt from its folder would lose exactly those.
+        self.assertEqual(stream.manifest, {"items": [{"path": image, "is_back": False}]})
+
+    def test_an_image_file_is_a_single_photo(self) -> None:
+        folder = self.make_folder("box3_025.jpg", "box3_026.jpg")
+        image = os.path.join(folder, "box3_025.jpg")
+
+        code, stderr, stream = self._run([image])
+
+        self.assertIsNone(code)
+        self.assertIn(f"[INFO] Treating `{image}` as a single photo (it is a .jpg file).", stderr)
+        self.assertEqual(stream.manifest["source"]["type"], "single")
+        # One item, not the folder it sits in -- the neighbouring image is the
+        # thing a folder/photo confusion would drag in.
+        self.assertEqual(stream.item_paths(), [image])
+
+    def test_a_directory_named_like_a_manifest_is_still_a_folder(self) -> None:
+        # Directories are tested before extensions, so this is correct; the log
+        # line is what keeps it from being a surprise.
+        parent = self.scratch()
+        folder = os.path.join(parent, "batch.json")
+        os.mkdir(folder)
+        _write_bytes(os.path.join(folder, "box3_025.jpg"))
+
+        code, stderr, stream = self._run([folder])
+
+        self.assertIsNone(code)
+        self.assertIn(f"[INFO] Treating `{folder}` as a folder (it is a directory).", stderr)
+        self.assertEqual(stream.manifest["source"]["type"], "folder")
+        self.assertEqual(stream.item_paths(), [os.path.join(folder, "box3_025.jpg")])
+
+    def test_a_capitalized_json_extension_is_still_a_manifest(self) -> None:
+        folder = self.make_folder()
+        image = os.path.join(folder, "box3_025.jpg")
+        manifest_path = _write_manifest(folder, [{"path": image}], name="BATCH.JSON")
+
+        code, stderr, stream = self._run([manifest_path])
+
+        self.assertIsNone(code)
+        # The reason names the rule, spelled the way the rule is written, rather
+        # than echoing the extension the file happens to carry.
+        self.assertIn(
+            f"[INFO] Treating `{manifest_path}` as a manifest (it is a .json file).", stderr
+        )
+        self.assertEqual(stream.manifest, {"items": [{"path": image}]})
+
+    def test_a_capitalized_image_extension_is_still_a_single_photo(self) -> None:
+        folder = self.scratch()
+        image = _write_bytes(os.path.join(folder, "BOX3_025.JPG"))
+
+        code, stderr, stream = self._run([image])
+
+        self.assertIsNone(code)
+        self.assertIn(f"[INFO] Treating `{image}` as a single photo (it is a .jpg file).", stderr)
+        self.assertEqual(stream.item_paths(), [image])
+
+    def test_a_path_that_is_not_there_is_refused_before_anything_is_detected(self) -> None:
+        missing = os.path.join(self.scratch(), "scanz")
+
+        stderr = self.assert_refused([missing], f"`{missing}` not found.")
+
+        self.assertEqual(
+            self.usage_error(stderr)[1],
+            "Try: check the spelling, or run from the folder that contains it",
+        )
+        # Nothing may be claimed about a path that does not exist.
+        self.assertNotIn("Treating", stderr)
+
+    def test_an_unrecognized_extension_names_the_three_invocations(self) -> None:
+        notes = _write_bytes(os.path.join(self.scratch(), "notes.txt"), b"not a scan")
+
+        stderr = self.assert_refused(
+            [notes], f"`{notes}` isn't an image, folder, or .json manifest."
+        )
+
+        self.assertEqual(
+            self.usage_error(stderr)[1],
+            "Try: photokin ./scans/ (folder), photokin batch.json (manifest), "
+            "or photokin scan_042.jpg (single photo)",
+        )
+        self.assertNotIn("Treating", stderr)
+
+
+class TestAliasesAndPositionalsAgree(_CliTestCase):
+    """``--folder``/``--manifest`` assert a type where a positional infers one.
+
+    They are permanent aliases rather than a deprecation, so the contract is that
+    the run either way is the same run. The one visible difference is the
+    detection line, which only a positional earns -- an alias inferred nothing,
+    so it has nothing to report.
+    """
+
+    def _stream_kwargs(self, argv: list[str]) -> tuple[dict[str, Any], list[str]]:
+        """Run *argv* and return the stream's arguments plus the plan block.
+
+        Args:
+            argv: Arguments after the program name.
+
+        Returns:
+            ``(keyword arguments minus the hydrator, plan summary lines)``.
+        """
+        stream = _StreamSpy()
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, stderr = self.run_cli(argv)
+        self.assertIsNone(code, stderr)
+        return stream.kwargs_without_hydrator(), self.plan_block(stderr)
+
+    def test_a_folder_runs_identically_through_both_spellings(self) -> None:
+        folder = self.make_folder("box3_025.jpg", "box3_025-back.jpg")
+
+        positional, positional_plan = self._stream_kwargs([folder])
+        alias, alias_plan = self._stream_kwargs(["--folder", folder])
+
+        self.assertEqual(positional, alias)
+        self.assertEqual(positional_plan, alias_plan)
+        self.assertNotEqual(positional_plan, [])
+
+    def test_a_manifest_runs_identically_through_both_spellings(self) -> None:
+        folder = self.make_folder()
+        manifest_path = _write_manifest(folder, [{"path": os.path.join(folder, "box3_025.jpg")}])
+
+        positional, positional_plan = self._stream_kwargs([manifest_path])
+        alias, alias_plan = self._stream_kwargs(["--manifest", manifest_path])
+
+        self.assertEqual(positional, alias)
+        self.assertEqual(positional_plan, alias_plan)
+        # The hydrator is manifest-only, and it is the argument the comparison
+        # above had to drop, so its presence is asserted separately for both.
+        self.assertEqual(positional["strict_run_failures"], False)
+
+    def test_only_the_positional_reports_what_it_inferred(self) -> None:
+        folder = self.make_folder()
+        stream = _StreamSpy()
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            _code, _stdout, alias_stderr = self.run_cli(["--folder", folder])
+            _code, _stdout, positional_stderr = self.run_cli([folder])
+
+        self.assertIn(f"Treating `{folder}` as a folder", positional_stderr)
+        self.assertNotIn("Treating", alias_stderr)
+
+
+class TestTheMessageMatrix(_CliTestCase):
+    """Every refusal C2 owns, as one row each: exit code 2 and the first line.
+
+    Wording is centralized in ``cli_messages`` precisely so it can be asserted
+    without the pipeline, but what a user hits is the wording *as the CLI reaches
+    it*, and reaching the wrong message is the failure this table catches -- a
+    remedy that leads back to the error it came from, or an OS error reported as
+    a spelling mistake. :meth:`assert_refused` carries the house-style half:
+    two lines, a remedy, no argparse dump, no traceback, and nothing analyzed.
+    """
+
+    def _fixture(self) -> tuple[str, str, str]:
+        """Build one valid input of each kind, so a row can vary one thing.
+
+        Returns:
+            ``(folder, image, manifest path)``.
+        """
+        folder = self.make_folder("box3_025.jpg")
+        image = os.path.join(folder, "box3_025.jpg")
+        return folder, image, _write_manifest(folder, [{"path": image}])
+
+    def test_every_refusal_states_its_own_problem(self) -> None:
+        folder, image, manifest_path = self._fixture()
+        empty_folder = self.scratch()
+        missing = os.path.join(folder, "scanz")
+        notes = _write_bytes(os.path.join(folder, "notes.txt"), b"not a scan")
+        not_json = os.path.join(folder, "broken.json")
+        _write_bytes(not_json, b"{not json at all")
+        not_manifest = os.path.join(folder, "settings.json")
+        _write_bytes(not_manifest, b'{"provider": "openai"}')
+        empty_items = _write_manifest(folder, [], name="empty.json")
+        pathless = _write_manifest(folder, [{"is_back": True}], name="pathless.json")
+        gone = os.path.join(folder, "box3_099.jpg")
+        broken_item = _write_manifest(
+            folder, [{"path": image}, {"path": gone}], name="broken2.json"
+        )
+
+        cases: tuple[tuple[str, list[str], str], ...] = (
+            (
+                "the input is not there",
+                [missing],
+                f"`{missing}` not found.",
+            ),
+            (
+                "the folder holds nothing readable",
+                [empty_folder],
+                f"`{empty_folder}` holds no images; looked for {_IMAGE_EXTENSIONS}.",
+            ),
+            (
+                "the extension is not one of the three",
+                [notes],
+                f"`{notes}` isn't an image, folder, or .json manifest.",
+            ),
+            (
+                "the .json does not parse",
+                [not_json],
+                f"`{not_json}` is not valid JSON: Expecting property name enclosed in "
+                "double quotes: line 1 column 2 (char 1).",
+            ),
+            (
+                "the .json is not a manifest",
+                [not_manifest],
+                f"`{not_manifest}` is not a manifest; expected a top-level `items` list.",
+            ),
+            (
+                "the manifest has no items",
+                [empty_items],
+                f"`{empty_items}` has an empty `items` list; there is nothing to analyze.",
+            ),
+            (
+                "a manifest item has no path",
+                [pathless],
+                f"`{pathless}` items[0] has no `path` string.",
+            ),
+            (
+                "a manifest item names a file that is gone",
+                [broken_item],
+                f"`{broken_item}` items[1] points at a file that does not exist: {gone}.",
+            ),
+            (
+                "a positional and an alias both name an input",
+                [image, "--folder", folder],
+                f"`{image}` was given as the input and `--folder {folder}` names another; "
+                "only one input is allowed.",
+            ),
+            (
+                "both aliases name an input",
+                ["--folder", folder, "--manifest", manifest_path],
+                f"`--folder {folder}` and `--manifest {manifest_path}` both name an input; "
+                "only one is allowed.",
+            ),
+            (
+                "no input at all",
+                ["--output-file", "results.json"],
+                "no input was given.",
+            ),
+            (
+                "--back against a folder",
+                [folder, "--back", image],
+                f"`--back {image}` only applies to a single photo, but `{folder}` was "
+                "treated as a folder.",
+            ),
+            (
+                "--back against a manifest",
+                [manifest_path, "--back", image],
+                f"`--back {image}` only applies to a single photo, but `{manifest_path}` "
+                "was treated as a manifest.",
+            ),
+            (
+                "--meta against a folder",
+                [folder, "--meta", manifest_path],
+                f"`--meta {manifest_path}` only applies to a single photo, but `{folder}` "
+                "was treated as a folder.",
+            ),
+            (
+                "--meta against a manifest",
+                [manifest_path, "--meta", manifest_path],
+                f"`--meta {manifest_path}` only applies to a single photo, but "
+                f"`{manifest_path}` was treated as a manifest.",
+            ),
+            (
+                "-w contradicted by --exiftool-write false",
+                [folder, "-w", "--exiftool-write", "false"],
+                "`-w` means --changeset true --exiftool-write true, but "
+                "`--exiftool-write false` was also given.",
+            ),
+            (
+                "-w contradicted by --changeset false",
+                [folder, "-w", "--changeset", "false"],
+                "`-w` means --changeset true --exiftool-write true, but "
+                "`--changeset false` was also given.",
+            ),
+            (
+                "a write with nothing to write from",
+                [folder, "--exiftool-write", "true"],
+                "`--exiftool-write true` needs a changeset to apply, but --changeset is false.",
+            ),
+            (
+                "--output-file cannot hold results",
+                [folder, "--output-file", os.path.join(folder, "results.txt")],
+                f"`--output-file {os.path.join(folder, 'results.txt')}` must end with "
+                ".ndjson or .json.",
+            ),
+        )
+
+        for label, argv, problem in cases:
+            with self.subTest(case=label):
+                self.assert_refused(argv, problem)
+
+    def test_the_meta_remedy_points_into_the_manifest_it_was_given(self) -> None:
+        # The remedy is the half that differs by input kind: telling a manifest
+        # user to "name the front image instead" would be advice to stop using
+        # the manifest.
+        folder, image, manifest_path = self._fixture()
+
+        stderr = self.assert_refused(
+            [manifest_path, "--meta", manifest_path],
+            f"`--meta {manifest_path}` only applies to a single photo, but "
+            f"`{manifest_path}` was treated as a manifest.",
+        )
+        folder_stderr = self.assert_refused(
+            [folder, "--meta", manifest_path],
+            f"`--meta {manifest_path}` only applies to a single photo, but `{folder}` "
+            "was treated as a folder.",
+        )
+
+        self.assertEqual(
+            self.usage_error(stderr)[1],
+            "Try: carry it in the manifest item's `metadata` or `metadata_path` instead",
+        )
+        self.assertEqual(
+            self.usage_error(folder_stderr)[1],
+            f"Try: name the front image instead: photokin <front image> --meta {manifest_path}",
+        )
+        self.assertTrue(os.path.isfile(image))
+
+    def test_a_positional_beside_an_alias_is_not_answered_by_argparse(self) -> None:
+        # The mutually exclusive group argparse would use for this prints a
+        # usage block and the flag list; removing it is what bought the message.
+        folder, image, _manifest = self._fixture()
+
+        stderr = self.assert_refused(
+            [image, "--folder", folder],
+            f"`{image}` was given as the input and `--folder {folder}` names another; "
+            "only one input is allowed.",
+        )
+
+        self.assertEqual(
+            self.usage_error(stderr)[1],
+            f"Try: pass just one: photokin {image}, or photokin --folder {folder}",
+        )
+        self.assertNotIn("--openrouter-model", stderr)
+
+    def test_exiftool_fields_with_nothing_to_write_is_a_note_not_an_error(self) -> None:
+        # The flag is not wrong, it is inert, so the run continues. Refusing it
+        # would break every caller that sets its tags once and toggles writing.
+        folder = self.make_folder()
+        stream = _StreamSpy()
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--exiftool-fields", "EXIF:UserComment"]
+            )
+
+        self.assertIsNone(code)
+        self.assertTrue(stream.called, "an inert flag must not stop the run")
+        self.assertIn(
+            "[WARNING] `--exiftool-fields EXIF:UserComment` was given but nothing will be "
+            "written; add -w (or --changeset true --exiftool-write true) to apply those tags.",
+            stderr,
+        )
+
+    def test_the_same_flag_is_silent_once_there_is_something_to_write(self) -> None:
+        folder, image, _manifest = self._fixture()
+        exiftool_path = _write_bytes(os.path.join(folder, "exiftool.exe"), b"")
+        stream, fake = _StreamSpy(), _FakeExifTool()
+
+        with patch("photokin.cli.process_manifest_stream", stream), patch(
+            "photokin.exiftool.apply.subprocess.run", fake
+        ):
+            code, _stdout, stderr = self.run_cli(
+                [
+                    folder,
+                    "-w",
+                    "--exiftool-fields",
+                    "XMP:Description",
+                    "--exiftool-path",
+                    exiftool_path,
+                ]
+            )
+
+        self.assertIsNone(code)
+        self.assertNotIn("nothing will be written", stderr)
+        # The flag really selected the tag set, rather than being accepted and
+        # dropped: only the tag asked for reaches the binary.
+        self.assertEqual(len(fake.commands), 1)
+        self.assertIn("-XMP:Description=a barn in winter", fake.commands[0])
+        self.assertNotIn("-EXIF:UserComment=a barn in winter", fake.commands[0])
+        self.assertEqual(fake.commands[0][0], exiftool_path)
+        self.assertEqual(fake.commands[0][-1], image)
+
+
+class _WriteFixtureTestCase(_CliTestCase):
+    """Base for the classes that let a run reach a real ExifTool write.
+
+    All of them need the same four things: one input of each kind over the same
+    photo, a binary path that resolves, an ExifTool stand-in that really touches
+    the file, and a way to ask whether the photos on disk changed.
+    """
+
+    def write_fixture(self) -> tuple[str, str, str, str]:
+        """Build a folder holding a photo, a manifest naming it, and a fake binary.
+
+        Returns:
+            ``(folder, image, manifest path, exiftool path)``. The binary is a
+            real empty file rather than a patched resolver, because the ExifTool
+            pre-flight resolves the path itself and nothing here executes it.
+        """
+        folder = self.make_folder("box3_025.jpg")
+        image = os.path.join(folder, "box3_025.jpg")
+        manifest_path = _write_manifest(folder, [{"path": image}])
+        exiftool_path = _write_bytes(os.path.join(folder, "exiftool.exe"), b"")
+        return folder, image, manifest_path, exiftool_path
+
+    def each_input(self, folder: str, image: str, manifest_path: str) -> tuple[list[str], ...]:
+        """Return one argv prefix per input kind, in detection order."""
+        return ([folder], [image], ["--manifest", manifest_path])
+
+    def photo_bytes(self, folder: str) -> dict[str, bytes]:
+        """Return the on-disk content of every image in *folder*.
+
+        Args:
+            folder: Directory to snapshot.
+
+        Returns:
+            A mapping of path to content, for the image extensions the pipeline
+            recognizes.
+        """
+        snapshot: dict[str, bytes] = {}
+        for name in sorted(os.listdir(folder)):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and os.path.splitext(name)[1].lower() in utils.VALID_EXTS:
+                with open(path, "rb") as handle:
+                    snapshot[path] = handle.read()
+        return snapshot
+
+    def assert_photos_untouched(
+        self, before: dict[str, bytes], folder: str, argv: list[str]
+    ) -> None:
+        """Assert every photo in *folder* is byte-identical to *before*.
+
+        Args:
+            before: The snapshot taken before the run.
+            folder: The directory that was scanned.
+            argv: The command that ran, quoted back in the failure message.
+        """
+        after = self.photo_bytes(folder)
+        self.assertEqual(sorted(after), sorted(before))
+        for path, content in before.items():
+            self.assertEqual(
+                after[path],
+                content,
+                "photokin modified the user's photos without being asked to: "
+                f"{path} changed on disk after `photokin {' '.join(argv)}`. Writing to "
+                "originals requires an explicit opt-in (-w, or --exiftool-write true "
+                "beside --changeset true); no other combination may touch them.",
+            )
+
+
+class TestNoPhotoIsTouchedWithoutAnOptIn(_WriteFixtureTestCase):
+    """The regression test for the flipped write default, asserted on the disk.
+
+    ``ExiftoolConfig.enabled`` reads False on the dataclass and used to be
+    unreachable from the CLI: ``from_env`` set it from ``EXIFTOOL_WRITE_ENABLED``
+    with a ``True`` fallback and then discarded the None a missing flag produces.
+    So ``--changeset true`` -- documented as *recording* the proposed writes --
+    applied them, and anyone reading the dataclass would have concluded the
+    opposite.
+
+    Two things make these cases able to fail. ``EXIFTOOL_WRITE_ENABLED`` is
+    removed rather than blanked, so the resolution really reaches the default
+    literal; and the ExifTool stand-in really appends to the file, so the claim
+    is about bytes rather than about which mock was called. The last case holds
+    everything constant but the opt-in and asserts the photo *is* rewritten,
+    which is what stops the rest from passing vacuously.
+    """
+
+    def test_a_plain_run_writes_to_no_file_in_any_input_mode(self) -> None:
+        folder, image, manifest_path, exiftool_path = self.write_fixture()
+        before = self.photo_bytes(folder)
+        directory_before = sorted(os.listdir(folder))
+
+        for argv in self.each_input(folder, image, manifest_path):
+            with self.subTest(argv=argv):
+                command = [*argv, "--exiftool-path", exiftool_path]
+                stream, fake = _StreamSpy(), _FakeExifTool()
+                with patch("photokin.cli.process_manifest_stream", stream), patch(
+                    "photokin.exiftool.apply.subprocess.run", fake
+                ):
+                    code, _stdout, stderr = self.run_cli(command, env={_WRITE_ENABLED: None})
+
+                self.assertIsNone(code, stderr)
+                self.assertTrue(stream.called, "the fixture never got as far as a write")
+                self.assert_photos_untouched(before, folder, command)
+                self.assertEqual(fake.commands, [])
+                # Nothing appeared either: a run asked for no artifact leaves a
+                # changeset or a sidecar behind only by accident.
+                self.assertEqual(sorted(os.listdir(folder)), directory_before)
+
+    def test_recording_a_changeset_is_not_applying_it_in_any_input_mode(self) -> None:
+        """``--changeset true`` is the one route that used to write on its own.
+
+        This is the whole blast radius of the flipped default: a run that asks
+        for the record of what *would* be written, and got the writes as well.
+        """
+        folder, image, manifest_path, exiftool_path = self.write_fixture()
+        before = self.photo_bytes(folder)
+
+        for argv in self.each_input(folder, image, manifest_path):
+            with self.subTest(argv=argv):
+                command = [*argv, "--changeset", "true", "--exiftool-path", exiftool_path]
+                stream, fake = _StreamSpy(), _FakeExifTool()
+                with patch("photokin.cli.process_manifest_stream", stream), patch(
+                    "photokin.exiftool.apply.subprocess.run", fake
+                ):
+                    code, _stdout, stderr = self.run_cli(command, env={_WRITE_ENABLED: None})
+
+                self.assertIsNone(code, stderr)
+                self.assert_photos_untouched(before, folder, command)
+                self.assertEqual(fake.commands, [])
+                # The record was still produced -- the run did what was asked,
+                # and only what was asked.
+                changesets = [n for n in os.listdir(folder) if n.endswith("_changeset.ndjson")]
+                self.assertEqual(len(changesets), 1, os.listdir(folder))
+                with open(os.path.join(folder, changesets[0]), "r", encoding="utf-8") as handle:
+                    self.assertEqual(json.loads(handle.readline())["path"], image)
+                self.assertIn("write     : none (--exiftool-write defaults to false)", stderr)
+                for stale in changesets:
+                    os.remove(os.path.join(folder, stale))
+
+    def test_the_same_fixture_does_rewrite_the_photo_once_it_is_asked_to(self) -> None:
+        folder, image, manifest_path, exiftool_path = self.write_fixture()
+        before = self.photo_bytes(folder)
+
+        for argv in self.each_input(folder, image, manifest_path):
+            with self.subTest(argv=argv):
+                stream, fake = _StreamSpy(), _FakeExifTool()
+                with patch("photokin.cli.process_manifest_stream", stream), patch(
+                    "photokin.exiftool.apply.subprocess.run", fake
+                ):
+                    code, _stdout, stderr = self.run_cli(
+                        [*argv, "-w", "--exiftool-path", exiftool_path],
+                        env={_WRITE_ENABLED: None},
+                    )
+
+                self.assertIsNone(code, stderr)
+                self.assertEqual([cmd[-1] for cmd in fake.commands], [image])
+                with open(image, "rb") as handle:
+                    self.assertNotEqual(handle.read(), before[image])
+                _write_bytes(image, before[image])
+                for stale in os.listdir(folder):
+                    if stale.endswith("_changeset.ndjson"):
+                        os.remove(os.path.join(folder, stale))
+
+
+class TestTheWriteShorthand(_WriteFixtureTestCase):
+    """``-w``: one definition, expanded once, overridable and refusable.
+
+    The bundle lives in ``cli._WRITE_BUNDLE`` so the expansion and the
+    contradiction check cannot disagree; what that buys is asserted here as
+    behavior. The contradictions' *wording* is pinned in the message matrix
+    above -- these cases pin the thing the wording is protecting, which is that
+    the photos are still there afterwards.
+    """
+
+    def test_it_expands_to_both_halves_in_every_input_mode(self) -> None:
+        folder, image, manifest_path, exiftool_path = self.write_fixture()
+
+        for argv in self.each_input(folder, image, manifest_path):
+            with self.subTest(argv=argv):
+                original = self.photo_bytes(folder)[image]
+                stream, fake = _StreamSpy(), _FakeExifTool()
+                with patch("photokin.cli.process_manifest_stream", stream), patch(
+                    "photokin.exiftool.apply.subprocess.run", fake
+                ):
+                    code, _stdout, stderr = self.run_cli(
+                        [*argv, "-w", "--exiftool-path", exiftool_path],
+                        env={_WRITE_ENABLED: None},
+                    )
+
+                self.assertIsNone(code, stderr)
+                # Each half observed where only it shows: the changeset file
+                # exists because --changeset true was set, and the photo changed
+                # because --exiftool-write true was.
+                changesets = [n for n in os.listdir(folder) if n.endswith("_changeset.ndjson")]
+                self.assertEqual(len(changesets), 1, "-w did not expand to --changeset true")
+                with open(image, "rb") as handle:
+                    self.assertNotEqual(
+                        handle.read(), original, "-w did not expand to --exiftool-write true"
+                    )
+                self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+                _write_bytes(image, original)
+                for stale in changesets:
+                    os.remove(os.path.join(folder, stale))
+
+    def test_an_explicit_flag_that_agrees_with_the_expansion_is_accepted(self) -> None:
+        # Every member of the bundle expands to "true", so agreement and
+        # contradiction are the only two outcomes an explicit flag can have.
+        folder, image, _manifest, exiftool_path = self.write_fixture()
+        original = self.photo_bytes(folder)[image]
+        stream, fake = _StreamSpy(), _FakeExifTool()
+
+        with patch("photokin.cli.process_manifest_stream", stream), patch(
+            "photokin.exiftool.apply.subprocess.run", fake
+        ):
+            code, _stdout, stderr = self.run_cli(
+                [
+                    folder,
+                    "-w",
+                    "--changeset",
+                    "true",
+                    "--exiftool-write",
+                    "true",
+                    "--exiftool-path",
+                    exiftool_path,
+                ],
+                env={_WRITE_ENABLED: None},
+            )
+
+        self.assertIsNone(code, stderr)
+        self.assertEqual([cmd[-1] for cmd in fake.commands], [image])
+        with open(image, "rb") as handle:
+            self.assertNotEqual(handle.read(), original)
+
+    def test_a_contradicted_bundle_leaves_the_photos_alone(self) -> None:
+        folder, image, manifest_path, exiftool_path = self.write_fixture()
+        before = self.photo_bytes(folder)
+
+        for argv in self.each_input(folder, image, manifest_path):
+            for contradiction in (["--exiftool-write", "false"], ["--changeset", "false"]):
+                with self.subTest(argv=argv, contradiction=contradiction):
+                    command = [*argv, "-w", *contradiction, "--exiftool-path", exiftool_path]
+                    self.assert_refused(
+                        command,
+                        "`-w` means --changeset true --exiftool-write true, but "
+                        f"`{contradiction[0]} {contradiction[1]}` was also given.",
+                    )
+                    self.assert_photos_untouched(before, folder, command)
+                    self.assertEqual(
+                        [n for n in os.listdir(folder) if n.endswith("_changeset.ndjson")], []
+                    )
+
+    def test_a_dry_run_beside_it_writes_nothing_at_all(self) -> None:
+        """``-w --dry-run`` stops at the plan, as C2 shipped it.
+
+        The brief for this phase described the pair as emitting a changeset whose
+        records carry ``dry_run: true``. C2 resolved that against the flag's own
+        promise -- print the plan and stop, before the first model call -- so no
+        analysis runs and there is nothing to record. Pinned as shipped, and as
+        the safer of the two readings: the combination now cannot cost money.
+        """
+        folder, image, manifest_path, exiftool_path = self.write_fixture()
+        before = self.photo_bytes(folder)
+
+        for argv in self.each_input(folder, image, manifest_path):
+            with self.subTest(argv=argv):
+                command = [*argv, "-w", "--dry-run", "--exiftool-path", exiftool_path]
+                stream, fake = _StreamSpy(), _FakeExifTool()
+                with patch("photokin.cli.process_manifest_stream", stream), patch(
+                    "photokin.exiftool.apply.subprocess.run", fake
+                ):
+                    code, stdout, stderr = self.run_cli(command, env={_WRITE_ENABLED: None})
+
+                self.assertIsNone(code, stderr)
+                self.assertFalse(stream.called, "--dry-run reached the model")
+                self.assertEqual(fake.commands, [])
+                self.assertEqual(stdout, "")
+                self.assert_photos_untouched(before, folder, command)
+                self.assertEqual(
+                    [n for n in os.listdir(folder) if n.endswith("_changeset.ndjson")],
+                    [],
+                    "--dry-run created the changeset it promised not to write",
+                )
+                self.assertIn("  write     : none (--dry-run)", stderr)
+
+
+class TestTheGatesAreLiftedForEveryInputType(_WriteFixtureTestCase):
+    """``--output-file``, ``--changeset`` and the ``--exiftool-*`` flags, everywhere.
+
+    Phase A made ``--output-file`` outside manifest mode an explicit error as a
+    stopgap, and the other two were simply unreachable: folder and single-photo
+    runs printed to stdout and never looked at them. C2 routed all three inputs
+    through one path, so the flags are asserted here against folder and
+    single-photo input specifically -- manifest input is the case that always
+    worked and proves nothing.
+    """
+
+    def test_folder_input_writes_the_aggregate_json(self) -> None:
+        folder = self.make_folder("box3_025.jpg", "box3_026.jpg")
+        out_path = os.path.join(folder, "results.json")
+        stream = _StreamSpy()
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, stdout, _stderr = self.run_cli([folder, "--output-file", out_path])
+
+        self.assertIsNone(code)
+        self.assertEqual(stdout, "", "a run with --output-file writes the file, not stdout")
+        with open(out_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(sorted(json.load(handle)["results"]), sorted(stream.item_paths()))
+
+    def test_single_photo_input_streams_ndjson(self) -> None:
+        folder = self.make_folder("box3_025.jpg", "box3_025-back.jpg")
+        image = os.path.join(folder, "box3_025.jpg")
+        out_path = os.path.join(folder, "results.ndjson")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, stdout, _stderr = self.run_cli(
+                [image, "--back", os.path.join(folder, "box3_025-back.jpg"),
+                 "--output-file", out_path]
+            )
+
+        self.assertIsNone(code)
+        self.assertEqual(stdout, "")
+        with open(out_path, "r", encoding="utf-8") as handle:
+            written = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual(
+            [record["path"] for record in written],
+            [image, os.path.join(folder, "box3_025-back.jpg")],
+        )
+
+    def test_the_changeset_path_follows_the_output_file_or_the_input(self) -> None:
+        """Q1, generalized: ``dirname(--output-file or input)`` plus the stem.
+
+        The no-output-file spellings are the ones that changed: both a ``.json``
+        output and no output at all used to yield a bare ``changeset.ndjson``,
+        which collides across runs sharing a directory.
+        """
+        folder, image, manifest_path, _exiftool = self.write_fixture()
+        elsewhere = self.scratch()
+        cases: tuple[tuple[str, list[str], str], ...] = (
+            (
+                "a folder is named by the folder",
+                [folder],
+                os.path.join(folder, f"{os.path.basename(folder)}_changeset.ndjson"),
+            ),
+            (
+                "a photo is named by the photo",
+                [image],
+                os.path.join(folder, "box3_025_changeset.ndjson"),
+            ),
+            (
+                "a manifest is named by the manifest",
+                ["--manifest", manifest_path],
+                os.path.join(folder, "batch_changeset.ndjson"),
+            ),
+            (
+                "an output file wins, and its _results suffix is dropped",
+                [folder, "--output-file", os.path.join(elsewhere, "box3_results.ndjson")],
+                os.path.join(elsewhere, "box3_changeset.ndjson"),
+            ),
+            (
+                "an aggregate .json output no longer yields a bare changeset",
+                [folder, "--output-file", os.path.join(elsewhere, "run7.json")],
+                os.path.join(elsewhere, "run7_changeset.ndjson"),
+            ),
+        )
+
+        for label, argv, expected in cases:
+            with self.subTest(case=label):
+                stream = _StreamSpy()
+                with patch("photokin.cli.process_manifest_stream", stream):
+                    code, _stdout, stderr = self.run_cli(
+                        [*argv, "--changeset", "true"], env={_WRITE_ENABLED: None}
+                    )
+
+                self.assertIsNone(code, stderr)
+                self.assertTrue(os.path.isfile(expected), f"no changeset at {expected}")
+                self.assertIn(f"  changeset : {expected}", stderr)
+                os.remove(expected)
+
+    def test_the_exiftool_flags_reach_the_binary_for_folder_and_photo_input(self) -> None:
+        folder, image, _manifest, exiftool_path = self.write_fixture()
+
+        for argv in ([folder], [image]):
+            with self.subTest(argv=argv):
+                original = self.photo_bytes(folder)[image]
+                stream, fake = _StreamSpy(), _FakeExifTool()
+                with patch("photokin.cli.process_manifest_stream", stream), patch(
+                    "photokin.exiftool.apply.subprocess.run", fake
+                ):
+                    code, _stdout, stderr = self.run_cli(
+                        [
+                            *argv,
+                            "--changeset",
+                            "true",
+                            "--exiftool-write",
+                            "true",
+                            "--exiftool-fields",
+                            "EXIF:UserComment",
+                            "--exiftool-path",
+                            exiftool_path,
+                        ],
+                        env={_WRITE_ENABLED: None},
+                    )
+
+                self.assertIsNone(code, stderr)
+                self.assertEqual(len(fake.commands), 1)
+                self.assertEqual(fake.commands[0][0], exiftool_path)
+                self.assertIn("-EXIF:UserComment=a barn in winter", fake.commands[0])
+                self.assertEqual(fake.commands[0][-1], image)
+                self.assertIn("[ExifTool] Apply result: files_seen=1 files_written=1", stderr)
+                _write_bytes(image, original)
+                for stale in os.listdir(folder):
+                    if stale.endswith("_changeset.ndjson"):
+                        os.remove(os.path.join(folder, stale))
+
+
+class TestThePlanPrecedesTheFirstModelCall(_CliTestCase):
+    """The cheapest guard against "wrong folder" and "I did not mean to write".
+
+    Presence is not the claim -- a summary printed after the batch would still be
+    in stderr. The analysis stand-in logs a marker as the first thing it does, so
+    the assertion is that the plan appears earlier in the stream than the marker
+    does.
+    """
+
+    _MARKER = "MODEL CALL WOULD HAPPEN HERE"
+
+    def test_the_summary_is_printed_before_the_stream_is_entered(self) -> None:
+        folder = self.make_folder("box3_025.jpg", "box3_025-back.jpg", "box3_040.jpg")
+        stream = _StreamSpy(marker=self._MARKER)
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--provider", "anthropic", "--claude-model", "haiku"]
+            )
+
+        self.assertIsNone(code)
+        self.assertTrue(stream.called)
+        self.assertLess(
+            stderr.index(_PLAN_HEADER),
+            stderr.index(self._MARKER),
+            "the plan summary must be printed before anything can cost money",
+        )
+        self.assertEqual(
+            self.plan_block(stderr),
+            [
+                f"[INFO] {_PLAN_HEADER}",
+                f"  input     : {os.path.abspath(folder)} (folder, 3 file(s) in 2 group(s), "
+                "group-by object)",
+                "  output    : stdout",
+                "  changeset : none (--changeset false)",
+                "  write     : none",
+                "  provider  : Claude",
+                f"  model     : {utils.resolve_claude_model('haiku')}",
+            ],
+        )
+
+    def test_the_summary_names_what_the_input_was_detected_as(self) -> None:
+        folder = self.make_folder()
+        image = os.path.join(folder, "box3_025.jpg")
+        manifest_path = _write_manifest(folder, [{"path": image}])
+        expected = {
+            "folder": (folder, "folder"),
+            "photo": (image, "single photo"),
+            "manifest": (manifest_path, "manifest"),
+        }
+
+        for kind, (token, label) in expected.items():
+            with self.subTest(kind=kind):
+                with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+                    _code, _stdout, stderr = self.run_cli([token, "--dry-run"])
+
+                self.assertIn(
+                    f"  input     : {os.path.abspath(token)} ({label}, 1 file(s) in "
+                    "1 group(s), group-by object)",
+                    stderr,
+                )
+
+    def test_a_dry_run_stops_after_the_summary(self) -> None:
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        _write_bytes(out_path, b"PREVIOUS RUN CONTENT\n")
+        stream = _StreamSpy(marker=self._MARKER)
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, stdout, stderr = self.run_cli([folder, "--output-file", out_path, "--dry-run"])
+
+        self.assertIsNone(code)
+        self.assertFalse(stream.called)
+        self.assertNotIn(self._MARKER, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn(
+            "  --dry-run : stopping here; no model call, and nothing written.", stderr
+        )
+        # The previous run's artifact survives, which is what makes the flag
+        # safe to point at a directory that already holds one: the streaming
+        # path opens its destination with a truncating "w".
+        with open(out_path, "rb") as handle:
+            self.assertEqual(handle.read(), b"PREVIOUS RUN CONTENT\n")
+
+
+if __name__ == "__main__":
+    unittest.main()

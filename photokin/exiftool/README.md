@@ -33,10 +33,15 @@ layer entirely.
 `write_sidecar_only`.
 
 `ExiftoolConfig.from_env()` builds the pipeline config from environment
-variables — `EXIFTOOL_WRITE_ENABLED` (default true), `EXIFTOOL_PATH`,
+variables — `EXIFTOOL_WRITE_ENABLED` (default false), `EXIFTOOL_PATH`,
 `EXIFTOOL_FIELDS` (comma-separated, default `EXIF:UserComment`) — with
-explicit keyword overrides winning. The main CLI's `--exiftool-*` flags layer
-on top (flag > env > default).
+explicit keyword overrides winning. The main CLI's `--exiftool-write`,
+`--exiftool-fields` and `--exiftool-path` flags layer on top
+(flag > env > default), and `-w` is the shorthand that turns writing on.
+
+Writing to the user's files takes an explicit opt-in: `from_env` agrees with the
+dataclass rather than overriding it, so an unset variable and an unset flag both
+mean "record what would be written, apply nothing".
 
 ## Binary resolution order
 
@@ -91,8 +96,11 @@ runs with `--changeset true`) and for each record:
 - invokes ExifTool with `-overwrite_original` (or `-o %d%f.xmp` when
   `write_sidecar_only`);
 - returns a summary dict: `files_seen`, `files_written`, `tags_written`,
-  `errors`, `warnings`, `dry_run`. The main CLI appends this summary as an
-  `exiftool_apply` status record to the results NDJSON.
+  `errors`, `warnings`, `dry_run`. The main CLI appends this summary as a
+  `{"run": "exiftool_apply", ...}` record to the results NDJSON when
+  `--output-file` names one, and logs it to stderr otherwise — which is now the
+  common case, since C2 made `--output-file` optional for every input type
+  rather than the manifest-mode fixture it used to be.
 
 `dry_run` counts what would be written without invoking ExifTool.
 
@@ -102,8 +110,14 @@ runs with `--changeset true`) and for each record:
 python -m photokin.exiftool --changeset results_changeset.ndjson \
   --enabled [--fields EXIF:UserComment,EXIF:DateTimeOriginal] \
   [--dry-run] [--exiftool-path /usr/local/bin/exiftool] \
-  [--no-overwrite-original | --write-sidecar-only] [--output summary.json]
+  [--overwrite-original | --no-overwrite-original | --write-sidecar-only] \
+  [--output summary.json]
 ```
+
+`--overwrite-original` is the default and is spelled out here only because its
+negation is the interesting one: ExifTool normally leaves a `_original` copy
+beside every file it edits, and `--no-overwrite-original` is what keeps those
+backups.
 
 (`photokin/exiftool_apply.py` remains as a deprecated shim for the old
 module path.)
@@ -114,7 +128,10 @@ module path.)
 ExifTool and emits a manifest-like JSON, mapping common tags into top-level
 keys (`dateTimeOriginal`, `userComment`, `caption`, `title`) while preserving
 every raw tag under `metadata["exiftool"]`. Run it with
-`python -m photokin.exiftool.manifest FILES... [--field TAG] [--out PATH]`.
+`python -m photokin.exiftool.manifest FILES... [--field TAG] [--out PATH]
+[--include-all-if-no-fields]`. Repeat `--field` per tag; with none given it
+reads a small default set, and `--include-all-if-no-fields` widens that to every
+tag ExifTool can see, which is a lot of output.
 `hydrate.py` reuses its `run_exiftool_json` primitive (and the `_find_tag_value`
 helper, tolerant of ExifTool's `-G1` group names) rather than duplicating the
 subprocess/JSON handling.

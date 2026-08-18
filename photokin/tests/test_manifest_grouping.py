@@ -11,7 +11,9 @@ writes to the repository tree; the one case that needs a manifest on disk uses a
 """
 import itertools
 import json
+import logging
 import os
+import re
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -20,6 +22,13 @@ from typing import cast
 from unittest.mock import patch
 
 from photokin import core, utils
+
+_COMPLETION_PREFIX = "Batch completed"
+
+#: Reads the completion line's own count back out of the rendered message rather
+#: than off ``record.args``. The wording is what a reader acts on, so a case that
+#: stopped matching it has stopped testing what it claims to.
+_UNSENT_COUNT_RE = re.compile(r"(\d+) file\(s\) recorded without being sent to the model")
 
 
 class _RecordingAnalyzers:
@@ -128,6 +137,49 @@ def _labelled_payload(calls: list[tuple]) -> list[tuple[str, str]]:
     return payload
 
 
+def _completion_record(log_records: list[logging.LogRecord]) -> logging.LogRecord:
+    """Return the run's single "Batch completed" summary record.
+
+    The level is deliberately not filtered on: a run that placed every file
+    summarizes itself at INFO and one that did not at WARNING, so which of the
+    two it chose is a behavior to assert rather than a detail to search past.
+
+    Args:
+        log_records: Every record the run logged.
+
+    Returns:
+        The completion record.
+
+    Raises:
+        AssertionError: If the run logged anything other than one such line.
+    """
+    found = [r for r in log_records if r.getMessage().startswith(_COMPLETION_PREFIX)]
+    if len(found) != 1:
+        raise AssertionError(
+            f"expected exactly one completion line, got {[r.getMessage() for r in found]}"
+        )
+    return found[0]
+
+
+def _unsent_count(record: logging.LogRecord) -> int:
+    """Return the number of unsent files the completion line reports.
+
+    Args:
+        record: The completion record.
+
+    Returns:
+        The reported count.
+
+    Raises:
+        AssertionError: If the line no longer carries that clause, since a case
+            asserting on a count it cannot find would silently stop asserting.
+    """
+    match = _UNSENT_COUNT_RE.search(record.getMessage())
+    if match is None:
+        raise AssertionError(f"the completion line changed wording: {record.getMessage()}")
+    return int(match.group(1))
+
+
 def _p(path: str) -> str:
     """Normalize a fixture path the same way the manifest loader does.
 
@@ -143,6 +195,49 @@ class ManifestGroupingTestCase(unittest.TestCase):
     #: The signatures compared below run to a few kilobytes, and a truncated
     #: diff would say a permutation differed without saying where.
     maxDiff = None
+
+    def run_manifest_records(
+        self,
+        manifest: dict | str,
+        *,
+        group_by: str = utils.GROUP_BY_OBJECT,
+        model_keywords: list[str] | None = None,
+        changeset_writer=None,
+    ) -> tuple[list[tuple], list[dict], list[logging.LogRecord]]:
+        """Process one manifest and return its calls, records and log records.
+
+        Captures from INFO, so the completion line is in the result whichever
+        level it chose -- it drops to INFO exactly when every listed file reached
+        the payload, which makes the level itself worth asserting. Every run logs
+        that line, so the capture can never come back empty.
+
+        Args:
+            manifest: A manifest dict, or a path to one on disk.
+            group_by: Grouping granularity, one of ``utils.GROUP_BY_VALUES``.
+            model_keywords: Keywords the mocked analysis returns.
+            changeset_writer: Receives each changeset NDJSON line, or ``None``
+                to emit no changeset. The run id is generated, since nothing
+                here asserts on it. Supplying one also keeps the real
+                ``build_canonical_patch``, which the changeset diffs against.
+
+        Returns:
+            A ``(calls, records, log_records)`` triple.
+        """
+        cfg = utils.Config(dry_run=True, group_by=group_by)
+        lines: list[str] = []
+        with (
+            self.assertLogs("photokin.core", level="INFO") as logs,
+            _recording(
+                model_keywords, real_patch_builder=changeset_writer is not None
+            ) as rec,
+        ):
+            core.process_manifest_stream(
+                manifest=manifest,
+                cfg=cfg,
+                ndjson_writer=lines.append,
+                changeset_writer=changeset_writer,
+            )
+        return rec.calls, [json.loads(line) for line in lines], logs.records
 
     def run_manifest_source(
         self,
@@ -164,25 +259,21 @@ class ManifestGroupingTestCase(unittest.TestCase):
                 ``build_canonical_patch``, which the changeset diffs against.
 
         Returns:
-            A ``(calls, records, warnings)`` triple.
+            A ``(calls, records, warnings)`` triple, the warnings rendered the
+            way ``assertLogs`` renders them.
         """
-        cfg = utils.Config(dry_run=True, group_by=group_by)
-        lines: list[str] = []
-        with self.assertLogs("photokin.core", level="WARNING") as logs:
-            # A group that warns about nothing would fail assertLogs, so keep a
-            # message of our own in the buffer and drop it from the result.
-            core.logger.warning("test-sentinel")
-            with _recording(
-                model_keywords, real_patch_builder=changeset_writer is not None
-            ) as rec:
-                core.process_manifest_stream(
-                    manifest=manifest,
-                    cfg=cfg,
-                    ndjson_writer=lines.append,
-                    changeset_writer=changeset_writer,
-                )
-        warnings = [m for m in logs.output if "test-sentinel" not in m]
-        return rec.calls, [json.loads(line) for line in lines], warnings
+        calls, records, log_records = self.run_manifest_records(
+            manifest,
+            group_by=group_by,
+            model_keywords=model_keywords,
+            changeset_writer=changeset_writer,
+        )
+        warnings = [
+            f"{r.levelname}:{r.name}:{r.getMessage()}"
+            for r in log_records
+            if r.levelno >= logging.WARNING
+        ]
+        return calls, records, warnings
 
     def run_manifest(
         self,
@@ -199,6 +290,15 @@ class ManifestGroupingTestCase(unittest.TestCase):
             model_keywords=model_keywords,
             changeset_writer=changeset_writer,
         )
+
+    def run_items_records(
+        self,
+        items: list[dict],
+        *,
+        group_by: str = utils.GROUP_BY_OBJECT,
+    ) -> tuple[list[tuple], list[dict], list[logging.LogRecord]]:
+        """Process an in-memory ``items`` array. See ``run_manifest_records``."""
+        return self.run_manifest_records({"items": items}, group_by=group_by)
 
     def assert_no_path_sent_under_two_labels(self, calls: list[tuple]) -> None:
         """Assert no single file was handed to the model as two different parts.
@@ -1075,6 +1175,218 @@ class TestFrontSideRoleCollision(ManifestGroupingTestCase):
             )],
         )
         self.assertNotIn("displaced", records[0]["result"]["all_variant_files"])
+
+
+class TestSlotCollisionAccounting(ManifestGroupingTestCase):
+    """A file that loses a contested slot is accounted for however it lost it.
+
+    One ``(version, part)`` slot can be contested two ways. Two filenames can
+    parse straight into the same address -- a TIFF master beside the JPEG
+    derivative of the same scan, which is ordinary archival practice -- or an
+    override can steer one file onto a front side another already holds. Both
+    warn, both cost the loser its place in the payload, and both leave it with a
+    record taken from the winner's analysis.
+
+    Only the second used to reach ``all_variant_files.displaced`` and the
+    completion line's count, so a run that warned about a TIFF beside its JPEG
+    closed by reporting nothing displaced at all. These cases pin the two shapes
+    against each other, and pin the count to the payload the recorder actually
+    saw rather than to the rule that assembled it.
+    """
+
+    #: One scan in two formats: same stem, same slot. One file is analyzed and
+    #: the result is recorded against both, which is the saving.
+    EXTENSION_PAIR = ({"path": "s/box3_025.tif"}, {"path": "s/box3_025.jpg"})
+
+    #: ``is_back: false`` puts the second file on the front side the first
+    #: already claims, so the two sit in different slots feeding one role.
+    OVERRIDE_PAIR = ({"path": "s/ov1.jpg"}, {"path": "s/ov1-back.jpg", "is_back": False})
+
+    #: ``(label, items)`` covering every way a listed file can miss the payload,
+    #: plus shapes that lose nothing so the invariant below cannot go vacuous.
+    SHAPES = (
+        ("an ordinary front and back", [{"path": "s/sc1.jpg"}, {"path": "s/sc1-back.jpg"}]),
+        ("a TIFF master beside its JPEG derivative", list(EXTENSION_PAIR)),
+        ("an override-driven collision", list(OVERRIDE_PAIR)),
+        ("a crop beside its parent", [{"path": "s/sc2.jpg"}, {"path": "s/sc2-crop.jpg"}]),
+        (
+            "an untagged file beside an explicit page 1",
+            [
+                {"path": "s/sc3.jpg"},
+                {"path": "s/sc3-page1.jpg"},
+                {"path": "s/sc3-page2.jpg"},
+            ],
+        ),
+        (
+            "one scan in three formats",
+            [{"path": "s/sc4.jpg"}, {"path": "s/sc4.png"}, {"path": "s/sc4.tif"}],
+        ),
+    )
+
+    def assert_the_loser_is_accounted_for(
+        self,
+        items: tuple[dict, ...],
+        *,
+        sent: str,
+        unsent: str,
+        warning_fragment: str,
+    ) -> None:
+        """Assert the warning, the record and the completion line tell one story.
+
+        Args:
+            items: The manifest's ``items`` array.
+            sent: Path of the file the model is expected to be shown.
+            unsent: Path of the file that loses the slot to it.
+            warning_fragment: Text the per-group warning must carry, so the case
+                cannot pass on a warning about something else entirely.
+        """
+        calls, records, log_records = self.run_items_records(list(items))
+
+        self.assertEqual(
+            [path for _label, path in _labelled_payload(calls)],
+            [_p(sent)],
+            "the collision changed which file the model was shown, or how many",
+        )
+        self.assertEqual(
+            sorted(rec["path"] for rec in records),
+            sorted(_p(item["path"]) for item in items),
+            "the loser of the slot still gets a record -- that is what makes this "
+            "a saving rather than a loss, and the wording rests on it",
+        )
+        self.assertEqual([rec["status"] for rec in records], ["ok"] * len(items))
+
+        named = [
+            r.getMessage()
+            for r in log_records
+            if r.levelno >= logging.WARNING
+            and warning_fragment in r.getMessage()
+            and os.path.basename(_p(unsent)) in r.getMessage()
+        ]
+        self.assertEqual(
+            len(named), 1, f"no warning named the loser: {[r.getMessage() for r in log_records]}"
+        )
+
+        for rec in records:
+            self.assertEqual(
+                rec["result"]["all_variant_files"].get("displaced"),
+                {":none": [_p(unsent)]},
+                "a warning named a file the record does not disclose",
+            )
+
+        completion = _completion_record(log_records)
+        self.assertEqual(
+            _unsent_count(completion),
+            1,
+            f"a warning says {os.path.basename(_p(unsent))} never reached the "
+            f"payload and the completion line contradicts it: {completion.getMessage()}",
+        )
+        self.assertEqual(
+            completion.levelno,
+            logging.WARNING,
+            "a file missed the payload, so the summary must not read as clean",
+        )
+
+    def test_a_tiff_master_beside_its_jpeg_derivative_is_counted(self):
+        self.assert_the_loser_is_accounted_for(
+            self.EXTENSION_PAIR,
+            sent="s/box3_025.tif",
+            unsent="s/box3_025.jpg",
+            warning_fragment="claim the same none slot",
+        )
+
+    def test_an_override_driven_collision_is_counted(self):
+        self.assert_the_loser_is_accounted_for(
+            self.OVERRIDE_PAIR,
+            sent="s/ov1-back.jpg",
+            unsent="s/ov1.jpg",
+            warning_fragment="claim the front side",
+        )
+
+    def test_the_two_collision_shapes_are_reported_identically(self):
+        # Two collisions of the same kind, differing only in how the two files
+        # arrived at one slot. Compared as a whole rather than field by field so
+        # a future divergence in any part of the accounting shows up here.
+        def accounting(items: tuple[dict, ...]) -> tuple:
+            _calls, records, log_records = self.run_items_records(list(items))
+            completion = _completion_record(log_records)
+            displaced = records[0]["result"]["all_variant_files"].get("displaced") or {}
+            return (
+                _unsent_count(completion),
+                completion.levelno,
+                sorted(displaced),
+                [len(paths) for _slot, paths in sorted(displaced.items())],
+            )
+
+        self.assertEqual(
+            accounting(self.EXTENSION_PAIR),
+            accounting(self.OVERRIDE_PAIR),
+            "the same loss is reported one way when two filenames parse into one "
+            "slot and another way when an override puts them there",
+        )
+
+    def test_the_count_is_exactly_what_the_model_calls_left_out(self):
+        # The invariant, asserted against the recorder rather than against the
+        # rules that built the payload: an accounting site that forgets to
+        # register its loser fails here whichever rule it belongs to.
+        for label, items in self.SHAPES:
+            with self.subTest(label):
+                calls, _records, log_records = self.run_items_records(items)
+                sent = {path for _label, path in _labelled_payload(calls)}
+                unsent = {_p(item["path"]) for item in items} - sent
+                completion = _completion_record(log_records)
+                self.assertEqual(
+                    _unsent_count(completion),
+                    len(unsent),
+                    f"the summary and the payload disagree about {sorted(unsent)}: "
+                    f"{completion.getMessage()}",
+                )
+                self.assertEqual(
+                    completion.levelno,
+                    logging.WARNING if unsent else logging.INFO,
+                    f"the summary chose the wrong level for {sorted(unsent)}",
+                )
+
+    def test_every_unsent_file_the_summary_counts_is_named_in_a_warning(self):
+        # The invariant read the other way round. A count with no warning behind
+        # it would be as useless as a warning with no count.
+        for label, items in self.SHAPES:
+            with self.subTest(label):
+                calls, _records, log_records = self.run_items_records(items)
+                sent = {path for _label, path in _labelled_payload(calls)}
+                warnings = [
+                    r.getMessage() for r in log_records if r.levelno >= logging.WARNING
+                ]
+                for path in {_p(item["path"]) for item in items} - sent:
+                    name = os.path.basename(path)
+                    self.assertTrue(
+                        any(name in warning for warning in warnings),
+                        f"{name} never reached the model and nothing said so: {warnings}",
+                    )
+
+    def test_a_path_that_won_two_slots_is_sent_and_so_is_not_counted(self):
+        # One path listed twice under contradicting flags wins two addresses and
+        # travels under the better of them. The address it gives up is still
+        # disclosed -- that is what ``displaced`` is for -- but the file itself
+        # reached the model, so counting it would restate the contradiction the
+        # other way round.
+        items = [{"path": "s/tl1.jpg"}, {"path": "s/tl1.jpg", "is_back": True}]
+        calls, records, log_records = self.run_items_records(items)
+
+        self.assertEqual(
+            [path for _label, path in _labelled_payload(calls)], [_p("s/tl1.jpg")]
+        )
+        self.assertTrue(
+            any("sending it once" in r.getMessage() for r in log_records),
+            [r.getMessage() for r in log_records],
+        )
+        self.assertEqual(
+            records[0]["result"]["all_variant_files"]["displaced"],
+            {":back": [_p("s/tl1.jpg")]},
+            "the slot it gave up is not disclosed",
+        )
+        completion = _completion_record(log_records)
+        self.assertEqual(_unsent_count(completion), 0)
+        self.assertEqual(completion.levelno, logging.INFO)
 
 
 class TestDuplicateListing(ManifestGroupingTestCase):

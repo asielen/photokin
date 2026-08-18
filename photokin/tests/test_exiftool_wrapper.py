@@ -40,11 +40,14 @@ class TestExiftoolConfig(unittest.TestCase):
         self.assertEqual(cfg.path, "/opt/exiftool")
 
     def test_from_env_defaults_when_unset(self):
+        # Writes are off unless they are asked for. ``enabled`` used to default
+        # to True here while the dataclass declared False, so the line anyone
+        # would read to learn the default was the one the CLI never reached.
         with patch.dict(os.environ, {}, clear=False):
             for name in ("EXIFTOOL_WRITE_ENABLED", "EXIFTOOL_FIELDS", "EXIFTOOL_PATH"):
                 os.environ.pop(name, None)
             cfg = ExiftoolConfig.from_env()
-        self.assertTrue(cfg.enabled)
+        self.assertFalse(cfg.enabled)
         self.assertEqual(cfg.fields, ("EXIF:UserComment",))
         self.assertIsNone(cfg.path)
 
@@ -174,11 +177,12 @@ class TestCliExiftoolConfigResolution(unittest.TestCase):
         self.assertEqual(cfg.fields, ("EXIF:CreateDate",))
 
     def test_defaults_when_nothing_set(self):
+        # No flag and no environment means no writing: the CLI has to be told.
         with patch.dict(os.environ, {}, clear=False):
             for name in ("EXIFTOOL_WRITE_ENABLED", "EXIFTOOL_FIELDS", "EXIFTOOL_PATH"):
                 os.environ.pop(name, None)
             cfg = cli._resolve_exiftool_config(self._args(), dry_run=True)
-        self.assertTrue(cfg.enabled)
+        self.assertFalse(cfg.enabled)
         self.assertEqual(cfg.fields, ("EXIF:UserComment",))
         self.assertTrue(cfg.dry_run)
         self.assertTrue(cfg.overwrite_original)

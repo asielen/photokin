@@ -38,6 +38,8 @@ That's a good first command to confirm everything's wired up correctly: it only 
 
 The transcription (`caption`) and the interpretation (`ai_caption`) are kept strictly separate — the model is not allowed to "improve" what's actually written on the object. That separation is most of the reason this tool exists.
 
+The `back` in that second record's keywords is photokin's own, not the model's. Every file gets at most one keyword naming which part of the object it is: `back` on a reverse side, `negative` on a negative, and nothing on a front. They are the one thing not shared across a group — everything else in a group's analysis is — so you can always tell which file is which afterwards. See [Naming conventions](#folders-and-batches) for how a part is decided and for the rule that leaves a `back` or `Negative` you applied yourself exactly where it is.
+
 New to Python, or starting from a completely bare machine? See the full [Windows Quick Start](#windows-quick-start) or [macOS Quick Start](#macos-quick-start) walkthroughs below.
 
 ## Windows Quick Start
@@ -58,7 +60,7 @@ python --version
 
 ### 2. Create a project folder
 
-Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point `--folder` or `--manifest` at wherever those already live.
+Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point photokin at wherever those already live.
 
 ```powershell
 mkdir C:\Users\YourName\photokin-work
@@ -128,7 +130,7 @@ photokin scan_042.jpg --back scan_042_back.jpg --provider anthropic
 or against a whole folder:
 
 ```powershell
-photokin --folder .\scans\ --provider anthropic > results.json
+photokin .\scans\ --provider anthropic > results.json
 ```
 
 ### Coming back later
@@ -159,7 +161,7 @@ Use `python3` (not `python`) for every command below — that's normal on macOS,
 
 ### 2. Create a project folder
 
-Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point `--folder` or `--manifest` at wherever those already live.
+Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point photokin at wherever those already live.
 
 ```bash
 mkdir ~/photokin-work
@@ -222,7 +224,7 @@ photokin scan_042.jpg --back scan_042_back.jpg --provider anthropic
 or against a whole folder:
 
 ```bash
-photokin --folder ./scans/ --provider anthropic > results.json
+photokin ./scans/ --provider anthropic > results.json
 ```
 
 ### Coming back later
@@ -260,32 +262,41 @@ Folder and manifest input are read by the same grouper, so anything one handles 
 > | `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
 > | `album-page1.jpg`, `album-page2.jpg` | ordered pages of one document |
 > | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but never analyzed as an object of its own — under `--group-by object` and `pair`; `--group-by none` has no groups, so every crop is analyzed as its own object and billed as one |
+> | `box3_025.tif` beside `box3_025.jpg` | the same scan in two formats — the extension sits outside the grammar, so these are one object, not two photos |
 >
 > The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other explicitly numbered pages.
 >
-> Every input mode reads this whole grammar and resolves it the same way, because they all route through one grouper. Pages and negatives reach the model in folder mode exactly as they do in manifest mode; crops are recorded with their group rather than analyzed, with a warning naming each one. To see how a folder would be grouped before spending anything on it, run `photokin --folder ./scans/ --generate-manifest scans-manifest.json`: it writes the manifest the run would have used and stops.
+> **Same name, different extension — one object, one analysis.** A TIFF master kept beside the JPEG derivative made from it is how a scanning archive is normally filed, and photokin reads the pair the way you mean it: the extension is not part of the name, so `box3_025.tif` and `box3_025.jpg` are one scan of one print and claim one place in the group. One of the two is sent to the model and the analysis is written to **both**, so the pair costs one call and one image where two unrelated photos would cost two of each. It applies to every side and every variant alike — `box3_025-back.tif` and `box3_025-back.jpg` pair up the same way.
 >
-> Resolution does not depend on the order the files are listed in: a crop never takes its parent's place, and a negative is analyzed as a negative rather than mistaken for the front. Both are recorded in the group's `all_variant_files` — under `crops` and `negatives` — and a negative travels under a `Negative` label and carries a `negative` keyword of its own, the way a back carries `back`. Those two keywords are per-file, so they are taken back off the other files of the group, which share its metadata — but only in a group that actually holds such a part. A print you tagged `Negative` by hand, in a group holding no negative, keeps the keyword. Crops are named in a warning rather than sent to the model. The exception is a crop with no uncropped original for the same side of the same variant: with nothing else to stand for that side, the crop is analyzed in its place, and says so. That is judged per side, so a group holding `box3_025-crop.jpg` and `box3_025-back.jpg` still gets both a front and a back.
+> This is a cost saving, not a loss. Both files come back with a full record, the keywords, caption, date and location the model produced, and any metadata write you asked for. The run still tells you which of the two it did not upload: a warning names it, `all_variant_files.displaced` lists it, and it is counted in the closing `N file(s) recorded without being sent to the model` line. So a folder of 200 TIFF/JPEG pairs ends by reporting 200 — one per pair — with all 400 files recorded and 200 images uploaded instead of 400. That number is the saving, counted; it is not a warning that anything went missing.
+>
+> Which one is sent is the higher-fidelity one, and it is the same on every run: TIFF first, then PNG, then the lossy formats, with the path settling anything still tied. The master goes to the model rather than the export, because only one of the pair is read and JPEG artifacts are exactly what costs you a line of faint pencil on the back of a card. If you want the other one analyzed anyway, mark it `"preferred": true` in a manifest; that outranks the format.
+>
+> Every input mode reads this whole grammar and resolves it the same way, because they all route through one grouper. Pages and negatives reach the model in folder mode exactly as they do in manifest mode; crops are recorded with their group rather than analyzed, with a warning naming each one. To see how a folder would be grouped before spending anything on it, run `photokin ./scans/ --generate-manifest scans-manifest.json`: it writes the manifest the run would have used and stops.
+>
+> Resolution does not depend on the order the files are listed in: a crop never takes its parent's place, and a negative is analyzed as a negative rather than mistaken for the front. Both are recorded in the group's `all_variant_files` — under `crops` and `negatives` — and a negative travels under a `Negative` label and carries a `negative` keyword of its own, the way a back carries `back`. Those two keywords are per-file, so they are taken back off the *other* files of the group, which share its metadata. Only a marker the group itself applied is ever removed, and never from a file that already carried it before the merge — so a print you tagged `Negative` by hand keeps that keyword whether or not a real negative sits beside it in the group, and no removal is proposed against your catalog. Crops are named in a warning rather than sent to the model. The exception is a crop with no uncropped original for the same side of the same variant: with nothing else to stand for that side, the crop is analyzed in its place, and says so. That is judged per side, so a group holding `box3_025-crop.jpg` and `box3_025-back.jpg` still gets both a front and a back.
 >
 > Under `object` a group is sent every image it holds: given `box3_025.jpg`, `box3_025b.jpg` and `box3_025b-back.jpg`, all three go in the one call, because the variants are scans of one object and so that back is the object's back. That costs images rather than calls — one call per group either way — and only for groups holding more than one scan of a side, which are uncommon. It buys the model every scan of the print, so it can read detail off whichever came out clearest. A group that is one front, or one front and its own back, is sent exactly as it always was.
 >
-> Files that are recorded but not sent are still exactly two kinds: a crop that yielded its parent's slot, and a file displaced out of a slot another file already held. Both are named in a warning and listed in the record.
+> Files that are recorded but not sent are exactly three kinds: a crop that yielded its parent's slot, the loser of two files claiming the same slot (the extension pair above), and a file displaced out of a slot something more specific already held. All three are named in a warning, listed in the record — crops under `all_variant_files.crops`, the other two under `all_variant_files.displaced` — and counted in the same closing number, so the summary can never read as clean while a warning says otherwise.
 
 ## Folder mode
 
 ```bash
-photokin --folder ./scans/ --provider anthropic > results.json
+photokin ./scans/ --provider anthropic > results.json
 ```
 
-Folder mode prints one aggregate JSON to stdout, shaped `{"results": {...}, "errors": {...}}` with **one entry per file** — every image in the folder appears in exactly one of the two, backs, variant scans, album pages, negatives and crops included. A record names the whole group it belongs to under `all_variant_files`, so you can still tell which files were scanned together and which of them the model was shown. Per-group diagnostics and the closing summary go to stderr, so read both.
+Folder mode prints one aggregate JSON to stdout, shaped `{"results": {...}, "errors": {...}}` with **one entry per file** — every image in the folder appears in exactly one of the two, backs, variant scans, album pages, negatives and crops included. A record names the whole group it belongs to under `all_variant_files`, so you can still tell which files were scanned together and which of them the model was shown. Per-group diagnostics, the plan summary and the closing summary go to stderr, so read both.
 
-For bigger or more repeatable jobs, manifest mode takes a JSON file instead of a folder and adds `--output-file`: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end. `--generate-manifest` turns a folder into exactly that file:
+`--output-file` is not a manifest-only flag: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end — for a folder, a manifest or one photo alike. With it, stdout stays empty.
+
+For bigger or more repeatable jobs a manifest is worth writing, and `--generate-manifest` turns a folder into exactly that file:
 
 ```bash
-photokin --folder ./scans/ --generate-manifest scans-manifest.json
+photokin ./scans/ --generate-manifest scans-manifest.json
 ```
 
-It writes the manifest the folder run would have used — same files, same order — and exits without calling the model, so it costs nothing and doubles as a way to check the grouping before committing to a batch. Edit it (add `is_back`, `group`, existing `metadata`) and feed it back with `--manifest`.
+It writes the manifest the folder run would have used — same files, same order — and exits without calling the model, so it costs nothing and doubles as a way to check the grouping before committing to a batch. Edit it (add `is_back`, `group`, existing `metadata`) and feed it straight back: `photokin scans-manifest.json`.
 
 ## Manifest mode
 
@@ -303,7 +314,7 @@ batch.json:
 ```
 
 ```bash
-photokin --manifest batch.json --output-file results.ndjson --changeset true
+photokin batch.json --output-file results.ndjson --changeset true
 ```
 
 Flags are optional when the filename already says the same thing; they exist so files that don't follow the naming conventions can still be grouped correctly. An explicit flag always beats the filename, in both directions and including when the two contradict each other — anything else would leave the flag inert in exactly the situation it is there for. Every override that changes what the filename implied is logged, so a typo is visible rather than silent.
@@ -316,7 +327,9 @@ Flags are optional when the filename already says the same thing; they exist so 
 | `group` | The group key outright, for names the grammar cannot parse at all. `base_id` is accepted as an alias and loses to `group` when both are given. |
 | `preferred` | Breaks a tie between two files claiming the same slot — the same side of the same variant — so the one you name is the one sent and the other is recorded and warned about. It chooses between candidates; it cannot create a place for one. See below. |
 
-Booleans may be written as JSON `true`/`false`, as `0`/`1`, or as the strings `"true"`, `"false"`, `"yes"`, `"no"`. A `null` value means "not specified" and leaves the filename in charge.
+`is_back` and `is_crop` may be written as JSON `true`/`false`, as `0`/`1`, or as the strings `"true"`, `"false"`, `"yes"`, `"no"`. A `null` value means "not specified" and leaves the filename in charge.
+
+`preferred` is the exception and does not read that grammar: it is plain truthiness, so any non-empty string sets it and `"preferred": "false"` means **true**. Write it as a JSON `true`, or leave the key out entirely.
 
 `preferred` used to pick the one file of a group that got analyzed. There is no longer one — under `object` every scan of the group is sent — so what survives is the narrower job above: deciding which of two files contesting one slot travels. It also still nominates the file the group's analysis is filed under.
 
@@ -326,7 +339,7 @@ Two shapes leave `preferred` with nothing to pick. A crop is a supporting view o
 
 Items may have existing `metadata` (face tags, existing captions and comments) that can be forwarded to the model as context. Additionally, you can supply `photo_context_text` as free-text additional context to a single photo or a folder. Such as "these photos are all part of a wedding album." The model treats it as truth for the whole batch. Both make a real difference on hard photos.
 
-For auditing, `--changeset true` emits a changeset NDJSON alongside the results: a record of proposed field writes that the ExifTool wrapper can apply to the actual files, either in the same run (`--exiftool-write true --exiftool-fields EXIF:UserComment`) or later and separately. The changeset is named after the output file and lands beside it, so the `--output-file results.ndjson` run above writes `results_changeset.ndjson` (a `.json` output path, or none at all, gets a plain `changeset.ndjson` in the same directory instead):
+For auditing, `--changeset true` emits a changeset NDJSON alongside the results: a record of proposed field writes that the ExifTool wrapper can apply to the actual files, either in the same run (`-w`, or `--exiftool-write true --exiftool-fields EXIF:UserComment`) or later and separately. It lands in `dirname(--output-file or input)` and is named `<stem>_changeset.ndjson`, where the stem is the output file's own (minus a trailing `_results`) or, with no `--output-file`, the input's — so the `--output-file results.ndjson` run above writes `results_changeset.ndjson`, and `photokin ./scans/ --changeset true` writes `scans_changeset.ndjson` inside the folder:
 
 ```bash
 python -m photokin.exiftool --changeset results_changeset.ndjson --enabled [--dry-run]
@@ -356,7 +369,9 @@ You only need the key for the provider you're actually calling. And since a batc
 
 ## Setting up ExifTool
 
-ExifTool is optional, and can be both used for reading initial values from the photos (so you don't just overwrite everything) and also write to the photos after. Before analysis, it reads fields straight out of the files so metadata already living in an image rides along to the model as context (hydration). After analysis, it writes approved changeset fields back into the files or their sidecars (apply).
+ExifTool is optional, and can be both used for reading initial values from the photos (so you don't just overwrite everything) and also write to the photos after. Before analysis, it reads `EXIF:UserComment` straight out of the files so a comment already living in an image rides along to the model as context (hydration). After analysis, it writes approved changeset fields back into the files or their sidecars (apply).
+
+Those two halves have different reach, which is worth knowing before you count on the first. Hydration runs for **manifest input only**, and only for items that already carry a `metadata` object whose `userComment` is missing or empty — a folder or single-photo run is never hydrated, because turning that on would change the prompt, the cost and the output of every existing folder run. Apply works for every input type.
 
 Where each result field lands when written:
 
@@ -369,9 +384,11 @@ Where each result field lands when written:
 | `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` |
 | `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location` |
 
-**Setup.** On Windows, run `python -m photokin.exiftool.fetch` once — it downloads the official ExifTool from exiftool.org (SHA256-verified) into `~/.photokin/bin`, no system install needed. On macOS/Linux install it yourself: `brew install exiftool` or `apt install libimage-exiftool-perl`. At runtime the binary is found in this order: an explicit `--exiftool-path` / `EXIFTOOL_PATH`, then the downloaded copy in `~/.photokin/bin`, then whatever `exiftool` is on your `PATH`. If none is found, analysis still runs — hydration and apply are skipped with a warning rather than failing the batch.
+**Setup.** On Windows, run `python -m photokin.exiftool.fetch` once — it downloads the official ExifTool distribution from the project's SourceForge host and verifies it against the SHA256 exiftool.org publishes, into `~/.photokin/bin`, no system install needed. On macOS/Linux install it yourself: `brew install exiftool` or `apt install libimage-exiftool-perl`. At runtime the binary is found in this order: an explicit `--exiftool-path` / `EXIFTOOL_PATH`, then the downloaded copy in `~/.photokin/bin`, then whatever `exiftool` is on your `PATH`.
 
-**Writing during a run.** In manifest mode with `--changeset true`, add `--exiftool-write true --exiftool-fields EXIF:UserComment` and the approved fields are written into the files right after analysis. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults.
+If none is found, hydration is skipped with a warning and the analysis still runs. A *requested write* is treated differently: the binary is resolved before the first model call, so `-w` with no ExifTool anywhere exits 2 immediately rather than analyzing the whole batch and only then discovering it cannot write any of it.
+
+**Writing during a run.** Nothing is written into your files unless you ask for it: `--exiftool-write` defaults to `false`, and a changeset on its own only records what *would* be written. `-w` is the one-flag spelling of `--changeset true --exiftool-write true` — record the proposed writes and apply them — and works for folder, manifest and single-photo input alike. Spelled out, that is `--changeset true --exiftool-write true --exiftool-fields EXIF:UserComment`; `--exiftool-write true` is required rather than a confirmation of the default. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults. Every run prints a plan summary before its first model call naming the write set, so "nothing will be written" is visible up front; `--dry-run` prints that summary and stops.
 
 **Writing later, with an audit step.** Since the changeset NDJSON is a plain record of proposed writes, you can inspect it first and apply it separately:
 
@@ -386,13 +403,19 @@ The standalone applier also takes `--fields` to narrow which tags may be written
 
 ### Input modes
 
+One input, given positionally; its type comes off the path. A directory is a
+folder, a `.json` file is a manifest, an image file is a single photo — and the
+run says which it decided on before it does anything else, so a mis-detection is
+visible rather than surprising. The two aliases are still accepted and assert the
+type instead of detecting it; passing a positional *and* an alias is an error.
+
 | Flag                 | What it does |
 |----------------------|---|
-| `image` (positional) | Path to the main/front image (single-photo mode) |
-| `--back PATH`        | Back-side image for single-photo mode |
-| `--meta PATH`        | Original metadata JSON for single-photo mode |
-| `--folder DIR`       | Process a whole folder (non-recursive) |
-| `--manifest PATH`    | Process a manifest JSON (items + optional metadata/context) |
+| `INPUT` (positional) | Folder of scans, `.json` manifest, or a single image; the type is detected from the path |
+| `--back PATH`        | Back-side image, for single-photo input only |
+| `--meta PATH`        | Original metadata JSON, for single-photo input only |
+| `--folder DIR`       | Alias for a folder INPUT; asserts the path is a directory |
+| `--manifest PATH`    | Alias for a manifest INPUT; asserts the path is a `.json` manifest file |
 
 ### Provider and model
 
@@ -433,18 +456,19 @@ The standalone applier also takes `--fields` to narrow which tags may be written
 
 | Flag                       | What it does |
 |----------------------------|---|
-| `--output-file PATH`       | `.ndjson` streams one record per finished photo; `.json` writes one aggregate object atomically (manifest mode) |
+| `--output-file PATH`       | `.ndjson` streams one record per finished photo; `.json` writes one aggregate object atomically. Works for every input type; without it, results go to stdout |
 | `--output-sidecars`        | Also write a per-photo sidecar JSON next to each image (default off) |
-| `--generate-manifest PATH` | Write the manifest folder or single-photo input would be grouped into, then exit without calling the model (not valid with `--manifest`) |
-| `--batch-id ID`            | Identifier stored in output metadata and logs |
-| `--changeset {true,false}` | Emit a changeset NDJSON of proposed file writes (manifest mode; default `false`) |
-| `--dry-run`                | Analyze without applying anything downstream; records are marked `dry_run=true` (default off) |
+| `--generate-manifest PATH` | Write the manifest folder or single-photo input would be grouped into, then exit without calling the model (not valid with manifest input) |
+| `--batch-id ID`            | Identifier added to each record on the `.ndjson` streaming path, and used to name debug-dump files. It does not appear in the aggregate `.json` or on stdout |
+| `--changeset {true,false}` | Emit a changeset NDJSON of proposed file writes, for every input type (default `false`) |
+| `--dry-run`                | Print the plan summary and stop, before the first model call. Nothing is analyzed and no destination is touched. Beside `--generate-manifest`, reports the grouping it would write and leaves the file alone |
 
 ### ExifTool write-back
 
 | Flag                            | What it does |
 |---------------------------------|---|
-| `--exiftool-write {true,false}` | Apply changeset fields to the files after analysis (default true) |
+| `-w`, `--write`                 | Shorthand for `--changeset true --exiftool-write true`: record the proposed writes and apply them. An explicit flag that contradicts it is an error rather than a guess |
+| `--exiftool-write {true,false}` | Apply changeset fields to the files after analysis (default `false`; nothing is written without an explicit opt-in) |
 | `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write (default `EXIF:UserComment`) |
 | `--exiftool-path PATH`          | ExifTool binary to use (default: auto-detect) |
 
@@ -453,7 +477,7 @@ The standalone applier also takes `--fields` to narrow which tags may be written
 | Flag                                    | What it does |
 |-----------------------------------------|---|
 | `--debug-dump-llm-request {true,false}` | Save full request payloads to disk before each model call (default `false`) |
-| `--debug-dump-dir DIR`                  | Where those dumps go (default `<output-dir>/debug`) |
+| `--debug-dump-dir DIR`                  | Where those dumps go. Default depends on the input: `<dirname of --output-file, else of the manifest>/debug` for manifest input, and `./debug` under the working directory for folder and single-photo input |
 
 ## Providers
 
@@ -470,9 +494,10 @@ Dependency direction: the wrapper imports from the core; the core never imports 
 
 ## Tests
 
+From the repository root:
+
 ```bash
-cd python
 python -m pytest
 ```
 
-Runs `photokin/tests/` and `tests/`. Python 3.11+.
+Runs `photokin/tests/` and `tests/`, which `pyproject.toml` sets as the test paths. Python 3.11+.
