@@ -51,8 +51,11 @@ Perl distribution into a `py3-none-any` package installed on every platform).
 
 1. Configured path (`ExiftoolConfig.path` / `--exiftool-path` /
    `EXIFTOOL_PATH`) — errors if set but missing.
-2. A copy previously downloaded by `photokin.exiftool.fetch` into the cache dir
-   (`ExiftoolConfig.cache_dir`, default `~/.photokin/bin/exiftool/<platform>`).
+2. A copy previously downloaded by `photokin.exiftool.fetch` under the cache
+   root (`ExiftoolConfig.cache_dir`, default `~/.photokin/bin`), looked for at
+   `<cache_dir>/exiftool/<platform>/`. `cache_dir` names the root, not that
+   subdirectory — pointing it at the platform path makes resolution miss the
+   cached copy and fall through to system `PATH`.
 3. System `PATH` (`which exiftool`).
 
 A cached copy is only used when its runtime dependencies sit alongside it (the
@@ -65,12 +68,13 @@ than returning a path that would fail at runtime.
 
 The Lightroom plugin's "Install/Update Requirements" flow runs
 `python -m photokin.exiftool.fetch` after installing the package. On **Windows**
-this downloads the official self-contained ExifTool from exiftool.org, verifies
-its SHA256 (against an offline pin in `KNOWN_SHA256` when set, else the
-release's published checksum file — `checksums-<version>.txt` first, then the
-unversioned `checksums.txt`), and extracts it into the cache as
-`exiftool.exe` + `exiftool_files/`. On **macOS/Linux** it is a no-op — install a
-system ExifTool (`brew install exiftool`, `apt install libimage-exiftool-perl`).
+this downloads the official self-contained ExifTool release archive from the
+project's SourceForge host, verifies its SHA256 (against an offline pin in
+`KNOWN_SHA256` when set, else the checksum file exiftool.org publishes —
+`checksums-<version>.txt` first, then the unversioned `checksums.txt`), and
+extracts it into the cache as `exiftool.exe` + `exiftool_files/`. On
+**macOS/Linux** it is a no-op — install a system ExifTool
+(`brew install exiftool`, `apt install libimage-exiftool-perl`).
 Provisioning is best-effort: any failure leaves resolution to fall back to
 system `PATH`.
 

@@ -60,12 +60,14 @@ python --version
 
 ### 2. Create a project folder
 
-Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point photokin at wherever those already live.
+Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point photokin at wherever those already live, by full path.
 
 ```powershell
 mkdir C:\Users\YourName\photokin-work
 cd C:\Users\YourName\photokin-work
 ```
+
+One thing does not land here by default: a changeset is written beside the *input*, so `--changeset true` on a photo folder drops the `.ndjson` inside that folder. Pass `--output-file` a path in this folder and the changeset follows it.
 
 ### 3. Create and activate a virtual environment
 
@@ -113,7 +115,7 @@ Note that `setx` doesn't affect your *current* window — open a new terminal to
 
 ### 6. (Optional) Set up ExifTool
 
-Only needed if you want photokin to read/write metadata into the image files themselves:
+Only needed if you want photokin to write metadata into the image files themselves:
 
 ```powershell
 python -m photokin.exiftool.fetch
@@ -121,16 +123,20 @@ python -m photokin.exiftool.fetch
 
 This downloads the official ExifTool binary into `~/.photokin/bin` — no separate system install required.
 
+Installing it does not turn writing on. Nothing is written to your files unless you add `-w` to a run, so the commands in step 7 still only read. See [Setting up ExifTool](#setting-up-exiftool) for what `-w` writes and where.
+
 ### 7. Run it
 
+Give it the full path to the photo — you're in `photokin-work`, not in your pictures folder, and the type is detected from the path you pass:
+
 ```powershell
-photokin scan_042.jpg --back scan_042_back.jpg --provider anthropic
+photokin C:\Users\YourName\Pictures\scan_042.jpg --back C:\Users\YourName\Pictures\scan_042_back.jpg --provider anthropic
 ```
 
 or against a whole folder:
 
 ```powershell
-photokin .\scans\ --provider anthropic > results.json
+photokin C:\Users\YourName\Pictures\Scans\ --provider anthropic > results.json
 ```
 
 ### Coming back later
@@ -161,12 +167,14 @@ Use `python3` (not `python`) for every command below — that's normal on macOS,
 
 ### 2. Create a project folder
 
-Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point photokin at wherever those already live.
+Pick a folder to hold your virtual environment and any manifest/output files. This does *not* need to contain your actual photos — you'll point photokin at wherever those already live, by full path.
 
 ```bash
 mkdir ~/photokin-work
 cd ~/photokin-work
 ```
+
+One thing does not land here by default: a changeset is written beside the *input*, so `--changeset true` on a photo folder drops the `.ndjson` inside that folder. Pass `--output-file` a path in this folder and the changeset follows it.
 
 ### 3. Create and activate a virtual environment
 
@@ -207,24 +215,28 @@ Open a new terminal window (or run `source ~/.zshrc`) to pick it up.
 
 ### 6. (Optional) Set up ExifTool
 
-Only needed if you want photokin to read/write metadata into the image files themselves. Install it with Homebrew:
+Only needed if you want photokin to write metadata into the image files themselves. Install it with Homebrew:
 
 ```bash
 brew install exiftool
 ```
 
-No Homebrew? Grab the installer package from exiftool.org instead.
+No Homebrew? Grab the installer package from exiftool.org instead. (`python -m photokin.exiftool.fetch` is a Windows-only convenience and does nothing here.)
+
+Installing it does not turn writing on. Nothing is written to your files unless you add `-w` to a run, so the commands in step 7 still only read. See [Setting up ExifTool](#setting-up-exiftool) for what `-w` writes and where.
 
 ### 7. Run it
 
+Give it the full path to the photo — you're in `photokin-work`, not in your pictures folder, and the type is detected from the path you pass:
+
 ```bash
-photokin scan_042.jpg --back scan_042_back.jpg --provider anthropic
+photokin ~/Pictures/scan_042.jpg --back ~/Pictures/scan_042_back.jpg --provider anthropic
 ```
 
 or against a whole folder:
 
 ```bash
-photokin ./scans/ --provider anthropic > results.json
+photokin ~/Pictures/Scans/ --provider anthropic > results.json
 ```
 
 ### Coming back later
@@ -388,7 +400,9 @@ Where each result field lands when written:
 
 If none is found, hydration is skipped with a warning and the analysis still runs. A *requested write* is treated differently: the binary is resolved before the first model call, so `-w` with no ExifTool anywhere exits 2 immediately rather than analyzing the whole batch and only then discovering it cannot write any of it.
 
-**Writing during a run.** Nothing is written into your files unless you ask for it: `--exiftool-write` defaults to `false`, and a changeset on its own only records what *would* be written. `-w` is the one-flag spelling of `--changeset true --exiftool-write true` — record the proposed writes and apply them — and works for folder, manifest and single-photo input alike. Spelled out, that is `--changeset true --exiftool-write true --exiftool-fields EXIF:UserComment`; `--exiftool-write true` is required rather than a confirmation of the default. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults. Every run prints a plan summary before its first model call naming the write set, so "nothing will be written" is visible up front; `--dry-run` prints that summary and stops.
+**Writing during a run.** Nothing is written into your files unless you ask for it: `--exiftool-write` defaults to `false`, and a changeset on its own only records what *would* be written. `-w` is the one-flag spelling of `--changeset true --exiftool-write true` — record the proposed writes and apply them — and works for folder, manifest and single-photo input alike. Spelled out, that is `--changeset true --exiftool-write true` — those two flags and no others, with `--exiftool-fields` left at its `EXIF:UserComment` default; `--exiftool-write true` is required rather than a confirmation of the default. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults. Every run prints a plan summary before its first model call naming the write set, so "nothing will be written" is visible up front; `--dry-run` prints that summary and stops.
+
+**Know where it lands before you start a batch.** Both halves of `-w` reach into your photo directory. The changeset is written beside the *input* unless `--output-file` redirects it, so `photokin ./scans/ -w` drops `scans_changeset.ndjson` **inside `./scans/`** and then edits the images there in place. Photo directories are often cloud-synced, network-mounted or read-only, and none of those is a good place to discover this: give `--output-file` a path somewhere you control and the changeset follows it, or run `--dry-run` first, which prints the exact changeset path it would use and stops.
 
 **Writing later, with an audit step.** Since the changeset NDJSON is a plain record of proposed writes, you can inspect it first and apply it separately:
 
