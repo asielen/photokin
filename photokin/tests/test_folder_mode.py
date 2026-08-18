@@ -11,10 +11,10 @@ that the completion line reports a clean run.
 
 What is pinned here:
 
-* every group reaches the model and every file gets a record, in both
-  ``process_all_variants`` settings -- the album pages travel as ``Page 1`` /
-  ``Page 2`` in one call once the flag is on, which is the flag working in
-  folder mode for the first time;
+* every group reaches the model and every file gets a record -- the album pages
+  travel as ``Page 1`` / ``Page 2`` in one call, which Phase C1 made the
+  default when it retired the primary and bound the payload to the group's own
+  contents;
 * nothing is dropped in silence: a file that cannot be placed in its group's
   payload is warned about by name and recorded under ``all_variant_files``;
 * one failing group costs one group, every file of it carries the same error
@@ -198,19 +198,23 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
     """
 
     def _run_mixed_folder(
-        self, *, process_all_variants: bool = False
+        self, *, group_by: str = utils.GROUP_BY_OBJECT
     ) -> tuple[dict, list[logging.LogRecord], list]:
         """Analyze album pages, a negative-only set and one ordinary photo.
 
+        Both callees are stubbed because the folder holds both payload shapes:
+        the album pages and the negative are group payloads and take
+        ``analyze_group_parts``, while the lone ordinary photo is fully
+        described by one image and takes ``analyze_photo``. Which callee a group
+        gets follows the group's own contents now that the primary has retired.
+
         Args:
-            process_all_variants: When True the group-aware path is taken, so
-                the mocked callee is ``analyze_group_parts`` rather than
-                ``analyze_photo``.
+            group_by: Grouping granularity, one of ``utils.GROUP_BY_VALUES``.
 
         Returns:
             ``(result, log records, what each call sent)``, where a sent entry
-            is the front's basename on the legacy path and the call's ordered
-            ``(label, [basenames])`` parts on the group-aware one.
+            is the front's basename on the pair path and the call's ordered
+            ``(label, [basenames])`` parts on the group one.
         """
         self._make_images(
             "album-page1.jpg",
@@ -228,16 +232,11 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
             sent.append([(label, [os.path.basename(p) for p in paths]) for label, paths in parts])
             return _fake_group_analysis(parts)
 
-        if process_all_variants:
-            target, stub = "photokin.core.analyze_group_parts", analyze_group_parts
-        else:
-            target, stub = "photokin.core.analyze_photo", analyze_photo
-
-        with patch(target, side_effect=stub):
+        with patch("photokin.core.analyze_photo", side_effect=analyze_photo), patch(
+            "photokin.core.analyze_group_parts", side_effect=analyze_group_parts
+        ):
             with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
-                result = core.analyze_folder(
-                    self.folder, utils.Config(process_all_variants=process_all_variants)
-                )
+                result = core.analyze_folder(self.folder, utils.Config(group_by=group_by))
 
         return result, captured.records, sent
 
@@ -261,21 +260,32 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
             [],
             "no group is skipped any more; that limitation is what B2 removed",
         )
-        self.assertEqual(sorted(sent), ["album-page1.jpg", "box3_025.jpg", "neg-negative.jpg"])
+        self.assertEqual(
+            sorted(repr(entry) for entry in sent),
+            [
+                "'box3_025.jpg'",
+                "[('Negative', ['neg-negative.jpg'])]",
+                "[('Page 1', ['album-page1.jpg']), ('Page 2', ['album-page2.jpg'])]",
+            ],
+        )
 
-    def test_process_all_variants_sends_every_album_page_in_one_call(self) -> None:
-        _result, records, sent = self._run_mixed_folder(process_all_variants=True)
+    def test_the_default_sends_every_album_page_in_one_call(self) -> None:
+        _result, records, sent = self._run_mixed_folder()
 
         self.assertEqual(
             [m for m in _group_warnings(records) if m.startswith("Skipping group")], []
         )
-        # The flag was dead in folder mode before B2: the group-aware path was
-        # unreachable, so both settings analyzed the same single primary file.
+        # Reachable only with --process-all-variants before C1: the default sent
+        # page 1 alone through analyze_photo and recorded page 2 without ever
+        # showing it to the model. Retiring the primary is what puts the whole
+        # document in the call, and it is the largest quality change of Phase C.
         self.assertIn(
             [("Page 1", ["album-page1.jpg"]), ("Page 2", ["album-page2.jpg"])], sent
         )
         self.assertIn([("Negative", ["neg-negative.jpg"])], sent)
-        self.assertIn([("Front", ["box3_025.jpg"])], sent)
+        # The lone ordinary photo is still one image on ``analyze_photo``: one
+        # file needs no group prompt, so it does not get one.
+        self.assertIn("box3_025.jpg", sent)
 
     def test_completion_line_reports_a_clean_run_at_info(self) -> None:
         _result, records, _sent = self._run_mixed_folder()
@@ -297,9 +307,12 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
             "album.jpg", "album-page1.jpg", "album-page2.jpg", "album-negative.jpg"
         )
 
+        # A group holding pages and a negative is a group payload at every value
+        # of --group-by, so the callee is ``analyze_group_parts``; the file that
+        # cannot be placed is a property of the slot map, not of the callee.
         with patch(
-            "photokin.core.analyze_photo",
-            side_effect=lambda front, *args, **kwargs: _fake_analysis(front),
+            "photokin.core.analyze_group_parts",
+            side_effect=lambda parts, *args, **kwargs: _fake_group_analysis(parts),
         ):
             with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
                 result = core.analyze_folder(self.folder, utils.Config())
@@ -475,29 +488,41 @@ class TestFolderModeSidecarWrite(_FolderModeTestCase):
     the returned record, which is where a caller should read it.
     """
 
-    def _analyze_two_groups(self, *, write_sidecars: bool) -> tuple[dict, Mock, list[logging.LogRecord]]:
-        """Analyze a two-group folder with the analysis call mocked out."""
+    def _analyze_two_groups(self, *, write_sidecars: bool) -> tuple[dict, list, list[logging.LogRecord]]:
+        """Analyze a two-group folder with both analysis calls mocked out.
+
+        The four-scan group takes ``analyze_group_front_back`` and the lone
+        photo takes ``analyze_photo``, so both are stubbed: the point is that
+        whichever call a group gets is the one and only sidecar writer.
+        """
         self._make_images(
             "box3_025.jpg",
             "box3_025-back.jpg",
             "box3_025b.jpg",
             "box3_026.jpg",
         )
-        analyze = Mock(side_effect=lambda front, *args, **kwargs: _fake_analysis(front))
+        photo = Mock(side_effect=lambda front, *args, **kwargs: _fake_analysis(front))
+        group = Mock(
+            side_effect=lambda fronts, backs, *args, **kwargs: _fake_analysis(
+                (list(fronts) + list(backs))[0]
+            )
+        )
 
-        with patch("photokin.core.analyze_photo", analyze):
+        with patch("photokin.core.analyze_photo", photo), patch(
+            "photokin.core.analyze_group_front_back", group
+        ):
             with self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
                 result = core.analyze_folder(
                     self.folder, utils.Config(), write_sidecars=write_sidecars
                 )
 
-        return result, analyze, captured.records
+        return result, photo.call_args_list + group.call_args_list, captured.records
 
     def test_sidecar_writing_is_delegated_to_the_shared_analysis_call(self) -> None:
-        result, analyze, _records = self._analyze_two_groups(write_sidecars=True)
+        result, calls, _records = self._analyze_two_groups(write_sidecars=True)
 
-        self.assertEqual(analyze.call_count, 2)
-        for call in analyze.call_args_list:
+        self.assertEqual(len(calls), 2)
+        for call in calls:
             self.assertTrue(
                 call.kwargs["write_sidecar"],
                 "the analysis call is now the only sidecar writer in any mode",
@@ -515,9 +540,9 @@ class TestFolderModeSidecarWrite(_FolderModeTestCase):
         )
 
     def test_no_sidecar_is_written_when_sidecars_are_off(self) -> None:
-        result, analyze, records = self._analyze_two_groups(write_sidecars=False)
+        result, calls, records = self._analyze_two_groups(write_sidecars=False)
 
-        for call in analyze.call_args_list:
+        for call in calls:
             self.assertFalse(call.kwargs["write_sidecar"])
         self.assertEqual(
             [name for name in os.listdir(self.folder) if name.endswith(".json")], []

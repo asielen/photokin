@@ -27,7 +27,7 @@ Code map (by section):
 - JSON parsing        model-output cleanup and the retry-parser (_ParseLogger)
 - Filename parsing    parse_media_filename: base id / part kind / variant / page
 - Folder listing      list_folder_images: the image files a folder run reads
-- Manifest helpers    load_manifest (shape validation), master selection
+- Manifest helpers    load_manifest (shape validation)
 - Metadata merge      small helpers shared by the merge step
 - Response helpers    normalize/inspect provider responses
 """
@@ -38,8 +38,9 @@ from __future__ import annotations
 # flatten_known_keywords, warn_forbiddenish_keywords, note_looks_placeholder,
 # insert_keyword_into_vocab_file, safe_backup, resolve_default_paths,
 # build_data_url_and_size, archival_upload, build_prompt_bundle, parse_with_retry,
-# parse_media_filename, list_folder_images, pick_master_index, load_manifest,
-# load_item_metadata, combine_group_metadata, ensure_keyword_back, union_keywords,
+# parse_media_filename, list_folder_images, load_manifest,
+# load_item_metadata, combine_group_metadata, part_markers_in, apply_part_keyword,
+# union_keywords,
 # merge_original_sources, dedupe_captions_with_source, extract_usage.
 import base64
 import io
@@ -64,6 +65,14 @@ logger = logging.getLogger(__name__)
 # Resolve defaults relative to this file (NOT the current working directory).
 _THIS_DIR = Path(__file__).resolve().parent
 _DEFAULT_PROMPTS_DIR = _THIS_DIR / "prompts_photo_ai"
+
+# The one grouping-granularity axis. Defined here rather than in ``core`` because
+# ``Config.group_by`` needs the default literal and ``utils`` is the lower layer.
+GROUP_BY_OBJECT = "object"
+GROUP_BY_PAIR = "pair"
+GROUP_BY_NONE = "none"
+#: Coarsest first, which is also the order ``--help`` lists them in.
+GROUP_BY_VALUES: tuple[str, ...] = (GROUP_BY_OBJECT, GROUP_BY_PAIR, GROUP_BY_NONE)
 
 @dataclass
 class Config:
@@ -91,7 +100,7 @@ class Config:
     no_update_vocab: bool = False
     fail_on_forbidden: bool = False
     max_edge: int | None = 1024
-    process_all_variants: bool = False
+    group_by: str = GROUP_BY_OBJECT
     date_confidence_threshold: float = 0.7
     location_confidence_threshold: float = 0.7
     # date_guess override policy (merge.py)
@@ -1315,37 +1324,6 @@ def parse_media_filename(path: str) -> ParsedName:
     )
 
 # === Folder listing ===
-_VERSION_RE = re.compile(r"""
-    ^
-    (?P<stem>.+?)                          # non-greedy base name
-    (?:
-        -(?P<version>[a-z])                # explicit single-letter version: -b, -c, …
-        |(?<=\d)(?P<version2>[a-z])        # or letter immediately after a digit: 034b
-    )?
-    (?P<part>-negative|-back|-front)?      # optional part kind (longest match wins)
-    (?P<crop>-crop)?                       # optional crop modifier
-    $
-""", re.IGNORECASE | re.VERBOSE)
-
-def _split_name_version_back(filename_no_ext: str) -> Optional[dict]:
-    """
-    Decompose a bare filename (no extension) into its constituent parts.
-    Returns dict: {'stem','version','is_front','is_back','is_negative','is_crop'} or None.
-    """
-    m = _VERSION_RE.match(filename_no_ext)
-    if not m:
-        return None
-    version = (m.group("version") or m.group("version2") or "").lower() or None
-    part = (m.group("part") or "").lower()
-    return {
-        "stem": m.group("stem"),
-        "version": version,
-        "is_front": part == "-front",
-        "is_back": part == "-back",
-        "is_negative": part == "-negative",
-        "is_crop": bool(m.group("crop")),
-    }
-
 def _is_image_file(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in VALID_EXTS
 
@@ -1388,19 +1366,71 @@ def list_folder_images(folder: str) -> list[str]:
     names.sort(key=lambda name: (name.lower(), name))
     return [os.path.join(folder, name) for name in names]
 
-def ensure_keyword_back(record: dict) -> dict:
+#: Keywords the pipeline applies to say which part of an object a file is. They
+#: are asserted per file rather than shared across the group, so every one of
+#: them that does not describe *this* file has to come back off it.
+PART_MARKER_KEYWORDS: frozenset[str] = frozenset({"back", "negative"})
+
+def part_markers_in(keywords: object) -> frozenset[str]:
+    """Return the part markers a keyword collection spells, case-insensitively.
+
+    Reads the same shapes ``merge_original_sources`` accepts -- a list, a bare
+    string, or nothing -- so a file's own keywords can be inspected before the
+    group's are merged into them.
+
+    Args:
+        keywords: A keyword list, a single keyword, or ``None``.
+
+    Returns:
+        The subset of :data:`PART_MARKER_KEYWORDS` present, lowercased.
     """
-    Guarantee 'back' is present (case-insensitive) in record['keywords'].
-    Returns the same dict for convenience.
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    if not isinstance(keywords, list):
+        return frozenset()
+    return frozenset(
+        kw.strip().lower()
+        for kw in keywords
+        if isinstance(kw, str) and kw.strip().lower() in PART_MARKER_KEYWORDS
+    )
+
+def apply_part_keyword(record: dict, marker: str | None, leaked: frozenset[str]) -> dict:
+    """Assert this file's part marker and strip the ones that leaked onto it.
+
+    Only the markers in *leaked* are removed, and only when they are not
+    ``marker`` itself. They are the only ones that can have arrived from another
+    file: the group's metadata keywords are merged into every record, so one
+    file's marker would otherwise land on all of them. Anything else spelled
+    like a marker is somebody's own keyword -- a hand-tagged "Negative" on a
+    print scanned from a negative, say -- and deleting it would be proposing the
+    removal of user data rather than undoing a leak. ``marker`` is appended when
+    it is not already present in any casing, and every other keyword keeps its
+    original spelling and position.
+
+    Args:
+        record: The merged record to amend in place.
+        marker: This file's own marker -- ``"back"``, ``"negative"``, or
+            ``None`` for a file that is neither.
+        leaked: The markers this record can only have received from a sibling:
+            the ones its group applies, less the ones the file itself carried
+            before the merge. A subset of :data:`PART_MARKER_KEYWORDS`.
+
+    Returns:
+        The same dict, for convenience.
     """
     kws = record.get("keywords") or []
     if isinstance(kws, str):
         kws = [kws]
-    # case-insensitive check
-    lower = {k.strip().lower() for k in kws if isinstance(k, str)}
-    if "back" not in lower:
-        kws = list(kws) + ["back"]
-    record["keywords"] = kws
+    unwanted = leaked - ({marker} if marker else set())
+    kept = [
+        kw for kw in kws
+        if not (isinstance(kw, str) and kw.strip().lower() in unwanted)
+    ]
+    if marker and not any(
+        isinstance(kw, str) and kw.strip().lower() == marker for kw in kept
+    ):
+        kept.append(marker)
+    record["keywords"] = kept
     return record
 
 # === Manifest helpers ===
@@ -1416,43 +1446,6 @@ def load_manifest(path: str) -> dict:
     if not isinstance(data, dict) or "items" not in data or not isinstance(data["items"], list):
         raise ValueError("Manifest must be an object with an 'items' array of {path, ...}.")
     return data
-
-def pick_master_index(items_in_group: list[dict], *, update_policy: str | None = None) -> int:
-    """
-    Choose the master within a grouped list.
-
-    Rule order:
-      1. Any item with preferred=true.
-      2. If ``update_policy == "master_exact"`` pick the non-back item whose
-         version is the lowest letter (with ``None``/no letter sorted first).
-      3. The first non-back whose basename has no version suffix.
-      4. Fallback to index 0.
-    """
-    for i, it in enumerate(items_in_group):
-        if it.get("preferred"):
-            return i
-    if update_policy == "master_exact":
-        candidates: list[tuple[int, str | None]] = []
-        for i, it in enumerate(items_in_group):
-            if it.get("is_back"):
-                continue
-            version = it.get("version")
-            if version is None:
-                name = os.path.splitext(os.path.basename(it["path"]))[0]
-                parsed = _split_name_version_back(name)
-                version = parsed["version"] if parsed else None
-            candidates.append((i, version))
-        if candidates:
-            candidates.sort(key=lambda t: ((t[1] is not None), t[1] or ""))
-            return candidates[0][0]
-    # pick the first whose name looks like primary (no version suffix)
-    for i, it in enumerate(items_in_group):
-        if it.get("is_back"):
-            continue
-        version = it.get("version")
-        if version is None:
-            return i
-    return 0
 
 def load_item_metadata(it: dict) -> dict | None:
     """Return inline metadata if present, else load from metadata_path if provided."""

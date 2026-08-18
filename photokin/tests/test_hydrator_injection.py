@@ -35,7 +35,6 @@ class TestHydratorInjection(unittest.TestCase):
             core.process_manifest_stream(
                 manifest=manifest,
                 cfg=cfg,
-                update_policy=core.UPDATE_MASTER_EXACT,
                 metadata_hydrator=calls.append,
             )
 

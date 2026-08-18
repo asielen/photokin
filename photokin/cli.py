@@ -43,7 +43,6 @@ from typing import NoReturn
 from . import utils
 from .utils import Config, normalize_path
 from .core import (
-    UPDATE_MERGE_PER_VARIANT,
     analyze_folder,
     build_folder_manifest,
     build_manifest_buckets,
@@ -358,7 +357,7 @@ def _generate_manifest(args: argparse.Namespace, cfg: Config) -> None:
     # checking when they reach for this flag, and resolving the entries is also
     # what reports an explicit override that disagrees with a filename -- most
     # usefully a --back the grammar reads as a front.
-    buckets = build_manifest_buckets(manifest["items"])
+    buckets = build_manifest_buckets(manifest["items"], group_by=cfg.group_by)
     _write_generated_manifest(manifest, out_path)
     logger.info(
         "Wrote manifest for %d file(s) in %d group(s) to %s; no model call was made.",
@@ -460,8 +459,26 @@ def main() -> None:
         ap.add_argument("--photo-context-file", help="Path to UTF-8 text file containing authoritative photo context", default=None)
         ap.add_argument("--photo-context-text", help="Inline authoritative photo context text", default=None)
 
-        ap.add_argument("--update-policy", choices=["master_exact", "merge_per_variant"], default="merge_per_variant",
-                        help="How to apply results to each file in a group")
+        ap.add_argument(
+            "--group-by",
+            choices=list(utils.GROUP_BY_VALUES),
+            default=utils.GROUP_BY_OBJECT,
+            help="Grouping granularity (default: %(default)s). "
+                 "object: every scan of one print is one object and shares a single analysis. "
+                 "pair: each rescan (print plus variant letter) is analyzed on its own. "
+                 "none: every file is analyzed alone -- an escape hatch for when filenames "
+                 "mis-group. It is the most expensive and the lowest quality: a back analyzed "
+                 "alone is handwriting with no photo, caption, date and location inference all "
+                 "lean on seeing the front, a multipage document is split into unrelated pages, "
+                 "and every crop becomes its own object.",
+        )
+        # Retired in 0.2.0, still accepted: the Lightroom plug-in launches
+        # ``python -m photokin.cli`` and may pass either, and argparse exits 2 on
+        # an unrecognized flag -- a hard crash rather than a behavior change.
+        # ``--update-policy`` defaults to None so a supplied value is
+        # distinguishable from the default and the warning can fire at all.
+        ap.add_argument("--update-policy", choices=["master_exact", "merge_per_variant"],
+                        default=None, help=argparse.SUPPRESS)
         ap.add_argument("--provider", choices=["openai", "anthropic", "gemini", "openrouter"], default=defaults.provider,
                         help="LLM provider backend to use")
         ap.add_argument("--openai-model", default=defaults.model,
@@ -476,8 +493,7 @@ def main() -> None:
                         help="JPEG quality 1-100 (default: %(default)s)")
         ap.add_argument("--max-edge", type=int, default=defaults.max_edge,
                         help="Downscale longest edge before model (e.g., 1024). 0/None = keep size")
-        ap.add_argument("--process-all-variants", action="store_true",
-                        help="Also analyze -b/-c variants and fold outputs")
+        ap.add_argument("--process-all-variants", action="store_true", help=argparse.SUPPRESS)
         ap.add_argument("--date-confidence-threshold", type=float, default=defaults.date_confidence_threshold,
                         help="Minimum confidence required to apply dates to the patch (default: %(default)s)")
         ap.add_argument("--location-confidence-threshold", type=float, default=defaults.location_confidence_threshold,
@@ -538,6 +554,18 @@ def main() -> None:
 
         args = ap.parse_args(argv)
 
+        if args.process_all_variants:
+            logger.warning(
+                "--process-all-variants no longer does anything and is ignored; grouping is "
+                "controlled by --group-by (default 'object', which sends every scan of a "
+                "group in one call)."
+            )
+        if args.update_policy is not None:
+            logger.warning(
+                "--update-policy no longer does anything and is ignored; grouping is "
+                "controlled by --group-by (default 'object')."
+            )
+
         # --- early validation ---
         if args.jpeg_quality < 1 or args.jpeg_quality > 100:
             ap.error("--jpeg-quality must be between 1 and 100")
@@ -569,7 +597,7 @@ def main() -> None:
             jpeg_quality=args.jpeg_quality,
             no_update_vocab=args.no_update_vocab,
             max_edge=(None if (args.max_edge in (None, 0)) else args.max_edge),
-            process_all_variants=args.process_all_variants,
+            group_by=args.group_by,
             date_confidence_threshold=args.date_confidence_threshold,
             location_confidence_threshold=args.location_confidence_threshold,
             dry_run=args.dry_run,
@@ -651,7 +679,6 @@ def main() -> None:
                     process_manifest_stream(
                         manifest=man,
                         cfg=cfg,
-                        update_policy=args.update_policy,
                         write_sidecars=args.output_sidecars,
                         ndjson_writer=writer,
                         changeset_writer=changeset_writer,
@@ -670,7 +697,6 @@ def main() -> None:
                         data = process_manifest_stream(
                             manifest=man,
                             cfg=cfg,
-                            update_policy=args.update_policy,
                             write_sidecars=args.output_sidecars,
                             ndjson_writer=None,
                             changeset_writer=changeset_writer,
@@ -688,7 +714,6 @@ def main() -> None:
                 data = process_manifest_stream(
                     manifest=man,
                     cfg=cfg,
-                    update_policy=args.update_policy,
                     write_sidecars=args.output_sidecars,
                     ndjson_writer=None,
                     changeset_writer=changeset_writer,
@@ -718,7 +743,6 @@ def main() -> None:
                     photo_context_text=cfg.photo_context_text,
                 ),
                 cfg=cfg,
-                update_policy=UPDATE_MERGE_PER_VARIANT,
                 write_sidecars=args.output_sidecars,
                 strict_run_failures=True,
             )

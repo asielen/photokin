@@ -38,6 +38,9 @@ Code map (public-facing entry points marked PUBLIC):
 - _log_manifest_override        warn that an explicit flag beat the filename
 - _manifest_group_override      resolve an item's explicit bucket key
 - _resolve_manifest_entry       build one grouping entry, filename plus overrides
+- _item_part_marker             the per-file part keyword an entry earns, if any
+- _escape_pair_half             make one half of a pair key free of bare separators
+- _pair_bucket_key              the escaped group-key/variant join '--group-by pair' uses
 - build_manifest_buckets        PUBLIC: group items the way the stream will
 - _manifest_part_key            the slot an entry competes for in its variant
 - _slot_rank_key                the one ordering every grouping tie-break uses
@@ -74,8 +77,6 @@ from .changeset import (
 
 logger = logging.getLogger(__name__)
 
-UPDATE_MASTER_EXACT = "master_exact"
-UPDATE_MERGE_PER_VARIANT = "merge_per_variant"
 _EMPTY_CAPTION_MARKERS = (
     "no text visible",
     "none",
@@ -540,6 +541,11 @@ def analyze_photo(
                 if k.upper().startswith("PC-"):
                     logger.warning('Skipping keyword "%s" (PC- prefix not allowed).', k)
                     continue
+                if k.strip().lower() in utils.PART_MARKER_KEYWORDS:
+                    # Approving one would teach the model to propose a token the
+                    # fan-out then strips from every file it does not describe.
+                    logger.warning('Skipping keyword "%s" (part marker, not a vocabulary keyword).', k)
+                    continue
 
                 p = proposed_map.get(k)
                 if not p:
@@ -701,9 +707,15 @@ def analyze_group_parts(
             cfg = config,
     )
 
+    # A group reaches this analyzer for its part labels as much as for its size:
+    # a lone negative or a lone album page is one image that still has to be
+    # named as the part it is. Telling the model it is seeing several would be
+    # contradicted by the payload it can count for itself.
     extra_lines: list[str] = [
         "GROUP VARIANTS NOTE:",
-        "You are seeing multiple scans or variants of the same physical photograph or document.",
+        "You are seeing multiple scans or variants of the same physical photograph or document."
+        if len(flat_paths) > 1
+        else "You are seeing a single scan of one part of a physical photograph or document.",
     ]
 
     part_counts = [{"label": lbl, "count": len(plist)} for lbl, plist in norm_parts]
@@ -846,6 +858,11 @@ def analyze_group_parts(
                 if k.upper().startswith("PC-"):
                     logger.warning('Skipping keyword "%s" (PC- prefix not allowed).', k)
                     continue
+                if k.strip().lower() in utils.PART_MARKER_KEYWORDS:
+                    # Approving one would teach the model to propose a token the
+                    # fan-out then strips from every file it does not describe.
+                    logger.warning('Skipping keyword "%s" (part marker, not a vocabulary keyword).', k)
+                    continue
 
                 p = proposed_map.get(k)
                 if not p:
@@ -963,12 +980,18 @@ def build_single_photo_manifest(
 
     Unlike a folder, single-photo input carries real assertions the filename
     cannot make, so this one does set overrides. ``--back`` says "this file is
-    the reverse of that one" whatever it is called, which is both ``is_back``
-    and a shared ``group`` -- without the group key, ``photo.jpg --back
-    reverse.jpg`` would split into two objects and two model calls. ``--meta``
-    rides inline on the front only, matching the single ``original_meta`` blob
-    the old call site forwarded; the group's other item still receives it
-    through ``merge_original_sources`` under ``merge_per_variant``.
+    the reverse of that one" whatever it is called, so the back is given the
+    front's whole address -- ``is_back``, the shared ``group`` and the front's
+    ``version`` -- rather than only the group key. Without the group key
+    ``photo.jpg --back reverse.jpg`` splits into two objects and two model
+    calls; without the version the same split happens under ``--group-by pair``
+    alone, whose bucket key carries the variant letter, for a back named
+    ``IMG_0042b.jpg`` -- which is exactly the sort of unreadable name ``--back``
+    exists to handle. (Under ``--group-by none`` neither key is consulted, so
+    the pair does split in two; that is what the escape hatch is for.)
+    ``--meta`` rides inline on the front only, matching the single
+    ``original_meta`` blob the old call site forwarded; the group's other item
+    still receives it through ``merge_original_sources``.
 
     Args:
         image_path: The front image.
@@ -985,14 +1008,24 @@ def build_single_photo_manifest(
     # Empty only for an empty path, which the caller is expected to have refused
     # already; emitting ``group: ""`` would be an unusable override rather than a
     # grouping instruction, and would be warned about as one.
-    group_key = utils.parse_media_filename(front).base_id if front else ""
-    shared_group = {"group": group_key} if group_key else {}
-    front_item: Dict[str, Any] = {"path": front, **shared_group}
+    parsed_front = utils.parse_media_filename(front) if front else None
+    group_key = parsed_front.base_id if parsed_front else ""
+    # The front keeps the version its own name yields, which is the value the
+    # back is pinned to. ``""`` is the documented spelling of "no variant
+    # letter"; leaving the key out would fall back to the back's own filename.
+    back_address = (
+        {"group": group_key, "version": parsed_front.variant_id or ""}
+        if group_key and parsed_front
+        else {}
+    )
+    front_item: Dict[str, Any] = {"path": front}
+    if group_key:
+        front_item["group"] = group_key
     if meta:
         front_item["metadata"] = meta
     items = [front_item]
     if back_path:
-        items.append({"path": utils.normalize_path(back_path), **shared_group, "is_back": True})
+        items.append({"path": utils.normalize_path(back_path), **back_address, "is_back": True})
 
     manifest: Dict[str, Any] = {
         "schema_version": 1,
@@ -1017,11 +1050,9 @@ def analyze_folder(
     The folder is translated into manifest items and handed to
     :func:`process_manifest_stream`, so folder and manifest input group
     identically: album pages, negative-only sets, crops and variant scans are
-    all analyzed rather than skipped, and ``config.process_all_variants`` works
-    here for the first time.  ``update_policy`` is fixed at
-    ``UPDATE_MERGE_PER_VARIANT`` -- the CLI default -- because the policy flag is
-    manifest-only until Phase C lifts that gate; this is a decision, not an
-    omission.  Failure handling is folder mode's own: a group that raises is
+    all analyzed rather than skipped, and ``config.group_by`` selects the
+    grouping granularity here exactly as it does for a manifest.  Failure
+    handling is folder mode's own: a group that raises is
     recorded under ``errors`` and the batch carries on, a run-fatal provider
     error aborts immediately, and a run in which nothing succeeded re-raises its
     first failure rather than exiting 0 with an empty result set.
@@ -1047,7 +1078,6 @@ def analyze_folder(
     return process_manifest_stream(
         manifest=manifest,
         cfg=config,
-        update_policy=UPDATE_MERGE_PER_VARIANT,
         write_sidecars=write_sidecars,
         strict_run_failures=True,
     )
@@ -1059,6 +1089,14 @@ def analyze_folder(
 # crop flag leads it (see ``_slot_rank_key``) so a derivative can never take the
 # slot of the scan it was cropped from, whatever order the manifest listed them in.
 _PART_RANK = {"front": 0, "none": 1, "page": 2, "back": 3, "negative": 4}
+
+_GROUP_BY_VALUES = frozenset(utils.GROUP_BY_VALUES)
+
+# Joins the two halves of a ``pair`` bucket key. Illegal in a Windows filename,
+# so a key the grammar derived there never contains one -- but an explicit
+# manifest ``group`` may, on any platform, which is why the halves are escaped.
+_PAIR_KEY_SEPARATOR = "|"
+_PAIR_KEY_ESCAPE = "\\"
 
 # The plug-in writes manifests from Lua, which passes literal true/false strings.
 _MANIFEST_TRUE = frozenset({"true", "1", "yes"})
@@ -1225,7 +1263,84 @@ def _resolve_manifest_entry(raw: dict) -> dict | None:
     }
 
 
-def build_manifest_buckets(items: List[dict]) -> Dict[str, List[dict]]:
+def _item_part_marker(entry: dict) -> str | None:
+    """Return the part-marker keyword a grouping entry earns, if any.
+
+    ``is_back`` is defined as ``part_kind == "back"``, so the two kinds are
+    mutually exclusive and at most one marker ever applies to a file.
+
+    Args:
+        entry: One :func:`_resolve_manifest_entry` result.
+
+    Returns:
+        ``"back"``, ``"negative"``, or ``None`` for a file that is neither.
+    """
+    if entry["is_back"]:
+        return "back"
+    return "negative" if entry["part_kind"] == "negative" else None
+
+
+def _escape_pair_half(half: str) -> str:
+    """Escape one half of a ``pair`` bucket key so its separators are inert.
+
+    The escape character is doubled first, then the separator is prefixed with
+    it, so every separator in the result is preceded by an odd-length run of
+    escape characters. The escaped half therefore ends in an even-length run,
+    possibly empty, and the separator :func:`_pair_bucket_key` joins on is the
+    only one in the whole key that an odd run does not precede.
+
+    Args:
+        half: The group key or the variant letter, verbatim.
+
+    Returns:
+        The escaped half, which contains no bare separator.
+    """
+    return half.replace(_PAIR_KEY_ESCAPE, _PAIR_KEY_ESCAPE * 2).replace(
+        _PAIR_KEY_SEPARATOR, _PAIR_KEY_ESCAPE + _PAIR_KEY_SEPARATOR
+    )
+
+
+def _pair_bucket_key(group_key: str, version: str | None) -> str:
+    """Join a group key and a variant letter into one ``pair`` bucket key.
+
+    Each half is escaped by :func:`_escape_pair_half` and the two are joined on
+    a bare separator. The encoding is injective. Reading left to right, an
+    escape character consumes the character after it and a separator that is not
+    consumed that way is the join, so a key holding no bare separator came from
+    a ``None`` version and one holding a bare separator splits at exactly the
+    first: the two halves are recovered unambiguously, and only one input can
+    spell any given key.
+
+    Doubling the separator instead -- the first attempt -- is not injective,
+    because a half's escaped trailing run merges with the joining separator:
+    ``("a|", "a")`` and ``("a", "|a")`` both spell ``a|||a``.
+
+    A plain join is worse still: an explicit manifest ``group`` of ``"album|b"``
+    and a filename-derived ``("album", "b")`` both spell ``album|b``, which puts
+    two unrelated objects in one model call and writes both of them the same
+    caption, date and location. A key holding neither the separator nor the
+    escape character keeps its exact spelling when there is no variant letter,
+    which is every key the grammar derives on Windows, so the ordinary shape
+    carries the same changeset ``group_id`` under ``pair`` as under ``object``.
+
+    Args:
+        group_key: The entry's resolved group key.
+        version: The entry's variant letter, or ``None`` when it has none.
+
+    Returns:
+        The bucket key.
+    """
+    escaped = _escape_pair_half(group_key)
+    if version is None:
+        return escaped
+    return f"{escaped}{_PAIR_KEY_SEPARATOR}{_escape_pair_half(version)}"
+
+
+def build_manifest_buckets(
+    items: List[dict],
+    *,
+    group_by: str = utils.GROUP_BY_OBJECT,
+) -> Dict[str, List[dict]]:
     """Bucket manifest items by resolved group key, dropping items with no usable path.
 
     The single implementation of the grouping every input mode sees, so a count
@@ -1234,19 +1349,41 @@ def build_manifest_buckets(items: List[dict]) -> Dict[str, List[dict]]:
     surfaces the explicit-override warnings, which is why the flag can report a
     disagreeing ``--back`` before it writes the file.
 
+    The key stays a string at every granularity, because it is the ``stem`` the
+    stream logs every per-group message against and the changeset's
+    ``group_id``/``group_key``; a tuple would ripple into all of those. Under
+    ``pair`` the two halves are joined by :func:`_pair_bucket_key`, which
+    escapes its separator rather than assuming neither half can contain one.
+
     Args:
         items: The manifest's ``items`` array.
+        group_by: One of :data:`utils.GROUP_BY_VALUES`. ``object`` keys on the
+            resolved group key, ``pair`` on the group key plus the variant
+            letter, and ``none`` on the file itself.
 
     Returns:
         ``{group_key: [entry, ...]}`` in first-seen key order, entries in item
         order.
+
+    Raises:
+        ValueError: If *group_by* is not one of :data:`utils.GROUP_BY_VALUES`.
+            argparse already guards the CLI; this guards a library caller who
+            sets ``cfg.group_by`` by hand.
     """
+    if group_by not in _GROUP_BY_VALUES:
+        raise ValueError(f"Unknown group_by value: {group_by!r}")
     buckets: Dict[str, List[dict]] = {}
     for raw in items:
         entry = _resolve_manifest_entry(raw)
         if entry is None:
             continue
-        buckets.setdefault(entry["group_key"], []).append(entry)
+        if group_by == utils.GROUP_BY_OBJECT:
+            key = entry["group_key"]
+        elif group_by == utils.GROUP_BY_PAIR:
+            key = _pair_bucket_key(entry["group_key"], entry["version"])
+        else:
+            key = entry["path"]
+        buckets.setdefault(key, []).append(entry)
     return buckets
 
 
@@ -1316,7 +1453,6 @@ def analyze_manifest(
     manifest: dict | str,
     config: utils.Config = utils.Config(),
     *,
-    update_policy: str = UPDATE_MERGE_PER_VARIANT,
     write_sidecars: bool = False,
     ndjson_writer=None,
     changeset_writer=None,
@@ -1333,7 +1469,6 @@ def analyze_manifest(
     return process_manifest_stream(
         manifest=manifest,
         cfg=config,
-        update_policy=update_policy,
         write_sidecars=write_sidecars,
         ndjson_writer=ndjson_writer,
         changeset_writer=changeset_writer,
@@ -1346,7 +1481,6 @@ def process_manifest_stream(
     manifest: dict | str,
     cfg: utils.Config,
     *,
-    update_policy: str = UPDATE_MERGE_PER_VARIANT,
     write_sidecars: bool = False,
     ndjson_writer=None,
     changeset_writer=None,
@@ -1360,6 +1494,10 @@ def process_manifest_stream(
     so we stream NDJSON records as soon as each group finishes *and* build the
     aggregate result that older callers expect.  This dual behavior is the core
     design constraint worth documenting.
+
+    Grouping granularity comes off the config as ``cfg.group_by``, one of
+    :data:`utils.GROUP_BY_VALUES`; which analyzer each group then reaches
+    follows the group's own contents rather than any flag.
 
     Args:
         strict_run_failures: Folder mode's Phase A failure contract, off by
@@ -1399,7 +1537,8 @@ def process_manifest_stream(
     items = man.get("items", [])
     if metadata_hydrator is not None:
         metadata_hydrator(items)
-    buckets = build_manifest_buckets(items)
+    group_by = cfg.group_by
+    buckets = build_manifest_buckets(items, group_by=group_by)
 
     results: dict[str, dict] = {}
     errors: dict[str, dict] = {}
@@ -1618,22 +1757,15 @@ def process_manifest_stream(
                     seen_candidate_paths.add(entry["path"])
                     candidates.append(entry)
 
-            master_pool = candidates
-            if any(c["part_kind"] != "negative" for c in candidates) and not any(
-                c["preferred"] for c in candidates
-            ):
-                # A negative is never the primary while anything else could be:
-                # rank alone would not stop pick_master_index preferring an
-                # unversioned negative over a versioned front. An explicit
-                # ``preferred`` suspends the filter, since explicit beats derived.
-                # It narrows the master pick only: removing negatives from
-                # ``candidates`` outright would hide the sole front-side file of a
-                # negative-plus-back group from the fallback below, which is how
-                # that group came to send its back twice and drop the negative.
-                master_pool = [c for c in candidates if c["part_kind"] != "negative"]
-
-            primary_idx = utils.pick_master_index(master_pool, update_policy=update_policy)
-            primary_item = master_pool[primary_idx]
+            # ``candidates`` is already in rank order, so its head IS "the best
+            # non-crop, preferred-if-any, front-side, unversioned file" -- the
+            # thing the retired ``pick_master_index`` approximated by scanning
+            # arrival order, and the second of the two order-dependent choices
+            # behind the B1 crop bug. Rank puts a negative last on its own
+            # (``_PART_RANK["negative"] == 4``), so the separate negative filter
+            # that used to guard the master pick is gone with it; a ``preferred``
+            # negative still wins, since ``preferred`` outranks part kind.
+            primary_item = candidates[0]
             primary_front = primary_item["path"] if not primary_item["is_back"] else None
             primary_version = primary_item["version"]
             # A back is only ever chosen here because the caller preferred it or
@@ -1690,17 +1822,48 @@ def process_manifest_stream(
                 )
                 primary_back = None
 
+            all_fronts: list[str] = []
+            all_backs: list[str] = []
+            for ver in variant_list_sorted:
+                slot_pair = variant_pairs.get(ver, {})
+                front_path = slot_pair.get("front")
+                if front_path and front_path not in all_fronts:
+                    all_fronts.append(front_path)
+                back_path = slot_pair.get("back")
+                if back_path and back_path not in all_backs:
+                    all_backs.append(back_path)
+
+            # The one predicate the whole payload hangs on, computed from the
+            # group's own contents rather than from a flag. There is no primary
+            # any more, so "send the whole group" is decided by whether the group
+            # holds anything a single front/back pair cannot describe: a page, a
+            # negative, a second front-side scan or a second back.
+            group_payload = (
+                multipage_present
+                or bool(all_negatives)
+                or len(all_fronts) > 1
+                or len(all_backs) > 1
+            )
+
             # Warn only once the file set bound for the model is known, and test
             # against that set rather than against ``primary_front``: the
             # group-aware path sends more than the primary, and a crop the caller
             # marked ``preferred`` can be the primary yet still miss the payload.
-            if cfg.process_all_variants:
+            if group_payload:
                 analyzed_paths = {p for parts in variant_parts.values() for p in parts.values()}
             else:
                 analyzed_paths = {p for p in (primary_front, primary_back) if p}
 
+            # The ``group_by`` guard: under ``none`` every crop is an orphan by
+            # construction -- its group holds one file, so there is no parent for
+            # it to be a supporting view of -- and this warning is written to
+            # flag a surprising input, not a property of the mode.
             for it in crops:
-                if it["path"] in orphan_crops and it["path"] in analyzed_paths:
+                if (
+                    group_by != utils.GROUP_BY_NONE
+                    and it["path"] in orphan_crops
+                    and it["path"] in analyzed_paths
+                ):
                     # Nothing uncropped claimed this slot, so the crop is all
                     # that stands for the object -- manifest mode owes every
                     # listed file a result, so it is analyzed rather than skipped.
@@ -1730,14 +1893,18 @@ def process_manifest_stream(
             #   - ``primary_front`` / ``primary_back``: the chosen canonical pair
             #   - ``variant_pairs``: {version -> {"front": ..., "back": ...}}
             #
-            # We now call into the model. When ``cfg.process_all_variants`` is True we
-            # send *all* front/back variants together so the model can write a single
-            # natural caption that applies across the set. When it is False we fall
-            # back to the older behavior of analyzing only the primary pair.
+            # We now call into the model. A group payload sends every file that
+            # owns a slot in one call, so the model can write a single natural
+            # caption that applies across the set; a group a single pair fully
+            # describes takes the pair call instead. The two analyzers are not
+            # interchangeable -- the group one prefixes a "multiple scans or
+            # variants" note to the prompt, tags its dump differently and raises
+            # where the pair one rewraps -- so binding the callee to the payload
+            # shape is what keeps an ordinary front/back run byte-identical.
 
             analyses: list[tuple[dict, str, str | None]] = []
 
-            if cfg.process_all_variants:
+            if group_payload:
                 # --- Group-aware path: send all variants in one call -----------------
                 if multipage_present:
                     parts_for_analysis: list[tuple[str, list[str]]] = []
@@ -1775,44 +1942,32 @@ def process_manifest_stream(
                         original_meta=combined_meta,
                         write_sidecar=write_sidecars,
                     )
+                elif all_negatives:
+                    # A negative is neither a front nor a back, so it needs the
+                    # generic part form. The ordinary front/back call site is
+                    # left exactly as it was.
+                    data_group = analyze_group_parts(
+                        parts=[
+                            (label, paths)
+                            for label, paths in (
+                                ("Front", all_fronts),
+                                ("Back", all_backs),
+                                ("Negative", all_negatives),
+                            )
+                            if paths
+                        ],
+                        config=cfg,
+                        original_meta=combined_meta,
+                        write_sidecar=write_sidecars,
+                    )
                 else:
-                    all_fronts: list[str] = []
-                    all_backs: list[str] = []
-                    for ver in variant_list_sorted:
-                        pair = variant_pairs.get(ver, {})
-                        f = pair.get("front")
-                        if f and f not in all_fronts:
-                            all_fronts.append(f)
-                        b = pair.get("back")
-                        if b and b not in all_backs:
-                            all_backs.append(b)
-
-                    if all_negatives:
-                        # A negative is neither a front nor a back, so it needs
-                        # the generic part form. The ordinary front/back call
-                        # site is left exactly as it was.
-                        data_group = analyze_group_parts(
-                            parts=[
-                                (label, paths)
-                                for label, paths in (
-                                    ("Front", all_fronts),
-                                    ("Back", all_backs),
-                                    ("Negative", all_negatives),
-                                )
-                                if paths
-                            ],
-                            config=cfg,
-                            original_meta=combined_meta,
-                            write_sidecar=write_sidecars,
-                        )
-                    else:
-                        data_group = analyze_group_front_back(
-                            all_fronts,
-                            all_backs,
-                            cfg,
-                            original_meta = combined_meta,
-                            write_sidecar = write_sidecars,
-                        )
+                    data_group = analyze_group_front_back(
+                        all_fronts,
+                        all_backs,
+                        cfg,
+                        original_meta = combined_meta,
+                        write_sidecar = write_sidecars,
+                    )
 
                 # The group helper uses the same JSON shape as ``analyze_photo`` but
                 # we still normalize to ``primary_front`` for consistency with the
@@ -1832,7 +1987,7 @@ def process_manifest_stream(
                 analyses.append((canonical, primary_front, primary_version))
 
             else:
-                # --- Legacy path: analyze a single front/back pair -------------------
+                # --- Pair path: one front and, at most, its own back ------------------
                 data_primary = analyze_photo(
                         primary_front,
                         primary_back,
@@ -1847,14 +2002,12 @@ def process_manifest_stream(
             multiple_backs = len([it for it in group if it["is_back"]]) > 1
 
             # Variant merge rules:
-            # - When analyzing all variants, combine keywords from every photo but keep "back"
-            #   on backs only and share PC* codes across the whole group.
+            # - Combine keywords from every photo but keep the part markers on the
+            #   files they describe and share PC* codes across the whole group.
             # - Preserve existing captions, then append generated captions labeled by
             #   front/back and variant letter when multiples exist.
             # - Share AI analysis notes across the set.
             # - Pick the highest-confidence location/date guess across analyses.
-            # - When only the master is analyzed, apply its merged metadata to every file,
-            #   still sharing PC* across the group and keeping "back" on backs.
 
             def _split_keywords_for_merge(keywords: list[str] | None) -> tuple[list[str], list[str]]:
                 base: list[str] = []
@@ -1865,10 +2018,13 @@ def process_manifest_stream(
                     kw = raw.strip()
                     if not kw:
                         continue
-                    upper_kw = kw.upper()
-                    if upper_kw == "BACK":
+                    # A part marker describes one file, so it must not reach the
+                    # group-wide pool that lands on all of them. The model emits
+                    # "Negative" now that it is told a ``Negative`` part is
+                    # present, and it would otherwise spread to the print.
+                    if kw.lower() in utils.PART_MARKER_KEYWORDS:
                         continue
-                    if upper_kw.startswith("PC"):
+                    if kw.upper().startswith("PC"):
                         pc_only.append(kw)
                         continue
                     base.append(kw)
@@ -1947,28 +2103,14 @@ def process_manifest_stream(
                 stripped = _remove(r"^(front|back)\s*:?", start)
                 return stripped if stripped is not None else cap.strip()
 
-                # Rule 2/2a/2b: keep per-photo captions, then append AI captions.
-                #
-                # When ``cfg.process_all_variants`` is True, we treat the analysis as
-                # group-level: the single caption from ``analyses[0]`` is assumed to be
-                # a natural description of the logical photo as a whole, so we build at
-                # most two entries:
-                #
-                #   [Front] <group caption>   (if any fronts exist)
-                #   [Back]  <group caption>   (if any backs exist)
-                #
-                # When ``cfg.process_all_variants`` is False, we fall back to the
-                # original behavior of building per-variant entries like:
-                #
-                #   [Front a] ...
-                #   [Back b]  ...
-                #
-
-            # Build the block we’re going to append to any existing Lightroom caption.
+            # Rule 2/2a/2b: keep per-photo captions, then append AI captions. The
+            # branch follows ``group_payload`` rather than the grouping axis, which
+            # is what keeps ordinary output stable: a plain front/back pair keeps
+            # its per-variant "[Back] ..." entry, and only a payload the model saw
+            # as a set reuses the caption block the model wrote for that set.
             caption_entries: list[str] = []
 
-            if cfg.process_all_variants:
-                # Group-aware mode:
+            if group_payload:
                 # The model has already produced a complete transcription in the
                 # caption field (with any [Front]/[Back] headers it decided to add).
                 # We reuse that block as-is for every item in the group.
@@ -1978,7 +2120,7 @@ def process_manifest_stream(
                     if cap0:
                         caption_entries.append(cap0)
             else:
-                # Legacy per-variant behavior: preserve separate entries with variant
+                # Per-variant behavior: preserve separate entries with variant
                 # letters when needed so you can see each version's caption.
                 seen_caps: set[str] = set()
                 for rec, _, ver in analyses:
@@ -2104,17 +2246,32 @@ def process_manifest_stream(
                 # Rule 3: keep analysis notes in sync across all variants.
                 canonical["analysis_notes"] = canonical_analysis_notes
 
+            # Rule 1 (continued): the markers this group asserts. Nothing else
+            # spelled like a marker can have leaked from a sibling, so the strip
+            # below narrows this set per file rather than applying it whole.
+            applied_markers = frozenset(
+                marker for marker in map(_item_part_marker, group) if marker
+            )
+
             # emit per-file (merged with per-file metadata)
             for it in group:
-                per_meta = utils.load_item_metadata(it) or {}
-                if update_policy == UPDATE_MERGE_PER_VARIANT:
-                    per_meta = utils.merge_original_sources(per_meta, combined_meta)
+                own_meta = utils.load_item_metadata(it) or {}
+                # Read before the merge below, which is the last moment the two
+                # are distinguishable: a marker this file already carried is the
+                # caller's own keyword however many siblings share the part it
+                # names, so it is not one of the leaks the strip may undo.
+                own_markers = utils.part_markers_in(
+                    own_meta.get("keywords") or own_meta.get("tags")
+                )
+                per_meta = utils.merge_original_sources(own_meta, combined_meta)
 
+                # The one keyword that is a property of this file rather than of
+                # the object.
+                part_marker = _item_part_marker(it)
                 record_for_item = deepcopy(canonical)
                 keywords_for_item = utils.union_keywords(shared_keywords, group_pc_codes)
-                if it["is_back"]:
-                    # Rule 1 (continued): append "back" only on back items.
-                    keywords_for_item = utils.union_keywords(keywords_for_item, ["back"])
+                if part_marker:
+                    keywords_for_item = utils.union_keywords(keywords_for_item, [part_marker])
                 record_for_item["keywords"] = keywords_for_item
 
                 # Rule 2: preserve each photo's caption, then append labeled AI captions.
@@ -2123,12 +2280,12 @@ def process_manifest_stream(
                     record_for_item["caption"] = combined_caption
 
                 merged, report = merge_metadata(record_for_item, per_meta, cfg)
-                if it["is_back"]:
-                    utils.ensure_keyword_back(merged)
-                else:
-                    merged["keywords"] = [
-                        kw for kw in merged.get("keywords") or [] if not (isinstance(kw, str) and kw.strip().lower() == "back")
-                    ]
+                # ``combined_meta`` is the whole group's metadata keywords,
+                # un-stripped, and it has just been merged into every file, so a
+                # marker belonging to one file has to come back off the others.
+                utils.apply_part_keyword(
+                    merged, part_marker, applied_markers - own_markers
+                )
                 merged["all_variant_files"] = canonical["all_variant_files"]
                 merged["_merge"] = report
                 patch, patch_meta = build_canonical_patch(merged, cfg)
@@ -2187,9 +2344,10 @@ def process_manifest_stream(
         raise first_error
     # A lossy run reports its total at WARNING: the per-group messages it
     # summarizes are already at that level, so an INFO-only summary would vanish
-    # at exactly the threshold where the count matters most. A variant recorded
-    # but not sent because ``process_all_variants`` is off is not counted --
-    # that is the documented design, not a loss.
+    # at exactly the threshold where the count matters most. Every group now
+    # travels whole, so the only files it can count are crops that yielded their
+    # parent's slot and files displaced out of a slot they contested -- both of
+    # which are already the subject of a WARNING naming them.
     lossy = bool(failed_groups or unplaced_paths)
     logger.log(
         logging.WARNING if lossy else logging.INFO,

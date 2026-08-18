@@ -68,7 +68,6 @@ def analyze_manifest(
     manifest: Dict[str, Any] | str,
     *,
     cfg: Optional[Config] = None,
-    update_policy: str = "merge_per_variant",
     # log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
     """
@@ -76,7 +75,10 @@ def analyze_manifest(
 
     The wrapper exists so plug-in builds can continue importing from the public
     surface while we freely refactor the core module layout.
+
+    ``update_policy`` is gone as of 0.2.0: grouping granularity is one axis now,
+    so an embedder sets ``cfg.group_by`` instead.
     """
 
     cfg = cfg or Config()
-    return core.analyze_manifest(manifest, cfg, update_policy=update_policy)
+    return core.analyze_manifest(manifest, cfg)

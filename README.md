@@ -239,25 +239,37 @@ photokin ...
 
 Point it at a folder and it works through everything in it (non-recursive). Filename suffixes group scans of the same physical object automatically — `photo-a.jpg` / `photo-b.jpg` are variants, `photo-back.jpg` is the reverse side, `album-page1.jpg` / `album-page2.jpg` are pages of one document — and each group is analyzed together as one object.
 
-Folder and manifest input are read by the same grouper, so anything one handles the other handles identically. A set with no plain front scan in it is analyzed like any other object — nothing but pages (`album-page1.jpg`, `album-page2.jpg`), nothing but a negative, or nothing but a back (`box3_030-back.jpg`, where the front was never scanned or lives in another folder). With `--process-all-variants` every page of a document goes to the model in one call, and without it only the group's primary item (the lowest-numbered page) is analyzed and its result is applied across the set. Albums, multi-page documents, negative-only scans and loose backs no longer need a manifest. (Earlier releases grouped those sets correctly and then skipped them, warning per group; that limitation is gone.)
+Folder and manifest input are read by the same grouper, so anything one handles the other handles identically. A set with no plain front scan in it is analyzed like any other object — nothing but pages (`album-page1.jpg`, `album-page2.jpg`), nothing but a negative, or nothing but a back (`box3_030-back.jpg`, where the front was never scanned or lives in another folder). Every page of a document goes to the model in one call, and every scan of a print goes in one call with its siblings. Albums, multi-page documents, negative-only scans and loose backs no longer need a manifest. (Earlier releases grouped those sets correctly and then skipped them, warning per group; that limitation is gone.)
+
+**How much is one object: `--group-by {object,pair,none}`.** Granularity is a single axis, defaulting to `object`. On `box3_025.jpg`, `box3_025-back.jpg`, `box3_025b.jpg`, `box3_025b-back.jpg`, `box3_025c.jpg`:
+
+| Value | Group key | On that five-file set |
+|---|---|---|
+| `object` (default) | the print | 1 call, 5 images; every scan shares one analysis |
+| `pair` | the print plus the variant letter | 3 calls, 5 images; each rescan judged on its own merits |
+| `none` | the file | 5 calls, 5 images; every file alone, backs separated from fronts |
+
+`object` is the default because scans of one print are one print: a shared date and location is the wanted answer, not three opinions to reconcile. `pair` costs one call per rescan and gives each its own verdict; on ordinary input — a group with no variant letters at all — it is identical to `object`, group id included. `none` is an **escape hatch for when filenames lie**, not a normal mode. It is the most expensive and the lowest quality: a back analyzed alone is handwriting with no photo attached, caption, date and location inference all lean on seeing the front, a multipage document is split into unrelated pages, and every crop becomes its own object and is analyzed as one. Reach for it when the grammar has mis-grouped something and you want the files judged individually; not otherwise.
 
 > SIDE NOTE ON EXPECTED **Naming conventions.** The full suffix grammar is `name[letter][-front|-back|-negative|-pageN][-crop]`, case-insensitive, applied right to left:
 >
 > | Example | Meaning |
 > |---|---|
-> | `box3_025.jpg` | the photo itself (primary front) |
+> | `box3_025.jpg` | the photo itself (the print's front, no variant letter) |
 > | `box3_025-b.jpg` or `box3_025b.jpg` | another scan of the same object (variant letter, with or without dash after a digit) |
 > | `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
 > | `album-page1.jpg`, `album-page2.jpg` | ordered pages of one document |
-> | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but never analyzed as an object of its own |
+> | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but never analyzed as an object of its own — under `--group-by object` and `pair`; `--group-by none` has no groups, so every crop is analyzed as its own object and billed as one |
 >
 > The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other explicitly numbered pages.
 >
 > Every input mode reads this whole grammar and resolves it the same way, because they all route through one grouper. Pages and negatives reach the model in folder mode exactly as they do in manifest mode; crops are recorded with their group rather than analyzed, with a warning naming each one. To see how a folder would be grouped before spending anything on it, run `photokin --folder ./scans/ --generate-manifest scans-manifest.json`: it writes the manifest the run would have used and stops.
 >
-> Resolution does not depend on the order the files are listed in: a crop never takes its parent's place, and a negative is analyzed as a negative rather than mistaken for the front. Both are recorded in the group's `all_variant_files` — under `crops` and `negatives` — and crops are named in a warning rather than sent to the model. The exception is a crop with no uncropped original for the same side of the same variant: with nothing else to stand for that side, the crop is analyzed in its place, and says so. That is judged per side, so a group holding `box3_025-crop.jpg` and `box3_025-back.jpg` still gets both a front and a back.
+> Resolution does not depend on the order the files are listed in: a crop never takes its parent's place, and a negative is analyzed as a negative rather than mistaken for the front. Both are recorded in the group's `all_variant_files` — under `crops` and `negatives` — and a negative travels under a `Negative` label and carries a `negative` keyword of its own, the way a back carries `back`. Those two keywords are per-file, so they are taken back off the other files of the group, which share its metadata — but only in a group that actually holds such a part. A print you tagged `Negative` by hand, in a group holding no negative, keeps the keyword. Crops are named in a warning rather than sent to the model. The exception is a crop with no uncropped original for the same side of the same variant: with nothing else to stand for that side, the crop is analyzed in its place, and says so. That is judged per side, so a group holding `box3_025-crop.jpg` and `box3_025-back.jpg` still gets both a front and a back.
 >
-> Without `--process-all-variants` a group is sent one front and one back. The back is the primary front's own if it has one, and otherwise a variant's: given `box3_025.jpg`, `box3_025b.jpg` and `box3_025b-back.jpg`, the call is `box3_025.jpg` plus `box3_025b-back.jpg`, because the variants are scans of one object and so that back is the object's back. Only groups shaped that way — a primary front with no back of its own, beside a variant that has one — cost the extra image. Folder mode in earlier releases sent no back at all in that case; manifest mode already sent it.
+> Under `object` a group is sent every image it holds: given `box3_025.jpg`, `box3_025b.jpg` and `box3_025b-back.jpg`, all three go in the one call, because the variants are scans of one object and so that back is the object's back. That costs images rather than calls — one call per group either way — and only for groups holding more than one scan of a side, which are uncommon. It buys the model every scan of the print, so it can read detail off whichever came out clearest. A group that is one front, or one front and its own back, is sent exactly as it always was.
+>
+> Files that are recorded but not sent are still exactly two kinds: a crop that yielded its parent's slot, and a file displaced out of a slot another file already held. Both are named in a warning and listed in the record.
 
 ## Folder mode
 
@@ -265,7 +277,7 @@ Folder and manifest input are read by the same grouper, so anything one handles 
 photokin --folder ./scans/ --provider anthropic > results.json
 ```
 
-Folder mode prints one aggregate JSON to stdout, shaped `{"results": {...}, "errors": {...}}` with **one entry per file** — every image in the folder appears in exactly one of the two, backs, variant scans, album pages, negatives and crops included. A record names the whole group it belongs to under `all_variant_files`, so you can still tell which files were scanned together and which one was sent to the model. Per-group diagnostics and the closing summary go to stderr, so read both.
+Folder mode prints one aggregate JSON to stdout, shaped `{"results": {...}, "errors": {...}}` with **one entry per file** — every image in the folder appears in exactly one of the two, backs, variant scans, album pages, negatives and crops included. A record names the whole group it belongs to under `all_variant_files`, so you can still tell which files were scanned together and which of them the model was shown. Per-group diagnostics and the closing summary go to stderr, so read both.
 
 For bigger or more repeatable jobs, manifest mode takes a JSON file instead of a folder and adds `--output-file`: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end. `--generate-manifest` turns a folder into exactly that file:
 
@@ -302,9 +314,11 @@ Flags are optional when the filename already says the same thing; they exist so 
 | `is_crop` | `true` marks a cropped derivative, so the file is recorded with its group but not analyzed; `false` unmarks a file whose name ends in `-crop`. |
 | `version` | The variant id, replacing any letter read off the filename. Any string, not just one letter; empty means no variant. |
 | `group` | The group key outright, for names the grammar cannot parse at all. `base_id` is accepted as an alias and loses to `group` when both are given. |
-| `preferred` | Picks which file of the group is the one analyzed, overriding the usual choice — among the files the group can actually send. It chooses between candidates; it cannot create a place for one. See below. |
+| `preferred` | Breaks a tie between two files claiming the same slot — the same side of the same variant — so the one you name is the one sent and the other is recorded and warned about. It chooses between candidates; it cannot create a place for one. See below. |
 
 Booleans may be written as JSON `true`/`false`, as `0`/`1`, or as the strings `"true"`, `"false"`, `"yes"`, `"no"`. A `null` value means "not specified" and leaves the filename in charge.
+
+`preferred` used to pick the one file of a group that got analyzed. There is no longer one — under `object` every scan of the group is sent — so what survives is the narrower job above: deciding which of two files contesting one slot travels. It also still nominates the file the group's analysis is filed under.
 
 Two shapes leave `preferred` with nothing to pick. A crop is a supporting view of its parent, so it yields the parent's place whenever the parent is listed — marking the crop `preferred` does not promote a derivative over the original it was cut from, and the crop is recorded rather than analyzed. Likewise a file that is untagged in a group whose front side is already claimed, such as a plain `album.jpg` beside an explicit `album-page1.jpg`: there is no part left for it to travel in, and `preferred` cannot make one. Both cases are warnings naming the file, and both are listed in the result record — crops under `all_variant_files.crops`, the rest under `all_variant_files.displaced` — so nothing disappears quietly.
 
@@ -408,11 +422,12 @@ The standalone applier also takes `--fields` to narrow which tags may be written
 
 | Flag                                               | What it does |
 |----------------------------------------------------|---|
-| `--update-policy {master_exact,merge_per_variant}` | Whether results apply to just the primary file or to every variant in a group (default `merge_per_variant`) |
-| `--process-all-variants`                           | Also analyze `-b`/`-c` variant scans, and every page of a multipage set, folding their outputs together (default off — only the primary scan of each group is analyzed). Works in every input mode |
+| `--group-by {object,pair,none}`                    | Grouping granularity, the one axis (default `object`). `object`: every scan of one print is one object and shares a single analysis. `pair`: each rescan — print plus variant letter — is analyzed on its own. `none`: every file alone. See below |
 | `--date-confidence-threshold X`                    | Minimum model confidence before a date guess is applied, 0-1 (default 0.7) |
 | `--location-confidence-threshold X`                | Same, for location guesses (default 0.7) |
 | `--no-update-vocab`                                | Don't append newly proposed keywords to the vocabulary file |
+
+`--group-by` replaced `--process-all-variants` and `--update-policy`. Both are still accepted so nothing that passes them crashes, but they do nothing and each warns once. There is no replacement for "analyze one scan per group and copy the answer onto the rest": `object` sends the whole group, `pair` one call per rescan, `none` one call per file. `object` never costs more model calls than the old default did — it forms the same groups and makes one call each — but a group holding more than one scan of the print now sends every one of them, so a five-scan group costs five images on that one call instead of two.
 
 ### Output
 

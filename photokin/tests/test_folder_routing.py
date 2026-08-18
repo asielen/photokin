@@ -19,13 +19,14 @@ This module covers the routing itself:
 * ``--generate-manifest`` against checked-in goldens -- both the document it
   writes and the grouping that document describes -- the round trip back in
   through ``--manifest``, and the atomicity of the write itself;
-* ``--process-all-variants``, dead in folder mode until B2, now changing what is
-  sent;
+* ``--group-by``, the one grouping axis Phase C1 collapsed
+  ``--process-all-variants`` and ``--update-policy`` into, changing folder
+  granularity across all three of its values;
 * single-photo input with ``--back`` behaving as the two-item manifest it is
   translated into, including a back the filename grammar cannot read;
-* an ordinary front/back folder still making exactly the model calls commit
-  7bcaf2f made, since the point of B2 was to add the missing groups rather than
-  to move the ones that already worked.
+* an ordinary front/back folder measured against the model calls commit 7bcaf2f
+  made: same call count, and the only payload that moved is the group holding
+  more than one scan of the print.
 
 Every model entry point is mocked, so no provider client is ever built and
 nothing here opens a socket. The image fixtures are empty placeholder files --
@@ -242,29 +243,28 @@ class _FolderRoutingTestCase(unittest.TestCase):
         shutil.copytree(_FOLDER_FIXTURE, folder)
         return folder
 
-    def run_folder(self, folder: str, *, process_all_variants: bool = False) -> _Run:
+    def run_folder(self, folder: str, *, group_by: str = utils.GROUP_BY_OBJECT) -> _Run:
         """Analyze *folder* with every model entry point recorded.
 
         Args:
             folder: Directory to analyze.
-            process_all_variants: Send every variant of a group in one call.
+            group_by: Grouping granularity, one of ``utils.GROUP_BY_VALUES``.
 
         Returns:
             The run's model calls, its aggregate result and its log records.
         """
-        config = utils.Config(process_all_variants=process_all_variants)
+        config = utils.Config(group_by=group_by)
         with _recording() as rec, self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
             result = core.analyze_folder(folder, config)
         return _Run(rec.calls, result, captured.records)
 
-    def run_manifest(self, manifest: dict | str, *, process_all_variants: bool = False) -> _Run:
+    def run_manifest(self, manifest: dict | str, *, group_by: str = utils.GROUP_BY_OBJECT) -> _Run:
         """Process *manifest* the way the folder path processes its synthesized one."""
-        config = utils.Config(process_all_variants=process_all_variants)
+        config = utils.Config(group_by=group_by)
         with _recording() as rec, self.assertLogs(_CORE_LOGGER, level=logging.INFO) as captured:
             result = core.process_manifest_stream(
                 manifest=manifest,
                 cfg=config,
-                update_policy=core.UPDATE_MERGE_PER_VARIANT,
                 strict_run_failures=True,
             )
         return _Run(rec.calls, result, captured.records)
@@ -362,11 +362,25 @@ class TestAlbumPagesReachTheModel(_FolderRoutingTestCase):
     )
 
     def test_an_album_page_set_is_sent_to_the_model(self) -> None:
+        # Every page, in one call. B2 analyzed the set but sent only page 1
+        # through ``analyze_photo``; retiring the primary in C1 is what puts the
+        # rest of the document in front of the model, and it is the largest
+        # single-file quality change of the phase.
         folder = self.make_folder("album-page1.jpg", "album-page2.jpg")
 
         run = self.run_folder(folder)
 
-        self.assertEqual(_sent(run.calls), [("photo", "album-page1.jpg", None, False)], self._LOST)
+        self.assertEqual(
+            _sent(run.calls),
+            [
+                (
+                    "parts",
+                    (("Page 1", ("album-page1.jpg",)), ("Page 2", ("album-page2.jpg",))),
+                    False,
+                )
+            ],
+            self._LOST,
+        )
         self.assert_nothing_skipped(run)
 
     def test_both_pages_are_recorded_and_the_page_map_names_them(self) -> None:
@@ -398,7 +412,14 @@ class TestAlbumPagesReachTheModel(_FolderRoutingTestCase):
 
         self.assertEqual(
             _sent(run.calls),
-            [("photo", "album-page1.jpg", None, False), ("photo", "box3_025.jpg", None, False)],
+            [
+                (
+                    "parts",
+                    (("Page 1", ("album-page1.jpg",)), ("Page 2", ("album-page2.jpg",))),
+                    False,
+                ),
+                ("photo", "box3_025.jpg", None, False),
+            ],
             self._LOST,
         )
         self.assertEqual(
@@ -426,7 +447,7 @@ class TestNegativeOnlyGroupsReachTheModel(_FolderRoutingTestCase):
             _sent(run.calls),
             [
                 ("photo", "box3_025.jpg", None, False),
-                ("photo", "box3_026-negative.jpg", None, False),
+                ("parts", (("Negative", ("box3_026-negative.jpg",)),), False),
             ],
             "a negative-only group was not analyzed; folder mode used to skip "
             "every group whose primary front was absent",
@@ -443,14 +464,21 @@ class TestNegativeOnlyGroupsReachTheModel(_FolderRoutingTestCase):
         self.assertEqual(
             run.result["results"][negative]["all_variant_files"]["negatives"], [negative]
         )
+        # C1's other half: a back has carried a "back" keyword since before the
+        # plan; a negative carried nothing, so the rule "every file in a group
+        # shares one analysis except its own part marker" was half implemented.
+        self.assertIn("negative", run.result["results"][negative]["keywords"])
 
-    def test_under_all_variants_it_travels_as_a_negative_part(self) -> None:
+    def test_it_always_travels_as_a_negative_part(self) -> None:
         # Not as a "Front": the part label is what the model is told the image
         # is, and B1 gave negatives their own slot precisely so a negative is
-        # never described as the print.
+        # never described as the print. Before C1 that label was reachable only
+        # with --process-all-variants; the default sent the negative through
+        # ``analyze_photo`` as the group's front-side fallback. Same one image,
+        # same one call -- only the label changed, and now it is true.
         folder = self.make_folder("box3_026-negative.jpg")
 
-        run = self.run_folder(folder, process_all_variants=True)
+        run = self.run_folder(folder)
 
         self.assertEqual(
             _sent(run.calls), [("parts", (("Negative", ("box3_026-negative.jpg",)),), False)]
@@ -533,45 +561,53 @@ class TestBackOnlyGroupsReachTheModel(_FolderRoutingTestCase):
         )
 
 
-class TestAVariantsBackIsPairedWithThePrimaryFront(_FolderRoutingTestCase):
+class TestAVariantsBackTravelsWithItsGroup(_FolderRoutingTestCase):
     """An accepted behavior change, pinned here so it stays a decision.
 
-    Where a group's primary front has no back of its own but a variant scan
-    does, folder mode used to send the front alone and never send the back at
-    all::
+    Where a group's primary front had no back of its own but a variant scan did,
+    folder mode used to send the front alone and never send the back at all::
 
         7bcaf2f : photo(front=box3_025.jpg, back=None)
         B2      : photo(front=box3_025.jpg, back=box3_025b-back.jpg)
+        C1      : front_back([box3_025b.jpg, box3_025.jpg], [box3_025b-back.jpg])
 
-    This is not a B2 invention -- 7bcaf2f's *manifest* mode already made the
-    second call for the same three files, so it is B1 grouping arriving in
-    folder mode, which is what parity means. The maintainer decided to keep it:
-    the variants are scans of one object, so that back is the object's back, and
-    the old behavior was ignoring an available scan of it.
+    B2's answer was 7bcaf2f's *manifest* answer arriving in folder mode, which
+    is what parity means, and the maintainer kept it: the variants are scans of
+    one object, so that back is the object's back. C1 goes one step further for
+    the same reason -- with the primary retired there is no "the group's back"
+    to pair, because every scan the group holds is sent.
 
-    The cost is bounded and worth stating: one extra image on the one call, and
-    only for groups shaped this way. A group whose primary front has its own
-    back is untouched -- ``TestOrdinaryFolderIsUnchangedFrom7bcaf2f`` pins that
-    -- because the primary's own back outranks a variant's for the slot.
+    The cost is images, never calls: this group cost one call before and costs
+    one now. ``pair`` is the value that still judges each rescan on its own, and
+    it is the only one under which the question "which back goes with which
+    front" is still asked.
     """
 
     _FIXTURE = ("box3_025.jpg", "box3_025b.jpg", "box3_025b-back.jpg")
 
-    def test_the_variants_back_is_sent_as_the_groups_back(self) -> None:
+    def test_the_variants_back_is_sent_with_the_rest_of_the_group(self) -> None:
         folder = self.make_folder(*self._FIXTURE)
 
         run = self.run_folder(folder)
 
         self.assertEqual(
             _sent(run.calls),
-            [("photo", "box3_025.jpg", "box3_025b-back.jpg", False)],
+            [
+                (
+                    "front_back",
+                    ("box3_025b.jpg", "box3_025.jpg"),
+                    ("box3_025b-back.jpg",),
+                    False,
+                )
+            ],
             "the group's only back scan is no longer being sent. 7bcaf2f's folder "
-            "mode sent photo(box3_025.jpg, None) here and manifest mode sent the "
-            "back; B2 chose the manifest answer deliberately, so a bare None back "
-            "means folder mode has drifted out of parity again",
+            "mode sent photo(box3_025.jpg, None) here and never sent the back; "
+            "under --group-by object every scan of the print travels in the one "
+            "call, so a payload missing the back means the group is being split "
+            "again",
         )
 
-    def test_this_is_the_answer_manifest_mode_gave_before_the_routing(self) -> None:
+    def test_this_is_the_answer_manifest_mode_gives_for_the_same_files(self) -> None:
         # The literal above could be satisfied by a folder-only rule that
         # happens to agree today. What makes it correct is that it is the same
         # answer the manifest pipeline produces for the same three files, which
@@ -586,24 +622,48 @@ class TestAVariantsBackIsPairedWithThePrimaryFront(_FolderRoutingTestCase):
             folder_run.calls,
             manifest_run.calls,
             "folder input and the equivalent manifest disagree about this group, "
-            "so the variant-back pairing is a folder-mode quirk rather than the "
-            "parity it was accepted as",
+            "so the payload is a folder-mode quirk rather than the parity it was "
+            "accepted as",
         )
 
-    def test_a_primary_with_its_own_back_still_prefers_it(self) -> None:
-        # The bound on the change: adding the primary's own back to the same
-        # fixture must put the pairing back where 7bcaf2f had it, so this is one
-        # extra image for one group shape and not a general re-pairing.
+    def test_under_pair_the_variants_back_stays_with_its_own_front(self) -> None:
+        # ``pair`` is where the pairing question survives, and the grammar
+        # answers it without a rule: a back carries the variant letter of the
+        # front it belongs to, so the two land in the same bucket and the
+        # unversioned front is judged alone.
+        folder = self.make_folder(*self._FIXTURE)
+
+        run = self.run_folder(folder, group_by=utils.GROUP_BY_PAIR)
+
+        self.assertEqual(
+            _sent(run.calls),
+            [
+                ("photo", "box3_025.jpg", None, False),
+                ("photo", "box3_025b.jpg", "box3_025b-back.jpg", False),
+            ],
+        )
+
+    def test_a_primary_with_its_own_back_adds_it_rather_than_replacing_one(self) -> None:
+        # The bound on the change: adding the primary front's own back to the
+        # same fixture sends both backs rather than choosing between them, so
+        # nothing displaces anything and no scan goes unseen.
         folder = self.make_folder(*self._FIXTURE, "box3_025-back.jpg")
 
         run = self.run_folder(folder)
 
         self.assertEqual(
             _sent(run.calls),
-            [("photo", "box3_025.jpg", "box3_025-back.jpg", False)],
-            "a variant's back displaced the primary front's own back; the "
-            "accepted change was to use a variant's back when the primary has "
-            "none, not to prefer one over the primary's",
+            [
+                (
+                    "front_back",
+                    ("box3_025b.jpg", "box3_025.jpg"),
+                    ("box3_025b-back.jpg", "box3_025-back.jpg"),
+                    False,
+                )
+            ],
+            "a back went missing from a four-scan group's payload; under "
+            "--group-by object the whole group is sent and nothing is chosen "
+            "between",
         )
 
     def test_every_file_is_still_recorded(self) -> None:
@@ -669,12 +729,10 @@ class TestFolderManifestParity(_FolderRoutingTestCase):
         folder = self.copy_fixture_folder()
         manifest = self._hand_written_manifest(folder)
 
-        for process_all_variants in (False, True):
-            with self.subTest(process_all_variants=process_all_variants):
-                folder_run = self.run_folder(folder, process_all_variants=process_all_variants)
-                manifest_run = self.run_manifest(
-                    manifest, process_all_variants=process_all_variants
-                )
+        for group_by in utils.GROUP_BY_VALUES:
+            with self.subTest(group_by=group_by):
+                folder_run = self.run_folder(folder, group_by=group_by)
+                manifest_run = self.run_manifest(manifest, group_by=group_by)
 
                 self.assertEqual(
                     folder_run.calls,
@@ -688,12 +746,10 @@ class TestFolderManifestParity(_FolderRoutingTestCase):
         folder = self.copy_fixture_folder()
         manifest = self._hand_written_manifest(folder)
 
-        for process_all_variants in (False, True):
-            with self.subTest(process_all_variants=process_all_variants):
-                folder_run = self.run_folder(folder, process_all_variants=process_all_variants)
-                manifest_run = self.run_manifest(
-                    manifest, process_all_variants=process_all_variants
-                )
+        for group_by in utils.GROUP_BY_VALUES:
+            with self.subTest(group_by=group_by):
+                folder_run = self.run_folder(folder, group_by=group_by)
+                manifest_run = self.run_manifest(manifest, group_by=group_by)
 
                 self.assertEqual(folder_run.result, manifest_run.result)
                 self.assertEqual(folder_run.result["errors"], {})
@@ -946,13 +1002,19 @@ class TestGeneratedManifestAtomicWrite(_CliTestCase):
         )
 
 
-class TestProcessAllVariantsWorksInFolderMode(_FolderRoutingTestCase):
-    """The flag was accepted, documented and dead in folder mode before B2.
+class TestGroupByChangesFolderGranularity(_FolderRoutingTestCase):
+    """The one grouping axis, over a folder holding every shape it separates.
 
-    ``core.py:915``: the group-aware branch lived in the manifest path, which
-    folder input never entered, so ``--process-all-variants`` changed nothing at
-    all -- both settings analyzed the same single primary file and the flag read
-    as a no-op the user had no way to detect.
+    This class replaces ``TestProcessAllVariantsWorksInFolderMode``. That flag
+    was accepted, documented and dead in folder mode before B2, and B2 made it
+    work; C1 retires it, because "how many images go in the call" and "which
+    files get written" were never two knobs -- granularity is one axis, and the
+    payload follows from the group rather than from a flag.
+
+    The costs pinned below are the ones in the plan's own table: ``object``
+    makes one call per print, ``pair`` one per rescan, ``none`` one per file.
+    ``object`` never costs more calls than the code did before C1, only more
+    images, and only for a group holding more than one front-side scan.
     """
 
     def _mixed_folder(self) -> str:
@@ -964,41 +1026,29 @@ class TestProcessAllVariantsWorksInFolderMode(_FolderRoutingTestCase):
             "box3_025b.jpg",
         )
 
-    def test_the_flag_changes_what_the_model_is_sent(self) -> None:
+    def test_the_three_values_send_the_model_three_different_things(self) -> None:
         folder = self._mixed_folder()
 
-        off = self.run_folder(folder)
-        on = self.run_folder(folder, process_all_variants=True)
+        payloads = {
+            group_by: _sent(self.run_folder(folder, group_by=group_by).calls)
+            for group_by in utils.GROUP_BY_VALUES
+        }
 
-        self.assertNotEqual(
-            _sent(off.calls),
-            _sent(on.calls),
-            "--process-all-variants is a no-op in folder mode again",
+        self.assertEqual(
+            len({repr(payload) for payload in payloads.values()}),
+            len(utils.GROUP_BY_VALUES),
+            f"--group-by is not changing what is sent: {payloads}",
         )
 
-    def test_with_the_flag_off_only_the_primary_pair_is_sent(self) -> None:
+    def test_object_sends_each_group_whole_in_one_call(self) -> None:
         folder = self._mixed_folder()
 
         run = self.run_folder(folder)
 
-        self.assertEqual(
-            _sent(run.calls),
-            [
-                ("photo", "album-page1.jpg", None, False),
-                ("photo", "box3_025.jpg", "box3_025-back.jpg", False),
-            ],
-        )
-
-    def test_with_the_flag_on_each_group_travels_whole_in_one_call(self) -> None:
-        folder = self._mixed_folder()
-
-        run = self.run_folder(folder, process_all_variants=True)
-
         # The versioned front leading the unversioned one is what the manifest
         # path has always done here -- ``variant_list_sorted`` sorts ``None``
-        # last -- and B2 changed nothing about it. Pinned as observed rather
-        # than as intended: folder input reaches this ordering for the first
-        # time, so this is where a later decision to change it will surface.
+        # last -- and neither B2 nor C1 changed it. Pinned as observed rather
+        # than as intended, so a later decision to change it surfaces here.
         self.assertEqual(
             _sent(run.calls),
             [
@@ -1016,6 +1066,65 @@ class TestProcessAllVariantsWorksInFolderMode(_FolderRoutingTestCase):
             ],
         )
 
+    def test_pair_judges_each_rescan_on_its_own(self) -> None:
+        folder = self._mixed_folder()
+
+        run = self.run_folder(folder, group_by=utils.GROUP_BY_PAIR)
+
+        # The pages carry no variant letter, so a multipage set stays whole:
+        # splitting it is ``none``'s price, not ``pair``'s.
+        self.assertEqual(
+            _sent(run.calls),
+            [
+                (
+                    "parts",
+                    (("Page 1", ("album-page1.jpg",)), ("Page 2", ("album-page2.jpg",))),
+                    False,
+                ),
+                ("photo", "box3_025.jpg", "box3_025-back.jpg", False),
+                ("photo", "box3_025b.jpg", None, False),
+            ],
+        )
+
+    def test_none_analyzes_every_file_alone_and_splits_the_album(self) -> None:
+        folder = self._mixed_folder()
+
+        run = self.run_folder(folder, group_by=utils.GROUP_BY_NONE)
+
+        # One call per file, backs separated from fronts, and page 2 analyzed
+        # with no page 1 in front of the model. That last one is meaningless
+        # output and it is stated as such in the --group-by help text: it is the
+        # accepted cost of "split every file", not a carve-out.
+        self.assertEqual(
+            _sent(run.calls),
+            [
+                ("parts", (("Page 1", ("album-page1.jpg",)),), False),
+                ("parts", (("Page 2", ("album-page2.jpg",)),), False),
+                ("photo", "box3_025-back.jpg", None, False),
+                ("photo", "box3_025.jpg", None, False),
+                ("photo", "box3_025b.jpg", None, False),
+            ],
+        )
+
+    def test_every_file_is_recorded_at_every_value(self) -> None:
+        folder = self._mixed_folder()
+
+        for group_by in utils.GROUP_BY_VALUES:
+            with self.subTest(group_by=group_by):
+                run = self.run_folder(folder, group_by=group_by)
+
+                self.assertEqual(
+                    self.basenames(run.result["results"]),
+                    [
+                        "album-page1.jpg",
+                        "album-page2.jpg",
+                        "box3_025-back.jpg",
+                        "box3_025.jpg",
+                        "box3_025b.jpg",
+                    ],
+                )
+                self.assertEqual(run.result["errors"], {})
+
 
 class TestSinglePhotoModeMatchesATwoItemManifest(_CliTestCase):
     """``--back`` is the one place folder-style input carries a real override.
@@ -1024,7 +1133,8 @@ class TestSinglePhotoModeMatchesATwoItemManifest(_CliTestCase):
     that one" whatever it is called. B2 turns that into ``is_back`` plus a shared
     ``group`` on a two-item manifest, which is the only way the pair stays one
     object: without the group key the two files bucket separately and the run
-    makes two calls and pays twice.
+    makes two calls and pays twice. C1 added the front's ``version`` to that
+    address, because ``--group-by pair`` keys on the variant letter as well.
     """
 
     def _photo_run(self, argv: list[str]) -> tuple[dict, list[tuple]]:
@@ -1078,25 +1188,66 @@ class TestSinglePhotoModeMatchesATwoItemManifest(_CliTestCase):
             built["items"],
             [
                 {"path": front, "group": "box3_025"},
-                {"path": back, "group": "box3_025", "is_back": True},
+                # ``""`` is the documented spelling of "no variant letter": the
+                # front has none, so neither has its back, whatever its own name
+                # would have been read as.
+                {"path": back, "group": "box3_025", "version": "", "is_back": True},
             ],
         )
         self.assertEqual(built["source"], {"type": "single", "path": front})
 
+    def test_the_backs_version_is_pinned_to_the_fronts(self) -> None:
+        folder = self.make_folder("box3_025b.jpg", "reverse.jpg")
 
-class TestOrdinaryFolderIsUnchangedFrom7bcaf2f(_FolderRoutingTestCase):
-    """B2 was to add the missing groups, not to move the ones that already worked.
+        built = core.build_single_photo_manifest(
+            os.path.join(folder, "box3_025b.jpg"), os.path.join(folder, "reverse.jpg")
+        )
 
-    The literals below were captured by running commit 7bcaf2f's ``analyze_folder``
-    over this fixture with the analyzers recorded. Everything in it -- a lone
-    front, a front with a back and a "b" rescan of both, a second extension --
-    was analyzed correctly before the routing, so any difference here is
-    collateral damage rather than the fix.
+        self.assertEqual(built["items"][1]["version"], "b")
 
-    One thing does change, deliberately and documented as Breaking change #2:
-    ``results`` holds one entry per file instead of one per group. That is
-    asserted below as the *only* difference, so the shape change stays a
-    decision rather than something the next reader has to rediscover.
+    def test_a_back_whose_name_ends_in_a_letter_is_not_split_off_under_pair(self) -> None:
+        # ``pair`` keys on the variant letter, and the grammar reads one off
+        # every name in this list -- ordinary camera and scanner output, and
+        # exactly the sort of name --back exists to handle. Left to the
+        # filename, the back buckets alone and reaches the model with no front
+        # attached: handwriting with no photo, which is the quality loss the
+        # plan reserves for the ``none`` escape hatch.
+        for back_name in ("reverse.jpg", "IMG_0042b.jpg", "scan-b.jpg", "DSC_0001a.jpg"):
+            for group_by in (utils.GROUP_BY_OBJECT, utils.GROUP_BY_PAIR):
+                with self.subTest(back=back_name, group_by=group_by):
+                    folder = self.make_folder("box3_025.jpg", back_name)
+                    front = os.path.join(folder, "box3_025.jpg")
+                    back = os.path.join(folder, back_name)
+
+                    run = self.run_manifest(
+                        core.build_single_photo_manifest(front, back),
+                        group_by=group_by,
+                    )
+
+                    self.assertEqual(
+                        _sent(run.calls),
+                        [("photo", "box3_025.jpg", back_name, False)],
+                        "--back states the pairing outright; only --group-by "
+                        "none is allowed to ignore it",
+                    )
+
+
+class TestOrdinaryFolderAgainst7bcaf2f(_FolderRoutingTestCase):
+    """What an ordinary folder costs now, measured against the pre-plan baseline.
+
+    ``_BASELINE_CALLS`` was captured by running commit 7bcaf2f's
+    ``analyze_folder`` over this fixture with the analyzers recorded. Through
+    B2 it was the assertion; C1 keeps it as the documented BEFORE, because
+    retiring the primary changed exactly one group in it -- the four-scan one --
+    and left the two single-file groups alone.
+
+    The change is images, not calls: three calls before, three calls now, and
+    the four-scan group's payload goes from 2 images to 4. No shape gains a call
+    under ``object``, at any scale, because ``object`` forms exactly the groups
+    the code already formed and makes one call per group.
+
+    One further thing changed in B2, deliberately and documented as Breaking
+    change #2: ``results`` holds one entry per file instead of one per group.
     """
 
     _FIXTURE: ClassVar[tuple[str, ...]] = (
@@ -1109,9 +1260,23 @@ class TestOrdinaryFolderIsUnchangedFrom7bcaf2f(_FolderRoutingTestCase):
     )
     #: Captured from 7bcaf2f. ``write_sidecar`` is part of the tuple because the
     #: old folder path passed it explicitly, keeping the sidecar write to itself.
+    #: Two of the three survive C1 unchanged; the middle one is the group that
+    #: now travels whole, and ``box3_025b{,-back}.jpg`` were never sent at all.
     _BASELINE_CALLS: ClassVar[list[tuple]] = [
         ("photo", "box3_024.jpg", None, False),
         ("photo", "box3_025.jpg", "box3_025-back.jpg", False),
+        ("photo", "box3_026.png", None, False),
+    ]
+    #: The same folder under the default axis value: same three calls, and the
+    #: only difference is the two scans 7bcaf2f recorded and never sent.
+    _CURRENT_CALLS: ClassVar[list[tuple]] = [
+        ("photo", "box3_024.jpg", None, False),
+        (
+            "front_back",
+            ("box3_025b.jpg", "box3_025.jpg"),
+            ("box3_025b-back.jpg", "box3_025-back.jpg"),
+            False,
+        ),
         ("photo", "box3_026.png", None, False),
     ]
     #: Captured from 7bcaf2f: ``{"front": [...], "back": [...]}`` for the one
@@ -1123,14 +1288,38 @@ class TestOrdinaryFolderIsUnchangedFrom7bcaf2f(_FolderRoutingTestCase):
     #: Captured from 7bcaf2f: one result key per group, the primary front.
     _BASELINE_RESULT_KEYS: ClassVar[list[str]] = ["box3_024.jpg", "box3_025.jpg", "box3_026.png"]
 
-    def test_the_model_receives_exactly_what_7bcaf2f_sent_it(self) -> None:
+    def test_the_default_sends_every_scan_of_the_multi_scan_group(self) -> None:
         run = self.run_folder(self.make_folder(*self._FIXTURE))
 
         self.assertEqual(
             _sent(run.calls),
-            self._BASELINE_CALLS,
-            "an ordinary front/back folder changed: B2 was meant to add the "
-            "groups folder mode dropped, not to re-route the ones it handled",
+            self._CURRENT_CALLS,
+            "the default payload moved. --group-by object sends every scan a "
+            "group holds in one call; a primary pair here means the retired "
+            "primary is back",
+        )
+
+    def test_the_single_file_groups_are_the_ones_7bcaf2f_sent(self) -> None:
+        # The bound on the change, and the reason it was accepted: the cost is
+        # confined to groups holding more than one front-side scan. Every other
+        # group in the folder is byte-identical to the pre-plan baseline.
+        run = self.run_folder(self.make_folder(*self._FIXTURE))
+
+        unchanged = [call for call in _sent(run.calls) if call[0] == "photo"]
+        self.assertEqual(
+            unchanged,
+            [call for call in self._BASELINE_CALLS if call[1] != "box3_025.jpg"],
+        )
+
+    def test_no_shape_here_costs_more_calls_than_7bcaf2f(self) -> None:
+        run = self.run_folder(self.make_folder(*self._FIXTURE))
+
+        self.assertEqual(
+            len(run.calls),
+            len(self._BASELINE_CALLS),
+            "--group-by object gained a model call. It forms exactly the groups "
+            "the code already formed and makes one call per group, so the entire "
+            "cost of retiring the primary is images-per-call",
         )
 
     def test_the_variant_file_lists_are_the_ones_7bcaf2f_recorded(self) -> None:

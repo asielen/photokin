@@ -75,15 +75,28 @@ class _RecordingAnalyzers:
 
 
 @contextmanager
-def _recording(keywords: list[str] | None = None) -> Iterator[_RecordingAnalyzers]:
-    """Patch the three analyzers with recorders for the duration of the block."""
+def _recording(
+    keywords: list[str] | None = None, *, real_patch_builder: bool = False
+) -> Iterator[_RecordingAnalyzers]:
+    """Patch the three analyzers with recorders for the duration of the block.
+
+    Args:
+        keywords: Keywords the stand-in analyses return.
+        real_patch_builder: Leave ``build_canonical_patch`` alone. It is stubbed
+            by default because these cases assert on the model call, not on the
+            patch -- but the changeset diffs the record against the patch, so a
+            stubbed empty patch makes every keyword the file already had look
+            like a proposed deletion.
+    """
     rec = _RecordingAnalyzers(keywords)
     with patch("photokin.core.analyze_photo", rec.photo), patch(
         "photokin.core.analyze_group_front_back", rec.front_back
-    ), patch("photokin.core.analyze_group_parts", rec.parts), patch(
-        "photokin.core.build_canonical_patch", return_value=({}, {})
-    ):
-        yield rec
+    ), patch("photokin.core.analyze_group_parts", rec.parts):
+        if real_patch_builder:
+            yield rec
+        else:
+            with patch("photokin.core.build_canonical_patch", return_value=({}, {})):
+                yield rec
 
 
 def _labelled_payload(calls: list[tuple]) -> list[tuple[str, str]]:
@@ -135,33 +148,38 @@ class ManifestGroupingTestCase(unittest.TestCase):
         self,
         manifest: dict | str,
         *,
-        process_all_variants: bool = False,
-        update_policy: str = core.UPDATE_MERGE_PER_VARIANT,
+        group_by: str = utils.GROUP_BY_OBJECT,
         model_keywords: list[str] | None = None,
+        changeset_writer=None,
     ) -> tuple[list[tuple], list[dict], list[str]]:
         """Process one manifest and return its model calls, records and warnings.
 
         Args:
             manifest: A manifest dict, or a path to one on disk.
-            process_all_variants: Send every variant in one call when true.
-            update_policy: Master-selection policy to apply.
+            group_by: Grouping granularity, one of ``utils.GROUP_BY_VALUES``.
             model_keywords: Keywords the mocked analysis returns.
+            changeset_writer: Receives each changeset NDJSON line, or ``None``
+                to emit no changeset. The run id is generated, since nothing
+                here asserts on it. Supplying one also keeps the real
+                ``build_canonical_patch``, which the changeset diffs against.
 
         Returns:
             A ``(calls, records, warnings)`` triple.
         """
-        cfg = utils.Config(dry_run=True, process_all_variants=process_all_variants)
+        cfg = utils.Config(dry_run=True, group_by=group_by)
         lines: list[str] = []
         with self.assertLogs("photokin.core", level="WARNING") as logs:
             # A group that warns about nothing would fail assertLogs, so keep a
             # message of our own in the buffer and drop it from the result.
             core.logger.warning("test-sentinel")
-            with _recording(model_keywords) as rec:
+            with _recording(
+                model_keywords, real_patch_builder=changeset_writer is not None
+            ) as rec:
                 core.process_manifest_stream(
                     manifest=manifest,
                     cfg=cfg,
-                    update_policy=update_policy,
                     ndjson_writer=lines.append,
+                    changeset_writer=changeset_writer,
                 )
         warnings = [m for m in logs.output if "test-sentinel" not in m]
         return rec.calls, [json.loads(line) for line in lines], warnings
@@ -170,16 +188,16 @@ class ManifestGroupingTestCase(unittest.TestCase):
         self,
         items: list[dict],
         *,
-        process_all_variants: bool = False,
-        update_policy: str = core.UPDATE_MERGE_PER_VARIANT,
+        group_by: str = utils.GROUP_BY_OBJECT,
         model_keywords: list[str] | None = None,
+        changeset_writer=None,
     ) -> tuple[list[tuple], list[dict], list[str]]:
         """Process an in-memory ``items`` array. See ``run_manifest_source``."""
         return self.run_manifest_source(
             {"items": items},
-            process_all_variants=process_all_variants,
-            update_policy=update_policy,
+            group_by=group_by,
             model_keywords=model_keywords,
+            changeset_writer=changeset_writer,
         )
 
     def assert_no_path_sent_under_two_labels(self, calls: list[tuple]) -> None:
@@ -205,8 +223,8 @@ class ManifestGroupingTestCase(unittest.TestCase):
     ) -> None:
         """Assert each listed file either reached the model or was named in a warning.
 
-        Only meaningful under ``--process-all-variants``, where the payload is
-        the whole slot map; the single-pair path leaves variants out by design.
+        Meaningful for a group payload, where the payload is the whole slot
+        map; the pair path carries one front and, at most, its own back.
 
         Args:
             items: The manifest's ``items`` array.
@@ -288,12 +306,16 @@ class TestCropSlotOccupancy(ManifestGroupingTestCase):
         self.assertEqual(calls, [("photo", _p("s/a-crop.jpg"), _p("s/a-back.jpg"))])
         self.assertTrue(any("no uncropped original" in w for w in warnings))
 
-    def test_cropped_front_survives_under_process_all_variants(self):
+    def test_cropped_front_survives_under_pair_too(self):
+        # ``pair`` cannot separate a crop from its parent, and it is not a rule
+        # anyone had to write: ``parse_media_filename`` strips ``-crop`` before
+        # it reads the part suffix or the variant letter, so a crop always
+        # carries its parent's base id and version.
         items = [{"path": "s/a-crop.jpg"}, {"path": "s/a-back.jpg"}]
-        calls, _records, _warnings = self.run_manifest(items, process_all_variants=True)
-        self.assertEqual(
-            calls, [("front_back", (_p("s/a-crop.jpg"),), (_p("s/a-back.jpg"),))]
+        calls, _records, _warnings = self.run_manifest(
+            items, group_by=utils.GROUP_BY_PAIR
         )
+        self.assertEqual(calls, [("photo", _p("s/a-crop.jpg"), _p("s/a-back.jpg"))])
 
     def test_crop_ness_is_tested_per_slot_even_when_the_group_is_full_of_originals(self):
         # "Does this group contain anything uncropped" answers a resounding yes
@@ -306,11 +328,9 @@ class TestCropSlotOccupancy(ManifestGroupingTestCase):
             {"path": "s/a2b.jpg"},
             {"path": "s/a2b-back.jpg"},
         ]
-        for process_all_variants in (False, True):
-            with self.subTest(process_all_variants=process_all_variants):
-                calls, _records, _warnings = self.run_manifest(
-                    items, process_all_variants=process_all_variants
-                )
+        for group_by in utils.GROUP_BY_VALUES:
+            with self.subTest(group_by=group_by):
+                calls, _records, _warnings = self.run_manifest(items, group_by=group_by)
                 self.assertIn(
                     _p("s/a2-crop.jpg"),
                     [path for _label, path in _labelled_payload(calls)],
@@ -327,10 +347,8 @@ class TestCropSlotOccupancy(ManifestGroupingTestCase):
             {"path": "s/a3-crop.jpg"},
             {"path": "s/a3-back.jpg"},
         ]
-        calls, _records, warnings = self.run_manifest(items, process_all_variants=True)
-        self.assertEqual(
-            calls, [("front_back", (_p("s/a3.jpg"),), (_p("s/a3-back.jpg"),))]
-        )
+        calls, _records, warnings = self.run_manifest(items)
+        self.assertEqual(calls, [("photo", _p("s/a3.jpg"), _p("s/a3-back.jpg"))])
         self.assertTrue(
             any("recorded but not analyzed" in w and "a3-crop.jpg" in w for w in warnings)
         )
@@ -342,18 +360,27 @@ class TestCropSlotOccupancy(ManifestGroupingTestCase):
             calls, [("photo", _p("s/b025.jpg"), _p("s/b025-back-crop.jpg"))]
         )
 
-    def test_orphan_crop_warning_names_only_the_crop_that_was_analyzed(self):
-        # Two crops, two variants, no original: only the first is analyzed, so
-        # only the first may be described as standing in for the object.
+    def test_the_orphan_crop_warning_names_every_crop_that_was_analyzed(self):
+        # Two crops, two variants, no original. Each is the sole claimant of its
+        # own slot, so each stands in for the object at its own variant letter,
+        # and with the group travelling whole both are analyzed and both say so.
+        # Before C1 only the first was sent and the second was "recorded but not
+        # analyzed" -- a scan paid for by the user and never looked at.
         items = [{"path": "s/a025-crop.jpg"}, {"path": "s/a025b-crop.jpg"}]
         calls, _records, warnings = self.run_manifest(items)
-        self.assertEqual(calls, [("photo", _p("s/a025-crop.jpg"), None)])
+        self.assertEqual(
+            calls,
+            [("front_back", (_p("s/a025b-crop.jpg"), _p("s/a025-crop.jpg")), ())],
+        )
         analyzed = [w for w in warnings if "no uncropped original" in w]
-        self.assertEqual(len(analyzed), 1, warnings)
-        self.assertIn("a025-crop.jpg", analyzed[0])
-        self.assertTrue(
-            any("recorded but not analyzed" in w and "a025b-crop.jpg" in w for w in warnings),
-            f"the unanalyzed crop was not disclosed: {warnings}",
+        self.assertEqual(len(analyzed), 2, warnings)
+        self.assertEqual(
+            sorted("a025b-crop.jpg" in w for w in analyzed), [False, True]
+        )
+        self.assertEqual(
+            [w for w in warnings if "recorded but not analyzed" in w],
+            [],
+            "a crop the payload actually carried was reported as unanalyzed",
         )
 
     def test_preferred_crop_left_out_of_the_group_payload_is_disclosed(self):
@@ -361,16 +388,18 @@ class TestCropSlotOccupancy(ManifestGroupingTestCase):
         # its own original, so a preferred crop is recorded rather than analyzed
         # and has to be named as such. README.md carries the carve-out.
         items = [{"path": "s/h1.jpg"}, {"path": "s/h1-crop.jpg", "preferred": True}]
-        for process_all_variants in (False, True):
-            with self.subTest(process_all_variants=process_all_variants):
-                calls, _records, warnings = self.run_manifest(
-                    items, process_all_variants=process_all_variants
-                )
+        # ``object`` and ``pair`` only: under ``none`` the crop is its own group,
+        # so there is no original beside it to lose the slot to and it is
+        # analyzed as an object in its own right. That is the mode's documented
+        # price, not a hole in this rule.
+        for group_by in (utils.GROUP_BY_OBJECT, utils.GROUP_BY_PAIR):
+            with self.subTest(group_by=group_by):
+                calls, _records, warnings = self.run_manifest(items, group_by=group_by)
                 self.assertEqual(
                     [path for _label, path in _labelled_payload(calls)],
                     [_p("s/h1.jpg")],
                     "a preferred crop must not be analyzed while its own "
-                    "uncropped original is listed, in either setting",
+                    "uncropped original is listed, at either granularity",
                 )
                 self.assertTrue(
                     any(
@@ -389,10 +418,8 @@ class TestCropSlotOccupancy(ManifestGroupingTestCase):
             {"path": "s/h3-back.jpg"},
             {"path": "s/h3-crop.jpg", "preferred": True},
         ]
-        calls, records, _warnings = self.run_manifest(items, process_all_variants=True)
-        self.assertEqual(
-            calls, [("front_back", (_p("s/h3.jpg"),), (_p("s/h3-back.jpg"),))]
-        )
+        calls, records, _warnings = self.run_manifest(items)
+        self.assertEqual(calls, [("photo", _p("s/h3.jpg"), _p("s/h3-back.jpg"))])
         self.assertEqual(
             {rec["status"] for rec in records},
             {"ok"},
@@ -408,11 +435,11 @@ class TestCropSlotOccupancy(ManifestGroupingTestCase):
             {"path": "s/pf1.jpg", "group": "pf"},
             {"path": "s/pf2.jpg", "group": "pf", "preferred": True},
         ]
-        for process_all_variants in (False, True):
-            with self.subTest(process_all_variants=process_all_variants):
-                calls, _records, warnings = self.run_manifest(
-                    items, process_all_variants=process_all_variants
-                )
+        # Not under ``none``: an explicit ``group`` override has no effect on a
+        # key that is the file's own path, so the two never contest a slot.
+        for group_by in (utils.GROUP_BY_OBJECT, utils.GROUP_BY_PAIR):
+            with self.subTest(group_by=group_by):
+                calls, _records, warnings = self.run_manifest(items, group_by=group_by)
                 self.assertEqual(
                     [path for _label, path in _labelled_payload(calls)],
                     [_p("s/pf2.jpg")],
@@ -429,7 +456,7 @@ class TestCropSlotOccupancy(ManifestGroupingTestCase):
             {"path": "s/cm1-crop.jpg"},
             {"path": "s/cm1-page2.jpg"},
         ]
-        _calls, records, _warnings = self.run_manifest(items, process_all_variants=True)
+        _calls, records, _warnings = self.run_manifest(items)
         variant_map = records[0]["result"]["all_variant_files"]
         self.assertEqual(variant_map["pages"], {
             "1": [_p("s/cm1.jpg")], "2": [_p("s/cm1-page2.jpg")]
@@ -442,7 +469,7 @@ class TestPageSlots(ManifestGroupingTestCase):
 
     def test_page_zero_does_not_evict_page_one(self):
         items = [{"path": "s/al-page0.jpg"}, {"path": "s/al-page1.jpg"}]
-        calls, records, _warnings = self.run_manifest(items, process_all_variants=True)
+        calls, records, _warnings = self.run_manifest(items)
         self.assertEqual(
             calls,
             [(
@@ -460,7 +487,7 @@ class TestPageSlots(ManifestGroupingTestCase):
 
     def test_page_zero_is_not_relabelled_as_page_one(self):
         items = [{"path": "s/al-page0.jpg"}, {"path": "s/al-page2.jpg"}]
-        calls, _records, _warnings = self.run_manifest(items, process_all_variants=True)
+        calls, _records, _warnings = self.run_manifest(items)
         labels = [label for label, _paths in calls[0][1]]
         self.assertEqual(labels, ["Page 0", "Page 2"])
 
@@ -470,7 +497,7 @@ class TestPageSlots(ManifestGroupingTestCase):
         # exposes it from both ends: both files reach the model, and the slot
         # map holds two distinct pages rather than one contested one.
         items = [{"path": "s/pz-page0.jpg"}, {"path": "s/pz-page1.jpg"}]
-        calls, records, warnings = self.run_manifest(items, process_all_variants=True)
+        calls, records, warnings = self.run_manifest(items)
         self.assertEqual(
             sorted(path for _label, path in _labelled_payload(calls)),
             sorted([_p("s/pz-page0.jpg"), _p("s/pz-page1.jpg")]),
@@ -498,36 +525,68 @@ class TestPageSlots(ManifestGroupingTestCase):
 
 
 class TestPreferredBack(ManifestGroupingTestCase):
-    """``preferred`` names the file to analyze, including when it is a back."""
+    """Every back of a group is sent, whichever of them ``preferred`` names.
 
-    def test_preferred_versioned_back_is_the_back_sent(self):
+    Through B2 this class pinned which single back a group sent, because only
+    one could travel and ``preferred`` was how a caller chose it -- and the B1
+    defect it guards is a ``preferred`` back being discarded outright while
+    resolving the primary. C1 retires the primary, so the question changes
+    shape: the group sends every back it holds, and the way to fail the guard
+    now is for one of them to go missing rather than for the wrong one to win.
+
+    ``preferred`` has not become inert. It remains the tie-break for two files
+    contesting one ``(version, part)`` slot --
+    ``TestCropSlotOccupancy.test_preferred_takes_a_slot_it_is_allowed_to_take``
+    pins that -- and it still nominates the file the analysis is filed under.
+    """
+
+    def test_a_preferred_versioned_back_is_sent_rather_than_discarded(self):
         items = [
             {"path": "s/k1.jpg"},
             {"path": "s/k1-back.jpg"},
             {"path": "s/k1b-back.jpg", "preferred": True},
         ]
         calls, _records, _warnings = self.run_manifest(items)
-        self.assertEqual(calls, [("photo", _p("s/k1.jpg"), _p("s/k1b-back.jpg"))])
+        self.assertEqual(
+            calls,
+            [(
+                "front_back",
+                (_p("s/k1.jpg"),),
+                (_p("s/k1b-back.jpg"), _p("s/k1-back.jpg")),
+            )],
+        )
 
-    def test_preferred_unversioned_back_beats_a_same_version_back(self):
-        # The front carries version 'b', so the version lookup alone would pick
-        # k1b-back.jpg and quietly ignore what the caller asked for.
+    def test_a_preferred_unversioned_back_is_sent_rather_than_discarded(self):
+        # The front carries version 'b', so a version lookup alone would drop
+        # k1-back.jpg -- which is the shape the B1 defect was found on.
         items = [
             {"path": "s/k1b.jpg"},
             {"path": "s/k1-back.jpg", "preferred": True},
             {"path": "s/k1b-back.jpg"},
         ]
         calls, _records, _warnings = self.run_manifest(items)
-        self.assertEqual(calls, [("photo", _p("s/k1b.jpg"), _p("s/k1-back.jpg"))])
+        self.assertEqual(
+            calls,
+            [(
+                "front_back",
+                (_p("s/k1b.jpg"),),
+                (_p("s/k1b-back.jpg"), _p("s/k1-back.jpg")),
+            )],
+        )
 
-    def test_unpreferred_group_still_pairs_a_front_with_its_own_variant_back(self):
-        items = [
+    def test_the_same_group_without_the_flag_sends_the_same_files(self):
+        # The consequence, stated directly: with every back in the payload there
+        # is nothing left for ``preferred`` to choose between, so setting it on
+        # a back no longer changes what the model is shown.
+        plain = [
             {"path": "s/k1b.jpg"},
             {"path": "s/k1-back.jpg"},
             {"path": "s/k1b-back.jpg"},
         ]
-        calls, _records, _warnings = self.run_manifest(items)
-        self.assertEqual(calls, [("photo", _p("s/k1b.jpg"), _p("s/k1b-back.jpg"))])
+        preferred = [plain[0], dict(plain[1], preferred=True), plain[2]]
+        plain_calls, _records, _warnings = self.run_manifest(plain)
+        preferred_calls, _records, _warnings = self.run_manifest(preferred)
+        self.assertEqual(plain_calls, preferred_calls)
 
     def test_a_pc_code_reaches_every_scan_of_the_object(self):
         # A PC* code is a short identifier the model transcribes off the print
@@ -553,30 +612,30 @@ class TestPreferredBack(ManifestGroupingTestCase):
                 f"{path} is a scan of the same print, so it must carry the code",
             )
 
-    def test_a_pc_code_reaches_a_variant_rescan_in_every_mode(self):
+    def test_a_pc_code_reaches_a_variant_rescan_at_every_granularity(self):
         # The case per-variant scoping actually lost: pc3b.jpg is a second scan
         # of the same print, and only one analysis runs for the group, so under
-        # the old rule the code never reached it in any policy or variant mode.
+        # the old rule the code never reached it. ``pair`` and ``none`` analyze
+        # it directly, so the code is read off its own scan there instead --
+        # either way the rescan ends up carrying it.
         items = [
             {"path": "s/pc3.jpg"},
             {"path": "s/pc3b.jpg"},
             {"path": "s/pc3-back.jpg"},
         ]
-        for process_all_variants in (False, True):
-            for update_policy in (core.UPDATE_MERGE_PER_VARIANT, core.UPDATE_MASTER_EXACT):
-                with self.subTest(pav=process_all_variants, policy=update_policy):
-                    _calls, records, _warnings = self.run_manifest(
-                        items,
-                        model_keywords=["PC-R-123", "portrait"],
-                        process_all_variants=process_all_variants,
-                        update_policy=update_policy,
-                    )
-                    keywords = {rec["path"]: rec["result"]["keywords"] for rec in records}
-                    self.assertIn(
-                        "PC-R-123",
-                        keywords[_p("s/pc3b.jpg")],
-                        "the variant rescan lost the code read off its sibling",
-                    )
+        for group_by in utils.GROUP_BY_VALUES:
+            with self.subTest(group_by=group_by):
+                _calls, records, _warnings = self.run_manifest(
+                    items,
+                    model_keywords=["PC-R-123", "portrait"],
+                    group_by=group_by,
+                )
+                keywords = {rec["path"]: rec["result"]["keywords"] for rec in records}
+                self.assertIn(
+                    "PC-R-123",
+                    keywords[_p("s/pc3b.jpg")],
+                    "the variant rescan lost the code read off its sibling",
+                )
 
     def test_that_scoping_matches_the_same_group_without_the_preferred_flag(self):
         base = [{"path": "s/pv2.jpg"}, {"path": "s/pv2b-back.jpg"}]
@@ -650,10 +709,8 @@ class TestPermutationInvariance(ManifestGroupingTestCase):
         ],
     )
 
-    def _signature(self, items: list[dict], process_all_variants: bool) -> str:
-        calls, records, warnings = self.run_manifest(
-            items, process_all_variants=process_all_variants
-        )
+    def _signature(self, items: list[dict], group_by: str) -> str:
+        calls, records, warnings = self.run_manifest(items, group_by=group_by)
         slots = {
             rec["path"]: {
                 key: rec["result"]["all_variant_files"].get(key)
@@ -669,18 +726,18 @@ class TestPermutationInvariance(ManifestGroupingTestCase):
 
     def test_every_grouping_decision_is_invariant_under_permutation(self):
         for group_index, group in enumerate(self.GROUPS):
-            for process_all_variants in (False, True):
+            for group_by in utils.GROUP_BY_VALUES:
                 baseline_order = [item["path"] for item in group]
-                expected = self._signature(list(group), process_all_variants)
+                expected = self._signature(list(group), group_by)
                 for permutation in itertools.permutations(group):
                     order = [item["path"] for item in permutation]
                     with self.subTest(
                         group=group_index,
-                        process_all_variants=process_all_variants,
+                        group_by=group_by,
                         order=order,
                     ):
                         self.assertEqual(
-                            self._signature(list(permutation), process_all_variants),
+                            self._signature(list(permutation), group_by),
                             expected,
                             "PHASE B1 REGRESSION: manifest listing order changed the "
                             "grouping. The same files in a different order must send "
@@ -708,7 +765,13 @@ class TestNegativeIsNotAnUntaggedFront(ManifestGroupingTestCase):
                 calls, records, _warnings = self.run_manifest(items)
                 self.assertEqual(
                     calls,
-                    [("photo", _p("s/n1.jpg"), None)],
+                    [(
+                        "parts",
+                        (
+                            ("Front", (_p("s/n1.jpg"),)),
+                            ("Negative", (_p("s/n1-negative.jpg"),)),
+                        ),
+                    )],
                     "the negative displaced the real scan as the group's front",
                 )
                 variant_map = records[0]["result"]["all_variant_files"]
@@ -720,14 +783,26 @@ class TestNegativeIsNotAnUntaggedFront(ManifestGroupingTestCase):
 
     def test_a_negative_does_not_outrank_a_versioned_front(self):
         # The negative is unversioned and the front is not, which is the shape
-        # that would have let master selection prefer the negative on rank.
+        # that would have let master selection prefer the negative on rank. The
+        # separate "no negative in the master pool" filter is gone with
+        # ``pick_master_index``; ``_PART_RANK["negative"] == 4`` does the job on
+        # its own, and the part label the front travels under proves it.
         items = [{"path": "s/n5-negative.jpg"}, {"path": "s/n5b.jpg"}]
         calls, _records, _warnings = self.run_manifest(items)
-        self.assertEqual(calls, [("photo", _p("s/n5b.jpg"), None)])
+        self.assertEqual(
+            calls,
+            [(
+                "parts",
+                (
+                    ("Front", (_p("s/n5b.jpg"),)),
+                    ("Negative", (_p("s/n5-negative.jpg"),)),
+                ),
+            )],
+        )
 
     def test_a_negative_reaches_the_model_under_its_own_label(self):
         items = [{"path": "s/n3-negative.jpg"}, {"path": "s/n3.jpg"}, {"path": "s/n3-back.jpg"}]
-        calls, _records, _warnings = self.run_manifest(items, process_all_variants=True)
+        calls, _records, _warnings = self.run_manifest(items)
         self.assertEqual(
             calls,
             [(
@@ -747,7 +822,9 @@ class TestNegativeIsNotAnUntaggedFront(ManifestGroupingTestCase):
         # nothing left to fall back to: it sent the back as the front as well,
         # and dropped the negative without a word. Commit 525e9a6 sends
         # photo(negative, back) here, which is also the only answer that keeps
-        # both listed files in the payload.
+        # both listed files in the payload. Since C1 the group holds a negative
+        # and so takes the labelled part form, but the property the guard exists
+        # for is the same one: both files travel, exactly once each.
         for label, items in (
             ("negative first", [{"path": "s/w1-negative.jpg"}, {"path": "s/w1-back.jpg"}]),
             ("back first", [{"path": "s/w1-back.jpg"}, {"path": "s/w1-negative.jpg"}]),
@@ -755,8 +832,11 @@ class TestNegativeIsNotAnUntaggedFront(ManifestGroupingTestCase):
             with self.subTest(label):
                 calls, _records, _warnings = self.run_manifest(items)
                 self.assertEqual(
-                    calls,
-                    [("photo", _p("s/w1-negative.jpg"), _p("s/w1-back.jpg"))],
+                    sorted(_labelled_payload(calls)),
+                    [
+                        ("Back", _p("s/w1-back.jpg")),
+                        ("Negative", _p("s/w1-negative.jpg")),
+                    ],
                     "a group holding a negative and a back has exactly one "
                     "front-side file and it is the negative; sending anything "
                     "else here means the back was sent twice or the negative "
@@ -764,9 +844,9 @@ class TestNegativeIsNotAnUntaggedFront(ManifestGroupingTestCase):
                 )
                 self.assert_no_path_sent_under_two_labels(calls)
 
-    def test_that_group_still_sends_both_parts_under_process_all_variants(self):
+    def test_that_group_sends_both_parts_under_their_own_labels(self):
         items = [{"path": "s/w1-negative.jpg"}, {"path": "s/w1-back.jpg"}]
-        calls, _records, warnings = self.run_manifest(items, process_all_variants=True)
+        calls, _records, warnings = self.run_manifest(items)
         self.assertEqual(
             calls,
             [(
@@ -788,12 +868,20 @@ class TestNegativeIsNotAnUntaggedFront(ManifestGroupingTestCase):
             {"path": "s/w3-back.jpg"},
         ]
         calls, _records, _warnings = self.run_manifest(items)
-        self.assertEqual(calls, [("photo", _p("s/w3.jpg"), _p("s/w3-back.jpg"))])
+        self.assertEqual(
+            calls,
+            [(
+                "parts",
+                (
+                    ("Front", (_p("s/w3.jpg"),)),
+                    ("Back", (_p("s/w3-back.jpg"),)),
+                    ("Negative", (_p("s/w3-negative.jpg"),)),
+                ),
+            )],
+        )
 
     def test_a_lone_negative_is_labelled_negative_rather_than_front(self):
-        calls, records, _warnings = self.run_manifest(
-            [{"path": "s/n2-negative.jpg"}], process_all_variants=True
-        )
+        calls, records, _warnings = self.run_manifest([{"path": "s/n2-negative.jpg"}])
         self.assertEqual(calls, [("parts", (("Negative", (_p("s/n2-negative.jpg"),)),))])
         self.assertEqual(
             records[0]["result"]["all_variant_files"]["negatives"],
@@ -805,7 +893,7 @@ class TestNegativeIsNotAnUntaggedFront(ManifestGroupingTestCase):
         # unconditional assignment, so two that differ only by variant letter
         # overwrote each other. This path -- now the only one -- keeps both.
         items = [{"path": "s/n4-negative.jpg"}, {"path": "s/n4b-negative.jpg"}]
-        calls, records, _warnings = self.run_manifest(items, process_all_variants=True)
+        calls, records, _warnings = self.run_manifest(items)
         self.assertEqual(
             calls,
             [(
@@ -863,27 +951,25 @@ class TestPayloadInvariants(ManifestGroupingTestCase):
 
     def test_no_file_is_ever_sent_under_two_labels(self):
         for label, items in self.SHAPES:
-            for process_all_variants in (False, True):
-                with self.subTest(label, process_all_variants=process_all_variants):
+            for group_by in utils.GROUP_BY_VALUES:
+                with self.subTest(label, group_by=group_by):
                     calls, _records, _warnings = self.run_manifest(
-                        items, process_all_variants=process_all_variants
+                        items, group_by=group_by
                     )
                     self.assert_no_path_sent_under_two_labels(calls)
 
     def test_no_listed_file_leaves_the_group_payload_in_silence(self):
         for label, items in self.SHAPES:
             with self.subTest(label):
-                calls, _records, warnings = self.run_manifest(
-                    items, process_all_variants=True
-                )
+                calls, _records, warnings = self.run_manifest(items)
                 self.assert_every_file_sent_or_disclosed(items, calls, warnings)
 
     def test_every_shape_still_records_every_listed_file(self):
         for label, items in self.SHAPES:
-            for process_all_variants in (False, True):
-                with self.subTest(label, process_all_variants=process_all_variants):
+            for group_by in utils.GROUP_BY_VALUES:
+                with self.subTest(label, group_by=group_by):
                     _calls, records, _warnings = self.run_manifest(
-                        items, process_all_variants=process_all_variants
+                        items, group_by=group_by
                     )
                     self.assertEqual({rec["status"] for rec in records}, {"ok"})
                     self.assertEqual(
@@ -913,10 +999,12 @@ class TestFrontSideRoleCollision(ManifestGroupingTestCase):
     OVERRIDE_PAIR = ({"path": "s/fr1.jpg"}, {"path": "s/fr1-back.jpg", "is_back": False})
 
     def test_only_one_of_them_is_sent_and_the_other_is_named(self):
-        for process_all_variants in (False, True):
-            with self.subTest(process_all_variants=process_all_variants):
+        # ``object`` and ``pair`` only: the collision is between two files of one
+        # group, and under ``none`` there is no group for them to collide in.
+        for group_by in (utils.GROUP_BY_OBJECT, utils.GROUP_BY_PAIR):
+            with self.subTest(group_by=group_by):
                 calls, _records, warnings = self.run_manifest(
-                    list(self.OVERRIDE_PAIR), process_all_variants=process_all_variants
+                    list(self.OVERRIDE_PAIR), group_by=group_by
                 )
                 sent = [path for _label, path in _labelled_payload(calls)]
                 self.assertEqual(sent, [_p("s/fr1-back.jpg")])
@@ -928,21 +1016,20 @@ class TestFrontSideRoleCollision(ManifestGroupingTestCase):
                     f"the file that lost the front side was dropped in silence: {warnings}",
                 )
 
-    def test_both_settings_send_the_same_file(self):
-        single, _records, _warnings = self.run_manifest(list(self.OVERRIDE_PAIR))
-        grouped, _records, _warnings = self.run_manifest(
-            list(self.OVERRIDE_PAIR), process_all_variants=True
+    def test_object_and_pair_send_the_same_file(self):
+        by_object, _records, _warnings = self.run_manifest(list(self.OVERRIDE_PAIR))
+        by_pair, _records, _warnings = self.run_manifest(
+            list(self.OVERRIDE_PAIR), group_by=utils.GROUP_BY_PAIR
         )
         self.assertEqual(
-            {path for _label, path in _labelled_payload(single)},
-            {path for _label, path in _labelled_payload(grouped)},
-            "--process-all-variants changed which of the two the model saw",
+            {path for _label, path in _labelled_payload(by_object)},
+            {path for _label, path in _labelled_payload(by_pair)},
+            "--group-by changed which of the two the model saw, though both "
+            "files carry no variant letter and so form one group either way",
         )
 
     def test_the_record_names_the_file_that_could_not_be_sent(self):
-        _calls, records, _warnings = self.run_manifest(
-            list(self.OVERRIDE_PAIR), process_all_variants=True
-        )
+        _calls, records, _warnings = self.run_manifest(list(self.OVERRIDE_PAIR))
         variant_map = records[0]["result"]["all_variant_files"]
         self.assertEqual(variant_map["displaced"], {":none": [_p("s/fr1.jpg")]})
         self.assertEqual(
@@ -958,11 +1045,11 @@ class TestFrontSideRoleCollision(ManifestGroupingTestCase):
             {"path": "s/fr2.jpg"},
             {"path": "s/fr2-page2.jpg"},
         ]
-        for process_all_variants in (False, True):
-            with self.subTest(process_all_variants=process_all_variants):
-                calls, records, warnings = self.run_manifest(
-                    items, process_all_variants=process_all_variants
-                )
+        # Not under ``none``: with one file per group there is no multipage set
+        # for anything to stow away in, and every page is analyzed alone.
+        for group_by in (utils.GROUP_BY_OBJECT, utils.GROUP_BY_PAIR):
+            with self.subTest(group_by=group_by):
+                calls, records, warnings = self.run_manifest(items, group_by=group_by)
                 self.assertNotIn(
                     _p("s/fr2.jpg"),
                     [path for _label, path in _labelled_payload(calls)],
@@ -976,7 +1063,7 @@ class TestFrontSideRoleCollision(ManifestGroupingTestCase):
 
     def test_an_untagged_file_still_becomes_page_one_when_the_slot_is_free(self):
         items = [{"path": "s/fr3.jpg"}, {"path": "s/fr3-page2.jpg"}]
-        calls, records, _warnings = self.run_manifest(items, process_all_variants=True)
+        calls, records, _warnings = self.run_manifest(items)
         self.assertEqual(
             calls,
             [(
@@ -1066,18 +1153,34 @@ class TestReadmeSampleManifest(ManifestGroupingTestCase):
             f"the override that did the grouping was not logged: {warnings}",
         )
 
-    def test_the_sample_is_one_group_under_process_all_variants_too(self):
+    def test_the_sample_is_one_group_under_pair_too(self):
+        # Neither file carries a variant letter, so ``pair`` keys on the bare
+        # group key and the sample stays one object -- the stability that makes
+        # ``pair`` safe to reach for on ordinary input.
         calls, _records, _warnings = self.run_manifest_source(
-            self.SAMPLE, process_all_variants=True
+            self.SAMPLE, group_by=utils.GROUP_BY_PAIR
         )
         self.assertEqual(
             calls,
-            [(
-                "front_back",
-                (_p("scans/box3_017.jpg"),),
-                (_p("scans/box3_017_back.jpg"),),
-            )],
+            [("photo", _p("scans/box3_017.jpg"), _p("scans/box3_017_back.jpg"))],
         )
+
+    def test_group_by_none_splits_the_sample_the_is_back_flag_joined(self):
+        # The escape hatch doing what it says: the flag still marks the back,
+        # but there is no group for it to join, so the pair costs two calls and
+        # the back is analyzed as handwriting with no photo beside it.
+        calls, records, _warnings = self.run_manifest_source(
+            self.SAMPLE, group_by=utils.GROUP_BY_NONE
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("photo", _p("scans/box3_017.jpg"), None),
+                ("photo", _p("scans/box3_017_back.jpg"), None),
+            ],
+        )
+        keywords = {rec["path"]: rec["result"]["keywords"] for rec in records}
+        self.assertIn("back", keywords[_p("scans/box3_017_back.jpg")])
 
     def test_the_sample_groups_the_same_way_when_listed_back_first(self):
         reversed_sample = dict(self.SAMPLE, items=list(reversed(self.SAMPLE["items"])))
@@ -1151,8 +1254,8 @@ class TestExplicitOverrides(ManifestGroupingTestCase):
             {"path": "s/oc2.jpg"},
             {"path": "s/oc2-detail.jpg", "group": "oc2", "is_crop": True},
         ]
-        calls, records, warnings = self.run_manifest(items, process_all_variants=True)
-        self.assertEqual(calls, [("front_back", (_p("s/oc2.jpg"),), ())])
+        calls, records, warnings = self.run_manifest(items)
+        self.assertEqual(calls, [("photo", _p("s/oc2.jpg"), None)])
         variant_map = records[0]["result"]["all_variant_files"]
         self.assertEqual(variant_map["crops"], {":none": [_p("s/oc2-detail.jpg")]})
         self.assertTrue(
@@ -1300,36 +1403,24 @@ class TestPluginContractRegression(ManifestGroupingTestCase):
             },
         )
 
-    def test_front_and_back_group_the_same_under_process_all_variants(self):
+    def test_front_and_back_group_the_same_under_pair(self):
+        # The default and ``pair`` agree on any group with no variant letters,
+        # which is the overwhelmingly common shape, so a plug-in manifest keeps
+        # its group id whichever of the two is selected.
         calls, _records, warnings = self.run_manifest(
-            self.ORDINARY, process_all_variants=True
+            self.ORDINARY, group_by=utils.GROUP_BY_PAIR
         )
         self.assertEqual(
-            calls,
-            [(
-                "front_back",
-                (_p("s/box3_025.jpg"),),
-                (_p("s/box3_025-back.jpg"),),
-            )],
+            calls, [("photo", _p("s/box3_025.jpg"), _p("s/box3_025-back.jpg"))]
         )
         self.assert_no_grouping_warnings(warnings)
 
-    def test_two_variants_still_analyze_only_the_unversioned_pair(self):
+    def test_two_variants_now_travel_together_rather_than_leaving_two_scans_unsent(self):
+        # CHANGED IN C1, deliberately. 525e9a6 and every tree through B2 sent
+        # ``photo(v1.jpg, v1-back.jpg)`` and never showed the model v1b.jpg or
+        # v1b-back.jpg at all, though both were recorded. Retiring the primary
+        # sends all four. Same one call, four images instead of two.
         calls, records, warnings = self.run_manifest(self.TWO_VARIANTS)
-        self.assertEqual(calls, [("photo", _p("s/v1.jpg"), _p("s/v1-back.jpg"))])
-        self.assert_no_grouping_warnings(warnings)
-        variant_map = records[0]["result"]["all_variant_files"]
-        self.assertEqual(variant_map["front"], [_p("s/v1.jpg"), _p("s/v1b.jpg")])
-        self.assertEqual(
-            variant_map["back"], [_p("s/v1-back.jpg"), _p("s/v1b-back.jpg")]
-        )
-        for key in ("crops", "negatives", "pages"):
-            self.assertNotIn(key, variant_map)
-
-    def test_two_variants_keep_their_versioned_ordering_in_the_group_call(self):
-        calls, _records, warnings = self.run_manifest(
-            self.TWO_VARIANTS, process_all_variants=True
-        )
         self.assertEqual(
             calls,
             [(
@@ -1339,16 +1430,39 @@ class TestPluginContractRegression(ManifestGroupingTestCase):
             )],
         )
         self.assert_no_grouping_warnings(warnings)
+        variant_map = records[0]["result"]["all_variant_files"]
+        self.assertEqual(variant_map["front"], [_p("s/v1.jpg"), _p("s/v1b.jpg")])
+        self.assertEqual(
+            variant_map["back"], [_p("s/v1-back.jpg"), _p("s/v1b-back.jpg")]
+        )
+        for key in ("crops", "negatives", "pages"):
+            self.assertNotIn(key, variant_map)
+
+    def test_pair_analyzes_each_rescan_on_its_own(self):
+        # The value that comes closest to the retired default, and still does
+        # not reproduce it: one call per rescan rather than one for the group.
+        # No value of the axis brings the primary-pair payload back.
+        calls, _records, warnings = self.run_manifest(
+            self.TWO_VARIANTS, group_by=utils.GROUP_BY_PAIR
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("photo", _p("s/v1.jpg"), _p("s/v1-back.jpg")),
+                ("photo", _p("s/v1b.jpg"), _p("s/v1b-back.jpg")),
+            ],
+        )
+        self.assert_no_grouping_warnings(warnings)
 
     def test_every_listed_file_still_gets_exactly_one_record(self):
-        for process_all_variants in (False, True):
-            with self.subTest(process_all_variants=process_all_variants):
+        for group_by in utils.GROUP_BY_VALUES:
+            with self.subTest(group_by=group_by):
                 _calls, records, _warnings = self.run_manifest(
-                    self.TWO_VARIANTS, process_all_variants=process_all_variants
+                    self.TWO_VARIANTS, group_by=group_by
                 )
                 self.assertEqual(
-                    [rec["path"] for rec in records],
-                    [_p(item["path"]) for item in self.TWO_VARIANTS],
+                    sorted(rec["path"] for rec in records),
+                    sorted(_p(item["path"]) for item in self.TWO_VARIANTS),
                 )
                 self.assertEqual({rec["status"] for rec in records}, {"ok"})
 
@@ -1414,6 +1528,279 @@ class TestPartialGroupFailure(ManifestGroupingTestCase):
             sorted(set(aggregate["results"]) | set(aggregate["errors"])),
             sorted(_p(item["path"]) for item in self.ITEMS),
         )
+
+
+class TestPairKeyCannotCollide(ManifestGroupingTestCase):
+    """``pair`` builds its bucket key by joining, so the join must be injective.
+
+    ``|`` was chosen because it is illegal in a Windows filename -- true of the
+    keys the grammar derives there, and of nothing else. A manifest may state
+    ``group`` outright, which the README documents for names the grammar cannot
+    parse at all and which ``_manifest_group_override`` accepts verbatim, and
+    POSIX filenames take the character happily. An unescaped join therefore lets
+    ``group="album|b"`` and a filename-derived ``("album", "b")`` spell one key:
+    two unrelated objects in one model call, sharing one caption, date, location
+    and keyword set, and writing them to both files under one changeset
+    ``group_id``.
+
+    Escaping by doubling the separator does not fix it, which is why the check
+    below is a brute force over the whole cross product rather than a list of
+    shapes somebody thought of. Doubling leaves a half's trailing run touching
+    the joining separator, and the two merge into one run that can be split more
+    than one way.
+    """
+
+    #: Small but exhaustive in kind: it holds the separator, the escape
+    #: character, the empty half, and each of them leading, trailing, doubled
+    #: and adjacent to the other. Both halves are escaped character by
+    #: character, so a scheme injective here cannot be defeated by a longer
+    #: string built from the same characters.
+    ALPHABET = ("", "a", "|", "\\", "a|", "|a", "\\|", "||")
+
+    #: Two objects that spell the same pair key under a broken join. Each is a
+    #: reachable form: an explicit key on any platform, a derived key on the
+    #: platforms where the separator is a legal filename character, and the
+    #: boundary pair that defeats separator doubling specifically.
+    COLLIDING = (
+        (
+            "an explicit group override",
+            [
+                {"path": "s/wedding_1965.jpg", "group": "album|b"},
+                {"path": "s/reunion_010b.jpg", "group": "album"},
+            ],
+        ),
+        (
+            "a posix filename holding the separator",
+            [{"path": "s/box3_025|b.jpg"}, {"path": "s/box3_025b.jpg"}],
+        ),
+        (
+            "a separator run touching the join",
+            [
+                {"path": "s/wedding.jpg", "group": "a|", "version": "a"},
+                {"path": "s/funeral.jpg", "group": "a", "version": "|a"},
+            ],
+        ),
+    )
+
+    def test_the_key_is_injective_over_the_whole_cross_product(self):
+        # Every ``(group_key, version)`` the alphabet can spell, including the
+        # ``None`` version an entry with no variant letter carries. Two pairs
+        # sharing a key are two objects sharing one analysis and one changeset
+        # ``group_id``.
+        source: dict[str, tuple[str, str | None]] = {}
+        collisions: list[str] = []
+        for group_key, version in itertools.product(
+            self.ALPHABET, self.ALPHABET + (None,)
+        ):
+            key = core._pair_bucket_key(group_key, version)
+            if key in source:
+                collisions.append(
+                    f"{source[key]!r} and {(group_key, version)!r} both spell {key!r}"
+                )
+            else:
+                source[key] = (group_key, version)
+        self.assertEqual(
+            collisions,
+            [],
+            f"the pair key is not injective over {self.ALPHABET!r}",
+        )
+        self.assertEqual(
+            len(source), len(self.ALPHABET) * (len(self.ALPHABET) + 1)
+        )
+
+    def test_a_trailing_separator_does_not_merge_with_the_join(self):
+        # The doubling scheme's own failure, named so the regression is obvious:
+        # it wrote ``a|`` as ``a||`` and then joined on ``|``, so the boundary
+        # run was indistinguishable from an escaped separator opening the second
+        # half, and both pairs spelled ``a|||a``.
+        self.assertNotEqual(
+            core._pair_bucket_key("a|", "a"),
+            core._pair_bucket_key("a", "|a"),
+            "('a|', 'a') and ('a', '|a') spell one key",
+        )
+
+    def test_two_objects_that_spell_one_key_stay_two_buckets(self):
+        for label, items in self.COLLIDING:
+            for group_by in utils.GROUP_BY_VALUES:
+                with self.subTest(label, group_by=group_by):
+                    buckets = core.build_manifest_buckets(items, group_by=group_by)
+                    self.assertEqual(
+                        sorted(
+                            sorted(entry["path"] for entry in entries)
+                            for entries in buckets.values()
+                        ),
+                        sorted([[_p(item["path"])] for item in items]),
+                        "two unrelated objects were merged into one bucket, so "
+                        "they share one analysis and one changeset group_id",
+                    )
+
+    def test_they_are_two_model_calls_rather_than_one_merged_one(self):
+        for label, items in self.COLLIDING:
+            with self.subTest(label):
+                calls, _records, _warnings = self.run_manifest(
+                    items, group_by=utils.GROUP_BY_PAIR
+                )
+                self.assertEqual(
+                    sorted(_labelled_payload(calls)),
+                    sorted(("front", _p(item["path"])) for item in items),
+                    "the two files were sent in one call as two scans of one print",
+                )
+                self.assertEqual(len(calls), 2)
+
+    def test_an_ordinary_group_keeps_the_key_object_gives_it(self):
+        # The escape must not move the changeset ``group_id`` of a key that
+        # holds no separator, which is every key the grammar derives on Windows.
+        items = [
+            {"path": "s/box3_025.jpg"},
+            {"path": "s/box3_025-back.jpg"},
+            {"path": "s/box3_025b.jpg"},
+        ]
+        self.assertEqual(
+            list(core.build_manifest_buckets(items, group_by=utils.GROUP_BY_OBJECT)),
+            ["box3_025"],
+        )
+        self.assertEqual(
+            list(core.build_manifest_buckets(items, group_by=utils.GROUP_BY_PAIR)),
+            ["box3_025", "box3_025|b"],
+        )
+
+
+class TestPartMarkersOnlyStripWhatTheGroupApplies(ManifestGroupingTestCase):
+    """A marker is removed to undo a leak, so there has to be a leak to undo.
+
+    ``merge_original_sources`` merges the group's metadata keywords into every
+    record, so the marker naming one file would otherwise land on all of them.
+    That is the entire reason the fan-out strips markers -- and it means a
+    marker no file in the group carries cannot have leaked from anywhere: it is
+    a keyword the caller applied by hand, and removing it makes the emitted
+    record drop it and the changeset propose deleting it from the catalog.
+
+    The same holds one level down. Whether a marker leaked is a property of the
+    file, not of the group: a print carrying a hand-tagged "Negative" in its own
+    metadata keeps it however many of its siblings really are negatives, because
+    the keyword was on the file before anything was merged into it.
+    """
+
+    def keywords_by_name(
+        self, items: list[dict], *, group_by: str = utils.GROUP_BY_OBJECT
+    ) -> dict[str, list[str]]:
+        """Return ``{basename: emitted keywords}`` for one run over *items*."""
+        _calls, records, _warnings = self.run_manifest(items, group_by=group_by)
+        return {
+            os.path.basename(rec["path"]): rec["result"]["keywords"] for rec in records
+        }
+
+    def removals_by_name(self, items: list[dict]) -> dict[str, list[str]]:
+        """Return ``{basename: proposed keywords_remove}`` for one run.
+
+        The emitted record and the changeset are two separate statements: the
+        record is what the file becomes, the changeset is the instruction sent
+        to the catalog. A keyword can survive in the first and still be proposed
+        for deletion in the second, so both are asserted.
+        """
+        changeset: list[str] = []
+        self.run_manifest(items, changeset_writer=changeset.append)
+        return {
+            os.path.basename(doc["path"]): doc["proposed_changes"]["keywords_remove"]
+            for doc in map(json.loads, changeset)
+        }
+
+    def test_a_hand_applied_marker_survives_a_group_holding_no_such_part(self):
+        # A print scanned from a negative and tagged "Negative" in Lightroom, or
+        # a scan somebody filed under "Back" -- neither name is one the grammar
+        # reads as a part, and there is no sibling for a marker to leak from.
+        for marker in sorted(utils.PART_MARKER_KEYWORDS):
+            with self.subTest(marker=marker):
+                spelling = marker.title()
+                keywords = self.keywords_by_name(
+                    [{
+                        "path": "s/scan001.jpg",
+                        "metadata": {"keywords": [spelling, "Family"]},
+                    }]
+                )
+                self.assertEqual(
+                    keywords["scan001.jpg"],
+                    [spelling, "Family"],
+                    f"{spelling!r} was the caller's own keyword and the run "
+                    "proposed deleting it",
+                )
+
+    def test_the_marker_still_comes_off_the_files_it_does_not_describe(self):
+        # The leak the strip exists for, and the reason it cannot simply go:
+        # the marker rides the group's metadata onto the print beside it.
+        for marker, sibling in (("negative", "s/m1-negative.jpg"), ("back", "s/m2-back.jpg")):
+            with self.subTest(marker=marker):
+                print_path = sibling.replace(f"-{marker}", "")
+                keywords = self.keywords_by_name([
+                    {"path": print_path},
+                    {"path": sibling, "metadata": {"keywords": [marker.title(), "Family"]}},
+                ])
+                self.assertNotIn(
+                    marker.title(),
+                    keywords[os.path.basename(_p(print_path))],
+                    f"the sibling's {marker!r} marker leaked onto the print",
+                )
+                self.assertIn(
+                    "Family",
+                    keywords[os.path.basename(_p(print_path))],
+                    "the rest of the group's metadata keywords must still arrive",
+                )
+                self.assertIn(
+                    marker,
+                    [kw.lower() for kw in keywords[os.path.basename(_p(sibling))]],
+                    "the file the marker describes must keep it",
+                )
+
+    def test_the_file_it_describes_keeps_it_at_every_granularity(self):
+        for group_by in utils.GROUP_BY_VALUES:
+            with self.subTest(group_by=group_by):
+                keywords = self.keywords_by_name(
+                    [{"path": "s/m3.jpg"}, {"path": "s/m3-negative.jpg"}],
+                    group_by=group_by,
+                )
+                self.assertIn("negative", keywords["m3-negative.jpg"])
+                self.assertNotIn("negative", keywords["m3.jpg"])
+
+    def test_a_hand_applied_marker_survives_a_sibling_that_is_that_part(self):
+        # The strip set is the group's markers, so a group that really does hold
+        # a negative -- or a back -- used to take the keyword off every other
+        # file in it, including the one that had carried it all along. Which
+        # markers a file received from a sibling is decided per file, and the
+        # answer is read from the file's own metadata before the merge.
+        for marker, sibling in (("negative", "s/m4-negative.jpg"), ("back", "s/m5-back.jpg")):
+            with self.subTest(marker=marker):
+                spelling = marker.title()
+                print_path = sibling.replace(f"-{marker}", "")
+                items = [
+                    {"path": print_path, "metadata": {"keywords": [spelling, "Trip"]}},
+                    {"path": sibling},
+                ]
+                name = os.path.basename(_p(print_path))
+
+                keywords = self.keywords_by_name(items)
+
+                self.assertIn(
+                    spelling,
+                    keywords[name],
+                    f"{spelling!r} was this file's own keyword and the group "
+                    f"holding a real {marker} destroyed it",
+                )
+                self.assertEqual(
+                    [kw for kw in keywords[name] if kw.strip().lower() == marker],
+                    [spelling],
+                    f"{marker!r} was re-added beside the caller's own spelling",
+                )
+                self.assertEqual(
+                    self.removals_by_name(items)[name],
+                    [],
+                    "the changeset proposed deleting the caller's keyword from "
+                    "the catalog",
+                )
+                self.assertIn(
+                    marker,
+                    [kw.lower() for kw in keywords[os.path.basename(_p(sibling))]],
+                    "the file the marker describes must still keep it",
+                )
 
 
 if __name__ == "__main__":

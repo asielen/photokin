@@ -598,6 +598,195 @@ Crops need a stated rule per value as well. They are recorded and never analyzed
 today; under `none` a crop would become its own object, which contradicts the README's
 "a supporting view of its parent, never as its own object".
 
+**C1 shipped - the axis, the primary's retirement and the negative marker.** The three
+were landed together because they are one change: the axis has no meaning while a flag
+still decides how many images go in the call, and "every file of a group shares one
+analysis except its own part marker" is not true until negatives have a marker.
+
+- `utils.GROUP_BY_OBJECT/PAIR/NONE/GROUP_BY_VALUES` sit above the `Config` dataclass, and
+  `Config.process_all_variants` is replaced by `Config.group_by`. One function derives the
+  key: `build_manifest_buckets(items, *, group_by=...)`, keyword-only and defaulted, so no
+  existing caller changed. `object` returns byte-identically what it returned before, at
+  every input; `pair` appends `|<letter>` to the key only when the entry has one, so a
+  group with no variant letters keeps the same changeset `group_id` under both; `none`
+  keys on the file's normalized path. An unrecognized value raises `ValueError` before the
+  loop, for the library caller argparse cannot guard.
+
+  `pair`'s join is escaped rather than assumed safe, which the first pass got wrong. The
+  separator was chosen because `|` is illegal in a Windows filename, and that holds for a
+  key the grammar derives *there* and for nothing else: `_manifest_group_override` takes
+  any non-empty string, and the README documents `group` for exactly the names the grammar
+  cannot parse. So `group: "album|b"` and a filename-derived `("album", "b")` spelt one
+  key, and two unrelated objects went to the model in one call and were written one
+  caption, date and location.
+
+  The second pass got the escape itself wrong. `_pair_bucket_key` doubled the separator in
+  both halves and claimed injectivity on the grounds that exactly one run of separators is
+  odd-length. That argument fails at the boundary: a half's escaped trailing run merges
+  with the joining separator into a single run that can be split more than one way, so
+  `("a|", "a")` and `("a", "|a")` both spelt `a|||a`. Brute force over `{'', 'a', '|',
+  '\', 'a|', '|a', '\|', '||'}` found 12 colliding pairs, and the collision is reachable
+  end to end - a manifest naming `{group: "a|", version: "a"}` and `{group: "a", version:
+  "|a"}` produced one bucket, one `analyze_group_parts([("Front", [both files])])` call,
+  and one caption, date, location and changeset `group_id` written to two unrelated
+  objects. Narrow reach, since it needs a `group` ending in `|` or a `version` starting
+  with one, but both are free-form strings and the claim was simply false.
+
+  The scheme is now a real escape rather than a doubling: `_escape_pair_half` rewrites `\`
+  as `\\` and then `|` as `\|`, and the two escaped halves are joined on a bare `|`.
+  Neither half can then contain a bare separator, so reading left to right - an escape
+  consumes the character after it, and the first separator it does not consume is the join
+  - recovers both halves unambiguously, and a key with no bare separator is the `None`
+  version. That is injective, and the brute force above is now a test rather than a
+  paragraph (`TestPairKeyCannotCollide`). A key holding neither the separator nor the
+  escape character is untouched, which is every key the grammar derives on Windows, so the
+  ordinary `group_id` is unchanged. The cost is that a POSIX key containing a literal `\`
+  now has it doubled under `pair`; that is unavoidable once an escape character exists,
+  and it does not reach `object` or `none`.
+- **The primary retires.** `utils.pick_master_index` is deleted, and with it the negative
+  filter that existed only to stop it preferring an unversioned negative over a versioned
+  front - `_slot_rank_key` already ranks a negative last. `primary_item = candidates[0]`
+  replaces both; `candidates` was already rank-ordered, so the head *is* "best non-crop,
+  preferred-if-any, front-side, unversioned". That is the second of the two
+  order-dependent choices behind the B1 crop bug leaving the tree. One divergence is
+  accepted rather than compensated: a group holding a versioned explicit `-front` beside
+  an unversioned untagged file now names the `-front` as primary where the old scan named
+  the untagged file. Both are sent under `object`, so only `main_key` and the caption's
+  variant label move.
+- **The callee follows the payload, not the axis.** One predicate replaces three reads of
+  `cfg.process_all_variants`: `multipage_present or all_negatives or len(all_fronts) > 1
+  or len(all_backs) > 1`. False takes `analyze_photo(front, back)` unchanged; true takes
+  the group form. This is what keeps ordinary output stable - the two analyzers differ in
+  prompt (the group one opens "You are seeing multiple scans or variants"), dump tag,
+  transport shape and failure mode, so routing every run through the group form would have
+  changed the record of 100% of runs. The caption branch follows the same predicate, which
+  is what keeps a plain front/back pair's `[Back] ` prefix.
+
+  A consequence the first pass missed: the predicate is true for a group of *one* whenever
+  that one file is a negative or a page, which is the commonest shape a negative has in an
+  archive. Those calls carry one image under a note opening "You are seeing multiple scans
+  or variants", a claim the payload contradicts and the model can count. The group reaches
+  the analyzer for its part label rather than for its size, so the fix is the sentence, not
+  the routing: it is now chosen on `len(flat_paths) > 1`, and a one-image call says so.
+- **What that costs.** Calls are unchanged at every scale: `object` forms exactly the
+  groups the old code formed and makes one call per group. The cost is images, and only
+  for a group holding more than one front-side scan, more than one back, or a page. On the
+  checked-in 6-file fixture the whole folder goes from 4 calls / 5 images to 4 calls / 8
+  images. The four shapes that changed under `object` are: a second front-side file, a
+  second back, any group holding a page (previously only page 1 was sent - the largest
+  single quality change of the phase), and any group holding a negative (same one image,
+  now labelled `Negative` rather than passed off as the front).
+- **No shape reproduces the old default.** `pair` comes closest and still makes one call
+  per rescan rather than one for the group. Anyone capping image cost with
+  `--process-all-variants` off has no equivalent.
+- **Compatibility, deliberately minimal.** `--process-all-variants` and `--update-policy`
+  remain accepted, are `argparse.SUPPRESS`ed out of `--help`, do nothing, and warn once
+  each naming `--group-by`. The reason is mechanical: the plug-in launches
+  `python -m photokin.cli`, and deleting an argument makes argparse exit 2. No deprecation
+  framework, no version gate. The Python API is not covered - `core.analyze_manifest`,
+  `core.process_manifest_stream` and `public.analyze_manifest` lose `update_policy`
+  outright, and `core.UPDATE_MASTER_EXACT`/`UPDATE_MERGE_PER_VARIANT` are deleted. An
+  embedder passing the keyword gets a `TypeError`; embedders set `cfg.group_by` instead.
+  `merge_original_sources` now runs unconditionally in the fan-out, which was the
+  `merge_per_variant` default, so the default behavior is preserved.
+- **`preferred` is not the no-op the plan expected.** It stops choosing the one analyzed
+  file - there is no longer one - but it remains component 2 of `_slot_rank_key` and so
+  still decides which of two files contesting one `(version, part)` slot is sent. It is
+  left exactly in place: removing it would change every colliding-slot group the plug-in
+  already sends and break the two carve-outs documented at `README.md`. Confirmed it
+  cannot raise on any JSON value, since `_resolve_manifest_entry` reads it as
+  `bool(raw.get("preferred"))`. No deprecation cycle is needed for a key that still has a
+  job.
+- **The negative marker.** `utils.ensure_keyword_back` is replaced by
+  `utils.apply_part_keyword(record, marker, leaked)` over `PART_MARKER_KEYWORDS = {"back",
+  "negative"}`, which asserts one marker and removes the others case-insensitively. It
+  replaces both the old ensure call and the hand-written `back` strip beside it, so the
+  change is net-negative in lines. `_split_keywords_for_merge` now drops either marker
+  from the group-wide pool, which matters because the model emits "Negative" once it is
+  told a `Negative` part is present.
+
+  Three things went wrong before it settled, each of them the marker escaping the per-file
+  scope the whole mechanism exists to enforce. The first two are one question answered
+  twice, at the wrong scope each time:
+
+  *The strip has to know what the group applied.* An unconditional `PART_MARKER_KEYWORDS`
+  removed any keyword spelt like a marker from any file, and a marker no file in the group
+  carries cannot have leaked from anywhere - it is the caller's own keyword. A print
+  scanned from a negative and hand-tagged `Negative` in Lightroom, alone in its group, lost
+  the keyword from its record and had `keywords_remove: ["Negative"]` proposed to the
+  plug-in: a deletion instruction against the catalog, on the default path, for ordinary
+  input. The strip set became the markers the group actually applies (`applied_markers`,
+  built from `_item_part_marker` over the group). This retires the same latent bug for
+  `back`, which behaved identically before C1 and at f4153ae; keeping one marker destroying
+  user data and the other not would have cost more code than fixing both. It also removes
+  the reason for an `is_negative` override, which stays out of scope.
+
+  *And per file, not per group.* A group is the wrong scope for that question, which the
+  second pass missed. Whether a marker leaked onto a record is a property of the file:
+  a print hand-tagged `Negative` **beside** a real negative still owned that keyword before
+  anything was merged into it, and a group-wide strip set took it off anyway - `print.jpg`
+  carrying `metadata.keywords: ["Negative", "Trip"]` next to `print-negative.jpg` emitted
+  `["Trip", ...]` and proposed `keywords_remove: ["Negative"]`, the same catalog deletion
+  in a narrower group. This was strictly better than f4153ae, which destroyed the keyword
+  unconditionally, but the information needed to tell the two apart is at the call site:
+  `utils.load_item_metadata(it)` is read immediately before `merge_original_sources`, which
+  is the last moment a file's own keywords are separable from the group's. The emit loop
+  now reads `utils.part_markers_in` off that pre-merge metadata and passes
+  `applied_markers - own_markers`, so the leak the strip exists for - one file's marker
+  riding `merge_original_sources` onto its siblings - is still undone and nothing else is.
+  `apply_part_keyword`'s third parameter is named `leaked` rather than `applied` to say so.
+
+  *A marker must not reach the vocabulary.* "`grep -in negative` over the prompts and the
+  vocabulary returns nothing" showed only that neither marker is *already* approved, not
+  that one cannot be added; the vocab-insert block runs on the raw model keywords, which is
+  the mechanism of the leak rather than a guard against it. Once the model is told a
+  `Negative` part is present it proposes "Negative", and a run over `box3_026.jpg` plus
+  `box3_026-negative.jpg` appended it to `vocab_keywords_examples.toml` inside the
+  installed package - an approved keyword in every later prompt, teaching the model to emit
+  a token this same commit defines as not being one. Both insert blocks now skip
+  `PART_MARKER_KEYWORDS` beside the existing `PC-` guard.
+- **`--back` states the whole address, not just the group.** B2 gave the pair a shared
+  `group` so `photo.jpg --back reverse.jpg` could not split into two objects; under `pair`
+  the bucket key carries the variant letter too, which the group key does not suppress, so
+  a back named `IMG_0042b.jpg`, `scan-b.jpg` or `DSC_0001a.jpg` - ordinary camera and
+  scanner output, and exactly the unreadable name `--back` exists to handle - split off
+  anyway and reached the model with no front attached. That is the "handwriting with no
+  photo" loss the plan reserves for `none`, and it inverted `_resolve_manifest_entry`'s own
+  rule that an explicit override beats the filename. `build_single_photo_manifest` now
+  pins the back's `version` to the front's, using the documented empty string when the
+  front has none. Only `none` splits the pair, which is what the escape hatch is for. The
+  cost under `object` is bounded and measured: the model call is unchanged, and there are
+  two record differences, not one as an earlier revision of this line claimed.
+
+  The first is the one that was stated: such a back is listed in
+  `all_variant_files.variants` with `version: null` rather than the letter its name
+  happened to end in - which is what `--back` asserted in the first place.
+
+  The second follows from it and reaches **both** files of the pair. The per-variant
+  caption label is chosen by asking whether the analyzed variant has a back
+  (`variant_pairs.get(ver)`), and pinning is what moves the back into the front's variant,
+  so the label flips from `[Front]` to `[Back]`:
+
+  ```
+  photo.jpg --back IMG_0042b.jpg          (object; the model call is identical)
+
+    unpinned : caption '[Front] a handwritten note'   on photo.jpg and IMG_0042b.jpg
+    pinned   : caption '[Back] a handwritten note'    on both
+  ```
+
+  Same for `scan-b.jpg` and `DSC_0001a.jpg`. `[Back]` is the more honest of the two - the
+  caption transcribes the back's handwriting, and unpinned the group had a back nothing
+  labelled as one - so this is recorded as a consequence rather than as a cost to pay
+  down. A back whose name carries no letter is unaffected in both respects, at every value.
+- **Crops per value.** `object` and `pair` are unchanged - a crop yields its parent's slot,
+  is recorded and warned about, and an orphan crop is analyzed in its place. `pair` needs
+  no rule: `parse_media_filename` strips `-crop` first, so a crop always carries its
+  parent's `base_id` and version. Under `none` a crop is its own object and is analyzed,
+  because "recorded but not analyzed" in a group of one means no record at all, which
+  would violate the `set(results) | set(errors) == input` contract. The README sentence is
+  scoped rather than contradicted. One guard was required: the orphan-crop WARNING is
+  suppressed under `none`, where its condition is true for every crop on every run.
+
 **Risk:** high. This is the breaking release, and the affected consumer is not in
 this repo.
 
@@ -641,8 +830,10 @@ The codes are now unioned across the group. The back already received them by sh
 the front's letter; the change is that sibling variants do too.
 
 Note this is not the same mechanism as a PC code that arrives in a file's *existing*
-metadata - that path is governed by `--update-policy`, is unchanged, and still keeps
-codes on their own file under `master_exact`. Only model-read codes are affected.
+metadata - that path was governed by `--update-policy`, which C1 retired. With the flag
+gone, `merge_original_sources` runs unconditionally, which is what `merge_per_variant` -
+the default and the only setting the CLI ever shipped as such - already did. Only
+model-read codes are affected by the union above.
 
 Side effect worth recording: this retires the `preferred`-versioned-back symptom rather
 than re-scoping it. A code can no longer be filed against the wrong variant because
@@ -747,6 +938,10 @@ by a test.
 | B2 | Written, `photokin/tests/test_folder_routing.py` (35 tests): the routing itself, where `test_folder_mode.py` covers the folder entry point's own contract. The headline regression - album pages, negative-only sets and back-only sets all reach the model, every file gets a record, and no group is reported skipped. Folder-vs-manifest parity over a fixture folder covering all five suffix forms, asserted on the model calls, the records and the diagnostic sequence in both `--process-all-variants` settings, against a hand-written manifest that spells the same paths differently so the comparison cannot collapse into a builder compared with itself. `--generate-manifest` against checked-in goldens under `photokin/tests/fixtures/manifests/` - both the document it writes and the grouping that document describes - the round trip back through `--manifest`, the file-and-group summary line, and the atomicity of the write. `--process-all-variants` changing what folder input sends, dead in that mode until B2. Single-photo `--back` matching the two-item manifest it is translated into, including a back the filename grammar cannot read. And `TestOrdinaryFolderIsUnchangedFrom7bcaf2f`, pinning call literals captured from that commit so the phase stays additive. |
 | B2 | Third pass, the two shapes the B2 differential missed: `TestBackOnlyGroupsReachTheModel` and `TestAVariantsBackIsPairedWithThePrimaryFront` (`test_folder_routing.py`). Neither is reachable from the checked-in fixture folder, which is why the sweep did not see them - its only multi-file group gives the primary front a back of its own, and it holds no back-only group at all - so both build their own folders. The second also asserts the bound on the change (a primary with its own back still prefers it) and that the same call comes out of the manifest pipeline, so the pairing is pinned as parity rather than as a folder-mode quirk. `TestGeneratedManifestAtomicWrite` covers the overwrite, the temp-file cleanup and a failed write leaving the previous manifest intact; the failure is injected at `os.replace` rather than at serialization, because a serialization failure happens before either write sequence touches the destination and so cannot tell the fixed code from the code that unlinked first. |
 | B2 | Nothing further owed. The two modules an earlier revision listed as outstanding - `test_generate_manifest.py` and `test_folder_manifest_parity.py` - were both written into `test_folder_routing.py` rather than as separate files, and the goldens they wanted are checked in: golden grouping over all five suffix forms and the four-group summary count in `TestGeneratedManifestGolden`, end-to-end parity in both `--process-all-variants` settings in `TestFolderManifestParity`, and the atomic write in `TestGeneratedManifestAtomicWrite`. |
+| C1 | Existing modules moved rather than a new one written, because the axis replaced the setting every grouping test was already parameterized on. `test_manifest_grouping.py`, `test_folder_routing.py` and `test_folder_mode.py` take `group_by` where they took `process_all_variants`, and the permutation sweep, the payload invariants and the crop-per-slot rule now run over all three values instead of two flag settings. Changed assertions, all of them the retirement of the primary landing: the album set travels as `Page 1`/`Page 2` by default, a lone negative takes the `Negative` label by default, a four-scan group sends four images, two orphan crops are both analyzed instead of one being recorded and dropped, and `TestPreferredBack` pins "every back is sent" where it pinned "this back is chosen". `TestOrdinaryFolderIsUnchangedFrom7bcaf2f` became `TestOrdinaryFolderAgainst7bcaf2f`, keeping the 7bcaf2f literals as the documented BEFORE and adding the assertion that matters most - the call count is unchanged. |
+| C1 | Second pass, one new module and two new classes, all four fixes pinned against the implementation they replace. `photokin/tests/test_group_analyzer_payload.py` stubs only the provider boundary, so the real prompt assembly and the real vocabulary-insert block run: a one-image group is not told it is seeing several while still carrying its part label, a genuine two-image group still is, and a proposed `Back`/`Negative` is refused while an ordinary keyword beside it is written - the latter proving the fixture is not vacuous. In `test_manifest_grouping.py`, `TestPairKeyCannotCollide` takes the reachable forms of the collision (an explicit `group` on any platform, a POSIX filename) through all three axis values and through the stream, and pins that an ordinary key keeps the `group_id` `object` gives it; `TestPartMarkersOnlyStripWhatTheGroupApplies` asserts the hand-applied marker survives a group with no such part, that the leak the strip exists for is still undone, and that the file the marker describes keeps it at every granularity - each over both markers. In `test_folder_routing.py`, `--back` is pinned against four back filenames the grammar reads a variant letter off, under `object` and `pair`. The three that could be injected were re-run against the pre-fix implementations and fail (4, 2 and 3 failures); the other two are covered by before/after captures of the prompt text and the vocabulary file. |
+| C1 | Third pass, the two defects the second pass's own tests could not see, both pinned by extending the class that missed them. `TestPairKeyCannotCollide` gains `test_the_key_is_injective_over_the_whole_cross_product` - a brute force over every `(group_key, version)` an eight-value alphabet spells, the `None` version included; the alphabet holds the empty half, a plain letter, the separator and the escape character alone, and each of those two leading, trailing and doubled - and `test_a_trailing_separator_does_not_merge_with_the_join`, which names the `('a\|', 'a')` against `('a', '\|a')` case so the regression is unmistakable; a third colliding pair carries the same shape through the stream. The old class asserted only the two shapes that defeat an *unescaped* join, so it passed while the injectivity claim was false. `TestPartMarkersOnlyStripWhatTheGroupApplies` gains `test_a_hand_applied_marker_survives_a_sibling_that_is_that_part`, over both markers, asserting the keyword survives, is not re-added beside the caller's spelling, and draws no `keywords_remove` - the last needing the real `build_canonical_patch`, since the stub the module uses elsewhere makes every pre-existing keyword read as a deletion, so `run_manifest` now keeps it whenever a changeset writer is supplied. Both replacements were re-run against the implementations they replace: 4 of 5 pair-key tests fail against separator doubling, and the marker test fails on both markers against the group-scoped strip while the three older tests in its class still pass. |
+| C1 | `--group-by` at the CLI seam, in `photokin/tests/test_group_by.py::TestTheRetiredFlagsStillParse`, which runs `cli.main` in process with a real argv. An earlier revision of this row listed all three as verified by hand; all three are pinned. `--process-all-variants` and `--update-policy` are each accepted and warn exactly once, over a folder holding three groups so a per-group or per-file warning would show up as three or four; neither warns when it is not passed, which a warning keyed on `--update-policy`'s old default would have done on every run; and `test_group_by_reaches_the_config_from_argparse` asserts the value `analyze_folder` receives for the bare default and for all three spellings. |
 | C | Detection matrix: directory, `.json`, image; deprecated aliases still work; positional plus alias conflicts; `--back` with a folder errors. |
 | C | Every error case asserts exit code and first line. `-w` expands correctly in all modes, explicit flags override the expansion, and the contradictory combination errors. |
 | C | Regression for the default flip: with no write flags, nothing is written in any mode. |

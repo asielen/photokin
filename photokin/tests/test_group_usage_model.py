@@ -7,28 +7,34 @@ from photokin import core, utils
 
 class TestGroupAwareUsageModel(unittest.TestCase):
     """Regression test for a bug where process_manifest_stream's group-aware
-    merge (cfg.process_all_variants=True) rebuilt _usage with summed token
-    counts but silently dropped the "model" key, so every group-analyzed
-    record (front/back pairs, multi-page sets) reported usage.model=None
-    downstream even though the underlying API call did return one.
+    merge rebuilt _usage with summed token counts but silently dropped the
+    "model" key, so every group-analyzed record (multi-variant sets, multi-page
+    sets) reported usage.model=None downstream even though the underlying API
+    call did return one.
+
+    The group here holds a "b" rescan, which is what routes it through
+    ``analyze_group_front_back``: since the primary retired, the callee follows
+    the payload shape rather than a flag, and a plain front/back pair takes
+    ``analyze_photo`` at every value of ``--group-by``.
     """
 
     def test_front_back_group_preserves_usage_model(self):
         manifest = {
             "items": [
-                {"path": "/photos/family.jpg"},
-                {"path": "/photos/family-back.jpg"},
+                {"path": "/photos/family1.jpg"},
+                {"path": "/photos/family1-back.jpg"},
+                {"path": "/photos/family1b.jpg"},
             ]
         }
-        cfg = utils.Config(dry_run=True, process_all_variants=True)
+        cfg = utils.Config(dry_run=True)
         lines: list[str] = []
 
         fake_result = {
             "result": {
-                "/photos/family.jpg": {
+                "/photos/family1.jpg": {
                     "caption": "Suggested caption",
                     "keywords": ["family", "portrait"],
-                    "all_variant_files": ["/photos/family.jpg", "/photos/family-back.jpg"],
+                    "all_variant_files": ["/photos/family1.jpg", "/photos/family1-back.jpg"],
                     "_usage": {
                         "prompt_tokens": 1200,
                         "completion_tokens": 350,
@@ -46,11 +52,10 @@ class TestGroupAwareUsageModel(unittest.TestCase):
             core.process_manifest_stream(
                 manifest=manifest,
                 cfg=cfg,
-                update_policy=core.UPDATE_MERGE_PER_VARIANT,
                 ndjson_writer=lines.append,
             )
 
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
         records = [json.loads(line) for line in lines]
         for record in records:
             self.assertEqual(record["status"], "ok")
