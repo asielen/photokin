@@ -49,7 +49,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, ClassVar
 from unittest.mock import patch
 
-from photokin import cli, utils
+from photokin import cli, cli_messages, utils
 from photokin.exiftool.manifest import DEFAULT_EXIFTOOL_FIELDS
 
 #: Blanked rather than removed: each of these is read through a falsy-default
@@ -883,10 +883,21 @@ class TestTheMessageMatrix(_CliTestCase):
         a guard that keyed on "has a second colon" would refuse working input.
         Without this test the refusal could be widened to that rule and stay
         green.
+
+        ``XMP:xmp:Rating`` is the same trap from the other direction: it is a
+        two-colon *XMP* spelling, the exact shape the guard exists to catch,
+        and it still writes -- because ``xmp`` collides with the family-0
+        group name rather than naming a real family-1 group. A guard that
+        keyed on "XMP, two colons" alone would refuse this one too.
         """
         folder = self.make_folder()
 
-        for good in ("EXIF:IFD0:Model", "XMP-dc:Description", "XMP:Description"):
+        for good in (
+            "EXIF:IFD0:Model",
+            "XMP-dc:Description",
+            "XMP:Description",
+            "XMP:xmp:Rating",
+        ):
             with self.subTest(tag=good):
                 with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
                     _code, _stdout, stderr = self.run_cli(
@@ -1384,8 +1395,10 @@ class TestThePlanPrecedesTheFirstModelCall(_CliTestCase):
                 # different run from the seven rows above it.
                 "  note      : this run only prints results - your photos are not read or",
                 "              changed. For the normal archival run:",
-                f'                  photokin "{folder}" --provider anthropic '
-                "--claude-model haiku -rw",
+                "                  "
+                + cli_messages.normal_run_command(
+                    [folder, "--provider", "anthropic", "--claude-model", "haiku"]
+                ),
             ],
         )
 
@@ -1554,20 +1567,33 @@ class TestThePlanAdvisesTheNormalRun(_CliTestCase):
         image = os.path.join(folder, "box3_025.jpg")
         back = os.path.join(folder, "box3_025-back.jpg")
         manifest_path = _write_manifest(folder, [{"path": image}])
+        # Expected commands are built with the real quoting rule rather than
+        # hardcoded quotes: whether a token needs `"..."` around it depends on
+        # what characters it holds (see cli_messages._quote_token), and a
+        # temp-dir path on POSIX never does while the same path on Windows
+        # always does (it contains a backslash). What this test asserts is the
+        # *wiring* -- that each input mode's tokens reach the suggestion at
+        # all, and in the right shape (e.g. --back survives as a flag, not as
+        # a second input) -- which is orthogonal to the quoting rule itself;
+        # quoting's own edge cases (spaces, `$`, a trailing backslash) are
+        # covered directly in test_message_style.py.
         expected = {
-            "folder": ([folder], f'photokin "{folder}" -rw'),
-            "folder alias": (["--folder", folder], f'photokin --folder "{folder}" -rw'),
-            "single photo": ([image], f'photokin "{image}" -rw'),
+            "folder": ([folder], cli_messages.normal_run_command([folder])),
+            "folder alias": (
+                ["--folder", folder],
+                cli_messages.normal_run_command(["--folder", folder]),
+            ),
+            "single photo": ([image], cli_messages.normal_run_command([image])),
             # The one case a reconstruction from resolved values would get wrong:
             # the back is not the input, it is a flag on it.
             "single photo with a back": (
                 [image, "--back", back],
-                f'photokin "{image}" --back "{back}" -rw',
+                cli_messages.normal_run_command([image, "--back", back]),
             ),
-            "manifest": ([manifest_path], f'photokin "{manifest_path}" -rw'),
+            "manifest": ([manifest_path], cli_messages.normal_run_command([manifest_path])),
             "manifest alias": (
                 ["--manifest", manifest_path],
-                f'photokin --manifest "{manifest_path}" -rw',
+                cli_messages.normal_run_command(["--manifest", manifest_path]),
             ),
         }
 
@@ -1780,6 +1806,41 @@ class TestThePlanAdvisesTheNormalRun(_CliTestCase):
                     f"`{flag} false` was also given.",
                     stderr,
                 )
+
+
+class TestTheQuotingRuleWithholdsRatherThanCorrupts(unittest.TestCase):
+    """Direct coverage of ``cli_messages.normal_run_command``'s quoting rule.
+
+    The CLI-level tests above only exercise it through real, mostly
+    special-character-free temp paths, so the rule's own edge cases -- the
+    ones its docstring makes specific, measured claims about -- had no direct
+    coverage of their own before this class.
+    """
+
+    def test_an_ordinary_path_is_not_quoted(self) -> None:
+        self.assertEqual(
+            cli_messages.normal_run_command(["/tmp/scans/box3_025.jpg"]),
+            "photokin /tmp/scans/box3_025.jpg -rw",
+        )
+
+    def test_a_windows_path_survives_a_posix_shlex_round_trip(self) -> None:
+        for raw in ("C:\\Scans\\Photos", "C:\\Scans\\"):
+            with self.subTest(path=raw):
+                command = cli_messages.normal_run_command([raw])
+                self.assertIsNotNone(command)
+                self.assertEqual(shlex.split(command)[1], raw)
+
+    def test_a_unc_path_withholds_the_hint_rather_than_corrupting_it(self) -> None:
+        """A leading double backslash is not the trailing case the doubling rule covers.
+
+        Quoted and then parsed by a POSIX shell -- exactly what a WSL prompt or
+        any POSIX ``paste()`` of a suggested command does -- ``\\\\`` inside
+        double quotes is itself an escape for one literal backslash, so a UNC
+        prefix would silently collapse from two backslashes to one and stop
+        naming the same share. No suggestion is offered instead.
+        """
+        unc = "\\\\server\\share\\folder"
+        self.assertIsNone(cli_messages.normal_run_command([unc]))
 
 
 class TestTheCombinedShortFlagIsTheDocumentedNormalRun(_CliTestCase):

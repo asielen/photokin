@@ -803,6 +803,16 @@ def normal_run_command(tokens: list[str]) -> str | None:
     """
     if any(_UNPASTEABLE & set(token) for token in tokens):
         return None
+    # A UNC path (``\\server\share``) is the one shape _quote_token's own
+    # doubling rule does not cover: that rule is proven only for a *trailing*
+    # backslash, and a *leading* double backslash is different -- inside a
+    # POSIX double-quoted string ``\\`` is itself an escape for one literal
+    # backslash, so a UNC prefix collapses from two to one on that shell and
+    # silently stops being a UNC path. Measured: every other Windows path
+    # shape (a bare path, one with a trailing backslash) survives a POSIX
+    # shlex round trip unchanged; only this one does not.
+    if any(token.startswith("\\\\") for token in tokens):
+        return None
     return " ".join(["photokin", *(_quote_token(token) for token in tokens), "-rw"])
 
 

@@ -654,10 +654,26 @@ class TestDryRunStopsAtThePlan(_CliTestCase):
         with open(out_path, "w", encoding="utf-8") as handle:
             handle.write("PREVIOUS RUN CONTENT\n")
         stream = Mock(return_value={"results": {}})
+        # A resolvable binary, same as every other write-flag test in this
+        # module: -w is not exempt from the ExifTool pre-flight under
+        # --dry-run (see the module docstring), so without one this would
+        # exit 2 on a real ExifTool-less machine rather than exercise the
+        # thing under test.
+        exiftool_path = os.path.join(folder, "exiftool.exe")
+        with open(exiftool_path, "w", encoding="utf-8"):
+            pass
 
         with patch("photokin.cli.process_manifest_stream", stream):
             code, stdout, stderr = self.run_cli(
-                [folder, "--output-file", out_path, "-w", "--dry-run"]
+                [
+                    folder,
+                    "--output-file",
+                    out_path,
+                    "-w",
+                    "--dry-run",
+                    "--exiftool-path",
+                    exiftool_path,
+                ]
             )
 
         self.assertIsNone(code)
