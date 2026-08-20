@@ -35,10 +35,12 @@ Code map:
 - _derive_changeset_path    ``dirname(--output-file or input)`` plus the stem
 - _apply_common_cfg         apply flags shared across every input type
 - _resolve_exiftool_config  build ExiftoolConfig (CLI flag > env > default)
-- _preflight_exiftool       stop before the first model call if writes can't run
+- _preflight_exiftool       stop before the first model call if reads/writes can't run
+- _refuse_unwritable_exiftool_fields  reject tag spellings ExifTool cannot write
 - _preflight_output_file    stop before the first model call if an output is unwritable
 - _write_generated_manifest atomically write a synthesized manifest, pretty-printed
 - _generate_manifest        --generate-manifest: describe the input's grouping, stop
+- _suggest_the_normal_run   offer ``-rw`` to a run that has asked for nothing
 - _apply_exiftool_changeset apply routed fields via ExifTool + append a status line
 - main                      PUBLIC: resolve the input, print the plan, run it
 """
@@ -65,10 +67,13 @@ from .errors import ProviderApiError, SELF_EXPLANATORY_ERROR_TYPES
 from .exiftool import (
     ExiftoolConfig,
     apply_changeset,
+    hydrate_item_metadata,
     make_manifest_hydrator,
     resolve_exiftool_path,
 )
 from .exiftool.config import parse_fields as exiftool_parse_fields
+from .exiftool.config import suggest_writable_spelling
+from .exiftool.manifest import DEFAULT_EXIFTOOL_FIELDS
 
 # Named explicitly rather than via __name__: under ``python -m photokin.cli``
 # (how the plugin launches this) __name__ is "__main__", which sits outside the
@@ -718,28 +723,73 @@ def _writes_are_planned(ecfg: ExiftoolConfig, *, changeset_requested: bool) -> b
     return changeset_requested and ecfg.enabled and bool(ecfg.fields)
 
 
-def _preflight_exiftool(ecfg: ExiftoolConfig, *, changeset_requested: bool) -> None:
-    """Fail before the first model call when a requested ExifTool write cannot run.
+def _preflight_exiftool(
+    ecfg: ExiftoolConfig, *, changeset_requested: bool, read_requested: bool = False
+) -> None:
+    """Fail before the first model call when a requested ExifTool run cannot happen.
 
     ``apply_changeset`` only looks for the binary once the whole batch has been
     analyzed and paid for, so the same lookup is done up front here. ``--dry-run``
     is not exempt: it stops after printing the plan, and a plan reporting
     ``write : ExifTool EXIF:UserComment`` when no binary exists would be a lie.
 
+    ``-r`` is guarded for the same reason and more sharply. A write that cannot
+    run is loud by construction -- no file changes -- while a read that cannot
+    run proceeds to call the model with a strictly worse prompt, pays for it in
+    full, and produces a record nothing in the results distinguishes from "there
+    was nothing to read". Writes are still reported first when both are broken,
+    since fetching a binary fixes the read at the same time.
+
     Args:
         ecfg: The resolved ExifTool configuration for this run.
         changeset_requested: True when ``--changeset true`` was resolved.
+        read_requested: True when ``-r`` was given.
 
     Raises:
-        SystemExit: With code 2 when writes are requested but no binary resolves.
+        SystemExit: With code 2 when a read or write is requested but no binary
+            resolves.
     """
-    if not (ecfg.enabled and changeset_requested):
+    writes_requested = ecfg.enabled and changeset_requested
+    if not (writes_requested or read_requested):
         return
     try:
+        # Not gated on ``ecfg.enabled``: a -r-only run has writes off and still
+        # needs the binary.
         resolve_exiftool_path(ecfg)
     except OSError as exc:
         logger.debug("ExifTool resolution failed: %s", exc)
-        _exit_with_usage_error(*cli_messages.exiftool_not_found(ecfg.path or ""))
+        if writes_requested:
+            _exit_with_usage_error(*cli_messages.exiftool_not_found(ecfg.path or ""))
+        _exit_with_usage_error(*cli_messages.exiftool_not_found_for_read(ecfg.path or ""))
+
+
+def _refuse_unwritable_exiftool_fields(value: str | None) -> None:
+    """Reject ``--exiftool-fields`` tags ExifTool is known to refuse.
+
+    The rejected spelling is ``XMP:<namespace>:<Tag>``. It is rejected rather
+    than quietly rewritten: it has never worked, so there is no behaviour to
+    preserve, and the same spelling fails identically in ExifTool itself and in
+    any other tool the user drives with it -- so correcting it silently here
+    would leave them with a habit that keeps failing everywhere else. Naming
+    the working spelling once teaches it; accepting it hides it.
+
+    Rewriting is also not generally safe. ``suggest_writable_spelling``
+    documents the measurements: ``EXIF:IFD0:Model`` is valid ExifTool syntax
+    whose hyphenated form is not, so a blanket colon-to-hyphen rewrite would
+    break input that works today.
+
+    Args:
+        value: The raw ``--exiftool-fields`` string, or ``None``.
+
+    Raises:
+        SystemExit: With code 2 when any named tag uses the rejected spelling.
+    """
+    for tag in exiftool_parse_fields(value) or ():
+        better = suggest_writable_spelling(tag)
+        if better:
+            _exit_with_usage_error(
+                *cli_messages.exiftool_field_is_not_writable(tag, better)
+            )
 
 
 def _preflight_output_file(out_path: str, *, role: str = "--output-file") -> None:
@@ -848,6 +898,12 @@ def _generate_manifest(resolved: ResolvedInput, args: argparse.Namespace, cfg: C
     described: provider, model and debug settings are run settings, and baking
     them in would let a generated file silently override a later run's flags.
 
+    ``-r`` fills each item's ``metadata`` from the file itself before the write,
+    so feeding the document back reproduces the same grouping and the same
+    forwarded metadata without needing ``-r`` again. The flag is not recorded:
+    the metadata is the evidence that a read happened, and a run setting in the
+    file would be exactly the silent override the rule above forbids.
+
     Args:
         resolved: The run's input, already validated.
         args: Parsed CLI arguments.
@@ -876,6 +932,18 @@ def _generate_manifest(resolved: ResolvedInput, args: argparse.Namespace, cfg: C
             photo_context_text=cfg.photo_context_text,
         )
 
+    if args.read:
+        # Hydrated before the bucketing and before the write, so the document
+        # written and the grouping reported describe the same items. Under
+        # --dry-run the pre-flight still runs -- matching the analysis path,
+        # where --dry-run is deliberately not exempt -- but no subprocess starts
+        # and nothing is written; grouping does not read metadata, so the group
+        # count is unaffected either way.
+        ecfg = _resolve_exiftool_config(args)
+        _preflight_exiftool(ecfg, changeset_requested=False, read_requested=True)
+        if not args.dry_run:
+            hydrate_item_metadata(manifest["items"], ecfg)
+
     # Bucketed before the write, not after: the group count is what the user is
     # checking when they reach for this flag, and resolving the entries is also
     # what reports an explicit override that disagrees with a filename -- most
@@ -902,6 +970,64 @@ def _generate_manifest(resolved: ResolvedInput, args: argparse.Namespace, cfg: C
     )
 
 
+def _suggest_the_normal_run(args: argparse.Namespace, argv: list[str]) -> str | None:
+    """Return the ``-rw`` command to advise, or None when the run has declared itself.
+
+    ``photokin <input>`` with nothing else analyzes, prints JSON and leaves the
+    files untouched. That is the documented way to check the wiring before
+    spending anything on it and it is not changed here; what it lacks is the next
+    step, which this supplies as one row of the plan rather than as a warning,
+    because nothing is wrong.
+
+    Silence is the answer for anyone who has already said what they want. Reading,
+    writing, previewing the plan, or naming a destination are all decisions, and
+    ``-rw`` is not news to a run that made one. Two of the flags are treated as
+    declarations at *either* value, which the write-half of the run does not:
+    ``--changeset false`` and ``--exiftool-write false`` say no just as plainly as
+    ``true`` says yes, and appending ``-rw`` beside either is refused outright by
+    :func:`cli_messages.write_bundle_contradiction` -- so a note offered there
+    would print a command that exits 2. ``--generate-manifest`` needs no entry at
+    all: it writes its manifest and returns above the plan, so the row this would
+    suppress is never built. The pre-flight refusals behave the same way, exiting
+    before the plan exists.
+
+    Nothing here consults ``sys.stdout.isatty()``, and that is a decision rather
+    than an omission. The note is a row of the plan summary, which goes to
+    *stderr*: redirecting stdout does not move it, and hiding one row of a block
+    printed on the other stream would make the block's shape turn on something it
+    is not printed to. A shell redirect is also a choice about where the JSON
+    lands rather than a statement about the photos -- ``--output-file`` is spelled
+    in photokin's own vocabulary and means the flag table was read, while
+    ``> results.json`` is a shell habit, and the reader who types it and then
+    wonders why Lightroom shows nothing is precisely who the note is for. Staying
+    unconditional also keeps one command's output identical everywhere, including
+    under the tests, whose captured stdout is never a terminal and would
+    otherwise exercise only the silent branch.
+
+    Args:
+        args: The parsed namespace, read before ``-w``'s expansion is written
+            back over it so every value here is one the user actually typed.
+        argv: The argv that produced it, without the program name. The suggestion
+            is built from these tokens rather than from the resolved values, so
+            what is printed is the command that was typed with two flags added.
+
+    Returns:
+        The suggested command line, or None when nothing should be printed.
+    """
+    declared = (
+        args.read
+        or args.write
+        or args.dry_run
+        or args.changeset is not None
+        or args.exiftool_write is not None
+        or bool(args.output_file)
+        or args.output_sidecars
+    )
+    if declared:
+        return None
+    return cli_messages.normal_run_command(argv)
+
+
 def _render_output_clause(out_path: str | None) -> str:
     """Return the plan summary's ``output`` line for this destination.
 
@@ -917,6 +1043,25 @@ def _render_output_clause(out_path: str | None) -> str:
     if out_path.lower().endswith(".ndjson"):
         return f"{absolute} (ndjson, one record per finished photo)"
     return f"{absolute} (json, one object written at the end)"
+
+
+def _render_read_clause(read_requested: bool) -> str:
+    """Return the plan summary's ``read`` line, naming the tags ``-r`` will read.
+
+    Stated on every run, including the runs that read nothing. Manifest input
+    used to hydrate unasked, so a plugin that never passed ``-r`` needs to see
+    that it now reads nothing -- the same mechanism C2 used to announce the
+    flipped write default rather than a separate deprecation warning.
+
+    Args:
+        read_requested: True when ``-r`` was given.
+
+    Returns:
+        The read set, or a ``none (...)`` clause stating what turned it off.
+    """
+    if read_requested:
+        return "ExifTool " + ", ".join(DEFAULT_EXIFTOOL_FIELDS)
+    return "none (-r not given)"
 
 
 def _render_write_clause(
@@ -958,13 +1103,31 @@ def _apply_exiftool_changeset(
     ecfg: ExiftoolConfig,
     changeset_path: str | None,
     out_path: str | None,
-) -> None:
-    """Apply routed fields from a changeset using ExifTool and append a status record."""
+    strict: bool = False,
+) -> bool:
+    """Apply routed fields from a changeset using ExifTool and append a status record.
+
+    Args:
+        ecfg: The resolved ExifTool configuration for this run.
+        changeset_path: The changeset to apply, or ``None`` when none was written.
+        out_path: The run's output destination, used to route the status record.
+        strict: Whether a total write failure should be reported to the caller.
+            False for manifest input, which keeps the plug-in's contract.
+
+    Returns:
+        True when the run should be treated as failed: writes were requested,
+        files were seen, and not one of them was written. A *partial* failure
+        returns False and stays in the records, because some files did get their
+        metadata and per-file trouble is ordinary -- one locked file, one corrupt
+        image. Zero written out of many seen is not ordinary; it means the
+        configuration was wrong (an unwritable tag, a missing binary, a read-only
+        tree) and every file failed for the same reason.
+    """
     if not changeset_path or not os.path.isfile(changeset_path):
-        return
+        return False
 
     if not ecfg.enabled or not ecfg.fields:
-        return
+        return False
 
     exiftool_path = ecfg.path or "(auto-detect)"
     logger.info(
@@ -982,7 +1145,9 @@ def _apply_exiftool_changeset(
         )
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
         logger.warning("ExifTool apply failed: %s", exc)
-        return
+        # The whole apply step raised, so nothing was written -- the same
+        # outcome the counters below describe, reached a different way.
+        return strict
 
     files_seen = int(exif_summary.get("files_seen") or 0)
     files_written = int(exif_summary.get("files_written") or 0)
@@ -1017,6 +1182,11 @@ def _apply_exiftool_changeset(
             file_handle.write(status_line + "\n")
     else:
         logger.info("[ExifTool] Apply status: %s", status_line)
+
+    # Reported after the status record is written, not instead of it: the
+    # summary is how a caller finds out which files failed and why, and it has
+    # to survive the run being called a failure.
+    return strict and files_seen > 0 and files_written == 0
 
 
 def main() -> None:
@@ -1130,6 +1300,18 @@ def main() -> None:
             help="Shorthand for --changeset true --exiftool-write true: record the "
                  "proposed writes and apply them to the files.",
         )
+        # Explicit, and not a member of _WRITE_BUNDLE: it reads rather than
+        # writes, so -w does not expand to it and it is allowed beside
+        # --generate-manifest, which is what makes that document round-trip.
+        ap.add_argument(
+            "-r", "--read",
+            action="store_true",
+            dest="read",
+            help="Before analysis, read the metadata already in the files with ExifTool "
+                 "(EXIF:DateTimeOriginal, EXIF:UserComment, XMP:Description, XMP:Title, "
+                 "XMP:Subject) and send it to the model. Only fills values the input does "
+                 "not already carry; nothing is written. Mirrors -w / --write.",
+        )
         ap.add_argument(
             "--debug-dump-llm-request",
             choices=["true", "false"],
@@ -1197,6 +1379,11 @@ def main() -> None:
         if args.generate_manifest:
             _refuse_generate_manifest_write_flags(args)
 
+        # Before the write-bundle guards: an unwritable tag name is wrong however
+        # the run is configured, and saying so is more use than "add --changeset
+        # true" for a tag that would write nothing even with the flag.
+        _refuse_unwritable_exiftool_fields(args.exiftool_fields)
+
         changeset_flag, exiftool_write = _resolve_write_bundle(args)
         changeset_requested = changeset_flag == "true"
         if exiftool_write == "true" and not changeset_requested:
@@ -1228,11 +1415,18 @@ def main() -> None:
             _generate_manifest(resolved, args, cfg)
             return
 
+        # Decided above the write-back on the next line, not below it: the
+        # suggestion turns on which write flags the *user* spelled out, and after
+        # the expansion ``args.exiftool_write`` may hold a value nobody passed.
+        suggested_command = _suggest_the_normal_run(args, argv)
+
         # ``-w``'s expansion is written back so everything downstream reads one
         # resolved value rather than re-deriving the bundle.
         args.exiftool_write = exiftool_write
         ecfg = _resolve_exiftool_config(args)
-        _preflight_exiftool(ecfg, changeset_requested=changeset_requested)
+        _preflight_exiftool(
+            ecfg, changeset_requested=changeset_requested, read_requested=args.read
+        )
 
         if loaded_manifest is not None:
             _apply_manifest_debug_settings(
@@ -1284,6 +1478,7 @@ def main() -> None:
             file_count=len(manifest_doc["items"]),
             group_count=len(buckets),
             group_by=cfg.group_by,
+            read=_render_read_clause(args.read),
             output=_render_output_clause(out_path),
             changeset=changeset_path or "none (--changeset false)",
             write=_render_write_clause(
@@ -1295,6 +1490,7 @@ def main() -> None:
             provider=cfg.provider_name,
             model=utils.resolve_model_for_provider(cfg),
             dry_run=args.dry_run,
+            suggested_command=suggested_command,
         )
         logger.info("%s", plan.render())
         if args.dry_run:
@@ -1330,11 +1526,8 @@ def main() -> None:
             write_sidecars=args.output_sidecars,
             ndjson_writer=ndjson_writer,
             changeset_writer=changeset_writer,
-            # Hydration stays manifest-only: seeding the ``{"metadata": {}}`` a
-            # synthesized item needs would change the merge inputs of every
-            # record of every folder run, which is a data change rather than a
-            # CLI one. See docs/unified-input-pipeline.md.
-            metadata_hydrator=make_manifest_hydrator(ecfg) if resolved.kind == "manifest" else None,
+            metadata_hydrator=make_manifest_hydrator(ecfg) if args.read else None,
+            titles_may_be_from_files=args.read,
             # Folder and single-photo input keep Phase A's failure contract;
             # manifest input keeps the plug-in's.
             strict_run_failures=resolved.kind != "manifest",
@@ -1343,7 +1536,19 @@ def main() -> None:
             print(json.dumps(data, indent=2 if cfg.pretty_json else None, ensure_ascii=False))
         elif out_path.lower().endswith(".json"):
             _write_aggregate_json(data, out_path, pretty=cfg.pretty_json)
-        _apply_exiftool_changeset(ecfg=ecfg, changeset_path=changeset_path, out_path=out_path)
+        # Manifest input is exempt for the same reason it keeps
+        # ``strict_run_failures=False``: it is the Lightroom plug-in's contract,
+        # and the plug-in reads the per-item records rather than the exit
+        # status, so failing the batch would tell it less than the records
+        # already do. See photokin/README.md's failure-contract section.
+        nothing_written = _apply_exiftool_changeset(
+            ecfg=ecfg,
+            changeset_path=changeset_path,
+            out_path=out_path,
+            strict=resolved.kind != "manifest",
+        )
+        if nothing_written:
+            _exit_with_usage_error(*cli_messages.every_write_failed())
 
     except SystemExit:
         raise

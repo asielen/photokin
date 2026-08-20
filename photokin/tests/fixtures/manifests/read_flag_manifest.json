@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "generated_by": "photokin --generate-manifest",
+  "source": {
+    "type": "folder",
+    "path": "<FOLDER>"
+  },
+  "items": [
+    {
+      "path": "<FOLDER>/box3_025-back.jpg",
+      "metadata": {
+        "userComment": "Ruth and Edith, back porch"
+      }
+    },
+    {
+      "path": "<FOLDER>/box3_025.jpg",
+      "metadata": {
+        "dateTimeOriginal": "2019:04:03 11:22:33",
+        "userComment": "box 3, envelope 12",
+        "caption": "Grandma on the porch",
+        "title": "Scanned Image",
+        "keywords": [
+          "family",
+          "ohio"
+        ]
+      }
+    },
+    {
+      "path": "<FOLDER>/box3_025b.jpg"
+    },
+    {
+      "path": "<FOLDER>/box3_026.jpg",
+      "metadata": {
+        "title": "Untitled Scan"
+      }
+    }
+  ]
+}

@@ -101,10 +101,22 @@ class Config:
     fail_on_forbidden: bool = False
     max_edge: int | None = 1024
     group_by: str = GROUP_BY_OBJECT
-    date_confidence_threshold: float = 0.7
+    # The two date gates are deliberately ordered: filling a date the file does
+    # not have is cheap, because nothing is lost if the guess is poor and the
+    # field was empty either way, while overwriting a date the file already
+    # holds destroys something. So the write gate sits BELOW the override gate.
+    #
+    # They used to sit the other way round -- 0.7 to fill a blank, 0.6 to
+    # overwrite -- which meant a 0.65 inference was too weak to fill an empty
+    # date and strong enough to replace a correct one. Nothing had gone wrong to
+    # produce that; the two knobs were set in different modules for different
+    # reasons and never compared.
+    date_confidence_threshold: float = 0.6
     location_confidence_threshold: float = 0.7
-    # date_guess override policy (merge.py)
-    date_override_confidence_threshold: float = 0.6
+    # date_guess override policy (merge.py). The precise variant below stays
+    # above this one: a tighter year gap buys less evidence of a real mismatch,
+    # so it has to be paid for with more confidence.
+    date_override_confidence_threshold: float = 0.7
     date_override_precise_confidence_threshold: float = 0.8
     date_override_year_gap: int = 20
     date_override_precise_year_gap: int = 5
@@ -1260,6 +1272,18 @@ class ParsedName:
     page_num: int | None
     is_crop: bool = False
 
+
+#: One canonical ordering over :attr:`ParsedName.part_kind`, from "this is the
+#: object" to "this is a supporting view of it". Every tie-break in the pipeline
+#: that has to rank the files of a group reads it, so the file whose slot is
+#: chosen first and the file whose metadata is taken first are the same file.
+PART_RANK: dict[str, int] = {"front": 0, "none": 1, "page": 2, "back": 3, "negative": 4}
+
+#: Where an entry with no recognized ``part_kind`` sorts: alongside an untagged
+#: file, which is what an unparsed one effectively is.
+UNRANKED_PART = PART_RANK["none"]
+
+
 def parse_media_filename(path: str) -> ParsedName:
     """
     Parse media filenames that may include variant letters and part suffixes.
@@ -1471,6 +1495,25 @@ def combine_group_metadata(items_in_group: list[dict]) -> dict:
     Rules:
       - keywords: union (case-insensitive)
       - title/caption/date/location: first non-empty wins, but any item with preferred=true takes precedence
+
+    First-non-empty needs a defined order to be a defined answer, and the answer
+    stands for the whole object, so the scan runs from the file that most is the
+    object to the file that least is. Preferred items still come first; within
+    each half a crop yields to what it was cut from, then :data:`PART_RANK`
+    ranks the front print ahead of its back, pages, and negatives, then the path
+    settles the rest -- the same order the bucket loop uses to decide which file
+    fills a slot, so the group's metadata and the group's primary scan are the
+    same file.
+
+    Ranking by path alone is not enough and is actively wrong here: ``-``
+    (0x2D) sorts before ``.`` (0x2E), so every ``-back``/``-crop``/``-negative``
+    sibling precedes the bare front scan and the front print's own title and
+    caption would reach neither the model nor its siblings' records.
+
+    The result is invariant under permutation of ``items_in_group``. Entries
+    carrying no ``part_kind`` -- a caller passing raw manifest items rather than
+    resolved ones -- all rank alike and fall through to the path, which is the
+    previous behavior.
     """
     def _norm_str_set(seq) -> List[str]:
         seen = set(); out = []
@@ -1480,12 +1523,24 @@ def combine_group_metadata(items_in_group: list[dict]) -> dict:
                 if k and k not in seen:
                     seen.add(k); out.append(x.strip())
         return out
+
+    def _scan_key(it: dict) -> tuple[int, int, int, str, str]:
+        p = normalize_path(it.get("path") or "") or ""
+        return (
+            1 if it.get("is_crop") else 0,
+            PART_RANK.get(it.get("part_kind") or "", UNRANKED_PART),
+            it.get("page_num") or 0,
+            p.lower(),
+            p,
+        )
+
     keywords = []
     title = caption = date = location = state = city = country = user_comment = None
 
     # if any preferred has values, pluck them first
-    preferred = [it for it in items_in_group if it.get("preferred")]
-    scan_order = preferred + [it for it in items_in_group if it not in preferred]
+    preferred = sorted((it for it in items_in_group if it.get("preferred")), key=_scan_key)
+    rest = sorted((it for it in items_in_group if not it.get("preferred")), key=_scan_key)
+    scan_order = preferred + rest
 
     for it in scan_order:
         meta = load_item_metadata(it) or {}
@@ -1508,7 +1563,15 @@ def combine_group_metadata(items_in_group: list[dict]) -> dict:
     if keywords: out["keywords"] = keywords
     if title:    out["title"] = title
     if caption:  out["caption"] = caption
-    if date:     out["date"] = date
+    if date:
+        # Two spellings of one value, deliberately. "date" is what merge.py
+        # reads (the gap heuristic and the evidence block) and what
+        # merge_original_sources picks; "dateTimeOriginal" is the spelling the
+        # forward allowlist, metadata_forward.toml and the README all name, and
+        # the one the prompt is written to receive. The rename between the two
+        # used to lose the field at the last step.
+        out["date"] = date
+        out["dateTimeOriginal"] = date
     if location: out["location"] = location
     if state:    out["state"] = state
     if city:     out["city"] = city
@@ -1537,6 +1600,12 @@ def merge_original_sources(primary: dict | None, fallback: dict | None) -> dict:
 
     - keywords/tags: case-insensitive union, preserving order (primary first)
     - title/caption/date/location: prefer ``primary`` when present, else fallback
+
+    ``date`` also reads ``dateTimeOriginal``. ``primary`` is the item's own raw
+    metadata, where a hydrated date is spelled ``dateTimeOriginal``; only
+    ``combine_group_metadata`` produces the ``date`` spelling. Without the alias
+    no file's own date ever reaches its own record, and every file in a group
+    would inherit whichever sibling the group scan happened to read first.
     """
     primary = primary or {}
     fallback = fallback or {}
@@ -1554,9 +1623,13 @@ def merge_original_sources(primary: dict | None, fallback: dict | None) -> dict:
 
     def _pick(field: str):
         v1 = (primary.get(field) or "").strip()
+        if not v1 and field == "date":
+            v1 = (primary.get("dateTimeOriginal") or "").strip()
         if v1:
             return v1
         v2 = (fallback.get(field) or "").strip()
+        if not v2 and field == "date":
+            v2 = (fallback.get("dateTimeOriginal") or "").strip()
         return v2 or None
 
     merged: dict[str, str | list[str]] = {}

@@ -35,6 +35,7 @@ Code map:
 - _split_fields                       expand comma-separated --field values
 - _normalize_paths                    absolutize/clean input file paths
 - run_exiftool_json                   PUBLIC: run exiftool -j and parse the JSON
+- manifest_value                      PUBLIC: one tag value -> the shape its key expects
 - _first_non_empty                    pick the first present value across tag aliases
 - exiftool_records_to_manifest_items  PUBLIC: ExifTool records -> manifest items
 - build_manifest                      PUBLIC: read + convert in one call -> manifest
@@ -49,7 +50,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 
 
 
@@ -58,6 +59,15 @@ DEFAULT_EXIFTOOL_FIELDS: tuple[str, ...] = (
     "EXIF:UserComment",
     "XMP:Description",
     "XMP:Title",
+    # Keywords are not read for their own sake. ``merge._has_date_keyword``
+    # treats a ``DATE:`` keyword as the human "hands off the date" signal, and
+    # that marker lives here -- it is what photokin's own canonical keyword tag
+    # names. Reading DateTimeOriginal without it arms the date-correction
+    # heuristic and disables its only interlock, so a hand-dated print would be
+    # re-dated from the model's inference. Read as ``XMP:Subject``, the
+    # writable family-0 spelling; ExifTool reports it back under ``-G1`` as
+    # ``XMP-dc:Subject``, and as a list whenever the file holds more than one.
+    "XMP:Subject",
 )
 
 def _split_fields(fields: Sequence[str]) -> List[str]:
@@ -82,42 +92,62 @@ def _normalize_paths(paths: Sequence[str]) -> List[str]:
     return [str(Path(p).expanduser()) for p in paths if p]
 
 
-def run_exiftool_json(
-    exiftool_path: str,
-    files: Sequence[str],
-    fields: Sequence[str],
-    *,
-    include_all_if_no_fields: bool = False,
-    timeout_sec: int = 60,
+#: Command-line budget, in characters, for one ExifTool invocation. Windows caps
+#: a command line at 32767 and fails past it with ``[WinError 206] The filename
+#: or extension is too long``, which ``subprocess`` raises as
+#: ``FileNotFoundError`` -- indistinguishable from a missing binary, and so
+#: reported as one. A folder of a few hundred scans reaches that on its own, and
+#: the whole read then fails as a single unit. Batching keeps every invocation
+#: well inside the limit; the headroom covers the quoting Windows adds. POSIX
+#: allows far more, but one rule that holds everywhere is worth more than the
+#: subprocess calls it costs on a very large folder.
+_ARGV_BUDGET = 30000
+
+#: Floor for the per-batch budget, so a long field list cannot starve it down to
+#: nothing. A batch always carries at least one file regardless.
+_MIN_ARGV_BUDGET = 4096
+
+#: Per argument: the separating space plus the quotes Windows may add.
+_ARGV_OVERHEAD_PER_ARG = 3
+
+
+def _argv_cost(arg: str) -> int:
+    return len(arg) + _ARGV_OVERHEAD_PER_ARG
+
+
+def _batch_files(files: List[str], prefix_cost: int) -> List[List[str]]:
+    """Split ``files`` so each batch plus the fixed prefix fits one command line.
+
+    Args:
+        files: Normalized file paths, in the order they should be requested.
+        prefix_cost: Command-line cost of the invariant part of the command
+            (binary, switches, tag selectors).
+
+    Returns:
+        One or more batches, together holding every path exactly once and in the
+        original order. A path too long to fit on its own still gets a batch, so
+        no input is silently dropped.
+    """
+    budget = max(_ARGV_BUDGET - prefix_cost, _MIN_ARGV_BUDGET)
+    batches: List[List[str]] = []
+    current: List[str] = []
+    used = 0
+    for path in files:
+        cost = _argv_cost(path)
+        if current and used + cost > budget:
+            batches.append(current)
+            current, used = [], 0
+        current.append(path)
+        used += cost
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _run_exiftool_batch(
+    exiftool_path: str, cmd: List[str], timeout_sec: int
 ) -> List[Dict[str, Any]]:
-    """
-    Run exiftool and return parsed JSON objects.
-
-    If fields is empty and include_all_if_no_fields is False, we still run exiftool but
-    only request SourceFile (minimal). If include_all_if_no_fields is True, we omit
-    field selectors and ExifTool returns a lot of tags (can be huge).
-    """
-    files_n = _normalize_paths(files)
-    if not files_n:
-        return []
-
-    cmd: List[str] = [exiftool_path, "-json", "-G1"]
-
-    # ExifTool can be finicky about encoding; UTF-8 is a good default.
-    cmd += ["-charset", "filename=utf8", "-charset", "utf8"]
-
-    fields_n = _split_fields(fields)
-    if fields_n:
-        for f in fields_n:
-            cmd.append(f"-{f}")
-    else:
-        if not include_all_if_no_fields:
-            # Keep response small; still returns SourceFile plus a minimal set.
-            pass
-        # else: omit -TAG selectors => lots of tags
-
-    cmd += list(files_n)
-
+    """Run one prepared ExifTool command line and return its parsed JSON list."""
     try:
         proc = subprocess.run(
             cmd,
@@ -160,6 +190,52 @@ def run_exiftool_json(
     return data
 
 
+def run_exiftool_json(
+    exiftool_path: str,
+    files: Sequence[str],
+    fields: Sequence[str],
+    *,
+    include_all_if_no_fields: bool = False,
+    timeout_sec: int = 60,
+) -> List[Dict[str, Any]]:
+    """
+    Run exiftool and return parsed JSON objects.
+
+    If fields is empty and include_all_if_no_fields is False, we still run exiftool but
+    only request SourceFile (minimal). If include_all_if_no_fields is True, we omit
+    field selectors and ExifTool returns a lot of tags (can be huge).
+
+    Large file lists are split across several invocations (see
+    :data:`_ARGV_BUDGET`) and their records concatenated in input order; a list
+    that fits one command line is still sent as exactly one.  ``timeout_sec``
+    applies per invocation.
+    """
+    files_n = _normalize_paths(files)
+    if not files_n:
+        return []
+
+    cmd: List[str] = [exiftool_path, "-json", "-G1"]
+
+    # ExifTool can be finicky about encoding; UTF-8 is a good default.
+    cmd += ["-charset", "filename=utf8", "-charset", "utf8"]
+
+    fields_n = _split_fields(fields)
+    if fields_n:
+        for f in fields_n:
+            cmd.append(f"-{f}")
+    else:
+        if not include_all_if_no_fields:
+            # Keep response small; still returns SourceFile plus a minimal set.
+            pass
+        # else: omit -TAG selectors => lots of tags
+
+    prefix_cost = sum(_argv_cost(part) for part in cmd)
+    records: List[Dict[str, Any]] = []
+    for batch in _batch_files(files_n, prefix_cost):
+        records.extend(_run_exiftool_batch(exiftool_path, cmd + batch, timeout_sec))
+    return records
+
+
 _TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     # capture time
     "EXIF:DateTimeOriginal": "dateTimeOriginal",
@@ -185,7 +261,14 @@ _TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     "XMP:Title": "title",
     "XMP-dc:Title": "title",
     "IPTC:ObjectName": "title",
+
+    # keywords (multi-valued; carries the reviewed "DATE:" marker)
+    "XMP:Subject": "keywords",
+    "XMP-dc:Subject": "keywords",
 }
+
+#: Manifest keys whose value is a list of strings rather than one string.
+_LIST_MANIFEST_KEYS: frozenset[str] = frozenset({"keywords"})
 
 # run_exiftool_json requests -G1, so ExifTool returns fine-grained group names
 # (e.g. "ExifIFD:UserComment", "XMP-dc:Description") that do not match the
@@ -218,14 +301,42 @@ def _find_tag_value(rec: Dict[str, Any], tag: str) -> Any:
     return None
 
 
-def _first_non_empty(values: Sequence[Optional[str]]) -> Optional[str]:
-    for v in values:
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s:
-            return s
-    return None
+def manifest_value(value: Any, manifest_key: str) -> str | List[str] | None:
+    """Normalize one ExifTool tag value into the shape its manifest key expects.
+
+    ExifTool returns a multi-valued tag (``XMP:Subject``) as a JSON list when the
+    file holds several values and as a bare string when it holds one, so a
+    list-valued key has to accept both. Everything else is a single trimmed
+    string. ``None`` means "nothing usable here", which is what both callers
+    test to decide whether a value is worth storing.
+
+    Args:
+        value: The raw value from an ExifTool JSON record.
+        manifest_key: The manifest key it maps to, per
+            :data:`_TAG_TO_MANIFEST_KEY`.
+
+    Returns:
+        A trimmed string, a list of trimmed strings for a list-valued key, or
+        ``None`` when nothing non-empty remains.
+    """
+    if manifest_key in _LIST_MANIFEST_KEYS:
+        raw = value if isinstance(value, (list, tuple)) else [value]
+        items = [str(v).strip() for v in raw if v is not None and str(v).strip()]
+        return items or None
+    if isinstance(value, (list, tuple)):
+        # A single-valued key that came back multi-valued: take the first
+        # usable entry rather than stringifying the list into the metadata.
+        value = next((v for v in value if v is not None and str(v).strip()), None)
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def _first_non_empty(
+    values: Sequence[str | List[str] | None],
+) -> str | List[str] | None:
+    """Return the first already-normalized value that is not ``None``."""
+    return next((v for v in values if v is not None), None)
 
 
 def exiftool_records_to_manifest_items(
@@ -261,13 +372,13 @@ def exiftool_records_to_manifest_items(
 
         meta: Dict[str, Any] = {"path": str(src), "exiftool": raw_tags}
 
-        candidates_by_key: Dict[str, List[Optional[str]]] = {}
+        candidates_by_key: Dict[str, List[str | List[str] | None]] = {}
 
         def consider(tag: str, value: Any) -> None:
             mk = _TAG_TO_MANIFEST_KEY.get(tag) or _BARE_TAG_TO_MANIFEST_KEY.get(_bare_tag(tag))
             if not mk:
                 return
-            candidates_by_key.setdefault(mk, []).append(None if value is None else str(value))
+            candidates_by_key.setdefault(mk, []).append(manifest_value(value, mk))
 
         source_dict = raw_tags if raw_tags else {k: v for k, v in rec.items() if k != "SourceFile"}
         for tag, value in source_dict.items():

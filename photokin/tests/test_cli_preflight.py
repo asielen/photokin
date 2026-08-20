@@ -241,19 +241,30 @@ class _CliTestCase(unittest.TestCase):
         return [line for line in stderr.splitlines() if fragment in line]
 
     def usage_error(self, stderr: str) -> list[str]:
-        """Return the two-line usage error a failed run ends with.
+        """Return the usage error a failed run ends with, however many lines.
 
         Taken from the end rather than the start: a positional input logs what
         it was detected as before anything can go wrong with it, and that line
         is the point of the detection contract.
 
+        Sliced from the ``[ERROR]`` line rather than by a fixed count. A problem
+        line may carry continuation lines -- a long configured path is put on
+        one of its own instead of into a parenthetical -- and a fixed ``[-2:]``
+        silently drops the problem itself when that happens, leaving the
+        continuation to be compared against the problem and failing in a way
+        that points at the message rather than at this slice.
+
         Args:
             stderr: The whole stderr capture.
 
         Returns:
-            The problem line and the ``Try:`` line.
+            Every line of the usage error, problem first, ``Try:`` last.
         """
-        return stderr.splitlines()[-2:]
+        lines = stderr.splitlines()
+        for index in range(len(lines) - 1, -1, -1):
+            if lines[index].startswith("[ERROR]"):
+                return lines[index:]
+        return lines[-2:]
 
 
 class TestCliLoggingHandler(_CliTestCase):
@@ -320,10 +331,15 @@ class TestCliLoggingHandler(_CliTestCase):
 class TestHydrationWarningVisibility(_CliTestCase):
     """The invisible-warning bug: ``exiftool.hydrate`` logs, and nobody listened.
 
-    ``hydrate_user_comments`` degrades to a warning when no ExifTool binary
-    resolves, which silently costs the run every ``EXIF:UserComment`` it would
-    have recovered. With no handler anywhere in the ``photokin`` hierarchy that
-    warning went nowhere, so the run looked complete.
+    ``hydrate_item_metadata`` degrades to a warning when the binary disappears
+    mid-run, which silently costs the run every tag it would have recovered.
+    With no handler anywhere in the ``photokin`` hierarchy that warning went
+    nowhere, so the run looked complete.
+
+    Since C3 the request itself is pre-flighted, so reaching the warning takes a
+    binary that resolves for ``main`` and then fails for the hydrator -- which is
+    the reachable shape it is kept for, and exactly what the two patches below
+    arrange.
     """
 
     def test_hydration_warning_reaches_stderr_through_the_cli_handler(self) -> None:
@@ -331,17 +347,19 @@ class TestHydrationWarningVisibility(_CliTestCase):
             manifest_path = _write_manifest(folder)
 
             with patch(
+                "photokin.cli.resolve_exiftool_path", return_value="/fake/exiftool"
+            ), patch(
                 "photokin.exiftool.hydrate.resolve_exiftool_path",
                 side_effect=FileNotFoundError("ExifTool not found."),
             ), patch("photokin.cli.process_manifest_stream", _stream_running_the_hydrator):
-                code, stdout, stderr = self.run_cli(["--manifest", manifest_path])
+                code, stdout, stderr = self.run_cli(["-r", "--manifest", manifest_path])
 
         self.assertIsNone(code)
         # The "[WARNING] " prefix is this CLI's own formatter, so its presence
         # proves the record travelled through the installed handler rather than
         # logging's last-resort fallback or a test-runner handler.
-        self.assertIn("[WARNING] Skipping EXIF:UserComment hydration: ExifTool not found.", stderr)
-        self.assertNotIn("Skipping EXIF:UserComment hydration", stdout)
+        self.assertIn("[WARNING] Skipping metadata hydration: ExifTool not found.", stderr)
+        self.assertNotIn("Skipping metadata hydration", stdout)
 
 
 class TestOutputFileForEveryInputType(_CliTestCase):
@@ -574,10 +592,10 @@ class TestExiftoolPreflight(_CliTestCase):
             lines = stderr.splitlines()
             self.assertEqual(
                 lines[0],
-                "[ERROR] --changeset true needs ExifTool to write the results, but no "
-                f"ExifTool binary was found (configured path: {missing_exiftool}).",
+                "[ERROR] no ExifTool found, and writing needs it.",
             )
-            self.assertTrue(lines[1].startswith("Try: "))
+            self.assertEqual(lines[1], f"  looked for it at: {missing_exiftool}")
+            self.assertTrue(lines[2].startswith("Try: "))
             self.assertEqual(stdout, "")
             self.assertFalse(os.path.exists(os.path.join(folder, "batch_changeset.ndjson")))
 
@@ -597,7 +615,7 @@ class TestExiftoolPreflight(_CliTestCase):
                 "photokin.cli.resolve_exiftool_path",
                 side_effect=FileNotFoundError("ExifTool not found."),
             ), patch("photokin.cli.process_manifest_stream", stream), patch(
-                "photokin.cli._apply_exiftool_changeset"
+                "photokin.cli._apply_exiftool_changeset", return_value=False
             ):
                 code, stdout, stderr = self.run_cli(
                     [
@@ -614,8 +632,7 @@ class TestExiftoolPreflight(_CliTestCase):
             self.assertEqual(code, 2)
             self.assertEqual(
                 stderr.splitlines()[0],
-                "[ERROR] --changeset true needs ExifTool to write the results, but no "
-                "ExifTool binary was found.",
+                "[ERROR] no ExifTool found, and writing needs it.",
             )
             self.assertNotIn(_PLAN_HEADER, stderr)
             self.assertEqual(stdout, "")
@@ -682,6 +699,150 @@ class _WriteFixtureTestCase(_CliTestCase):
     def each_input(self, folder: str, image: str, manifest_path: str) -> tuple[list[str], ...]:
         """Return one argv prefix per input kind, in detection order."""
         return ([folder], [image], ["--manifest", manifest_path])
+
+
+class TestWhichMissingExiftoolMessageAReadOrWriteRunGets(_WriteFixtureTestCase):
+    """Three requests, two messages, and one branch deciding between them.
+
+    ``-r`` and ``-w`` both need a binary that does not exist here, and C3 gave
+    the read its own wording because the write message's remedy -- "re-run with
+    --exiftool-write false" -- is useless advice to someone who asked to read.
+    When *both* were requested the phase chose to report the write, because the
+    other two remedies both messages offer (fetch a binary, install one) fix the
+    read at the same time, so the write message is the one that ends the whole
+    problem in a single step.
+
+    That choice is one ``if writes_requested:`` inside
+    ``cli._preflight_exiftool``, sitting above an unguarded fall-through to the
+    read message. Nothing passed the two flags together, so swapping the two
+    calls -- reporting the read and stranding the write -- shipped green. All
+    three states are pinned here, in every input mode, and the two-flag case is
+    pinned in both typing orders, since argparse makes the order invisible to
+    the branch and a reader should not have to know that.
+
+    The fixture's real ExifTool binary is deliberately left unused: every run
+    below points ``--exiftool-path`` at a path that is not there, which is also
+    what puts the configured path in the message and so pins that the run named
+    the thing it could not find.
+    """
+
+    #: Both messages, each as the exact two lines a failed run ends with. Stated
+    #: as literals rather than rendered from ``cli_messages``: a test that builds
+    #: its expectation from the function under test pins nothing about it. The
+    #: ``{configured}`` slot is the only part that varies per run.
+    #: The configured path sits on its own indented line rather than inside a
+    #: parenthetical, which is the whole point of the shape: a Windows path runs
+    #: past 80 characters routinely and used to swallow the sentence around it.
+    _READ_MESSAGE = (
+        (
+            "[ERROR] no ExifTool found, and -r needs it to read your files.\n"
+            "  looked for it at: {configured}"
+        ),
+        (
+            "Try: run `python -m photokin.exiftool.fetch` to install one, "
+            "or drop -r to analyze without reading"
+        ),
+    )
+    _WRITE_MESSAGE = (
+        (
+            "[ERROR] no ExifTool found, and writing needs it.\n"
+            "  looked for it at: {configured}"
+        ),
+        (
+            "Try: run `python -m photokin.exiftool.fetch` to install one, "
+            "or drop -w to analyze without writing"
+        ),
+    )
+
+    def _missing_binary(self, folder: str) -> str:
+        """Return a path inside *folder* that no binary will ever resolve to."""
+        return os.path.join(folder, "nosuchdir", "exiftool.exe")
+
+    def _assert_reports(
+        self, argv: list[str], missing: str, expected: tuple[str, str]
+    ) -> None:
+        """Run *argv* and assert it exits 2 with *expected*, having analyzed nothing.
+
+        Args:
+            argv: Arguments after the program name, ``--exiftool-path`` included.
+            missing: The configured path, interpolated into the expected lines.
+            expected: The two-line message this state is owed.
+        """
+        stream = Mock(return_value={"results": {}})
+        with patch("photokin.cli.process_manifest_stream", stream), patch(
+            "photokin.cli.apply_changeset"
+        ) as apply:
+            code, stdout, stderr = self.run_cli(argv)
+
+        # Asserted ahead of the exit code, as in TestExiftoolPreflight: a
+        # regression that runs the batch and only then fails also exits 2, so
+        # the code alone would report success at the point the money is spent.
+        stream.assert_not_called()
+        apply.assert_not_called()
+        self.assertEqual(code, 2)
+        # Joined rather than compared line-by-line, so a problem that spans two
+        # lines is one expectation instead of an index the reader has to align.
+        self.assertEqual(
+            "\n".join(self.usage_error(stderr)),
+            "\n".join(line.format(configured=missing) for line in expected),
+        )
+        self.assertEqual(stdout, "")
+
+    def test_each_request_is_answered_by_the_message_written_for_it(self) -> None:
+        folder, image, manifest_path, _exiftool = self.write_fixture()
+        missing = self._missing_binary(folder)
+        states = (
+            ("read only", ["-r"], self._READ_MESSAGE),
+            ("write only", ["-w"], self._WRITE_MESSAGE),
+            # Both: the write wins, because fetching or installing a binary --
+            # the first two remedies of either message -- clears the read too,
+            # while the read message's own remedy ("re-run without -r") would
+            # leave the user facing the write failure on the next run.
+            ("both", ["-r", "-w"], self._WRITE_MESSAGE),
+        )
+
+        for argv in self.each_input(folder, image, manifest_path):
+            for label, flags, expected in states:
+                with self.subTest(argv=argv, state=label):
+                    self._assert_reports(
+                        [*argv, *flags, "--exiftool-path", missing], missing, expected
+                    )
+
+    def test_the_two_flags_answer_the_same_way_in_either_order(self) -> None:
+        # ``-w -r`` and ``-r -w`` are the same request; argparse hands the branch
+        # a Namespace either way, so an answer that depended on typing order
+        # could only come from something reading argv directly. Cheap to state,
+        # and it is the spelling a user actually varies.
+        folder, _image, _manifest, _exiftool = self.write_fixture()
+        missing = self._missing_binary(folder)
+
+        for flags in (["-r", "-w"], ["-w", "-r"]):
+            with self.subTest(flags=flags):
+                self._assert_reports(
+                    [folder, *flags, "--exiftool-path", missing], missing, self._WRITE_MESSAGE
+                )
+
+    def test_a_run_asking_for_neither_does_not_need_a_binary_at_all(self) -> None:
+        """Non-vacuity, and the bound: ExifTool stays optional.
+
+        The same unresolvable path, in every input mode, with neither flag. If
+        this failed, the three states above would be asserting that a broken
+        ``--exiftool-path`` stops any run whatsoever, which is a different and
+        much weaker claim than the one this class is making.
+        """
+        folder, image, manifest_path, _exiftool = self.write_fixture()
+        missing = self._missing_binary(folder)
+
+        for argv in self.each_input(folder, image, manifest_path):
+            with self.subTest(argv=argv):
+                stream = Mock(return_value={"results": {}})
+                with patch("photokin.cli.process_manifest_stream", stream):
+                    code, _stdout, stderr = self.run_cli(
+                        [*argv, "--exiftool-path", missing]
+                    )
+
+                self.assertIsNone(code, stderr)
+                stream.assert_called_once()
 
 
 class TestNothingIsWrittenWithoutAnOptIn(_WriteFixtureTestCase):
@@ -1442,7 +1603,9 @@ class TestChangesetPreflight(_CliTestCase):
 
             with patch("photokin.cli._preflight_output_file", preflight), patch(
                 "photokin.cli.process_manifest_stream", return_value={"results": {}}
-            ), patch("photokin.cli._apply_exiftool_changeset"):
+            ), patch(
+                "photokin.cli._apply_exiftool_changeset", return_value=False
+            ):
                 code, _, _ = self.run_cli(
                     [
                         "--manifest",
@@ -1596,6 +1759,109 @@ class TestGenerateManifestInputExists(_CliTestCase):
                 manifest = json.load(handle)
             self.assertEqual(manifest["items"], [{"path": image, "group": "box3_025"}])
             self.assertFalse(stream.called)
+
+
+class TestARunThatWroteNothingSaysSo(_CliTestCase):
+    """Writes requested, files seen, none written: the run failed.
+
+    The apply step used to report ``files_written=0 errors=3`` and exit 0. The
+    analysis had run, the results had printed and the changeset had been
+    written, so the run looked successful while the one thing asked of it
+    silently did not happen -- and a script checking the exit status would carry
+    on to the next box of scans.
+
+    The line is drawn at *total* failure only. One locked file among fifty is
+    ordinary and belongs in the records; zero of fifty is a setting that is
+    wrong for all of them, which no amount of reading per-file errors will make
+    the caller notice if the process said it succeeded.
+
+    ``apply_changeset`` is stubbed rather than driven through real ExifTool: the
+    behaviour under test is what the CLI does with the summary, and the summary
+    is the seam. The real path was confirmed separately against read-only files.
+    """
+
+    def _run_with_summary(self, summary: dict, argv_extra: list[str] | None = None):
+        """Run a -w folder batch whose apply step reports *summary*."""
+        folder = self.make_folder()
+        # A real file rather than a patched resolver, matching the idiom above:
+        # the pre-flight resolves this path itself and nothing executes it.
+        exiftool_path = os.path.join(folder, "exiftool.exe")
+        with open(exiftool_path, "w", encoding="utf-8"):
+            pass
+        with patch(
+            "photokin.cli.process_manifest_stream", return_value={"results": {}}
+        ), patch("photokin.cli.apply_changeset", return_value=summary):
+            return self.run_cli(
+                [folder, "-w", "--exiftool-path", exiftool_path, *(argv_extra or [])]
+            )
+
+    def test_zero_written_out_of_several_seen_fails_the_run(self) -> None:
+        code, _stdout, stderr = self._run_with_summary(
+            {"files_seen": 3, "files_written": 0, "tags_written": 0,
+             "errors": [{"path": "a.jpg", "error": "read-only"}], "warnings": []}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("[ERROR] nothing was written", stderr)
+
+    def test_the_per_file_errors_survive_the_failure(self) -> None:
+        """The summary is logged before the exit, not replaced by it.
+
+        Failing the run is only an improvement if it still says which files
+        failed and why; a bare exit code would be less informative than the
+        exit 0 it replaces.
+        """
+        code, _stdout, stderr = self._run_with_summary(
+            {"files_seen": 2, "files_written": 0, "tags_written": 0,
+             "errors": [{"path": "a.jpg", "error": "Error renaming temporary file"}],
+             "warnings": []}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("[ExifTool] Errors:", stderr)
+        self.assertIn("Error renaming temporary file", stderr)
+
+    def test_a_partial_failure_is_not_a_failed_run(self) -> None:
+        """The bound. Some files were written, so the settings were right."""
+        code, _stdout, stderr = self._run_with_summary(
+            {"files_seen": 3, "files_written": 2, "tags_written": 2,
+             "errors": [{"path": "c.jpg", "error": "locked"}], "warnings": []}
+        )
+        self.assertIsNone(code)
+        self.assertNotIn("nothing was written", stderr)
+
+    def test_seeing_no_files_at_all_is_not_a_failed_run(self) -> None:
+        """An empty changeset proposes nothing, so nothing failing is correct."""
+        code, _stdout, stderr = self._run_with_summary(
+            {"files_seen": 0, "files_written": 0, "tags_written": 0,
+             "errors": [], "warnings": []}
+        )
+        self.assertIsNone(code)
+        self.assertNotIn("nothing was written", stderr)
+
+    def test_manifest_input_keeps_the_plugin_contract(self) -> None:
+        """Manifest mode reports per item and exits 0, here as everywhere else.
+
+        photokin/README.md records this asymmetry deliberately: the plug-in
+        reads the per-item records, so failing the batch tells it less than the
+        records already do. The same total failure that fails a folder run must
+        leave a manifest run's exit status alone.
+        """
+        folder = self.make_folder()
+        manifest_path = _write_manifest(folder)
+        exiftool_path = os.path.join(folder, "exiftool.exe")
+        with open(exiftool_path, "w", encoding="utf-8"):
+            pass
+        summary = {"files_seen": 3, "files_written": 0, "tags_written": 0,
+                   "errors": [{"path": "a.jpg", "error": "read-only"}], "warnings": []}
+        with patch(
+            "photokin.cli.process_manifest_stream", return_value={"results": {}}
+        ), patch("photokin.cli.apply_changeset", return_value=summary):
+            code, _stdout, stderr = self.run_cli(
+                ["--manifest", manifest_path, "-w", "--exiftool-path", exiftool_path]
+            )
+        self.assertIsNone(code)
+        self.assertNotIn("nothing was written", stderr)
+        # And the records the plug-in reads are still there.
+        self.assertIn("[ExifTool] Errors:", stderr)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,9 @@ Code map (public-facing entry points marked PUBLIC):
 - _build_llm_dump_writer        optional debug dumper for raw LLM requests
 - inject_analysis_date          stamp a date into the '[AI Analysis]:' caption prefix
 - _strip_empty_caption_sections drop empty [Front]/[Back] caption sections
+- _normalize_caption_text       reduce a caption to what two copies must share
+- _captions_are_near_identical  is this caption a restatement of that one?
+- _split_caption_sections       read one file's caption back as labelled sections
 - _build_provider_client        construct the SDK client for the active provider
 - _ensure_provenance_keyword    guarantee one provider/model provenance keyword
 - _should_run_archival_upload   gate Files-API upload by provider
@@ -48,6 +51,7 @@ Code map (public-facing entry points marked PUBLIC):
 - process_manifest_stream       PUBLIC: streaming NDJSON batch (the plugin path)
 """
 
+import difflib
 import json
 import logging
 import os
@@ -172,6 +176,247 @@ def _strip_empty_caption_sections(caption: str) -> str:
     return "\n".join(kept_sections).strip()
 
 
+#: The label the caption block puts on this run's analysis. Everything from this
+#: marker to the end of a caption is a previous run's output: the block photokin
+#: writes is what the next ``-r`` run reads back as the file's own caption, so
+#: the analysis has to be findable in it or it would be re-read as human prose,
+#: re-labelled, and kept beside the fresh one on every pass.
+#:
+#: Matched loosely on the way in. ``inject_analysis_date`` rewrites the marker to
+#: "[AI Analysis on 1952-06-01]:" in ``ai_caption``, and ``output_format.txt``
+#: tells the model to open with this exact string -- which it also does in
+#: ``caption`` often enough that both spellings have to be recognized.
+_CAPTION_AI_LABEL = "[AI Analysis]:"
+_CAPTION_AI_MARKER_RE = re.compile(r"^\s*\[AI Analysis\b[^\]]*\]\s*:?", re.IGNORECASE)
+
+#: A caption line that already carries one of our own section labels. ``Front``
+#: is read but never written: it is what photokin wrote before the wording
+#: became ``Photo``, and an archive enriched by an older release must keep those
+#: lines as they are rather than have them attributed a second time.
+_CAPTION_LABEL_RE = re.compile(r"^\s*\[(Photo|Front|Back)(\s+[^\]]+)?\]\s*:?\s*", re.IGNORECASE)
+
+#: The bare prefix a model sometimes puts on a caption of its own accord, and
+#: which an older tool may have written into a file. Stripped only when it names
+#: the same side as the label being applied, so "[Back] Back: pencil note"
+#: cannot happen.
+_CAPTION_ROLE_PREFIX_RE = re.compile(r"^\s*(photo|front|back)\s*:\s*", re.IGNORECASE)
+
+#: How alike two captions must read before the second is treated as a
+#: restatement of the first and dropped rather than appended.
+#:
+#: This is the dangerous knob -- too loose silently discards a caption someone
+#: typed, which is unrecoverable; too tight and the block grows a near-twin line
+#: every run -- so it was set by measuring ``difflib`` against real caption pairs
+#: rather than by taste. The measurement (scored on the normalized text below)
+#: says something sharper than "pick carefully": no ratio can do this job.
+#:
+#:   must SKIP  trailing period / case / spacing .................. 1.0000
+#:   must SKIP  "Ruth and Sam, outside" vs "Ruth and Sam outside" . 0.9841
+#:   must SKIP  "Grandma’s porch" vs "Grandma's porch" ............ 0.9643
+#:   must SKIP  "Ohio - summer" vs "Ohio — summer" ................ 0.9444
+#:   must SKIP  '"hello"' vs "'hello'" ............................ 0.9091
+#:   must KEEP  "...bakery, 1948" vs "...bakery, 1949" ............ 0.9730
+#:   must KEEP  "Ruth and Sam" vs "Ruth and Edith" ................ 0.8750
+#:   must KEEP  one digit of a year inside a 300-char analysis .... 0.9967
+#:
+#: Skipping needs ``ratio >= T``, so the rows that must be skipped want
+#: ``T <= 0.9091`` and the rows that must be kept want ``T > 0.9967``. There is
+#: no such T: the two ranges overlap almost completely, because ``ratio`` is
+#: relative to length and a changed *year* in a long block moves it less than a
+#: changed *quote mark* in a short one.
+#:
+#: What does separate them cleanly, on every row above, is whether any WORD
+#: changed. So the word sequence carries the decision -- a difference that
+#: changes no word is a difference in punctuation, quoting or spacing, which is
+#: the same caption typed twice.
+#:
+#: The word gate is NECESSARY, not an alternative. Reaching the ratio only when
+#: the words already differ means the ratio can only ever skip something
+#: materially different, which is precisely the data loss above. Measured: a
+#: 656-character postcard-back transcription -- the shape README.md:27 ships as
+#: its worked example -- with the year corrected 44 -> 45 scores 0.99847 and was
+#: dropped, writing the stale year back over the file the archivist had just
+#: fixed. One substituted character in a length-n block scores (n-1)/n, so any
+#: high ratio is a length test wearing a similarity test's clothes.
+#:
+#: So: same words is required, and the ratio is a FLOOR under it, guarding the
+#: case where identical words are re-punctuated so heavily the line no longer
+#: reads the same way. Measured with the tokens held equal, realistic
+#: re-punctuation spans 0.86-1.00 (curly quotes 0.88, semicolons for commas
+#: 0.86, added parentheses 0.98) while a punctuation dump sits at 0.43-0.69
+#: (dashes for spaces 0.43, an appended ASCII divider 0.69). 0.85 sits in that
+#: gap, and above the word gate it cannot discard a changed name, year or place
+#: at any length -- which the previous 0.998 provably could.
+_CAPTION_NEAR_IDENTICAL_RATIO = 0.85
+
+#: Trailing noise that says nothing about whether two captions are the same one.
+_CAPTION_TRAILING_NOISE = " \t.,;:!?-–—\"'`)]}"
+
+#: A run of word characters. Comparing these instead of the raw text is what
+#: folds away punctuation, quote style and dashes; see the table above.
+_CAPTION_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _normalize_caption_text(text: str) -> str:
+    """Reduce a caption to what two copies of it have to share to be one caption.
+
+    Args:
+        text: A caption, or one section of one.
+
+    Returns:
+        The text with runs of whitespace collapsed, case folded and trailing
+        punctuation removed -- so a caption that came back from a round trip
+        through a metadata tag compares equal to the one that went in.
+    """
+    return " ".join((text or "").split()).casefold().rstrip(_CAPTION_TRAILING_NOISE)
+
+
+def _captions_are_near_identical(existing: str, candidate: str) -> bool:
+    """Is *candidate* a restatement of *existing* rather than something new?
+
+    Args:
+        existing: A caption section already accepted into the block.
+        candidate: One offered for the same label.
+
+    Returns:
+        True when the two are the same caption written slightly differently, and
+        the candidate adds nothing by being kept. False for anything that reads
+        as a real edit, which is kept -- the failure this asymmetry is chosen
+        against is losing a correction someone typed, not carrying an extra line.
+    """
+    left = _normalize_caption_text(existing)
+    right = _normalize_caption_text(candidate)
+    if left == right:
+        return True
+    if not left or not right:
+        return False
+    # A changed word is a real edit and is always kept, however small it looks
+    # against a long block. This test comes first and is necessary: run the
+    # other way round, the ratio is only ever consulted once the words already
+    # differ, so it could only ever discard a genuine correction.
+    if _CAPTION_WORD_RE.findall(left) != _CAPTION_WORD_RE.findall(right):
+        return False
+    # Same words, then: one caption typed twice, unless the punctuation was
+    # changed so heavily the line no longer reads the same way.
+    return (
+        difflib.SequenceMatcher(None, left, right).ratio() >= _CAPTION_NEAR_IDENTICAL_RATIO
+    )
+
+
+def _caption_label_key(line: str) -> str:
+    """Return the section key a labelled caption line is filed under.
+
+    Case and the legacy ``Front`` spelling are folded away, so one section of the
+    block is one key however it was written. The key is what makes the merge
+    per-label: two files offering ``[Photo A]`` are the same section and settle
+    against each other, while ``[Photo B]`` is a different one and cannot be
+    disturbed by either.
+
+    Args:
+        line: A caption line matching :data:`_CAPTION_LABEL_RE`.
+
+    Returns:
+        A folded ``"role letter"`` key, e.g. ``"photo a"`` or ``"back"``.
+    """
+    match = _CAPTION_LABEL_RE.match(line)
+    if not match:
+        return ""
+    role = match.group(1).lower()
+    if role == "front":
+        role = "photo"
+    return f"{role} {(match.group(2) or '').strip().lower()}".strip()
+
+
+def _caption_section_text(body: list[str]) -> str:
+    """Return a section's text with its own label removed.
+
+    Comparison is on the text and not on the label, so one caption that two
+    files of a group both hold -- an archivist copied a note onto the print and
+    its back -- is written once rather than once per side. That is the
+    de-duplication the old per-variant branch existed for, kept; what is not kept
+    is how it used to get there, which was to file the front's caption under the
+    back's label.
+
+    Args:
+        body: One section, including its label line.
+
+    Returns:
+        The section's text, label stripped.
+    """
+    lines = list(body)
+    if lines:
+        lines[0] = _CAPTION_LABEL_RE.sub("", lines[0], count=1)
+    return "\n".join(lines).strip()
+
+
+def _split_caption_sections(caption: str, label: str) -> list[tuple[str, list[str]]]:
+    """Read one file's existing caption back as labelled sections.
+
+    A section starts at a labelled line and runs to the next one, so a multi-line
+    entry stays a single section and keeps the blank lines its author put in it.
+    Lines before the first label are prose nobody attributed -- a caption typed
+    straight into Lightroom, or one an older release wrote -- and they are
+    attributed to *label*, the file they were read off, which is the one moment
+    that attribution is free rather than guesswork.
+
+    That whole run of prose takes ONE label, on its first line, rather than a
+    label per line: the run is one thought, and a note whose paragraphs were
+    labelled separately would be several sections that later runs could
+    de-duplicate and reorder independently of each other.
+
+    Everything from an ``[AI Analysis]`` marker to the end is a previous run's
+    analysis. It is dropped here and regenerated from this run's answer, which is
+    what stops the block accumulating one analysis per pass; the model is told
+    the same thing about a caption it is shown (see the CAPTION MERGE BEHAVIOR
+    rules in ``prompts_photo_ai/instructions_front_back.txt``).
+
+    Args:
+        caption: The file's existing caption, verbatim.
+        label: The label unattributed prose earns, e.g. ``"[Photo A]"``, or
+            ``""`` for a group whose files are not labelled at all.
+
+    Returns:
+        ``(key, lines)`` pairs in the order they appear, where *key* comes from
+        :func:`_caption_label_key` and *lines* is the section including its own
+        label line.
+    """
+    kept: list[str] = []
+    for raw in (caption or "").strip().splitlines():
+        if _CAPTION_AI_MARKER_RE.match(raw):
+            break
+        kept.append(raw.rstrip())
+
+    first_labelled = next(
+        (i for i, line in enumerate(kept) if _CAPTION_LABEL_RE.match(line)), len(kept)
+    )
+
+    sections: list[tuple[str, list[str]]] = []
+    prose = list(kept[:first_labelled])
+    while prose and not prose[0].strip():
+        prose.pop(0)
+    while prose and not prose[-1].strip():
+        prose.pop()
+    if prose:
+        if label:
+            head = _CAPTION_ROLE_PREFIX_RE.match(prose[0])
+            if head:
+                role = head.group(1).lower()
+                # Strip it only when it names the side the label is about to
+                # say, so "[Back] Back: pencil note" cannot happen and a
+                # "Front:" a human meant as part of their own note survives on
+                # a section that is not about the front.
+                role = "photo" if role == "front" else role
+                if label.lower().startswith(f"[{role}"):
+                    prose[0] = prose[0][head.end():]
+            prose[0] = f"{label} {prose[0].strip()}".strip()
+        sections.append((_caption_label_key(prose[0]) if label else "", prose))
+
+    for line in kept[first_labelled:]:
+        if _CAPTION_LABEL_RE.match(line):
+            sections.append((_caption_label_key(line), [line]))
+        elif sections:
+            sections[-1][1].append(line)
+    return [(key, body) for key, body in sections if any(l.strip() for l in body)]
 
 
 def _missing_api_key_message(provider_label: str, env_var: str) -> str:
@@ -1088,7 +1333,9 @@ def analyze_folder(
 # One canonical ordering for every grouping tie-break in the manifest path. The
 # crop flag leads it (see ``_slot_rank_key``) so a derivative can never take the
 # slot of the scan it was cropped from, whatever order the manifest listed them in.
-_PART_RANK = {"front": 0, "none": 1, "page": 2, "back": 3, "negative": 4}
+# Defined in ``utils`` because ``combine_group_metadata`` ranks the same entries
+# by the same order, so which file stands for the object is decided once.
+_PART_RANK = utils.PART_RANK
 
 # Fidelity order for same-stem files that differ only by extension, e.g. a TIFF
 # master beside the JPEG derivative an archivist keeps for browsing. Only one of
@@ -1493,13 +1740,21 @@ def analyze_manifest(
     changeset_writer=None,
     changeset_run_id: str | None = None,
     metadata_hydrator: Callable[[List[dict]], None] | None = None,
+    titles_may_be_from_files: bool = False,
 ) -> dict:
     """
     Convenience wrapper around :func:`process_manifest_stream` that preserves the
     historically non-streaming signature.
 
-    The CLI and Lightroom plug-in both rely on this to share the manifest logic
-    without duplicating batching behavior, hence the one-stop wrapper.
+    Kept for external callers that want the whole snapshot and no streaming
+    callbacks; ``public.analyze_manifest`` is the narrowest of them. The CLI does
+    not use it -- it calls :func:`process_manifest_stream` directly, because it
+    needs the NDJSON and changeset writers this signature does not carry.
+
+    ``titles_may_be_from_files`` is forwarded rather than left out: a wrapper that
+    silently drops a keyword is worse than one that never offered it, because the
+    caller's title precedence would quietly differ from the callee's with nothing
+    to show for it. See :func:`process_manifest_stream` for what it means.
     """
     return process_manifest_stream(
         manifest=manifest,
@@ -1509,6 +1764,7 @@ def analyze_manifest(
         changeset_writer=changeset_writer,
         changeset_run_id=changeset_run_id,
         metadata_hydrator=metadata_hydrator,
+        titles_may_be_from_files=titles_may_be_from_files,
     )
 
 
@@ -1521,6 +1777,7 @@ def process_manifest_stream(
     changeset_writer=None,
     changeset_run_id: str | None = None,
     metadata_hydrator: Callable[[List[dict]], None] | None = None,
+    titles_may_be_from_files: bool = False,
     strict_run_failures: bool = False,
 ) -> dict:
     """Stream manifest processing results while still returning a full snapshot.
@@ -1535,6 +1792,13 @@ def process_manifest_stream(
     follows the group's own contents rather than any flag.
 
     Args:
+        titles_may_be_from_files: Whether the values ``metadata_hydrator``
+            supplies were read out of the files' own tags. It narrows exactly one
+            rule -- a title in an item's metadata stops outranking one the model
+            transcribed off the print -- and nothing else; in particular it reads
+            nothing itself. Off by default, so an embedder hydrating from a
+            database or a sidecar format keeps full title precedence for the
+            human words it supplies. The CLI sets it from ``-r``.
         strict_run_failures: Folder mode's Phase A failure contract, off by
             default so manifest mode -- the plug-in contract -- keeps behaving
             exactly as it did. When on, a ``ProviderApiError`` describing the run
@@ -1570,6 +1834,17 @@ def process_manifest_stream(
         forward_fields = None
 
     items = man.get("items", [])
+    # Provenance is the caller's fact to state, not ours to infer. This used to
+    # read ``metadata_hydrator is not None``, but "a hydrator ran" is not "these
+    # values came out of the files' own tags": the README invites embedders to
+    # supply their own hydrator reading a database or a sidecar format, where a
+    # title is a human's words and must keep beating the model's transcription
+    # exactly as an inline one does. Inferring it re-opened, through the public
+    # seam, the very data loss the -r title rule was narrowed to avoid.
+    # Marking photokin's own hydrator instead would answer for the one callable
+    # we ship and lie for every wrapper around it -- a decorator, a
+    # functools.partial, a lambda closing over two hydrators -- so the honest
+    # signal is the parameter: the caller knows, and the callee cannot.
     if metadata_hydrator is not None:
         metadata_hydrator(items)
     group_by = cfg.group_by
@@ -2134,94 +2409,173 @@ def process_manifest_stream(
             if best_date:
                 canonical["date_guess"] = best_date
 
-            def _label(kind: str, ver: str | None, include_ver: bool) -> str:
-                base = "Back" if kind == "back" else "Front"
-                if include_ver and ver:
-                    return f"[{base} {ver}]"
-                return f"[{base}]"
+            # === Rule 2: one caption block, built once, written to every file ===
+            #
+            # A print, its back and a rescan of it are one object, so whichever
+            # of them someone opens in Lightroom should tell the whole story of
+            # that object rather than a third of it. Every file of the group
+            # therefore ends up holding the SAME caption: each scan's own
+            # caption, labelled with the file it came off, then this run's
+            # analysis.
+            #
+            #     [Photo A] Caption A
+            #     [Photo B] Caption B
+            #     [Back] Back of Photo B
+            #     [AI Analysis]: Two people outside a bakery.
+            #
+            # It has to be built for the group rather than per file, and that is
+            # the whole architecture: a per-file block would carry that file's
+            # own caption as a personal preamble, no two files would match, and
+            # the point would be lost. So the intake below sweeps the group while
+            # it is still known WHICH file each caption came off -- the one
+            # moment attribution is free rather than guesswork -- and everything
+            # after it is keyed by label.
+            #
+            # Being keyed is also what makes the block safe to re-read, which is
+            # not optional: under ``-rw`` the block written here is exactly what
+            # the next run reads back as each file's existing caption. Intake
+            # recognizes its own output and takes it verbatim; attributing it a
+            # second time is how you get "[Photo A] [Photo A] Caption A" and a
+            # caption that grows on every pass.
 
-            def _strip_existing_label(cap: str, kind: str) -> str:
-                """Remove an existing front/back prefix from ``cap`` for ``kind``.
+            # --- Which label each file's caption is filed under -----------------
 
-                The model occasionally returns captions prefixed with "Front:",
-                "[Back]", etc. When we prepend our own label (which encodes
-                variant information), strip any matching prefix first so we
-                don't produce duplicated labels like "[Back] Back:".
-                """
+            has_front_side = any(not it["is_back"] for it in group)
+            has_back_side = any(it["is_back"] for it in group)
+            # "[Back]" only says anything opposite a "[Photo]", and a lone file
+            # has nothing to be told apart from, so the overwhelmingly common
+            # trivial case -- one scan, no back -- carries no label at all.
+            # Labelling it would bracket every caption in an archive that has no
+            # variants in it and say nothing by doing so.
+            label_backs = has_front_side and has_back_side
+            label_photos = multiple_fronts or label_backs
 
-                def _remove(prefix_pattern: str, text: str) -> str | None:
-                    m = re.match(prefix_pattern, text, re.IGNORECASE)
-                    if m and m.group(1).lower().startswith(kind):
-                        trimmed = text[m.end():].lstrip()
-                        return trimmed if trimmed else None
-                    return None
+            # An unversioned scan is variant A: that is precisely why the second
+            # scan of a print is lettered 'b' and not 'a'. Printing it as
+            # "[Photo A]" is what makes the letters in the block the letters on
+            # disk. Only beside a lettered sibling, though -- with none there is
+            # nothing to disambiguate and the A would be invented -- and never
+            # when the group holds a real 'a', which would be two files claiming
+            # one label.
+            explicit_versions = {
+                (it["version"] or "").strip().casefold()
+                for it in group
+                if (it["version"] or "").strip()
+            }
+            implied_first_variant = bool(explicit_versions) and "a" not in explicit_versions
 
-                start = cap.lstrip()
-                # Bracketed form, optionally with variant letter: [Back b]:
-                stripped = _remove(r"^\[(front|back)(\s+[a-z])?\]\s*:?", start)
-                if stripped is not None:
-                    return stripped
-                # Simple form: Back:
-                stripped = _remove(r"^(front|back)\s*:?", start)
-                return stripped if stripped is not None else cap.strip()
+            def _display_version(ver: str | None) -> str:
+                letter = (ver or "").strip()
+                if not letter:
+                    return "A" if implied_first_variant else ""
+                # A single letter is the filename grammar's own token and reads
+                # as an identifier, so it is capitalized to match; anything
+                # longer came from a manifest ``version`` and is the caller's
+                # own wording to leave alone.
+                return letter.upper() if len(letter) == 1 else letter
 
-            # Rule 2/2a/2b: keep per-photo captions, then append AI captions. The
-            # branch follows ``group_payload`` rather than the grouping axis, which
-            # is what keeps ordinary output stable: a plain front/back pair keeps
-            # its per-variant "[Back] ..." entry, and only a payload the model saw
-            # as a set reuses the caption block the model wrote for that set.
-            caption_entries: list[str] = []
+            def _label_for(is_back: bool, ver: str | None) -> str:
+                """Return the label a file's own caption is filed under, or ""."""
+                # The letter appears only where it disambiguates, decided per
+                # role independently -- which is exactly what multiple_fronts and
+                # multiple_backs already answer, so they answer it here. Two
+                # photos and one back give "[Photo A]", "[Photo B]" and a bare
+                # "[Back]": the lone back needs no letter to be found.
+                if is_back:
+                    if not label_backs:
+                        return ""
+                    base, lettered = "Back", multiple_backs
+                else:
+                    if not label_photos:
+                        return ""
+                    base, lettered = "Photo", multiple_fronts
+                letter = _display_version(ver) if lettered else ""
+                return f"[{base} {letter}]" if letter else f"[{base}]"
 
-            if group_payload:
-                # The model has already produced a complete transcription in the
-                # caption field (with any [Front]/[Back] headers it decided to add).
-                # We reuse that block as-is for every item in the group.
-                if analyses:
-                    rec0, _path0, _ver0 = analyses[0]
-                    cap0 = _strip_empty_caption_sections((rec0.get("caption") or "").strip())
-                    if cap0:
-                        caption_entries.append(cap0)
-            else:
-                # Per-variant behavior: preserve separate entries with variant
-                # letters when needed so you can see each version's caption.
-                seen_caps: set[str] = set()
-                for rec, _, ver in analyses:
-                    cap = _strip_empty_caption_sections((rec.get("caption") or rec.get("ai_caption") or "").strip())
-                    if not cap:
+            # --- Intake: every file's caption, in one deterministic order -------
+            #
+            # ``_slot_rank_key`` and not the manifest's order, for the reason
+            # every other choice in this loop is made on rank: the block is a
+            # property of the object, so a folder listed in a different order has
+            # to produce the same one. A file that already holds a whole block
+            # contributes all of its sections at once, in the order that block
+            # had, which is what keeps a settled group's answer stable.
+            own_metadata = [utils.load_item_metadata(it) or {} for it in group]
+            caption_sections: list[list[str]] = []
+            accepted_texts: list[str] = []
+            for entry, entry_meta in sorted(
+                zip(group, own_metadata), key=lambda pair: _slot_rank_key(pair[0])
+            ):
+                existing_caption = (entry_meta.get("caption") or "").strip()
+                if not existing_caption:
+                    continue
+                label = _label_for(entry["is_back"], entry["version"])
+                for _key, body in _split_caption_sections(existing_caption, label):
+                    # Section by section, never whole-string. Filling in a
+                    # missing "[Photo B]" therefore cannot disturb the
+                    # "[Photo A]" already written, and a sibling holding the same
+                    # caption -- or a trivially reworded copy of it -- adds
+                    # nothing rather than adding a near-twin line.
+                    text = _caption_section_text(body)
+                    if any(
+                        _captions_are_near_identical(seen, text) for seen in accepted_texts
+                    ):
                         continue
-                    pair = variant_pairs.get(ver) or {}
-                    has_back = bool(pair.get("back"))
+                    accepted_texts.append(text)
+                    caption_sections.append(body)
 
-                    def _add_caption(kind: str, include_ver: bool):
-                        label = _label(kind, ver, include_ver)
-                        body = _strip_existing_label(cap, kind)
-                        line = f"{label} {body}" if label else body
-                        key = " ".join(line.split()).lower()
-                        if line and key not in seen_caps:
-                            seen_caps.add(key)
-                            caption_entries.append(line)
-
-                    # If a back exists for this variant, prefer labeling that caption
-                    # with the back role only to avoid duplicating front/back copies
-                    # of the same text. When there's no back, keep the front entry
-                    # (with variant label when needed).
-                    if has_back:
-                        _add_caption("back", multiple_backs)
+            # --- This run's analysis, appended last -----------------------------
+            #
+            # One analysis per group either way -- both payload branches append
+            # exactly one entry to ``analyses`` -- so the caption block no longer
+            # forks on ``group_payload``. That fork is what left the default
+            # ``--group-by object`` path unlabelled while pair and none labelled,
+            # and it is also what labelled a FRONT file's caption "[Back]"
+            # whenever its variant happened to have a back.
+            analysis_lines: list[str] = []
+            if analyses:
+                record0 = analyses[0][0]
+                analysis_text = _strip_empty_caption_sections(
+                    (record0.get("caption") or record0.get("ai_caption") or "").strip()
+                )
+                supplied_marker = _CAPTION_AI_MARKER_RE.match(analysis_text)
+                if supplied_marker:
+                    # The model is told to open with this marker and does so in
+                    # the caption field too, so strip its copy rather than
+                    # stacking a second one in front of it.
+                    analysis_text = analysis_text[supplied_marker.end():].lstrip()
+                if analysis_text:
+                    body_lines = analysis_text.splitlines()
+                    if len(body_lines) == 1:
+                        analysis_lines = [f"{_CAPTION_AI_LABEL} {body_lines[0].strip()}"]
                     else:
-                        _add_caption("front", multiple_fronts)
+                        # A group payload comes back carrying its own
+                        # [Front]/[Back] headers, so the marker takes a line of
+                        # its own rather than being glued onto one of them.
+                        analysis_lines = [_CAPTION_AI_LABEL, *body_lines]
 
-            def _join_captions(existing: str | None, generated: list[str]) -> str | None:
-                lines: list[str] = []
-                seen_local: set[str] = set()
-                for part in [existing] + generated:
-                    if not part:
-                        continue
-                    key = " ".join(part.split()).lower()
-                    if key in seen_local:
-                        continue
-                    seen_local.add(key)
-                    lines.append(part)
-                return "\n".join(lines) if lines else None
+            # --- The block ------------------------------------------------------
+            #
+            # De-duplicated line by line as well as section by section. The
+            # section pass settles what each label says; this one is the last
+            # net, and it is what stops a model that echoed a caption it was
+            # shown from landing that line twice.
+            caption_block_lines: list[str] = []
+            seen_lines: set[str] = set()
+            for line in [ln for body in caption_sections for ln in body] + analysis_lines:
+                key = " ".join(line.split()).lower()
+                if not key:
+                    # A blank line is the author's paragraph break, not a
+                    # caption; it is kept as written and never counted as a
+                    # duplicate, which is what leaves a multi-paragraph note
+                    # byte-identical after a re-read.
+                    caption_block_lines.append(line)
+                    continue
+                if key in seen_lines:
+                    continue
+                seen_lines.add(key)
+                caption_block_lines.append(line)
+            caption_block = "\n".join(caption_block_lines).strip("\n") or None
 
             def _tok(u: dict | None, key: str) -> int:
                 return int(u.get(key)) if (u and isinstance(u.get(key), int)) else 0
@@ -2316,8 +2670,7 @@ def process_manifest_stream(
             )
 
             # emit per-file (merged with per-file metadata)
-            for it in group:
-                own_meta = utils.load_item_metadata(it) or {}
+            for it, own_meta in zip(group, own_metadata):
                 # Read before the merge below, which is the last moment the two
                 # are distinguishable: a marker this file already carried is the
                 # caller's own keyword however many siblings share the part it
@@ -2336,12 +2689,20 @@ def process_manifest_stream(
                     keywords_for_item = utils.union_keywords(keywords_for_item, [part_marker])
                 record_for_item["keywords"] = keywords_for_item
 
-                # Rule 2: preserve each photo's caption, then append labeled AI captions.
-                combined_caption = _join_captions((per_meta.get("caption") or "").strip() or None, caption_entries)
-                if combined_caption:
-                    record_for_item["caption"] = combined_caption
+                # Rule 2: the group's one block, byte-identical on every file.
+                # This file's own caption is already in it, under this file's
+                # label, put there by the intake sweep above -- joining it again
+                # here is what would give each file a personal preamble and make
+                # the blocks diverge.
+                if caption_block:
+                    record_for_item["caption"] = caption_block
 
-                merged, report = merge_metadata(record_for_item, per_meta, cfg)
+                merged, report = merge_metadata(
+                    record_for_item,
+                    per_meta,
+                    cfg,
+                    original_title_from_file=titles_may_be_from_files,
+                )
                 # ``combined_meta`` is the whole group's metadata keywords,
                 # un-stripped, and it has just been merged into every file, so a
                 # marker belonging to one file has to come back off the others.

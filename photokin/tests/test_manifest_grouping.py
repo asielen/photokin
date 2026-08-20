@@ -36,6 +36,14 @@ class _RecordingAnalyzers:
 
     def __init__(self, keywords: list[str] | None = None) -> None:
         self.calls: list[tuple] = []
+        #: The ``original_meta`` of each call, in call order and parallel to
+        #: :attr:`calls`. Kept in a list of its own rather than folded into a
+        #: call tuple because 79 call sites assert on that tuple's shape, and
+        #: because only the permutation sweep needs it: forwarded metadata is
+        #: the one part of a call that is computed from every item of a group
+        #: rather than from one file, so it is where an order-dependent answer
+        #: hides once more than one item in a group carries metadata.
+        self.metas: list[dict | None] = []
         #: Returned as the analysis keywords. A ``PC*`` entry here makes the
         #: version the analysis was filed under visible in the emitted records,
         #: since ``PC*`` codes are the one keyword class scoped per variant.
@@ -52,6 +60,7 @@ class _RecordingAnalyzers:
     ) -> dict:
         """Record an ``analyze_photo`` call and return a minimal valid result."""
         self.calls.append(("photo", front_path, back_path))
+        self.metas.append(original_meta)
         return {"result": {front_path: {"caption": "c", "keywords": list(self.keywords)}}}
 
     def front_back(
@@ -66,6 +75,7 @@ class _RecordingAnalyzers:
         """Record an ``analyze_group_front_back`` call."""
         fronts, backs = list(front_paths or []), list(back_paths or [])
         self.calls.append(("front_back", tuple(fronts), tuple(backs)))
+        self.metas.append(original_meta)
         key = (fronts + backs + ["?"])[0]
         return {"result": {key: {"caption": "c", "keywords": list(self.keywords)}}}
 
@@ -79,6 +89,7 @@ class _RecordingAnalyzers:
     ) -> dict:
         """Record an ``analyze_group_parts`` call."""
         self.calls.append(("parts", tuple((label, tuple(paths)) for label, paths in parts)))
+        self.metas.append(original_meta)
         flat = [p for _, paths in parts for p in paths]
         return {"result": {(flat or ["?"])[0]: {"caption": "c", "keywords": list(self.keywords)}}}
 
@@ -196,6 +207,13 @@ class ManifestGroupingTestCase(unittest.TestCase):
     #: diff would say a permutation differed without saying where.
     maxDiff = None
 
+    #: The ``original_meta`` of every model call the last run made, in call
+    #: order. Stashed here rather than returned so the three ``run_*`` helpers
+    #: keep the tuple shape their 79 call sites unpack; read it only where the
+    #: forwarded metadata is the thing under test. Declared without a default so
+    #: reading it before a run raises rather than quietly answering ``[]``.
+    last_metas: list[dict | None]
+
     def run_manifest_records(
         self,
         manifest: dict | str,
@@ -237,6 +255,7 @@ class ManifestGroupingTestCase(unittest.TestCase):
                 ndjson_writer=lines.append,
                 changeset_writer=changeset_writer,
             )
+        self.last_metas = rec.metas
         return rec.calls, [json.loads(line) for line in lines], logs.records
 
     def run_manifest_source(
@@ -770,47 +789,84 @@ class TestPermutationInvariance(ManifestGroupingTestCase):
     that decides which file reaches the model is not.
     """
 
-    #: One metadata-bearing item at most per group -- ``combine_group_metadata``
-    #: is still first-non-empty over arrival order and would skew the comparison.
+    #: Every item carries metadata, and the values deliberately conflict.
+    #:
+    #: B1 restricted these groups to one metadata-bearing item apiece, because
+    #: ``combine_group_metadata`` was then first-non-empty over *arrival* order:
+    #: a second populated item would have made the sweep fail for a reason B1
+    #: was not about. C3 replaced that scan with a sorted one -- crop rank, then
+    #: part rank, then path -- so the group's answer no longer depends on which
+    #: item the manifest happened to name first, and the restriction became a
+    #: gap rather than a precaution. Lifting it is what puts the sorted scan
+    #: under the same 24-permutation sweep as everything else, and ``-r`` makes
+    #: the widened shape the ordinary one: every item hydrates, so every item
+    #: arrives populated.
+    #:
+    #: The values conflict on purpose. Identical metadata would be invariant
+    #: under permutation no matter how the scan was written, which is the shape
+    #: that would let a first-non-empty regression pass unnoticed.
     GROUPS = (
         [
-            {"path": "s/g1.jpg"},
-            {"path": "s/g1-crop.jpg"},
-            {"path": "s/g1-back.jpg"},
-            {"path": "s/g1b-back.jpg"},
+            {"path": "s/g1.jpg", "metadata": {"title": "g1 front"}},
+            {"path": "s/g1-crop.jpg", "metadata": {"title": "g1 crop"}},
+            {"path": "s/g1-back.jpg", "metadata": {"caption": "g1 back caption"}},
+            {"path": "s/g1b-back.jpg", "metadata": {"caption": "g1b back caption"}},
         ],
         [
-            {"path": "s/g2-page0.jpg"},
-            {"path": "s/g2-page1.jpg"},
-            {"path": "s/g2-page1-crop.jpg"},
-            {"path": "s/g2-negative.jpg"},
+            {"path": "s/g2-page0.jpg", "metadata": {"title": "page 0"}},
+            {"path": "s/g2-page1.jpg", "metadata": {"title": "page 1"}},
+            {"path": "s/g2-page1-crop.jpg", "metadata": {"title": "page 1 crop"}},
+            {"path": "s/g2-negative.jpg", "metadata": {"title": "negative"}},
         ],
         [
-            {"path": "s/g3-crop.jpg"},
-            {"path": "s/g3-back.jpg"},
-            {"path": "s/g3b.jpg", "preferred": True},
-            {"path": "s/g3_back.jpg", "is_back": True},
+            {"path": "s/g3-crop.jpg", "metadata": {"userComment": "crop note"}},
+            {"path": "s/g3-back.jpg", "metadata": {"userComment": "back note"}},
+            {
+                "path": "s/g3b.jpg",
+                "preferred": True,
+                "metadata": {"userComment": "preferred note", "title": "g3b"},
+            },
+            {
+                "path": "s/g3_back.jpg",
+                "is_back": True,
+                "metadata": {"userComment": "override-back note"},
+            },
         ],
         # Front, back and one negative per variant: the negative must not
-        # become the front from any starting position.
+        # become the front from any starting position, nor supply the group's
+        # metadata over the print's.
         [
-            {"path": "s/g4.jpg"},
-            {"path": "s/g4-negative.jpg"},
-            {"path": "s/g4-back.jpg"},
-            {"path": "s/g4b-negative.jpg"},
+            {"path": "s/g4.jpg", "metadata": {"title": "g4 print"}},
+            {"path": "s/g4-negative.jpg", "metadata": {"title": "g4 negative"}},
+            {"path": "s/g4-back.jpg", "metadata": {"dateTimeOriginal": "1971:03:02 09:00:00"}},
+            {"path": "s/g4b-negative.jpg", "metadata": {"title": "g4b negative"}},
         ],
         # All four overrides at once, on names the filename grammar reads
         # differently or cannot read at all.
         [
-            {"path": "s/g5.jpg"},
-            {"path": "s/g5_back.jpg", "is_back": True},
-            {"path": "s/IMG_77.jpg", "group": "g5", "is_crop": True},
-            {"path": "s/g5x.jpg", "version": "c"},
+            {"path": "s/g5.jpg", "metadata": {"title": "g5 front", "keywords": ["Family"]}},
+            {
+                "path": "s/g5_back.jpg",
+                "is_back": True,
+                "metadata": {"title": "g5 back", "keywords": ["Bakery"]},
+            },
+            {
+                "path": "s/IMG_77.jpg",
+                "group": "g5",
+                "is_crop": True,
+                "metadata": {"title": "g5 crop", "keywords": ["Crop"]},
+            },
+            {
+                "path": "s/g5x.jpg",
+                "version": "c",
+                "metadata": {"title": "g5 variant c", "keywords": ["Variant"]},
+            },
         ],
     )
 
     def _signature(self, items: list[dict], group_by: str) -> str:
         calls, records, warnings = self.run_manifest(items, group_by=group_by)
+        metas = self.last_metas
         slots = {
             rec["path"]: {
                 key: rec["result"]["all_variant_files"].get(key)
@@ -819,7 +875,20 @@ class TestPermutationInvariance(ManifestGroupingTestCase):
             for rec in records
         }
         return json.dumps(
-            {"calls": calls, "slots": slots, "warnings": sorted(warnings)},
+            {
+                "calls": calls,
+                "slots": slots,
+                # Paired with the call it belongs to, so a metadata answer that
+                # moved between calls is a diff and not a re-sort. Without this
+                # the sweep cannot see the forwarded metadata at all, and every
+                # item could carry a different title with the run still looking
+                # identical -- which is what made lifting the one-item-per-group
+                # restriction worth doing rather than cosmetic.
+                "metas": [
+                    [call, meta] for call, meta in zip(calls, metas, strict=True)
+                ],
+                "warnings": sorted(warnings),
+            },
             sort_keys=True,
             indent=2,
         )

@@ -30,13 +30,13 @@ class TestExiftoolConfig(unittest.TestCase):
     def test_from_env_reads_environment(self):
         env = {
             "EXIFTOOL_WRITE_ENABLED": "false",
-            "EXIFTOOL_FIELDS": "EXIF:UserComment, XMP:dc:Description",
+            "EXIFTOOL_FIELDS": "EXIF:UserComment, XMP-dc:Description",
             "EXIFTOOL_PATH": "/opt/exiftool",
         }
         with patch.dict(os.environ, env, clear=False):
             cfg = ExiftoolConfig.from_env()
         self.assertFalse(cfg.enabled)
-        self.assertEqual(cfg.fields, ("EXIF:UserComment", "XMP:dc:Description"))
+        self.assertEqual(cfg.fields, ("EXIF:UserComment", "XMP-dc:Description"))
         self.assertEqual(cfg.path, "/opt/exiftool")
 
     def test_from_env_defaults_when_unset(self):
