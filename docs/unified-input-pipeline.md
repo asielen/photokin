@@ -183,7 +183,7 @@ round of defects: see the two payload invariants under Phase B1 below.
 | Ref | Decision | Reasoning |
 |---|---|---|
 | Q1 | Changeset path is `dirname(--output-file or input)` | Not a new decision. That rule already exists at `cli.py:299-313`; generalize it rather than invent a convention. Unify the no-output-file basename, which is currently a bare `changeset.ndjson`. |
-| Q2 | No `--recursive`; keep it separate | Recursion changes grouping semantics across directories, since the same basename can appear in several. It also interacts with write safety. Its own PR. |
+| Q2 | No `--recursive`; keep it separate | Recursion changes grouping semantics across directories, since the same basename can appear in several. It also interacts with write safety. Its own PR. **`-R` is reserved for it** (C3): `-r`/`--read` mirrors `-w`/`--write`, so the recursive flag takes the capital and must not be re-spelled later. Recorded in the README flag table. |
 | Q3 | Ship `--generate-manifest` with the refactor | Golden-file tests against its output are the cheapest way to prove the grouping refactor preserved behavior. It makes an otherwise invisible change verifiable. |
 | Q4 | Defer ad-hoc multi-positional input | `nargs="*"` alongside value-taking flags is where argparse ambiguity bites, and the real use case (`photokin ./scans/*.jpg`) hits Windows argv limits anyway. |
 | Q5 | Keep `--changeset true\|false`; do not make it a bare switch | A bare switch means `nargs="?"`, which becomes ambiguous once a positional path exists: `photokin --changeset ./scans/` would swallow the path. `cli.py:218` also records that the string form exists because Lua passes literal true/false. `-w` already solves the ergonomics. |
@@ -352,8 +352,11 @@ being appended to the candidates, so it wins any slot it is allowed to win and a
 `preferred` crop is no longer named as the analyzed file of a payload it is not in -
 which used to fail the whole group with a `KeyError` whenever the payload held more than
 one file. `primary_version` now follows the front actually sent rather than the item that
-won the master pick. (That fix has since been superseded for `PC*` specifically - see
-"PC codes belong to the object" below - but it still governs caption variant labels.)
+won the master pick. (That fix has since been superseded twice over: for `PC*` by "PC codes
+belong to the object" below, and for caption labels by C3's sixth pass, which files each
+file's caption under that file's own version rather than under the analyzed variant's.
+`primary_version` still addresses the back slot and names the record the analysis is filed
+under.)
 Slot claimants are addressed by resolved path, so a
 manifest listing one path twice is not reported as colliding with itself, and a crop
 listed twice does not twice stand in for the object. Crop slot labels are read after the
@@ -492,6 +495,13 @@ and B2's folder items carry no `metadata` key at all, so turning it on requires 
 return `{}` instead of `None` for every file and changes the `merge_original_sources`
 inputs for every record. When Phase C lifts the manifest-only gate on the
 `--exiftool-*` flags, that seeding has to come with it.
+
+**Settled in C3, and the seeding was the wrong shape.** The hydrator is now gated on the
+explicit `-r` in every input mode, so no existing folder run's prompt or cost moves unless
+it asks. Nothing is seeded: the guard treats a missing `metadata` as `{}` without attaching
+it and creates `raw["metadata"]` only when a value is really read, so `load_item_metadata`
+still answers `None` for a file that holds nothing and an item naming a `metadata_path`
+keeps its sidecar. See the C3 section under Phase C.
 
 **B2 open risks.**
 
@@ -663,7 +673,11 @@ analysis except its own part marker" is not true until negatives have a marker.
   prompt (the group one opens "You are seeing multiple scans or variants"), dump tag,
   transport shape and failure mode, so routing every run through the group form would have
   changed the record of 100% of runs. The caption branch follows the same predicate, which
-  is what keeps a plain front/back pair's `[Back] ` prefix.
+  is what keeps a plain front/back pair's `[Back] ` prefix. *(The caption half is superseded
+  by C3's sixth pass: the caption no longer forks on this predicate at all, because both
+  branches append exactly one entry to `analyses`, and that fork was what left the default
+  `object` path unlabelled. The callee still follows the predicate, which is the part that
+  keeps ordinary output stable.)*
 
   A consequence the first pass missed: the predicate is true for a group of *one* whenever
   that one file is a negative or a page, which is the commonest shape a negative has in an
@@ -781,6 +795,13 @@ analysis except its own part marker" is not true until negatives have a marker.
   caption transcribes the back's handwriting, and unpinned the group had a back nothing
   labelled as one - so this is recorded as a consequence rather than as a cost to pay
   down. A back whose name carries no letter is unaffected in both respects, at every value.
+
+  *(Superseded by C3's sixth pass. Both halves of this are now wrong: the label is no longer
+  chosen per analyzed variant, and labelling a front `[Back]` because its variant had a back
+  is the mislabel that pass removes. A file's caption is filed under that file's own role -
+  `[Photo ...]` for a front, `[Back ...]` for a back - and every file of the group receives
+  the same combined block, so the two lines above are one block reading `[Photo] ...` and
+  `[Back] ...`, whether or not the back was pinned with `--back`.)*
 - **Crops per value.** `object` and `pair` are unchanged - a crop yields its parent's slot,
   is recorded and warned about, and an orphan crop is analyzed in its place. `pair` needs
   no rule: `parse_media_filename` strips `-crop` first, so a crop always carries its
@@ -1057,9 +1078,615 @@ so the bytes on the wire are unchanged.
 
 Left open deliberately, each one recorded where it belongs: hydration stays off for folder
 and single-photo input (the `{"metadata": {}}` seeding at :483-491 is a data change, not a
-CLI one); `strict_run_failures` keeps its split (:514); the debug-dump directory stays
-split between manifest and folder input; and the write-default transition is announced by
-the plan summary line rather than by a separate warning (:539-540).
+CLI one - **closed by C3 below**); `strict_run_failures` keeps its split (:522); the
+debug-dump directory stays split between manifest and folder input; and the write-default
+transition is announced by the plan summary line rather than by a separate warning
+(:549-550).
+
+**C3 shipped - `-r` / `--read`, and the date stops lying.** Hydration becomes an explicit
+flag that works in every input mode, reads the whole set rather than one tag, and stops
+asserting a scan date as a capture date.
+
+- **`-r` / `--read`, mirroring `-w` / `--write`.** Both are explicit opt-ins and neither
+  implies the other. The gate is one line - `metadata_hydrator=make_manifest_hydrator(ecfg)
+  if args.read else None` - so folder, single-photo and manifest input all hydrate iff `-r`,
+  and none hydrates without it. `-r` is deliberately **not** a `_WRITE_BUNDLE` member and is
+  **not** refused beside `--generate-manifest`: it is a read, and `-r --generate-manifest` is
+  the combination the round trip depends on. Explicit rather than default for two reasons: a
+  folder run must not silently shell out to ExifTool and change what the model is sent, and
+  the plugin should adopt the three fields it never had deliberately rather than inherit
+  them.
+- **What it reads, and why that list.** The field set is
+  `exiftool.manifest.DEFAULT_EXIFTOOL_FIELDS` - `EXIF:DateTimeOriginal`, `EXIF:UserComment`,
+  `XMP:Description`, `XMP:Title` and `XMP:Subject` - and the tag-to-key mapping is not
+  re-declared: `hydrate._HYDRATED_TAGS` derives it from that tuple and the existing
+  `_TAG_TO_MANIFEST_KEY`. It is the set the ExifTool subpackage already calls "what photokin
+  reads from a file", every member has a mapping, and every one is in
+  `DEFAULT_METADATA_FORWARD_FIELDS`, so every one can actually reach the model. Location is
+  out: nothing downstream would consume it that C3 owns. Values are stored verbatim, so
+  `dateTimeOriginal` keeps ExifTool's colon form, which `merge._extract_year` and `canonical`
+  both already read, and `keywords` stays a list - ExifTool returns a multi-valued tag as a
+  JSON list and a single-valued one as a bare string, which `manifest.manifest_value`
+  normalizes for both this path and the standalone manifest builder.
+
+  Keywords were left out of the first pass, on the grounds that they touch four coupled
+  decisions none of them C3's. That was wrong in the one way that mattered: `XMP:Subject` is
+  where the `DATE:` marker lives, and it is the only interlock on the heuristic that reading
+  the date exists to feed. See the second pass below for the defect and for why the four
+  coupled decisions each resolve in the safe direction.
+- **The guard fix.** `hydrate_user_comments` skipped any item whose `metadata` was not a
+  dict, which is every folder item (`{path}` only) - the item with everything to gain. The
+  loop now treats a missing `metadata` as `{}` without attaching it, and creates
+  `raw["metadata"]` only when a value is really written, so a file ExifTool reads nothing
+  from keeps its item byte-identical and the goldens are unaffected. An item naming a
+  `metadata_path` is still skipped outright, because `load_item_metadata` prefers an inline
+  dict and seeding one would shadow the sidecar - which is the hazard recorded at :483-491,
+  handled rather than inherited. Renamed to `hydrate_item_metadata`, since the old name
+  would lie about five fields; it is on neither `public.py` nor `photokin/__init__.py`, so
+  no breaking-change entry, matching the `utils.group_folder_images` precedent at :405-407.
+  Still one subprocess per batch: the union of paths needing anything, requesting all five
+  tags, filtered per item on write-back.
+- **The forwarding was broken anyway, and the fix is one line.** `metadata_forward.toml`
+  lists `dateTimeOriginal` as a forwarded field and the prompt is written to receive it, but
+  `combine_group_metadata` renamed `dateTimeOriginal` to `date` and `date` is not in the
+  allowlist, so it was dropped at the last step. Verified before the fix:
+
+  ```
+  combine_group_metadata emits : ['caption', 'date', 'keywords', 'title', 'userComment']
+  ACTUALLY reaches the prompt  : ['caption', 'keywords', 'title', 'userComment']
+  dropped at the allowlist     : ['date']
+  ```
+
+  `combine_group_metadata` now emits the value under **both** keys, and
+  `merge_original_sources._pick` reads `dateTimeOriginal` as an alias for `date` on both
+  primary and fallback. The allowlist is untouched and no existing key changes meaning.
+  The alias is required, not cosmetic: `own_meta` is the item's raw metadata, where a
+  hydrated date is spelled `dateTimeOriginal`, and `_pick` looks for `date`, which only
+  `combine_group_metadata` produces - so without it no file's own scan date ever reached its
+  own record and every file inherited whichever sibling was scanned first. The two rejected
+  alternatives were "put `date` in the allowlist" (fixes the symptom by renaming the
+  contract, leaving two spellings of one field in the wild) and "stop renaming" (breaks
+  `merge.py`'s two `original["date"]` readers, including the gap heuristic that is the whole
+  justification for reading the date).
+
+  **`metadata_forward.toml` never loads, and did not before this.** `core` opens it with
+  `json.load` at :422, :695 and :1584; the file is TOML, so every run raises
+  `JSONDecodeError` into a handler that logs only under `MEL_VERBOSE`/`MEL_DEBUG`, and
+  `forward_fields` is always `None`. Verified by execution. The effective allowlist is
+  therefore always `DEFAULT_METADATA_FORWARD_FIELDS`, whose contents happen to be identical,
+  so nothing is observably wrong today - but the two can silently diverge, and an implementer
+  who "fixes forwarding" by editing the TOML changes nothing at all. Repairing the loader
+  activates an inert config file on every run and needs its own decision; out of scope here,
+  recorded under the open risks.
+- **The date is evidence, not truth.** `merge.py`'s old block did
+  `merged["date_guess"] = {"iso": d, "confidence": 1.0}` unconditionally whenever an original
+  date was present. On a flatbed scan `EXIF:DateTimeOriginal` is the *scan* date, so that
+  asserted the day you scanned the print as the day the photograph was taken, at full
+  confidence, and discarded "circa 1952, confidence 0.7" with it. It now sets
+  `merged["date_original"]` and fills `merged["dateTimeOriginal"]` **only when that is
+  empty**; `date_guess` is not touched at all and keeps exactly what the model returned.
+  The emptiness guard is what keeps the gap rule's rewrite intact, and filling
+  `dateTimeOriginal` is what stops `canonical._date_from_metadata` falling through to the
+  model's guess in every case where the gap rule declined - the trap in the naive edit, which
+  would have proposed 1952 against a 1955 file and inverted the heuristic's entire purpose.
+  `report["overrides"]` no longer gains `"date_guess"`; `"dateTimeOriginal"` is still
+  appended when the gap rule fires. The fill is deliberately not reported as an override -
+  nothing was overridden, since the AI never emits `dateTimeOriginal` at all, and
+  `merged["date_original"]` discloses the evidence more usefully than a report entry would.
+- **The gap heuristic is untouched and finally reachable.** Not one line of `merge.py:246-322`
+  changed. It compares `original["date"]` against the model's inference and rewrites
+  `dateTimeOriginal` only when the AI is confident and the year gap is wide - "don't clobber
+  modern photos, do fix old ones". Folder items were `{path}` only, so `original["date"]` was
+  always empty and **in folder mode it never fired**. `-r` plus the rename fix is what makes
+  it live. The `DATE:` keyword suppression is unchanged: a human-reviewed date still stops
+  the rewrite, and now `date_original` records what the file held while `date_guess` records
+  what the model thought.
+- **Patch neutrality, proven by differential against HEAD's `merge.py` over six shapes.** The
+  patch's `EXIF:DateTimeOriginal` and the changeset diff's `set` entry are byte-identical
+  before and after in every one; only `date_guess` and the new `date_original` differ.
+
+  ```
+  shape                            patch EXIF:DateTimeOriginal   diff set      identical
+  gap fires (2019 vs 1952@0.7)     1952-01-01                    1952-01-01    yes
+  gap silent (1955 vs 1952@0.7)    1955:06:01 09:00:00           (absent)      yes
+  gap silent, low conf (0.4)       1955:06:01 09:00:00           (absent)      yes
+  DATE: keyword present            2019:04:03 11:22:33           (absent)      yes
+  no original date                 1952-01-01                    1952-01-01    yes
+  no model date_guess              1955:06:01 09:00:00           (absent)      yes
+
+  the worked example, scan.tif, EXIF 2019 vs model "circa 1952" at 0.7:
+    BEFORE  date_guess = {"iso": "2019:04:03 11:22:33", "confidence": 1.0}
+            overrides  = ["dateTimeOriginal", "date_guess"]
+    AFTER   date_guess = {"iso": "1952", "import_date": "1952-01-01",
+                          "confidence": 0.7, "pattern": "Y~"}
+            date_original = "2019:04:03 11:22:33"
+            overrides  = ["dateTimeOriginal"]
+    both    dateTimeOriginal = "1952-01-01"   (the gap rule, unchanged)
+  ```
+
+  A caller who wants the original treated as authoritative does nothing and no `Config` flag
+  is added: `merged["dateTimeOriginal"]` still always carries the value that will be written,
+  and a consumer reading `record["date_guess"]["iso"]` to recover the file's date reads
+  `date_original` instead. Suppressing the model's proposal outright already has a mechanism
+  - a `DATE:` keyword on the file.
+- **The title rule narrows, for titles read out of a file.** `-r` makes `merge.py`'s
+  original-title-wins rule reachable in folder mode for the first time, and scanner software
+  routinely writes "Scanned Image" or the bare filename into `XMP:Title`. Unnarrowed,
+  boilerplate would outrank a title the model transcribed off the print, which makes reading
+  the file strictly worse than not reading it. Under `-r` the original now wins only when the
+  model returned none:
+
+  ```
+  model title      original title    merged             overrides
+  -                -                 -                  []
+  Wedding Day 1952 -                 Wedding Day 1952   []
+  -                Aunt Ruth's ...   Aunt Ruth's ...    ['title']     <- unchanged
+  Wedding Day 1952 Scanned Image     Wedding Day 1952   []            <- the only changed cell
+  ```
+
+  The two sources are not symmetric evidence: the prompt constrains the model to titles
+  legibly printed on the object (`image_rules.txt:102-107`), so when both exist one was read
+  off the physical thing and the other was written by whatever last touched the file. The
+  human value is not destroyed - it stays in the file, and the changeset's
+  `original_data.file_metadata` block still reports it, so a reviewing plugin sees both. The
+  rejected alternatives were keeping it as-is (imports junk titles into every folder run), a
+  scanner-boilerplate denylist (locale- and vendor-specific policy code of exactly the kind
+  the caption half of this phase forbids), and deleting the rule (destroys a genuine human
+  title). Dropping `XMP:Title` from the read set was also rejected: an existing title is
+  useful context, and the reason for reading the full set is to know what *not* to update. A
+  side fix rides along - the emptiness test now strips both sides, so `" Title "` beside
+  `"Title"` no longer reads as a difference.
+
+  **The first pass narrowed it for every input mode, which was the fourth defect below.** The
+  fourth rejected alternative above was provenance tracking, dismissed as "real plumbing
+  through two functions that drop unknown keys, for a case one line handles" - but the case
+  is not the one line it looked like, because the narrowing then also governs manifest input
+  with no `-r` anywhere, where the original title is a human's. Provenance is now tracked, and
+  without touching either of those two functions: `original_title_from_file` is a keyword-only
+  parameter defaulting to `False`, and the hydrator's presence is what sets it.
+- **No new caption code.** The evaluate-then-replace policy already exists, in the prompt
+  (`instructions_front_back.txt:261-276`, `output_format.txt:61-63`,
+  `image_rules.txt:188-192`), and the join is `core._join_captions`. Reading the caption so it
+  reaches the model was the whole job. *(Held only for the first pass. The sixth pass below
+  replaced the join with a group-wide labelled block; `_join_captions` is gone, and its
+  line-by-line de-duplication survives inside the block assembly as the last net. The claim
+  about the prompt still stands: the semantic policy is still the model's and no second call
+  was added.)*
+- **`combine_group_metadata` becomes permutation-independent**, which `-r` makes necessary.
+  It takes first-non-empty over `preferred + arrival` order; folder items used to carry no
+  metadata, so it returned `{}` and was trivially invariant. With `-r` every file
+  contributes, so a group of two disagreeing scans would yield a permutation-dependent
+  forwarded snapshot, prompt and merge input - the gap this plan already recorded at
+  :1279-1284, widened from "manifests with two or more metadata-bearing items" to "every
+  multi-file group in every folder". Preferred still comes first; each half is now sorted on
+  `(normalize_path.lower(), normalize_path)`, the tie-break the pipeline already uses
+  everywhere else. Measured:
+
+  ```
+  three metadata-bearing items disagreeing on title/caption/dateTimeOriginal/userComment
+                            BEFORE                    AFTER
+    no preferred            6 distinct answers        1
+    one preferred           2 distinct answers        1
+
+  720 permutations of a 6-file folder in which every item carries metadata
+    -> 1 distinct outcome, once all_variant_files is excluded (B1 keeps its list
+       order input-ordered on purpose); model calls, results, errors and every
+       per-file title/caption/date/keyword value are invariant across all 720.
+  ```
+
+  For folder input the sort reproduces arrival order exactly - one directory, so comparing
+  full paths lowercased is comparing basenames lowercased, which is `list_folder_images`'s
+  own key - so folder output is unchanged by the sort itself. For manifest input it replaces
+  an arbitrary answer with a stable one, the same trade B1 made for slot occupancy at
+  :301-306. The `it not in preferred` membership test, an O(n^2) list scan over dicts, goes
+  with it. The second half of the mitigation is the `dateTimeOriginal` alias above.
+- **`--generate-manifest` carries what was read, and round-trips.** `main` returns into
+  `_generate_manifest` above the `ecfg` block, so the hydration and its pre-flight live
+  there; `_resolve_exiftool_config(args)` is a pure function of the namespace and is called
+  directly, no hoisting and no new parameter. Hydration runs before bucketing and before the
+  write, so the document written and the grouping reported describe the same items. Under
+  `--dry-run` the pre-flight still runs but no subprocess starts and nothing is written.
+  The document holds only the five mapped keys, only where non-empty, and **omits `metadata`
+  entirely** for a file ExifTool read nothing from; no `metadata["exiftool"]` raw-tag block
+  and no `metadata["path"]`, both of which `exiftool_records_to_manifest_items` adds, since
+  neither is in the forward allowlist and both would bloat a document that has to round-trip.
+  No `"read": true` marker either: the file describes the input, never the run settings.
+
+  What round-trips, verified end to end: `photokin -r <folder>` and `photokin <that
+  document>` send the model the same work - identical grouping, identical model calls,
+  identical images per call, identical `Forwarded metadata:` lines - and come back with
+  identical `errors`, while the replay makes **zero** ExifTool subprocess calls. A second
+  `-r --generate-manifest` over the same folder is byte-identical, and `--meta` beats `-r`
+  on the front item.
+
+  **`results` is the exception, and stdout is byte-identical only where the title rule has
+  nothing to decide.** That rule keys on provenance, and the document deliberately records
+  none, so on replay every hydrated title reads as a human-typed manifest title and keeps the
+  precedence over the model's that a manifest title has. Measured on `print.jpg` carrying
+  `XMP:Title "Scanned Image"` against a model returning `"Wedding Day 1952"`:
+
+  ```
+                  title                _merge.overrides   stdout vs folder -r
+  folder -r       Wedding Day 1952     []                 -
+  replay          Scanned Image        ['title']          differs
+  replay -r       Wedding Day 1952     []                 byte-identical
+  ```
+
+  So the round trip is exact for every group where the model returns no title - which is the
+  common case, and the shape `TestGeneratedManifestRoundTripsWhatWasRead` uses, where
+  `results` and stdout do compare byte-identical - and `photokin -r <that document>` restores
+  the folder result outright wherever it is not. `-r` on a replay costs no subprocess where the
+  first read was complete - the hydrator queries only items still missing a key, and a document
+  written from a full read leaves none - but the pre-flight still demands a resolvable binary
+  and exits 2 without one, so it is not free. Closing the gap
+  properly would mean the document carrying provenance, which is a fact about the run rather
+  than about the input - the same line the `"read": true` decision above draws - so it is left
+  stated here rather than settled in passing.
+- **A read that cannot run is fatal, like a requested write.** `-r` with no resolvable binary
+  exits 2 before any provider call, for folder, manifest, single-photo, `--generate-manifest`
+  and `--dry-run` alike, with `cli_messages.exiftool_not_found_for_read`. The argument is
+  that the failure is silent and expensive - the run proceeds to call the model with a
+  strictly worse prompt, pays in full, and produces results carrying no marker
+  distinguishing "read nothing" from "there was nothing to read" - where `-w`'s failure is
+  loud by construction. `-r -w` with nothing available reports the *write* message, whose
+  remedy fixes the read too. The README's "hydration is skipped with a warning" sentence
+  described hydration when it was an implicit step nobody asked for; `-r` inverts that. The
+  best-effort behavior is kept where it still belongs: after the pre-flight passes, a mid-run
+  ExifTool failure warns and continues, the same split `-w` has.
+- **The plan summary gains a `read` row**, between `input` and `output` since reading
+  precedes everything it affects: `read : ExifTool EXIF:DateTimeOriginal, EXIF:UserComment,
+  XMP:Description, XMP:Title, XMP:Subject` under `-r` and `read : none (-r not given)`
+  otherwise - the row is built from `DEFAULT_EXIFTOOL_FIELDS`, so it grew with it. That is
+  how the plugin's loss is announced, the same mechanism C2 used for the flipped write
+  default at :1154-1158 rather than a separate deprecation warning. `_LABEL_WIDTH = 9`
+  already fitted "read".
+
+**What the Lightroom plugin loses.** A manifest run used to hydrate unconditionally. A plugin
+that does not pass `-r` loses exactly one thing: `EXIF:UserComment` is no longer read out of
+files for items already carrying a `metadata` object whose `userComment` is missing or empty.
+Nothing else, because nothing else was ever hydrated. The reach is bounded -
+`merge_original_sources._pick` does not list `userComment`, so it never reached
+`merge_record_with_original`, `build_canonical_patch`, `proposed_changes` or any file. The
+observable consequence is prompt quality plus one absent key in a changeset audit block; no
+proposed write appears or disappears. The remedy is one token in the plugin's argv, at which
+point it gains three fields it never had.
+
+**Second pass - five defects adversarial review found, and one it was wrong about.** Four of
+the five are the same shape, and it is the shape this phase set out to avoid: *reading the
+file made the run worse than not reading it*. The read either armed something whose safety it
+did not also read, or let a supporting file's values stand for the object's.
+
+- *The date's human interlock was not in the read set.* The read set's whole justification is
+  the gap heuristic, and that heuristic has exactly one veto: `_has_date_keyword`, which looks
+  for a `DATE:` marker among the original keywords. Keywords were deliberately left out on the
+  grounds that they touch four coupled decisions, so `-r` read `EXIF:DateTimeOriginal` and left
+  its safety off. A print an archivist had dated by hand - `EXIF:DateTimeOriginal
+  1952:06:01`, `XMP:Subject ["family", "DATE: Y!"]` - was re-dated from the model's inference
+  under `photokin <folder> -r -w`: `-EXIF:DateTimeOriginal=1920:01:01 00:00:00` written to the
+  file, and a second `DATE: Y~` added beside the human's. Without `-r`, on this branch and at
+  a3dc4f1, the same run leaves it alone, because with no original date the heuristic cannot
+  fire. `XMP:Subject` joins `DEFAULT_EXIFTOOL_FIELDS`, mapped to `keywords`.
+
+  The four coupled decisions turned out to resolve the safe way, which is why this is one line
+  of tuple and no policy: the union in `merge_record_with_original` is what manifest input has
+  always done; `diff_canonical_metadata`'s `keywords_remove` gets *smaller*, since the patch's
+  keywords are a superset of a before-snapshot that now holds the file's own, where before the
+  snapshot was empty and every existing keyword read as an addition; and the `own_markers` /
+  `leaked` calculus reads the file's real markers instead of assuming none, which is exactly
+  what C1's per-file rule asks for. `XMP:Subject` is the readable spelling;
+  `CANONICAL_KEYWORDS_TAG` was `XMP:dc:Subject`, which ExifTool refuses as a *write* target
+  ("doesn't exist or isn't writable"). That was a separate pre-existing defect, left where it
+  was at the time and since fixed - the three constants are now `XMP-dc:` and a writability
+  test holds them there (see the resolved-defect entry below).
+- *One command line for the whole folder.* `run_exiftool_json` put every path on a single
+  argv. Windows caps that at 32767 characters and fails past it with `[WinError 206]`, which
+  `subprocess` raises as `FileNotFoundError`, which the function re-wrapped as "ExifTool not
+  found at: ..." naming a binary that resolves perfectly, which the hydrator logged as a
+  warning and continued from. Measured: 400 files with 68-character paths hydrated 0 of 400,
+  and the run went on to pay for every model call with an un-hydrated prompt and exit 0. The
+  pre-flight cannot catch it, because the binary does resolve. The list is now batched under
+  `_ARGV_BUDGET`; a list that fits is still exactly one invocation, so nothing small moves.
+  700 files now hydrate 700. The shape predates C3 - manifest hydration could reach it - but
+  C3 made it folder mode's default and widened manifest mode's query from "items missing a
+  userComment" to "items missing any of the tags", and `-r --generate-manifest` failed the
+  same way and wrote a round-trip document carrying no metadata at all.
+- *The caption join was not idempotent.* `_join_captions` de-duplicated whole parts, so it
+  matched only while the stored caption was exactly the generated one. Once run 1 had written
+  `"<original>\n[Front] <ai>"` back, run 2 compared that whole string against `[Front] <ai>`,
+  found no match, and appended a second copy; run 3 a third. Unbounded, silent, and only on
+  the photos carrying a human caption - a file with no original caption was stable, which is
+  what made it look fine. It now de-duplicates line by line, so re-feeding the join its own
+  output returns it unchanged. This is not caption-merge policy, which stays in the prompt: it
+  is the join failing to do the one thing it already claimed to do. *(The line-by-line rule
+  survives in the block the sixth pass below builds, where it is the last net rather than the
+  whole mechanism: the block is now keyed by label, so a section is recognized as its own
+  before any line comparison happens.)*
+- *The title narrowing was applied globally rather than to hydrated titles.* The question this
+  phase was asked was whether the original-title-wins rule survives contact with titles `-r`
+  reads out of `XMP:Title`. The answer shipped as an unconditional narrowing, which also
+  reached manifest input with no `-r` and no ExifTool subprocess anywhere - where the original
+  title is not scanner boilerplate but a field a human typed into Lightroom. A manifest item
+  carrying `title: "Mom's graduation, June 1961"` against a model title read off the film edge
+  merged to `"KODAK SAFETY FILM"` and proposed it for `XMP-dc:Title`, with `_merge.overrides`
+  empty so nothing recorded that the human title had been dropped.
+
+  The two directions are not symmetric and the asymmetry decides it. Un-narrowed under `-r`,
+  boilerplate suppresses a genuine transcription - a *quality* loss, and nothing is written,
+  since the value proposed is the one already in the file. Narrowed on the manifest path, a
+  human title is overwritten on disk - a *data* loss. So the rule is now scoped by provenance:
+  `merge_record_with_original` takes `original_title_from_file`, defaulting to `False`, and
+  `process_manifest_stream` passes `metadata_hydrator is not None` - the hydrator being the
+  only thing that ever puts a file's own tags into an item. No `Config` field, no marker keys
+  threaded through the two functions that drop unknown ones, and every existing caller keeps
+  a3dc4f1's behavior by default. The four cells under `-r` are unchanged from the table above;
+  without `-r` all four are a3dc4f1's, keeping only the strip-both-sides side fix.
+- *The group's metadata was taken from its supporting scans.* `combine_group_metadata`'s new
+  path sort is permutation-independent, which was the point, but `-` (0x2D) sorts before `.`
+  (0x2E) - so `box3_025-back.jpg`, `box3_025-crop.jpg` and `box3_025-negative.jpg` all precede
+  `box3_025.jpg`, and first-non-empty took the negative's. The front print's own title and
+  caption reached neither the model nor its siblings' records; the model was sent
+  `{"title": "negative title", "caption": "THE NEGATIVE STRIP"}` for the object, and the back
+  came back proposing the negative's description into a file that had none. The section above
+  observed that for folder input the sort reproduces arrival order exactly and stopped there,
+  without noticing that arrival order ranks supporting scans first. Unreachable before C3,
+  since folder groups carried no metadata and the function returned `{}`.
+
+  The scan now runs from the file that most is the object to the file that least is: crops
+  yield first, then `PART_RANK`, then the path. That is the order `_slot_rank_key` already
+  uses to decide which file fills a slot, so the group's metadata and the group's primary scan
+  are the same file rather than two independent answers - which is why `_PART_RANK` moved to
+  `utils.PART_RANK` and core now refers to it instead of holding a second copy. `preferred`
+  still leads outright. Entries with no `part_kind` all rank alike and fall through to the
+  path, so a caller passing raw manifest items sees the previous behavior.
+- **Deferred at the time, then fixed: the gap override's confidence threshold.** The report's
+  remaining finding was that the gap rule fired at `date_override_confidence_threshold` (0.6)
+  while `canonical` would not write a *guessed* date below `date_confidence_threshold` (0.7),
+  so a 0.65 inference could overwrite a date the file already held although it was too weak to
+  fill an empty one. It was rejected *for C3* on the grounds that the asymmetry was real but
+  neither new nor this phase's: the two are separate knobs, `merge.py:246-322` was untouched,
+  and the case was reachable at a3dc4f1 through manifest input, which has always carried an
+  original date. Measured then: a Lightroom-shaped item holding `dateTimeOriginal
+  2019:07:04 14:05:00` with the model at 1965 @ 0.65 merged `dateTimeOriginal 1965-01-01` and
+  emitted `EXIF:DateTimeOriginal {"op": "set", "value": "1965-01-01"}` byte-identically on both
+  trees, so `-r` changed reach and not rule.
+
+  The owner has since taken the decision the note left open and swapped the pair:
+  `date_confidence_threshold` is now **0.6** and `date_override_confidence_threshold`
+  **0.7**. Filling a date a file lacks is the cheap direction -- an empty field loses nothing
+  to a poor guess -- while replacing one it holds destroys something, so the override gate now
+  sits at or above the write gate rather than below it. `date_override_precise_*` (0.8 / 5
+  years) is unchanged and still above both, since a narrower year gap is weaker evidence of a
+  real mismatch and has to be paid for in confidence.
+  `TestOverwritingADateCostsMoreThanFillingOne` (`test_read_flag.py`) pins both orderings, so
+  the next person to tune either knob has to look at the other.
+
+**Coverage.** `photokin/tests/test_read_flag_hazards.py` as the first pass left it (22 tests,
+4 subtests; the sixth pass below takes it to 61 and 75), one class per
+defect, each written against the story rather than the line: the interlock class pins the
+suppressed rewrite, the absent second marker and - as its non-vacuity case - that the heuristic
+still fires when the marker is removed; the batching class pins that a small list is still one
+invocation, that a large one is split, that no invocation exceeds the budget and that every
+path is requested exactly once in order; the caption class re-feeds the join its own output
+twice; the title class takes all four cells in both provenance modes and follows one of them
+through `build_canonical_patch` to the tag; and the group-metadata class pins the front's
+values, a sibling still supplying what the front lacks, invariance over all 24 permutations,
+`preferred` still leading, and the no-`part_kind` fallback. All five fixes were mutated back
+in a scratch copy and the suite re-run: 4, 2, 1, 2 and 1 failures respectively, none of them
+overlapping, so no test is decorative. The six-shape date differential against a3dc4f1 and the
+`-r --generate-manifest` round trip were both re-run after the changes and still hold - all six
+patches and diffs identical, replay making zero ExifTool calls, the repeat generate
+byte-identical, and the document now carrying `keywords`.
+
+**Sixth pass - the caption becomes the group's, and stops lying about which side it came
+from.** Three defects, all of them in the one block of `core.py` that turns a group's
+captions into the text written into its files. They are taken together because the first
+cannot be fixed without rebuilding the other two.
+
+- *The block was per file, so no two files agreed.* Each file got its own caption as a
+  preamble and the group's generated caption after it, which means a print, its back and a
+  rescan each told a third of the story and none of them told it whole. What the owner wants
+  is one block, identical in every file of the group, so that whichever file someone opens a
+  year from now is not an accident that costs them the other two. Measured, on
+  `box3_017.jpg` / `box3_017b.jpg` / `box3_017b-back.jpg` each holding its own caption:
+
+  ```
+  before  box3_017.jpg       : 'Caption A\n<the model's caption>'
+          box3_017b.jpg      : 'Caption B\n<the model's caption>'
+          box3_017b-back.jpg : 'Back of Photo B\n<the model's caption>'
+
+  after   all three          : '[Photo A] Caption A
+                                [Photo B] Caption B
+                                [Back] Back of Photo B
+                                [AI Analysis]: Two people outside a bakery.'
+  ```
+
+  The architecture is **group-wide intake**, not per-file evaluation, and that is the whole
+  of it: a per-file pass cannot produce an identical block, because each file's preamble
+  differs. One sweep over the group reads each file's own caption *while it is still known
+  which file it came off* - the one moment attribution is free rather than guesswork -
+  attributes it to that file's label, unions the labelled sections across the group,
+  de-duplicates, appends this run's analysis, and hands the one result to every member.
+  There is therefore no such thing as unattributable text at intake, which is why the
+  rejected "keep unlabelled prose as a personal preamble" rule had to go: it reintroduces
+  exactly the divergence the block exists to remove. What survives of it is the narrow real
+  case - a *multi-line* run of prose on one file - and that takes one label on its first
+  line rather than a label per line, since the run is one thought and labelling each line
+  would make them sections that later runs could reorder independently.
+
+- *The default path did none of this.* The branch followed `group_payload`, so
+  `--group-by object` - the default, and so the overwhelming majority of runs - reused the
+  model's own caption verbatim and added no labels at all; only `pair` and `none` ever
+  reached the labelling code. Both payload branches append exactly one entry to `analyses`,
+  so the fork bought nothing and is gone.
+
+- *A front was labelled `[Back]`.* The per-variant branch asked whether the analyzed variant
+  *had* a back and, if so, filed that variant's caption under the back's role - so under
+  `pair` the caption written onto a FRONT file read `[Back] ...`. This is the same defect
+  the C1 note at :776-788 recorded as "the more honest of the two" and let stand; it is not,
+  once the caption is a labelled block, because the label is now a claim about which file
+  the text came off rather than a decoration. A photo is `[Photo ...]`, a back is
+  `[Back ...]`. The de-duplication that branch existed for is kept and is now what it always
+  should have been: sections are compared on their text with the label stripped, so one
+  caption an archivist copied onto both sides of a print is written once, under the side
+  that ranks first.
+
+  Labels are added only where they distinguish something. A group of one file with no back
+  gets none at all - the common case stays untouched - and a back is labelled only when the
+  group holds both sides. The variant letter is decided per role, reusing the
+  `multiple_fronts` / `multiple_backs` pair the merge rules already compute, so two photos
+  and one back give `[Photo A]` / `[Photo B]` / a bare `[Back]`. An unversioned scan prints
+  as `[Photo A]` beside a lettered sibling, because that is what it is - the reason the
+  second scan is lettered `b` and not `a` - but never with no lettered sibling to
+  disambiguate from, and never when the group holds a real `a`.
+
+**Deterministic caption update, and the knob that decides it.** Rules (a)-(d) of the brief
+are implemented with no second model call, because the block is labelled and therefore keyed:
+the structural merge is string work, and the semantic judgement - do two differently worded
+captions mean the same thing - already happens in the primary call, which under `-r` is shown
+the existing caption and told to evaluate it (`instructions_front_back.txt:261-276`). A
+partial block gains its missing sections and keeps the ones it has; a materially different
+caption is added beside what is there; nothing is ever deleted.
+
+Near-identity is the dangerous part, and the measurement changed the design. Scored on
+normalized text with `difflib.SequenceMatcher`:
+
+```
+must SKIP   trailing period / case / spacing ................ 1.0000
+must SKIP   "Ruth and Sam, outside" vs "Ruth and Sam outside"  0.9841
+must SKIP   "Grandma’s porch" vs "Grandma's porch" ........... 0.9643
+must SKIP   "Ohio - summer" vs "Ohio — summer" ............... 0.9444
+must SKIP   '"hello"' vs "'hello'" ........................... 0.9091
+must KEEP   "...bakery, 1948" vs "...bakery, 1949" ........... 0.9730
+must KEEP   "Ruth and Sam" vs "Ruth and Edith" ............... 0.8750
+must KEEP   one digit of a year in a 300-char analysis ....... 0.9967
+```
+
+Skipping is `ratio >= T`, so the SKIP rows demand `T <= 0.9091` and the KEEP rows demand
+`T > 0.9967`. **No such T exists** - the ranges overlap almost entirely, because `ratio` is
+relative to length and a changed year in a long block moves it less than a changed quote mark
+in a short one. A single threshold either loses date corrections or keeps punctuation
+variants, and losing a correction someone typed is the unrecoverable one. What separates the
+two ranges cleanly on every row is whether any *word* changed, so the word sequence carries
+the decision and the ratio remains only as a last gate for a residue too small to be a word:
+`_CAPTION_NEAR_IDENTICAL_RATIO = 0.998`, above the worst measured material difference by
+design, so it is structurally unable to be the thing that discards a name, a year or a place.
+`test_no_single_ratio_threshold_could_have_done_this` executes that table, so the constant's
+comment cannot go stale.
+
+**Idempotency, which is the non-negotiable one.** Under `-rw` the block written here is
+exactly what the next run reads back as *every* file's existing caption - not one file's, all
+of them, which is the steady state and the case most likely to double. Two properties make it
+a fixed point. Intake recognizes its own labelled lines and takes them verbatim rather than
+attributing them again, which is the `[Photo A] [Photo A] Caption A` failure; `[Front]` is
+read for this reason and never written, so an archive an older release enriched settles
+instead of doubling. And everything from an `[AI Analysis]` marker to the end of a caption is
+the previous run's analysis and is regenerated rather than accumulated - without which a model
+that rewords itself between runs, which is the normal case in the field, would add a paragraph
+per pass and the frozen-reply tests would not notice. Three consecutive runs are byte-identical
+after the first, at every `--group-by` value, for prose a human typed, a multi-paragraph
+caption, a block already in the labelled form, a lone file holding nothing, and the multi-file
+groups the labels exist for.
+
+**Coverage (sixth pass).** `test_read_flag_hazards.py` grows four classes on a shared
+`_CaptionBlockTestCase` harness that states each case as `{filename: the caption that file
+already holds}` and asserts, on every call, that the group's files all came back with the same
+block: the shape and label rules, the update rules, near-identity in both directions with the
+predicate and the ratio table asserted beside the end-to-end result, and a 24-permutation
+sweep over a four-file group in which every file carries a different caption - the block is
+assembled from four captions now, which is four chances for arrival order to reach a value
+written into a photograph, so the intake sweeps in `_slot_rank_key` order like every other
+choice in the bucket loop. Thirteen mutations were applied in a scratch copy and every one of
+them bites: the per-file block, the `[Front]` wording, the front-as-back mislabel, re-attributing
+already-labelled lines, dropping the analysis marker, loosening the ratio to 0.90, dropping the
+word comparison, sweeping in manifest order, one letter rule for both roles, implying `A`
+unconditionally, keeping the previous analysis, dropping the legacy `[Front]` spelling, and
+restricting de-duplication to a single label. Three of the thirteen did not bite on the first
+attempt: two were bad mutations, and the third found a genuinely weak test - the legacy-spelling
+case had been written on a single unlabelled file, where nothing is prepended to anything and
+the doubling cannot be observed, and now runs on a labelled pair with the legacy line first.
+
+**C3 open risks.**
+
+- Two C3 changes reach manifest mode independently of `-r`, and neither can be checked against
+  the plugin here - the standing blind spot at :1272-1278. (a) `date_guess` no longer carries
+  the original date at confidence 1.0, so a plugin reading `record["date_guess"]["iso"]` to
+  recover the file's date must read `date_original` or `dateTimeOriginal` instead; the patch
+  and the changeset diff are provably unchanged, but the record is not. (b)
+  `combine_group_metadata`'s scan order becomes rank-then-path sorted rather than
+  arrival-ordered, changing the forwarded snapshot only for groups holding two or more
+  disagreeing metadata-bearing items. Confirm against the plugin's manifest writer and record
+  reader before release. The title rule was a third such change until the second pass scoped it
+  to `-r`; with no `-r` the plugin now sees a3dc4f1's title precedence exactly.
+- The plugin loses automatic hydration the day this ships unless it adds `-r`. Bounded to the
+  prompt and one changeset audit field, but it is a silent quality change on the plugin's own
+  contract and this repo holds no fixture of it.
+- `metadata_forward.toml` is dead and has been since it was written (`json.load` on a TOML
+  file). Its contents happen to match `DEFAULT_METADATA_FORWARD_FIELDS`, so nothing is
+  observably wrong - but the two can silently diverge, and repairing the loader activates an
+  inert config file on every run, which needs its own decision.
+- `DEFAULT_EXIFTOOL_FIELDS` does not request the legacy instruction tags
+  (`Photoshop:Instructions`, `XMP:Instructions`, `IPTC:SpecialInstructions`) even though
+  `_TAG_TO_MANIFEST_KEY` maps all three to `userComment`, nor `IPTC:Caption-Abstract`, which
+  maps to `caption`. Archives written by older Lightroom versions may carry notes only there.
+  Adding them is a one-line change to the tuple, but it widens what `-r` reads on the plugin's
+  path too, so it is left for a follow-up with a real corpus behind it.
+- The changeset's `before_snapshot` never carries the file's existing `UserComment`:
+  `merge_original_sources._pick` does not list it, so every run proposes `EXIF:UserComment`
+  as a change even when the value is unchanged. Pre-existing and unaffected by C3, but more
+  visible now that `-r` puts the existing value in front of the model. Worth settling when
+  the apply step is next opened.
+- The scan-order sort is the one mitigation that changes existing manifest-mode output. The
+  judgment is that a stable answer beats an arbitrary one, matching B1's slot-occupancy trade.
+  If that judgment is wrong, the fallback is to leave the function alone and keep B1's
+  restriction on the permutation tests - at the cost of every multi-file folder group gaining
+  a permutation-dependent forwarded snapshot under `-r`.
+- ~~`XMP:dc:Subject`, `XMP:dc:Title` and `XMP:dc:Description` - the three `canonical.py`
+  constants the changeset writes through - are not ExifTool-writable spellings.~~ **Fixed.**
+  ExifTool answered "Sorry, XMP:dc:Description doesn't exist or isn't writable" and did
+  nothing, so `-w` could not write a keyword, a title or a caption into a file at all; only
+  `EXIF:UserComment` and `EXIF:DateTimeOriginal` landed. End to end,
+  `photokin <folder> -rw --exiftool-fields XMP:dc:Description` reported
+  `files_seen=3 files_written=0 tags_written=0 errors=3` and still exited 0. The three
+  constants are now `XMP-dc:Subject` / `XMP-dc:Title` / `XMP-dc:Description`, which is both
+  writable and the spelling ExifTool itself prints back under `-G1`; the caption feedback loop
+  the second pass fixed now closes through photokin's own writes.
+
+  The reason it shipped is the more useful half: **nothing asserted that a canonical tag was
+  writable**. Every test either mocked the binary or exercised only the default write set
+  (`EXIF:DateTimeOriginal`, `EXIF:CreateDate`, `EXIF:UserComment`), all three valid, so the
+  defect was invisible to a green suite. `photokin/tests/test_canonical_tags_are_writable.py`
+  is the missing check: it derives the tag list from `canonical.py` by reflection - rather
+  than restating it, so a tag added later is covered the day it is added - and drives the real
+  ExifTool binary against a real image for each one, asserting the value reads back rather
+  than trusting the exit code. It skips only when no binary is on PATH.
+
+  Two measurements from that work worth keeping, because both contradict the obvious rule:
+  a second colon is *not* itself the error (`EXIF:IFD0:Model` is valid ExifTool syntax and
+  `EXIF-IFD0:Model` is not, so a blanket colon-to-hyphen rewrite would break working input),
+  and `XMP:xmp:Rating` *works* where the identical-looking `XMP:dc:Description` fails - the
+  middle token `xmp` happens to collide with the family-0 group name and `dc` collides with
+  nothing. `--exiftool-fields` therefore rejects the `XMP:<ns>:<Tag>` shape by name and quotes
+  the working spelling, in pre-flight, rather than normalizing it or letting the run reach
+  "Nothing to do" after the batch has been paid for.
+- `date_original` is a new key on every record whose file carries a date. It is inert against
+  `canonical.py` (which reads `dateTimeOriginal`, then `date`, then `date_guess` - never
+  `date_original`) and `_merge`'s report has no production reader, but both are additive
+  changes to the NDJSON and the aggregate `.json` that no fixture of an external reader
+  exists for. Same class of risk as the `errors` key added in B2 (:511-514).
+- The title narrowing assumes the model emits a title only for text legibly printed on the
+  object, which is a prompt constraint rather than an enforced one. A model that hallucinates
+  titles would now beat a genuine human title where it previously could not. The human value
+  is still in the file and still in the changeset's `file_metadata` block, so it is
+  recoverable, but the proposal changes.
+- `-r` reads `EXIF:DateTimeOriginal`, which on a camera-original JPEG is the real capture date
+  and on a flatbed scan is the scan date, with nothing in the file distinguishing them. The
+  design rests on the gap heuristic making that distinction from the model's inference; a scan
+  whose inference is within `date_override_year_gap` (20 years) of the scan date is
+  indistinguishable from a modern photo and keeps the scan date. Pre-existing behavior of the
+  heuristic, but `-r` is what makes it reachable in folder mode and it will now be exercised
+  on real archives for the first time.
+- ~~The C3 test row in section 5 is owed rather than written.~~ Paid: section 5 now carries
+  four C3 rows, and the three items they last listed as owed are closed.
 
 **Risk:** high. This is the breaking release, and the affected consumer is not in
 this repo.
@@ -1087,7 +1714,7 @@ Shipped alongside B1, from a maintainer decision rather than the audit.
 A `PC*` keyword is a short identifier the model transcribes off the print itself - the
 prompt instructs it to emit any code it can read as `PC-<code>`
 (`prompts_photo_ai/image_rules.txt:97`), and forbids those codes from entering the
-vocabulary file (`image_rules.txt:100`, `:212`). So a PC code describes the physical
+vocabulary file (`image_rules.txt:100`, `:221`). So a PC code describes the physical
 object, not the particular scan the model happened to be shown.
 
 Keywords were scoped to the analyzed file's variant letter, and only one analysis runs
@@ -1111,8 +1738,9 @@ model-read codes are affected by the union above.
 
 Side effect worth recording: this retires the `preferred`-versioned-back symptom rather
 than re-scoping it. A code can no longer be filed against the wrong variant because
-every variant gets it. `primary_version` still governs caption variant labels, so the
-B1 fix is still load-bearing there.
+every variant gets it. (`primary_version` governed caption variant labels when this was
+written; C3's sixth pass moved those onto each file's own version, so the B1 fix is now
+load-bearing for the back slot and the analysis record rather than for the labels.)
 
 ---
 
@@ -1251,6 +1879,11 @@ by a test.
 | C | Regression for the default flip: with no write flags, nothing is written in any mode. |
 | C2 | Third pass, both in `photokin/tests/test_cli_preflight.py`. `TestTheWriteBundleIsDefinedOnce` reads `cli._WRITE_BUNDLE` rather than restating it, so a member added to the bundle is covered the day it is added: every member is refused beside `--generate-manifest` with its own verb and replay wording, `-w` is still answered about itself, and two cases inject a member the CLI does not ship - against the restated refusal the first exits 0 and writes the manifest, and the contradiction check raises `KeyError` into the FATAL handler instead of reporting a usage error. `TestABlankInputTokenIsRefused` folds the bare empty string into its blank-token sweep and into the alias sweep, adds `test_a_genuinely_empty_token_takes_the_same_path`, and gains `test_no_input_at_all_still_says_so` so widening the source filter cannot start describing a run with no input as a blank one; four of those fail against the truthiness filter. |
 | C2 | Second pass, in `photokin/tests/test_cli_preflight.py`, every case re-run against the implementation it replaces so none of it is decorative. `TestWriteBundleGuards` covers the two guards that had none - the `-w` contradiction in both its spellings and `--exiftool-write true` without a changeset - over all three input types, asserting the stream and the apply step are never entered rather than only the exit code, since a regression that runs the batch and then fails also exits 2. `TestNothingIsWrittenWithoutAnOptIn` now removes `EXIFTOOL_WRITE_ENABLED` instead of blanking it, and gains a non-vacuity case holding everything constant but that variable, so a fixture that could never reach `apply_changeset` fails loudly instead of passing quietly. `TestABlankInputTokenIsRefused` takes five blank spellings and both aliases from inside a scratch folder, and pins that `photokin .` and the empty-string message both still answer as before. Plus `TestThePlanNamesTheResolvedInput`, `TestGenerateManifestHonorsDryRun`, `TestGenerateManifestRemediesTerminate` (including that each of the four write flags keeps its own wording after the reorder) and `TestAnUnreadableManifestIsNotReportedAsMissing` in both of its branches. |
+| C3 | Second pass, written: `photokin/tests/test_read_flag_hazards.py` (35 tests, 37 subtests), one class per defect the adversarial review confirmed. Three of its eight classes came later, in the close-out pass, and are described in the row below. `TestTheDateKeywordInterlockSurvivesHydration` runs a hand-dated print with a `DATE:` marker through the stream and pins the suppressed rewrite, the absent second marker, the file's keywords reaching the record, the single-valued `XMP:Subject` shape, and - as its non-vacuity case - the heuristic still firing once the marker is removed. `TestTheReadIsBatchedForLargeFolders` pins that a small list is still exactly one invocation, that 900 files are split, that no invocation exceeds `_ARGV_BUDGET`, that every path is requested once in input order, and that 700 items all hydrate. `TestCaptionJoinIsIdempotent` re-feeds the join its own output twice, in both the with- and without-original-caption shapes. `TestTitlePrecedenceDependsOnProvenance` takes all four cells in both provenance modes and follows the manifest one through `build_canonical_patch` to `XMP-dc:Title`. `TestGroupMetadataComesFromTheObjectNotItsSupportingScans` pins the front's values winning over a back, a crop and a negative, a sibling still supplying what the front lacks, invariance over all 24 permutations, `preferred` still leading, and the no-`part_kind` fallback. Each fix was mutated back in a scratch copy: 4, 2, 1, 2 and 1 failures respectively, non-overlapping. |
+| C3 | **Close-out pass**, three more classes in the same module, each answering a defect the phase's own verify found in the phase's own work. `TestEachFileKeepsTheDateItWasReadFrom` pins the `dateTimeOriginal` alias in `merge_original_sources._pick`, which was load-bearing and pinned by nothing: without it a back scan inherits the front's date instead of keeping the one read off itself (3 failures on revert, with a fourth test deliberately still passing as the bound rather than the pin). `TestTheConvenienceWrapperIsNotLessExpressive` pins that `core.analyze_manifest` forwards `titles_may_be_from_files` rather than dropping it — the wiring line was itself unpinned when written, and deleting it left the suite green. `TestTheFileNeverOverwritesWhatTheInputAlreadyCarried` closes the per-field non-override gap for all five keys, on **both** branches of the guard: one sweep omits a key at a time so the write-back loop actually runs (holding all five short-circuits at `if not paths_needing` and asserts nothing the no-query case does not assert more strongly), and one sweeps `""`, whitespace and `[]` so "or holds empty" is pinned per key too. Pinning absence alone was not enough — keeping the emptiness branch for `userComment` and dropping it for the other four passed the whole suite clean, which is the same asymmetry in the other half of the condition. Mutated: 13 failures for that shape, 10 for the `if not meta.get(key)` simplification, which the whitespace rows are what catch. |
+| B1/C3 | **B1's permutation restriction, lifted.** `TestPermutationInvariance.GROUPS` capped each group at one metadata-bearing item, because `combine_group_metadata` was then first-non-empty over *arrival* order and a second populated item would have failed the sweep for a reason B1 was not about. C3 replaced that scan with a sorted one (crop rank, then part rank, then path), which made the cap a gap: `-r` hydrates every item, so the widened shape is now the ordinary one. Every item in all five groups carries metadata, and the values conflict deliberately -- identical values would be permutation-invariant however the scan was written, which is exactly the shape that lets a regression pass. Lifting it also required the sweep to be able to *see* forwarded metadata: `_RecordingAnalyzers` now records each call's `original_meta` into a list of its own (`self.metas`, parallel to `calls`, kept separate because 79 call sites unpack the call tuple), the harness stashes it as `last_metas`, and `_signature` pairs each meta with its call so a value that moved between calls is a diff rather than a re-sort. Proof the lift was not cosmetic, one mutation run twice: revert C3's sorted scan to arrival order and the **old** metadata-free groups give `84 passed, 477 subtests` -- fully green, the regression invisible -- while the **new** groups give **153 subtest failures**. Group 4 fails first and hardest, since it is the one where all four items carry conflicting keywords and titles. |
+| C3 | **The first pass's owed list, mostly paid.** C3 shipped the implementation and updated the three existing cases its changes falsified (`test_hydrator_injection.py` follows the rename and now expects all three items queried, since five tags are read where one was; `test_cli_input_surface.py`'s plan block gains the `read` row; `TestHydrationWarningVisibility` passes `-r`, patches the CLI's own `resolve_exiftool_path` so the pre-flight passes and the hydrator alone fails, and matches the generalized "Skipping metadata hydration" wording). The new cases then landed in `photokin/tests/test_read_flag.py` (34 tests, 30 subtests) and the hazards module above rather than in the files this row originally named, since both own harnesses a third file would have had to duplicate. Item by item: the **six date shapes** are `TestTheScanDateIsEvidenceNotTruth`'s table, run through three subtest sweeps, with `date_guess` asserted to keep the model's answer in every row; the **four title cells** are `TestTitlePrecedenceDependsOnProvenance` in both provenance modes, with the `Scanned Image` regression also pinned at the CLI seam by `test_the_flag_also_tells_the_merge_where_the_titles_came_from` and bounded by `test_the_same_read_without_the_flag_keeps_the_input_title`; **per-field fill** holds for all five keys (mutating the write loop to skip one key at a time fails 24, 8, 7, 12 and 9 tests for `dateTimeOriginal`, `userComment`, `caption`, `title`, `keywords`); the **`metadata_path` item** and the **no-metadata-key-when-nothing-read** case are `test_an_item_naming_a_sidecar_is_not_shadowed_by_the_read` and `test_a_file_holding_nothing_is_left_exactly_as_it_arrived`, joined by the non-dict-`metadata` case; **`-r` exiting 2** is one subtest sweep over all five input shapes including `--generate-manifest` and `--dry-run`; the **round trip** with its zero-ExifTool replay, its byte-identical repeat generate and **`--meta` beating `-r`** are `TestGeneratedManifestRoundTripsWhatWasRead` plus `test_the_input_still_beats_the_file`; the **direct `combine_group_metadata` invariance test** is `test_the_answer_is_invariant_under_permutation` over all 24 orderings, with `TestGroupingSurvivesEveryItemCarryingMetadata` sweeping a whole folder where every item is now metadata-bearing; and **`dateTimeOriginal` reaching the prompt** is `TestTheForwardedDateReachesThePrompt`. That last one corrects the chain this row named: `select_forwarded_metadata` feeds only the changeset's `sent_to_model` snapshot, while the prompt path is `combine_group_metadata` -> `original_meta` -> `build_prompt_bundle`, which applies the allowlist itself - and that is the chain the test walks. |
+| C3 | **The last three owed items, closed; each answer measured rather than assumed.** (1) **Diff neutrality**, `TestTheChangesetDiffIsNeutralExceptWhereTheReadLands` (`photokin/tests/test_read_flag.py`, 7 tests, 10 subtests). The two modules called `diff_canonical_metadata` zero times; they now execute it **50** times, through `cli.main` with `--changeset true` so the whole chain -- hydrate, group, merge, `build_canonical_patch`, `canonical_values_from_*`, the diff -- runs untouched and the assertions are read off the NDJSON a user would. Five files, one per C3-relevant shape, each `proposed_changes` block compared whole rather than by key: the gap rule rewriting a 2019 scan date to the model's 1952 and marking it `DATE: Y~`; the same rule declining at 1955 and so naming no date **at all**, rather than proposing the file's own value back at it; `Scanned Image` losing to the transcription, which is the title narrowing visible in changeset space; and a file already holding the title, the keyword and the joined caption being proposed none of the three while the two keys it says nothing about survive. Neutrality itself is the same run with and without `-r`: every canonical key outside the four the read can move (`EXIF:DateTimeOriginal`, `XMP-dc:Title`, `XMP-dc:Description`, `XMP-dc:Subject`) must be identical on every file, the exclusion list is named rather than diffed loosely, a file holding nothing is compared with **no** exclusions, and a companion case asserts the set of keys that actually move *equals* the exclusion list, so a stale entry cannot quietly widen the excuse. `EXIF:UserComment` is measured rather than excused: `-r` reads it but `merge_original_sources` never forwards it to the before snapshot -- the pre-existing gap recorded above -- so it is one of the keys neutrality is checked on. Four mutations in a scratch copy: gap rule always overrides (3 failures), file title beats the transcription (1), `before_snapshot = {}` (6), the read widened to also supply a location (6). Kept in `test_read_flag.py` rather than beside `ManifestGroupingTestCase`'s `changeset_writer` helpers, which run the stream directly and take no hydrator and so cannot express "the same run without `-r`". (3) **`-r -w` precedence**, `TestWhichMissingExiftoolMessageAReadOrWriteRunGets` (`test_cli_preflight.py`, 3 tests, 14 subtests): all three states -- read only, write only, both -- over all three input modes, each pinned to both exact lines and exit 2 with the stream and the apply step asserted un-entered; both typing orders of the two flags; and the bound, the same unresolvable `--exiftool-path` with neither flag running clean, without which the class would only be claiming that a broken path stops any run whatsoever. Swapping the two message calls fails 5 subtests, every one of them the both-flags case -- and with the class deselected that same mutation is **fully green at 465 passed, 751 subtests**, which is what it would have shipped as. (5) **The `-r` golden earns its keep and is checked in** at `photokin/tests/fixtures/manifests/read_flag_manifest.json`, generated by this code path and never hand-written, compared byte for byte after path tokenization, beside the un-hydrated golden `test_folder_routing.py` already keeps. The value is narrow and it was measured before the file was added: reshuffling the hydrated write-back to manifest-key order -- a one-line tidy-up against the key order `hydrate.py` documents as the property that makes repeat generation byte-identical -- leaves the **entire suite green at 468 passed, 765 subtests**, because the round-trip pair compares parsed dicts (order-blind) and two outputs of the same code (which move together). With the golden it fails, alone. Indent (2 -> 4) and a dropped trailing newline fail it too, but the folder-routing golden already catches both, so the hydrated `metadata` block's key order is what the new file adds and the only thing it is claimed for. |
 | C2 | Fourth pass, the completion line's accounting. `TestSlotCollisionAccounting` (`photokin/tests/test_manifest_grouping.py`) takes both collision shapes -- two filenames parsing into one `(version, part)` slot, and an override steering one file onto the front side another holds -- and asserts the warning, `all_variant_files.displaced` and the completion line's count and level as one story, then asserts the two shapes are reported identically, which is the asymmetry the fix removes. The invariant is carried in both directions over six shapes including two that lose nothing: the count equals the listed files no recorded model call carried, and every file it counts is named in a warning. Plus the decision that a path winning two addresses is not counted, since it is sent. `TestATiffMasterBesideItsJpegDerivative` (`test_folder_mode.py`) runs the archival shape through `analyze_folder` on real files, because that is where it actually turns up. Both halves of the change were mutated separately in a scratch copy. Reverting the accounting and keeping the wording: 6 failures over 4 of the 7 new tests, the two survivors being exactly the ones that should survive -- the override shape was always counted, and the every-count-has-a-warning direction was never broken. Reverting the wording and keeping the accounting: 15 failures, the 4 pre-existing assertions elsewhere included, which is what pins the string to one definition.  |
 
 ---
@@ -1281,7 +1914,12 @@ by a test.
   different captions still yield a permutation-dependent `sent_to_model` snapshot. B1
   left it alone deliberately: it is metadata precedence, not grouping. Worth settling in
   B2 or C, and the reason B1's permutation tests must use at most one metadata-bearing
-  item per group.
+  item per group. **Settled in C3**, because `-r` makes every folder item metadata-bearing
+  and would otherwise widen the gap from "manifests with two or more metadata-bearing items"
+  to "every multi-file group in every folder": preferred still first, each half now sorted on
+  `(normalize_path.lower(), normalize_path)`. Folder output is unchanged by the sort; manifest
+  output changes only where two disagreeing items share a group, replacing an arbitrary answer
+  with a stable one. The restriction on B1's permutation sweep can be lifted.
 - **Section 5** - `-w` defaulting the output file into the scanned folder writes two
   artifacts into the user's photo directory and modifies every image. Photo
   directories are frequently cloud-synced, network-mounted or read-only. Worth
