@@ -21,6 +21,7 @@ drives; it groups manifest items by photo, analyzes each group, and emits NDJSON
 incrementally while also returning an aggregate snapshot.
 
 Code map (public-facing entry points marked PUBLIC):
+- _is_run_fatal                 does this error describe the run, not one photo?
 - _build_llm_dump_writer        optional debug dumper for raw LLM requests
 - inject_analysis_date          stamp a date into the '[AI Analysis]:' caption prefix
 - _strip_empty_caption_sections drop empty [Front]/[Back] caption sections
@@ -94,6 +95,19 @@ _EMPTY_CAPTION_MARKERS = (
 # on the first call, but the model is constant for the run, so every later group
 # would fail the same way.
 _RUN_FATAL_ERROR_TYPES = frozenset({"missing_api_key", "missing_dependency", "model_not_found"})
+
+# A 401/403 means the credential itself was rejected -- just as constant
+# across every remaining call as a missing key is. Checked by status code
+# rather than folded into _RUN_FATAL_ERROR_TYPES above because which
+# error_type wraps an auth rejection varies by provider SDK (api_status
+# today for OpenAI/Anthropic/OpenRouter); the HTTP status is the one
+# consistent signal across all of them.
+_RUN_FATAL_STATUS_CODES = frozenset({401, 403})
+
+
+def _is_run_fatal(exc: ProviderApiError) -> bool:
+    """Whether ``exc`` describes the run rather than one photo."""
+    return exc.error_type in _RUN_FATAL_ERROR_TYPES or exc.status_code in _RUN_FATAL_STATUS_CODES
 
 
 def _build_llm_dump_writer(
@@ -2907,7 +2921,7 @@ def process_manifest_stream(
             if (
                 strict_run_failures
                 and isinstance(e, ProviderApiError)
-                and e.error_type in _RUN_FATAL_ERROR_TYPES
+                and _is_run_fatal(e)
             ):
                 # A missing key or SDK is a property of the run, not of one
                 # photo: isolating it would repeat the same error per group.

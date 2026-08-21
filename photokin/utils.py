@@ -58,6 +58,12 @@ from json import JSONDecodeError
 from typing import Any, Dict, List, Set, Tuple, Optional
 
 from photokin.face_utils import face_tags_to_llm_block
+from photokin.errors import ProviderApiError, extract_provider_message, extract_retry_after
+
+try:
+    import openai
+except ImportError:
+    openai = None
 
 logger = logging.getLogger(__name__)
 
@@ -730,6 +736,49 @@ def build_data_url_and_size(path: str, jpeg_quality: int, max_edge: int | None =
     meta = {"mime": mime, "width": width, "height": height, "resized": False}
     return f"data:{mime};base64,{b64}", len(raw), meta
 
+def _create_archival_file(client, file_obj, purpose: str):
+    """``client.files.create`` normalized onto ``ProviderApiError``.
+
+    This upload runs unconditionally before the model call for every
+    OpenAI-provider request, so left unwrapped, an auth/rate-limit/bad-request
+    failure here would reach the caller as a raw SDK exception instead of the
+    structured ``provider_message``/``retry_after`` fields the rest of the
+    pipeline relies on (see ``api_openai.call_openai_model``, which this
+    mirrors). ``AuthenticationError`` is an ``APIStatusError`` subclass, so a
+    rejected key lands in the ``api_status`` branch below; ``BadRequestError``
+    is caught ahead of it (same ordering as ``call_openai_model`` and
+    ``call_openai_compat_model``) so a rejected file -- wrong extension, empty
+    file, oversized upload -- lands under ``invalid_input`` like every other
+    per-request validation failure, not the generic ``api_status`` bucket.
+    """
+    if openai is None:
+        return client.files.create(file=file_obj, purpose=purpose)
+    try:
+        return client.files.create(file=file_obj, purpose=purpose)
+    except openai.RateLimitError as exc:
+        raise ProviderApiError(
+            "rate_limit",
+            str(exc),
+            status_code=429,
+            provider_message=extract_provider_message(exc),
+            retry_after=extract_retry_after(exc),
+        ) from exc
+    except openai.BadRequestError as exc:
+        raise ProviderApiError(
+            "invalid_input",
+            str(exc),
+            status_code=getattr(exc, "status_code", None),
+            provider_message=extract_provider_message(exc),
+        ) from exc
+    except openai.APIStatusError as exc:
+        raise ProviderApiError(
+            "api_status",
+            str(exc),
+            status_code=getattr(exc, "status_code", None),
+            provider_message=extract_provider_message(exc),
+        ) from exc
+
+
 def archival_upload(client, path: str, jpeg_quality: int, purpose: str = "user_data") -> str:
     """Upload to Files API for archival. Returns file id. Not used in analysis request."""
     if _is_tiff(path):
@@ -739,10 +788,10 @@ def archival_upload(client, path: str, jpeg_quality: int, purpose: str = "user_d
         logger.info("TIFF -> JPEG in-memory (%s, quality=%d)", os.path.basename(path), jpeg_quality)
         bio = io.BytesIO(raw)
         bio.name = os.path.splitext(os.path.basename(path))[0] + "_upload.jpg"  # type: ignore[attr-defined]
-        uploaded = client.files.create(file=bio, purpose=purpose)
+        uploaded = _create_archival_file(client, bio, purpose)
         return uploaded.id
     with open(path, "rb") as fh:
-        uploaded = client.files.create(file=fh, purpose=purpose)
+        uploaded = _create_archival_file(client, fh, purpose)
         return uploaded.id
 
 

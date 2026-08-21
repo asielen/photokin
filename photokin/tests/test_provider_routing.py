@@ -418,6 +418,30 @@ class TestModelNotFound(unittest.TestCase):
         self.assertIn("model_not_found", core._RUN_FATAL_ERROR_TYPES)
 
 
+class TestRejectedCredentialIsRunFatal(unittest.TestCase):
+    """A 401/403 means the credential itself was rejected -- just as constant
+    across every remaining call as a missing key, so it must abort the batch
+    on the first group rather than failing every photo individually with the
+    same auth error. Keyed off status_code (not error_type) since which SDK
+    exception class an auth rejection surfaces as varies by provider."""
+
+    def test_401_is_run_fatal(self):
+        exc = ProviderApiError("api_status", "Incorrect API key provided", status_code=401)
+        self.assertTrue(core._is_run_fatal(exc))
+
+    def test_403_is_run_fatal(self):
+        exc = ProviderApiError("api_status", "forbidden", status_code=403)
+        self.assertTrue(core._is_run_fatal(exc))
+
+    def test_other_status_codes_are_not_run_fatal(self):
+        exc = ProviderApiError("api_status", "server error", status_code=500)
+        self.assertFalse(core._is_run_fatal(exc))
+
+    def test_named_run_fatal_types_still_covered(self):
+        exc = ProviderApiError("missing_api_key", "no key set")
+        self.assertTrue(core._is_run_fatal(exc))
+
+
 class TestInstalledSdkDetection(unittest.TestCase):
     """installed_provider_sdks reports importable SDKs without importing them."""
 
@@ -534,6 +558,85 @@ class TestNormalizedErrorPayloadCarriesProviderExtras(unittest.TestCase):
         payload = core._normalized_error_payload(ValueError("oops"))
         self.assertNotIn("provider_message", payload)
         self.assertNotIn("retry_after", payload)
+
+
+class TestArchivalUploadErrorNormalization(unittest.TestCase):
+    """utils.archival_upload runs unconditionally before the model call for
+    every OpenAI-provider request, so a rejected key or rate limit hitting
+    ``client.files.create`` must be normalized exactly like the model call
+    itself -- not leak a raw SDK exception into the NDJSON error record."""
+
+    def test_rejected_key_maps_to_api_status_with_provider_message(self):
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/files")
+        sdk_exc = openai.AuthenticationError(
+            "Incorrect API key provided",
+            response=httpx.Response(401, request=request),
+            body={"error": {"message": "Incorrect API key provided"}},
+        )
+
+        class _Files:
+            def create(self, **kwargs):
+                raise sdk_exc
+
+        client = types.SimpleNamespace(files=_Files())
+        with self.assertRaises(ProviderApiError) as ctx:
+            utils.archival_upload(client, __file__, 80)
+        err = ctx.exception
+        self.assertEqual(err.error_type, "api_status")
+        self.assertEqual(err.status_code, 401)
+        self.assertEqual(err.provider_message, "Incorrect API key provided")
+
+    def test_rate_limit_maps_to_rate_limit_with_retry_after(self):
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/files")
+        response = httpx.Response(429, request=request, headers={"retry-after": "12"})
+        sdk_exc = openai.RateLimitError("slow down", response=response, body=None)
+
+        class _Files:
+            def create(self, **kwargs):
+                raise sdk_exc
+
+        client = types.SimpleNamespace(files=_Files())
+        with self.assertRaises(ProviderApiError) as ctx:
+            utils.archival_upload(client, __file__, 80)
+        err = ctx.exception
+        self.assertEqual(err.error_type, "rate_limit")
+        self.assertEqual(err.status_code, 429)
+        self.assertEqual(err.retry_after, 12.0)
+
+    def test_rejected_file_maps_to_invalid_input_not_api_status(self):
+        """BadRequestError is an APIStatusError subclass, so it must be caught
+        ahead of the generic APIStatusError branch -- same ordering as
+        call_openai_model/call_openai_compat_model -- or a per-file problem
+        (wrong extension, empty file, oversized upload) reads as the generic
+        ``api_status`` bucket instead of the ``invalid_input`` every other
+        per-request validation failure in the codebase uses."""
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/files")
+        sdk_exc = openai.BadRequestError(
+            "Invalid file format",
+            response=httpx.Response(400, request=request),
+            body={"error": {"message": "Invalid file format"}},
+        )
+
+        class _Files:
+            def create(self, **kwargs):
+                raise sdk_exc
+
+        client = types.SimpleNamespace(files=_Files())
+        with self.assertRaises(ProviderApiError) as ctx:
+            utils.archival_upload(client, __file__, 80)
+        err = ctx.exception
+        self.assertEqual(err.error_type, "invalid_input")
+        self.assertEqual(err.status_code, 400)
+        self.assertEqual(err.provider_message, "Invalid file format")
 
 
 if __name__ == "__main__":
