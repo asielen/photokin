@@ -160,12 +160,19 @@ class _RunEnvelope:
     these exists, ``run: start`` is already on the stream.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, batch_id: str | None = None):
         self.path = path
+        # Captured once at open time (args.batch_id never changes after
+        # parsing) so every subsequent append -- including the ones from
+        # deep inside a pre-flight helper via _exit_with_usage_error, which
+        # has no args namespace to read it from -- is stamped the same way
+        # without having to thread batch_id to every call site individually.
+        # That was tried and missed exactly one: the usage-error fatal.
+        self.batch_id = batch_id
 
-    def append(self, record: dict, *, batch_id: str | None = None) -> None:
+    def append(self, record: dict) -> None:
         """Append one envelope or per-file record to this run's file."""
-        _append_ndjson_record(self.path, record, batch_id=batch_id)
+        _append_ndjson_record(self.path, record, batch_id=self.batch_id)
 
 
 #: The run's open envelope, or None when no fresh ``.ndjson`` destination has
@@ -200,8 +207,8 @@ def _open_run_envelope_if_fresh(out_path: str | None, *, batch_id: str | None) -
     if not out_path or not out_path.lower().endswith(".ndjson") or os.path.exists(out_path):
         return
     open(out_path, "w", encoding="utf-8").close()
-    _active_run_envelope = _RunEnvelope(out_path)
-    _active_run_envelope.append({"run": "start"}, batch_id=batch_id)
+    _active_run_envelope = _RunEnvelope(out_path, batch_id=batch_id)
+    _active_run_envelope.append({"run": "start"})
 
 
 def _open_run_envelope_deferred(out_path: str | None, *, batch_id: str | None) -> None:
@@ -224,8 +231,8 @@ def _open_run_envelope_deferred(out_path: str | None, *, batch_id: str | None) -
     if not out_path or not out_path.lower().endswith(".ndjson"):
         return
     open(out_path, "w", encoding="utf-8").close()
-    _active_run_envelope = _RunEnvelope(out_path)
-    _active_run_envelope.append({"run": "start"}, batch_id=batch_id)
+    _active_run_envelope = _RunEnvelope(out_path, batch_id=batch_id)
+    _active_run_envelope.append({"run": "start"})
 
 
 def _build_capabilities(ap: argparse.ArgumentParser) -> dict:
@@ -469,9 +476,14 @@ def _exit_with_usage_error(problem: str, remedy: str) -> NoReturn:
 def _interactive_prompt() -> list[str]:
     """Prompt the user for image paths and return extra argv tokens.
 
-    A blank front-image answer, an interrupt (Ctrl+C), or closed stdin (Ctrl+D
-    on macOS/Linux, Ctrl+Z then Enter on Windows, or an empty piped stdin) all
-    mean "nothing to run" and exit 0 quietly -- none should raise.
+    A blank front-image answer, an interrupt (Ctrl+C) on either prompt, or
+    closed stdin (Ctrl+D on macOS/Linux, Ctrl+Z then Enter on Windows, or an
+    empty piped stdin) on the front prompt all mean "nothing to run" and exit
+    0 quietly -- none should raise. Closed stdin on the *back* prompt is
+    narrower: the front path is already in hand, so it is treated as "no back
+    image" and the run proceeds front-only, the same as a typed blank answer
+    there -- unlike Ctrl+C on that same prompt, which still means "stop
+    entirely", not "narrow the request".
     """
 
     print("Interactive mode: Provide image paths for analysis.")
@@ -489,9 +501,18 @@ def _interactive_prompt() -> list[str]:
     front = normalize_path(front_raw)
     try:
         back_raw = input("Back image path (optional, blank if none): ")
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
+        # Closed stdin here just means "no back image" -- the front path is
+        # already in hand and a run with only it is a normal, complete
+        # request.
         back_raw = ""
         print("")
+    except KeyboardInterrupt:
+        # Unlike EOF, this is the user explicitly asking to stop -- treated
+        # the same as a Ctrl+C on the front prompt: the whole request is
+        # abandoned, not narrowed to "front only".
+        print("\nNo file provided. Exiting.")
+        raise SystemExit(0)
     back = normalize_path(back_raw) if back_raw.strip() else None
     extra = [front]
     if back:
@@ -2058,7 +2079,7 @@ def main() -> None:
         # envelope.
         _open_run_envelope_deferred(out_path, batch_id=args.batch_id)
         if _active_run_envelope is not None:
-            _active_run_envelope.append({"run": "plan", "plan": plan.as_dict()}, batch_id=args.batch_id)
+            _active_run_envelope.append({"run": "plan", "plan": plan.as_dict()})
 
         ndjson_writer = None
         run_event_writer = None
@@ -2139,8 +2160,7 @@ def main() -> None:
                     "files_recorded": len(data.get("results") or {}),
                     "groups_failed": data.get("groups_failed", 0),
                     "files_unsent": data.get("files_unsent", 0),
-                },
-                batch_id=args.batch_id,
+                }
             )
 
     except SystemExit:
@@ -2152,13 +2172,7 @@ def main() -> None:
             err["traceback"] = traceback.format_exception(e.__class__, e, e.__traceback__)
         logger.error("%s", json.dumps(err, ensure_ascii=False))
         if _active_run_envelope is not None:
-            # Reachable only once args.parse_args() has already succeeded (a
-            # failed parse raises SystemExit, caught above instead), so
-            # args.batch_id is always available here.
-            _active_run_envelope.append(
-                {"run": "fatal", "error": {"type": error_type, "message": str(e)}},
-                batch_id=args.batch_id,
-            )
+            _active_run_envelope.append({"run": "fatal", "error": {"type": error_type, "message": str(e)}})
         sys.exit(2)
 
 
