@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "photokin"
-version = "0.2.1"
+version = "0.3.0"
 description = "Photo metadata from vision LLMs: verbatim transcription of what's written on scans, plus captions, keywords, and cautious date/location guesses."
 readme = "README.md"
 requires-python = ">=3.11"
