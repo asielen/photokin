@@ -2099,6 +2099,25 @@ class TestRunEnvelope(_CliTestCase):
         records = _envelope_records(_ndjson_lines(out_path))
         self.assertTrue(all(rec.get("batch_id") == "b17" for rec in records))
 
+    def test_batch_id_reaches_a_usage_error_fatal_record_too(self):
+        """A pre-flight refusal's run: fatal comes from _exit_with_usage_error,
+        a different code path than the terminal complete/cancelled/plan
+        records above -- it used to skip batch_id entirely."""
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        code, _stdout, _stderr = self.run_cli(
+            [
+                folder,
+                "--output-file", out_path,
+                "--batch-id", "b17",
+                "--exiftool-fields", "XMP:dc:Description",
+            ]
+        )
+        self.assertEqual(code, 2)
+        records = _envelope_records(_ndjson_lines(out_path))
+        self.assertEqual(records[-1]["run"], "fatal")
+        self.assertTrue(all(rec.get("batch_id") == "b17" for rec in records))
+
     def test_dry_run_never_touches_the_destination(self):
         """--dry-run's existing promise: this includes the envelope, which is
         a destination like any other -- not an exception to the rule."""

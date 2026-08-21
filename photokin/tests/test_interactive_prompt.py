@@ -70,6 +70,15 @@ class TestInteractivePromptRealPaths(unittest.TestCase):
             extra = cli._interactive_prompt()
         self.assertEqual(extra, ["scan.jpg"])
 
+    def test_ctrl_c_on_back_prompt_aborts_entirely_not_front_only(self):
+        """Unlike EOF on the same prompt, Ctrl+C means stop -- not "run with
+        just the front image". Mirrors Ctrl+C on the front prompt."""
+        with patch("builtins.input", side_effect=["scan.jpg", KeyboardInterrupt()]), self.assertRaises(
+            SystemExit
+        ) as ctx:
+            cli._interactive_prompt()
+        self.assertEqual(ctx.exception.code, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
