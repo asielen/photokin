@@ -105,10 +105,20 @@ def call_gemini_model(
     except Exception as exc:
         status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
         message = str(exc)
+        # google-api-core's GoogleAPICallError subclasses expose a cleaner
+        # ``.message`` distinct from ``str(exc)``, which is usually the code
+        # and the message concatenated together -- not the repr'd-dict mess
+        # the httpx-backed SDKs produce, but still worth separating out where
+        # it's available. No confirmed retry-after equivalent exists here, so
+        # unlike the other three adapters this never sets one.
+        provider_message = getattr(exc, "message", None)
+        provider_message = provider_message if isinstance(provider_message, str) else None
 
         if google_api_exceptions is not None:
             if isinstance(exc, google_api_exceptions.ResourceExhausted):
-                raise ProviderApiError("rate_limit", message, status_code=429) from exc
+                raise ProviderApiError(
+                    "rate_limit", message, status_code=429, provider_message=provider_message
+                ) from exc
             if isinstance(exc, google_api_exceptions.NotFound):
                 raise ProviderApiError(
                     "model_not_found",
@@ -116,10 +126,14 @@ def call_gemini_model(
                     status_code=404,
                 ) from exc
             if isinstance(exc, google_api_exceptions.InvalidArgument):
-                raise ProviderApiError("invalid_input", message, status_code=400) from exc
+                raise ProviderApiError(
+                    "invalid_input", message, status_code=400, provider_message=provider_message
+                ) from exc
 
         if "429" in message or "RESOURCE_EXHAUSTED" in message:
-            raise ProviderApiError("rate_limit", message, status_code=429) from exc
+            raise ProviderApiError(
+                "rate_limit", message, status_code=429, provider_message=provider_message
+            ) from exc
         # An unknown model surfaces as "404 NOT_FOUND ... models/<id> is not
         # found for API version ..." from the google-genai SDK.
         if "404" in message or "NOT_FOUND" in message:
@@ -129,9 +143,13 @@ def call_gemini_model(
                 status_code=404,
             ) from exc
         if "400" in message or "INVALID_ARGUMENT" in message:
-            raise ProviderApiError("invalid_input", message, status_code=400) from exc
+            raise ProviderApiError(
+                "invalid_input", message, status_code=400, provider_message=provider_message
+            ) from exc
 
-        raise ProviderApiError("api_error", message, status_code=status_code) from exc
+        raise ProviderApiError(
+            "api_error", message, status_code=status_code, provider_message=provider_message
+        ) from exc
 
 
 def extract_gemini_output_text(resp: Any) -> str:

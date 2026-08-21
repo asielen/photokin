@@ -4,7 +4,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from photokin import core, utils
+from photokin import core, errors, utils
 from photokin.api_claude import _data_url_to_image_block
 from photokin.api_openai import ProviderApiError
 from photokin.api_openai_compat import extract_openai_compat_output_text
@@ -458,6 +458,82 @@ class TestMissingSdkMessage(unittest.TestCase):
             message = core._missing_sdk_message("OpenAI", "openai", "openai")
         self.assertIn('pip install "photokin[openai]"', message)
         self.assertNotIn("--provider", message)
+
+
+class TestExtractProviderMessage(unittest.TestCase):
+    """The clean message hiding inside an SDK exception's structured body,
+    dug out instead of leaving a caller to re-parse str(exc)'s dict repr."""
+
+    def test_reads_nested_error_message(self):
+        exc = types.SimpleNamespace(body={"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}})
+        self.assertEqual(errors.extract_provider_message(exc), "slow down")
+
+    def test_reads_flat_message(self):
+        exc = types.SimpleNamespace(body={"message": "flat shape"})
+        self.assertEqual(errors.extract_provider_message(exc), "flat shape")
+
+    def test_none_when_no_body(self):
+        exc = types.SimpleNamespace()
+        self.assertIsNone(errors.extract_provider_message(exc))
+
+    def test_none_when_body_is_not_a_dict(self):
+        exc = types.SimpleNamespace(body="not a dict")
+        self.assertIsNone(errors.extract_provider_message(exc))
+
+    def test_none_when_message_is_not_a_string(self):
+        exc = types.SimpleNamespace(body={"error": {"message": 12345}})
+        self.assertIsNone(errors.extract_provider_message(exc))
+
+
+class TestExtractRetryAfter(unittest.TestCase):
+    """Seconds to wait, read off an httpx-backed exception's response headers."""
+
+    def test_reads_a_numeric_header(self):
+        exc = types.SimpleNamespace(response=types.SimpleNamespace(headers={"retry-after": "30"}))
+        self.assertEqual(errors.extract_retry_after(exc), 30.0)
+
+    def test_none_when_no_response(self):
+        exc = types.SimpleNamespace()
+        self.assertIsNone(errors.extract_retry_after(exc))
+
+    def test_none_when_header_missing(self):
+        exc = types.SimpleNamespace(response=types.SimpleNamespace(headers={}))
+        self.assertIsNone(errors.extract_retry_after(exc))
+
+    def test_none_when_header_is_not_numeric(self):
+        """A provider may send an HTTP-date instead of a delay in seconds."""
+        exc = types.SimpleNamespace(
+            response=types.SimpleNamespace(headers={"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})
+        )
+        self.assertIsNone(errors.extract_retry_after(exc))
+
+
+class TestNormalizedErrorPayloadCarriesProviderExtras(unittest.TestCase):
+    """core._normalized_error_payload surfaces provider_message/retry_after
+    as extras beside message, not replacements for it -- and omits them
+    entirely (rather than emitting null) when a ProviderApiError didn't set
+    them, so an existing consumer reading only "message" sees no change."""
+
+    def test_both_present_when_set(self):
+        exc = ProviderApiError(
+            "rate_limit", "Error code: 429 - {...}", status_code=429,
+            provider_message="slow down", retry_after=30.0,
+        )
+        payload = core._normalized_error_payload(exc)
+        self.assertEqual(payload["message"], "Error code: 429 - {...}")
+        self.assertEqual(payload["provider_message"], "slow down")
+        self.assertEqual(payload["retry_after"], 30.0)
+
+    def test_both_absent_when_unset(self):
+        exc = ProviderApiError("invalid_input", "bad request")
+        payload = core._normalized_error_payload(exc)
+        self.assertNotIn("provider_message", payload)
+        self.assertNotIn("retry_after", payload)
+
+    def test_a_non_provider_exception_carries_neither(self):
+        payload = core._normalized_error_payload(ValueError("oops"))
+        self.assertNotIn("provider_message", payload)
+        self.assertNotIn("retry_after", payload)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,12 @@ import mimetypes
 from typing import Any, Callable, Dict, List
 from urllib.parse import urlparse
 
-from .errors import ProviderApiError, model_not_found_message
+from .errors import (
+    ProviderApiError,
+    extract_provider_message,
+    extract_retry_after,
+    model_not_found_message,
+)
 
 try:
     import anthropic
@@ -158,7 +163,13 @@ def call_claude_model(
         with client.messages.stream(**request_payload) as stream:
             return stream.get_final_message()
     except anthropic.RateLimitError as exc:
-        raise ProviderApiError("rate_limit", str(exc), status_code=429) from exc
+        raise ProviderApiError(
+            "rate_limit",
+            str(exc),
+            status_code=429,
+            provider_message=extract_provider_message(exc),
+            retry_after=extract_retry_after(exc),
+        ) from exc
     except anthropic.BadRequestError as exc:
         raise ProviderApiError("invalid_input", str(exc), status_code=getattr(exc, "status_code", None)) from exc
     except anthropic.NotFoundError as exc:
@@ -172,7 +183,12 @@ def call_claude_model(
         ) from exc
     except anthropic.APIStatusError as exc:
         err_type = "overloaded" if getattr(exc, "status_code", None) == 529 else "api_status"
-        raise ProviderApiError(err_type, str(exc), status_code=getattr(exc, "status_code", None)) from exc
+        raise ProviderApiError(
+            err_type,
+            str(exc),
+            status_code=getattr(exc, "status_code", None),
+            provider_message=extract_provider_message(exc),
+        ) from exc
 
 
 def extract_claude_output_text(resp: Any) -> str:

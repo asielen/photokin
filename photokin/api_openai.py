@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List
 
-from .errors import ProviderApiError, model_not_found_message
+from .errors import (
+    ProviderApiError,
+    extract_provider_message,
+    extract_retry_after,
+    model_not_found_message,
+)
 
 try:
     import openai
@@ -88,7 +93,13 @@ def call_openai_model(
             try:
                 return _request_responses_create(client, model, fallback)
             except openai.RateLimitError as exc2:
-                raise ProviderApiError("rate_limit", str(exc2), status_code=429) from exc2
+                raise ProviderApiError(
+                    "rate_limit",
+                    str(exc2),
+                    status_code=429,
+                    provider_message=extract_provider_message(exc2),
+                    retry_after=extract_retry_after(exc2),
+                ) from exc2
             except openai.NotFoundError as exc2:
                 # Same mapping as the outer NotFoundError handler below -- this
                 # retry hits the API again with the same model id, so it can
@@ -99,10 +110,21 @@ def call_openai_model(
                     status_code=404,
                 ) from exc2
             except openai.APIStatusError as exc2:
-                raise ProviderApiError("api_status", str(exc2), status_code=getattr(exc2, "status_code", None)) from exc2
+                raise ProviderApiError(
+                    "api_status",
+                    str(exc2),
+                    status_code=getattr(exc2, "status_code", None),
+                    provider_message=extract_provider_message(exc2),
+                ) from exc2
         raise ProviderApiError("invalid_input", msg, status_code=getattr(exc, "status_code", None)) from exc
     except openai.RateLimitError as exc:
-        raise ProviderApiError("rate_limit", str(exc), status_code=429) from exc
+        raise ProviderApiError(
+            "rate_limit",
+            str(exc),
+            status_code=429,
+            provider_message=extract_provider_message(exc),
+            retry_after=extract_retry_after(exc),
+        ) from exc
     except openai.NotFoundError as exc:
         # A 404 here means the model id itself was rejected -- often photokin's
         # own pinned default, so say how to move on from it.
@@ -112,7 +134,12 @@ def call_openai_model(
             status_code=404,
         ) from exc
     except openai.APIStatusError as exc:
-        raise ProviderApiError("api_status", str(exc), status_code=getattr(exc, "status_code", None)) from exc
+        raise ProviderApiError(
+            "api_status",
+            str(exc),
+            status_code=getattr(exc, "status_code", None),
+            provider_message=extract_provider_message(exc),
+        ) from exc
 
 
 def extract_openai_output_text(resp: Any) -> str:

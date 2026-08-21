@@ -128,6 +128,60 @@ def _build_llm_dump_writer(
     return _writer
 
 
+def _build_hydration_dump_writer(
+    config: utils.Config,
+    source_path: str,
+    phase: str,
+) -> Callable[[Dict[str, Any]], None] | None:
+    """Build a writer for the group's assembled metadata, before it becomes a prompt.
+
+    The mirror of :func:`_build_llm_dump_writer` for the other half of "what
+    did this run actually send" -- the LLM-request dump shows the *prompt*,
+    already merged into text; this shows the *metadata* the merge started
+    from (whatever ``-r`` read plus whatever the manifest supplied), one
+    level upstream of that merge, in the shape ``combine_group_metadata``
+    produced it. A hydration bug is a bug in that data, and finding it by
+    eye inside a fully assembled prompt is far harder than reading the
+    dict directly.
+
+    Args:
+        config: Run configuration; gated on ``debug_dump_hydration``.
+        source_path: The group's representative path, for the dump's stem.
+        phase: ``"single"`` or ``"group"`` -- same vocabulary as the
+            LLM-request dump, and for the same reason: which analyzer
+            produced this group is part of what a debugging session needs.
+
+    Returns:
+        A callable that writes one dump per call, or ``None`` when
+        ``debug_dump_hydration`` is off.
+    """
+    if not config.debug_dump_hydration:
+        return None
+
+    batch_id = (config.run_batch_id or "batch").strip() or "batch"
+    photo_stem = Path(source_path).stem or "photo"
+    dump_dir = Path(config.debug_dump_dir or os.path.join(os.getcwd(), "debug"))
+
+    def _writer(metadata: Dict[str, Any]) -> None:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        base_name = f"{batch_id}_hydration_{photo_stem}_{phase}"
+        dump_path = dump_dir / f"{base_name}.json"
+        suffix = 1
+        while dump_path.exists():
+            dump_path = dump_dir / f"{base_name}_{suffix}.json"
+            suffix += 1
+
+        try:
+            with open(dump_path, "w", encoding="utf-8") as fh:
+                json.dump(metadata, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            logger.info("Wrote hydration dump: %s", dump_path)
+        except OSError as exc:
+            logger.warning("Could not write hydration dump %s: %s", dump_path, exc)
+
+    return _writer
+
+
 def inject_analysis_date(ai_caption: Any, analysis_date: date | None = None) -> Any:
     """
     If the caption starts with the undated '[AI Analysis]:' prefix, replace it
@@ -558,14 +612,27 @@ def _normalized_error_payload(exc: Exception) -> Dict[str, Any]:
     """Build an error payload with provider-normalized types where possible."""
     error_type = exc.__class__.__name__
     status_code = None
+    provider_message = None
+    retry_after = None
 
     if isinstance(exc, ProviderApiError):
         error_type = exc.error_type
         status_code = exc.status_code
+        provider_message = exc.provider_message
+        retry_after = exc.retry_after
 
     payload: Dict[str, Any] = {"type": error_type, "message": str(exc)}
     if status_code is not None:
         payload["status_code"] = int(status_code)
+    # Both are extras beside ``message``, not replacements for it: a consumer
+    # that only reads ``message`` keeps working unchanged, and one that wants
+    # the provider's own wording without re-parsing a Python dict repr (see
+    # ProviderApiError.provider_message) or the raw retry-after header reads
+    # these instead.
+    if provider_message is not None:
+        payload["provider_message"] = provider_message
+    if retry_after is not None:
+        payload["retry_after"] = retry_after
     return payload
 
 
@@ -1808,6 +1875,8 @@ def process_manifest_stream(
     metadata_hydrator: Callable[[List[dict]], None] | None = None,
     titles_may_be_from_files: bool = False,
     strict_run_failures: bool = False,
+    should_cancel: Callable[[], bool] | None = None,
+    run_event_writer: Callable[[dict], None] | None = None,
 ) -> dict:
     """Stream manifest processing results while still returning a full snapshot.
 
@@ -1836,13 +1905,33 @@ def process_manifest_stream(
             failure rather than returning an empty result the caller exits 0 on.
             The asymmetry between the two modes is deliberate and owned by
             Phase C; see ``docs/unified-input-pipeline.md``.
+        should_cancel: Polled once before each group starts (never mid-group --
+            groups make one model call each under the default ``object``
+            grouping, so there is no narrower seam to check between). A
+            cooperative stop: the batch returns cleanly with whatever
+            ``results``/``errors`` it has already banked, rather than raising,
+            since stopping on request is not a failure. ``None`` disables
+            polling entirely, which is the default for every caller that has
+            no way to be asked to cancel.
+        run_event_writer: Called once per group, right before it starts, with
+            a ``{"group": ..., "index": ..., "of": ...}`` liveness signal --
+            deliberately a *separate* channel from ``ndjson_writer``, which
+            every existing caller already treats as "one ``path``/``status``
+            record per finished file" and asserts on exactly that shape. A
+            caller that wants these events folded into the same NDJSON stream
+            (the CLI does) does that itself; ``None`` means no one is
+            listening, which is the default.
 
     Returns:
-        ``{"results": {path: record}, "errors": {path: payload}}``, one entry per
-        file, and the two are disjoint. Every file of a failed group carries
-        that group's error payload, bar one already banked when the group raised
-        part-way through its per-file loop: that record is complete and its
-        ``ok`` line is already on the stream, so it stands.
+        ``{"results": {path: record}, "errors": {path: payload}, "groups_failed":
+        int, "files_unsent": int, "cancelled": bool}``. ``results``/``errors``
+        are one entry per file and disjoint -- every file of a failed group
+        carries that group's error payload, bar one already banked when the
+        group raised part-way through its per-file loop, since that record is
+        complete and its ``ok`` line is already on the stream. ``cancelled`` is
+        ``True`` only when ``should_cancel`` returned ``True`` before every
+        group had run; a batch that finished on its own always reports
+        ``False``, even if every group failed.
     """
     if isinstance(manifest, str):
         man = utils.load_manifest(utils.normalize_path(manifest))
@@ -1916,7 +2005,30 @@ def process_manifest_stream(
     unsent_paths: set[str] = set()
 
     group_keys = ordered_group_keys(buckets)
-    for stem in group_keys:
+    for group_index, stem in enumerate(group_keys):
+        if should_cancel is not None and should_cancel():
+            logger.warning(
+                "Cancelled after %d of %d group(s); %d file(s) already recorded.",
+                group_index, len(group_keys), len(results),
+            )
+            return {
+                "results": results,
+                "errors": errors,
+                "groups_failed": failed_groups,
+                "files_unsent": len(unsent_paths),
+                "cancelled": True,
+            }
+        if run_event_writer:
+            # A liveness signal for a caller that only watches the results
+            # stream: the last thing it saw otherwise might be one photo's
+            # ``ok`` line from several groups ago, with nothing to show
+            # whether the run is working through a slow group or has
+            # silently died. Announced at the group boundary rather than via
+            # a background heartbeat during the model call itself -- simpler
+            # and safe to call from the same thread that is about to block on
+            # that call, at the cost of no signal *within* one unusually slow
+            # group.
+            run_event_writer({"group": stem, "index": group_index + 1, "of": len(group_keys)})
         group = buckets[stem]
         # Bound before the try so the failure log always has a subject: a group
         # can fail well before primary selection has run.
@@ -2264,6 +2376,9 @@ def process_manifest_stream(
 
             combined_meta = utils.combine_group_metadata(group)
             sent_to_model_snapshot = select_forwarded_metadata(combined_meta, forward_fields)
+            hydration_dump_writer = _build_hydration_dump_writer(cfg, subject, "group")
+            if hydration_dump_writer:
+                hydration_dump_writer(combined_meta)
 
             # At this point we have:
             #   - ``group``: all manifest entries for this logical photo (same stem)
@@ -2841,4 +2956,10 @@ def process_manifest_stream(
         failed_groups,
         len(unsent_paths),
     )
-    return {"results": results, "errors": errors}
+    return {
+        "results": results,
+        "errors": errors,
+        "groups_failed": failed_groups,
+        "files_unsent": len(unsent_paths),
+        "cancelled": False,
+    }
