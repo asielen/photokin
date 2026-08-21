@@ -54,6 +54,13 @@ def suggest_writable_spelling(tag: str) -> str | None:
     if not match:
         return None
     namespace, leaf = match.groups()
+    if namespace.lower() == "xmp":
+        # XMP:xmp:Rating is the one two-colon spelling that actually works --
+        # see the measured table above -- because the middle token collides
+        # with the family-0 group name rather than naming a family-1 group
+        # ExifTool rejects. Flagging it as broken and "correcting" it to
+        # XMP-xmp:Rating would refuse a tag that was never broken.
+        return None
     return f"XMP-{namespace}:{leaf}"
 
 

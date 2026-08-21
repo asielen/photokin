@@ -1847,6 +1847,17 @@ def process_manifest_stream(
     # signal is the parameter: the caller knows, and the callee cannot.
     if metadata_hydrator is not None:
         metadata_hydrator(items)
+    # A per-item narrowing of titles_may_be_from_files, when the hydrator can
+    # state it precisely: photokin's own (exposed via make_manifest_hydrator's
+    # title_from_file attribute) knows exactly which items' titles it filled
+    # from the file, as opposed to items that already carried a manifest- or
+    # --meta-supplied title and so were never touched. Without it every title
+    # in the run would be treated as possibly-from-file merely because -r was
+    # given somewhere in the run, which is the run-wide bool's known blind
+    # spot -- see titles_may_be_from_files above. An arbitrary external
+    # hydrator carries no such attribute and falls back to that bool exactly
+    # as before.
+    title_from_file_ids: set[int] | None = getattr(metadata_hydrator, "title_from_file", None)
     group_by = cfg.group_by
     buckets = build_manifest_buckets(items, group_by=group_by)
 
@@ -2474,7 +2485,7 @@ def process_manifest_stream(
                 # own wording to leave alone.
                 return letter.upper() if len(letter) == 1 else letter
 
-            def _label_for(is_back: bool, ver: str | None) -> str:
+            def _label_for(is_back: bool, ver: str | None, page_num: int | None = None) -> str:
                 """Return the label a file's own caption is filed under, or ""."""
                 # The letter appears only where it disambiguates, decided per
                 # role independently -- which is exactly what multiple_fronts and
@@ -2490,6 +2501,17 @@ def process_manifest_stream(
                         return ""
                     base, lettered = "Photo", multiple_fronts
                 letter = _display_version(ver) if lettered else ""
+                if lettered and not letter and page_num is not None:
+                    # multiple_fronts is also true of a multi-page document,
+                    # where nothing distinguishes the pages but the page
+                    # number itself -- none of them carry a variant letter, so
+                    # _display_version has nothing to disambiguate with and
+                    # every page would otherwise collapse onto the identical
+                    # bare "[Photo]" label. The number is what disk already
+                    # calls them (album-page1.jpg, album-page2.jpg), so using
+                    # it here keeps the label the letters-on-disk rule already
+                    # promises for variants.
+                    letter = str(page_num)
                 return f"[{base} {letter}]" if letter else f"[{base}]"
 
             # --- Intake: every file's caption, in one deterministic order -------
@@ -2509,7 +2531,7 @@ def process_manifest_stream(
                 existing_caption = (entry_meta.get("caption") or "").strip()
                 if not existing_caption:
                     continue
-                label = _label_for(entry["is_back"], entry["version"])
+                label = _label_for(entry["is_back"], entry["version"], entry.get("page_num"))
                 for _key, body in _split_caption_sections(existing_caption, label):
                     # Section by section, never whole-string. Filling in a
                     # missing "[Photo B]" therefore cannot disturb the
@@ -2701,7 +2723,11 @@ def process_manifest_stream(
                     record_for_item,
                     per_meta,
                     cfg,
-                    original_title_from_file=titles_may_be_from_files,
+                    original_title_from_file=(
+                        titles_may_be_from_files
+                        if title_from_file_ids is None
+                        else id(own_meta) in title_from_file_ids
+                    ),
                 )
                 # ``combined_meta`` is the whole group's metadata keywords,
                 # un-stripped, and it has just been merged into every file, so a

@@ -27,7 +27,7 @@ from unittest.mock import patch
 from photokin import core, utils
 from photokin.canonical import build_canonical_patch
 from photokin.exiftool import ExiftoolConfig
-from photokin.exiftool.hydrate import hydrate_item_metadata
+from photokin.exiftool.hydrate import hydrate_item_metadata, make_manifest_hydrator
 from photokin.exiftool.manifest import (
     _ARGV_BUDGET,
     DEFAULT_EXIFTOOL_FIELDS,
@@ -170,6 +170,38 @@ class TestTheDateKeywordInterlockSurvivesHydration(unittest.TestCase):
         """ExifTool returns a one-value tag as a bare string, not a list."""
         merged = self._merged("DATE: Y!")
         self.assertEqual(merged["dateTimeOriginal"], "1952:06:01 00:00:00")
+
+    def test_the_marker_still_vetoes_when_the_item_already_has_other_keywords(self):
+        """"Missing or empty" must not blind the interlock to a marker on disk.
+
+        An item can arrive with its own keywords already set -- a Lightroom
+        export, a prior non-photokin tool -- unrelated to the ``DATE:``
+        marker a human wrote onto the *file* in an earlier photokin run.
+        ``dateTimeOriginal`` is still missing from the manifest, so it still
+        arms the heuristic; the file's ``XMP:Subject`` has to be checked for
+        the marker regardless, or the interlock protects nothing whenever a
+        caller happens to have supplied any keywords at all.
+        """
+        work = tempfile.mkdtemp(prefix="pk-datekw-existing-")
+        path = _touch(work, "box3_015.jpg")
+        store = {
+            utils.normalize_path(path): {
+                "EXIF:DateTimeOriginal": "1952:06:01 00:00:00",
+                "XMP:Subject": ["family", "DATE: Y!"],
+            }
+        }
+        out = _run(
+            [{"path": path, "metadata": {"keywords": ["some-other-tag"]}}],
+            self.REPLY,
+            hydrator=_tag_hydrator(store),
+        )
+        merged = out["results"][path]
+        self.assertEqual(merged["dateTimeOriginal"], "1952:06:01 00:00:00")
+        self.assertNotIn("dateTimeOriginal", merged["_merge"]["overrides"])
+        # The caller's own keyword survives; the marker is added beside it
+        # rather than the whole list being replaced by the file's.
+        self.assertIn("some-other-tag", merged["keywords"])
+        self.assertIn("DATE: Y!", merged["keywords"])
 
 
 class TestTheReadIsBatchedForLargeFolders(unittest.TestCase):
@@ -477,6 +509,31 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
             f"[AI Analysis]: {self.ANALYSIS}",
         )
 
+    def test_pages_are_told_apart_by_number_not_a_letter_none_of_them_have(self):
+        """A multi-page document has no variant letters -- the pages need one anyway.
+
+        ``multiple_fronts`` is true of a 3-page letter exactly as it is of two
+        rescans, so the pages are labelled. But none of them carry a variant
+        letter -- ``-pageN`` is a different token from a variant letter -- so
+        without a fallback every page's label collapses to the identical bare
+        "[Photo]", merging three distinct captions under one indistinguishable
+        heading. The page number is what the filenames already call them, so
+        that is what disambiguates them.
+        """
+        self.assertEqual(
+            self.one_block(
+                {
+                    "box5_010-page1.jpg": "Dear Ruth,",
+                    "box5_010-page2.jpg": "I hope this finds you well.",
+                    "box5_010-page3.jpg": "Love, Sam",
+                }
+            ),
+            "[Photo 1] Dear Ruth,\n"
+            "[Photo 2] I hope this finds you well.\n"
+            "[Photo 3] Love, Sam\n"
+            f"[AI Analysis]: {self.ANALYSIS}",
+        )
+
 
 class TestTheCaptionUpdateRules(_CaptionBlockTestCase):
     """What happens to a caption a photo already has.
@@ -696,9 +753,41 @@ class TestNearIdenticalCaptionsAreNotDuplicated(_CaptionBlockTestCase):
         # 0.998 gate and the correction was dropped. Asserted as a property over
         # length, because that failure only appears once a block is long enough
         # for one changed word to be a small fraction of it.
-        stale = "27 november 44. " + "The stonework had survived the shelling. " * 40
+        #
+        # The filler has to actually vary: repeating one short sentence dozens
+        # of times (an earlier version of this fixture did) crosses difflib's
+        # own autojunk threshold, which stops treating the repeated text as a
+        # match at all and collapses the ratio to near zero -- so the assertion
+        # below would pass even against a ratio-only implementation with no
+        # threshold whatsoever, proving nothing about the word gate. Varied
+        # prose keeps the ratio where a real long transcription's would sit.
+        stale = (
+            "27 november 44. The stonework had survived the shelling, though the "
+            "roofline was gone and the windows on the east side were boarded over "
+            "with whatever timber could be found. Someone had chalked a name and "
+            "a date onto the garden wall, half legible under the soot. The "
+            "fountain in the courtyard was dry and cracked, and a cart wheel "
+            "leaned against it where it had been left, rusting, since the spring. "
+            "Two of the shutters still bore their painted numbers. A stray dog "
+            "slept in the shade of the archway most afternoons, and the "
+            "neighbors said it had belonged to the family that used to keep the "
+            "corner shop before the war reached this street and left the block "
+            "the way it stands now, scarred but standing."
+        )
         fixed = stale.replace("november 44", "november 45", 1)
         self.assertNotEqual(stale, fixed)
+        # The ratio a plain (non-word-gated) implementation would have scored
+        # this pair, pinned so a future edit to the filler cannot quietly drop
+        # back below the near-identical floor and defang the assertion below.
+        self.assertGreater(
+            difflib.SequenceMatcher(
+                None, core._normalize_caption_text(stale), core._normalize_caption_text(fixed)
+            ).ratio(),
+            core._CAPTION_NEAR_IDENTICAL_RATIO,
+            "the fixture's ratio dropped to or below the near-identical floor, "
+            "so it no longer demonstrates a ratio-only implementation would "
+            "have wrongly discarded this correction",
+        )
         self.assertFalse(
             core._captions_are_near_identical(stale, fixed),
             "a corrected year in a long transcription was discarded as a "
@@ -1121,6 +1210,48 @@ class TestTitlePrecedenceDependsOnProvenance(unittest.TestCase):
                 )
                 self.assertEqual(title, "Wedding Day 1952")
                 self.assertNotIn("title", overrides)
+
+    def test_a_manifest_title_survives_a_run_that_also_hydrates_a_sibling(self):
+        """The run-wide -r bit must not smear a file's own claim onto another's.
+
+        ``titles_may_be_from_files`` is one bit for the whole run, but whether
+        *this* item's title came from a file is knowable precisely:
+        ``hydrate_item_metadata`` never fills a title the item already has.
+        Two items in the same ``-r`` run -- one with a manifest title, one
+        with none -- must each keep their own provenance rather than the
+        coarser run-wide bit deciding both from whichever is true anywhere.
+        """
+        work = tempfile.mkdtemp(prefix="pk-title-provenance-")
+        typed_path = _touch(work, "DSC_0050.jpg")
+        scanned_path = _touch(work, "DSC_0051.jpg")
+        store = {
+            utils.normalize_path(typed_path): {"XMP:Title": "Scanned Image"},
+            utils.normalize_path(scanned_path): {"XMP:Title": "Scanned Image"},
+        }
+        with patch(
+            "photokin.exiftool.hydrate.resolve_exiftool_path", return_value="/fake/exiftool"
+        ), patch(
+            "photokin.exiftool.manifest.run_exiftool_json",
+            lambda *, exiftool_path, files, fields, timeout_sec=None, **_kw: [
+                {"SourceFile": f.replace("\\", "/"), **store.get(utils.normalize_path(f), {})}
+                for f in files
+            ],
+        ):
+            out = _run(
+                [
+                    {"path": typed_path, "metadata": {"title": "Ellis Island Arrival"}},
+                    {"path": scanned_path},
+                ],
+                {"caption": "c", "title": "Wedding Day 1952", "keywords": []},
+                hydrator=make_manifest_hydrator(ExiftoolConfig()),
+                from_files=True,
+            )
+        # The manifest title was never touched by hydration (it was not
+        # missing), so it keeps outranking the model outright.
+        self.assertEqual(out["results"][typed_path]["title"], "Ellis Island Arrival")
+        # The sibling's title genuinely came from the file, so the model's
+        # transcription still wins for it.
+        self.assertEqual(out["results"][scanned_path]["title"], "Wedding Day 1952")
 
 
 class TestGroupMetadataComesFromTheObjectNotItsSupportingScans(unittest.TestCase):
