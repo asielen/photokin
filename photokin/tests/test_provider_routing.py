@@ -609,6 +609,35 @@ class TestArchivalUploadErrorNormalization(unittest.TestCase):
         self.assertEqual(err.status_code, 429)
         self.assertEqual(err.retry_after, 12.0)
 
+    def test_rejected_file_maps_to_invalid_input_not_api_status(self):
+        """BadRequestError is an APIStatusError subclass, so it must be caught
+        ahead of the generic APIStatusError branch -- same ordering as
+        call_openai_model/call_openai_compat_model -- or a per-file problem
+        (wrong extension, empty file, oversized upload) reads as the generic
+        ``api_status`` bucket instead of the ``invalid_input`` every other
+        per-request validation failure in the codebase uses."""
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/files")
+        sdk_exc = openai.BadRequestError(
+            "Invalid file format",
+            response=httpx.Response(400, request=request),
+            body={"error": {"message": "Invalid file format"}},
+        )
+
+        class _Files:
+            def create(self, **kwargs):
+                raise sdk_exc
+
+        client = types.SimpleNamespace(files=_Files())
+        with self.assertRaises(ProviderApiError) as ctx:
+            utils.archival_upload(client, __file__, 80)
+        err = ctx.exception
+        self.assertEqual(err.error_type, "invalid_input")
+        self.assertEqual(err.status_code, 400)
+        self.assertEqual(err.provider_message, "Invalid file format")
+
 
 if __name__ == "__main__":
     unittest.main()

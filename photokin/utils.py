@@ -745,7 +745,11 @@ def _create_archival_file(client, file_obj, purpose: str):
     structured ``provider_message``/``retry_after`` fields the rest of the
     pipeline relies on (see ``api_openai.call_openai_model``, which this
     mirrors). ``AuthenticationError`` is an ``APIStatusError`` subclass, so a
-    rejected key lands in the ``api_status`` branch below.
+    rejected key lands in the ``api_status`` branch below; ``BadRequestError``
+    is caught ahead of it (same ordering as ``call_openai_model`` and
+    ``call_openai_compat_model``) so a rejected file -- wrong extension, empty
+    file, oversized upload -- lands under ``invalid_input`` like every other
+    per-request validation failure, not the generic ``api_status`` bucket.
     """
     if openai is None:
         return client.files.create(file=file_obj, purpose=purpose)
@@ -758,6 +762,13 @@ def _create_archival_file(client, file_obj, purpose: str):
             status_code=429,
             provider_message=extract_provider_message(exc),
             retry_after=extract_retry_after(exc),
+        ) from exc
+    except openai.BadRequestError as exc:
+        raise ProviderApiError(
+            "invalid_input",
+            str(exc),
+            status_code=getattr(exc, "status_code", None),
+            provider_message=extract_provider_message(exc),
         ) from exc
     except openai.APIStatusError as exc:
         raise ProviderApiError(

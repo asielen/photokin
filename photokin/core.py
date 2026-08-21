@@ -21,6 +21,7 @@ drives; it groups manifest items by photo, analyzes each group, and emits NDJSON
 incrementally while also returning an aggregate snapshot.
 
 Code map (public-facing entry points marked PUBLIC):
+- _is_run_fatal                 does this error describe the run, not one photo?
 - _build_llm_dump_writer        optional debug dumper for raw LLM requests
 - inject_analysis_date          stamp a date into the '[AI Analysis]:' caption prefix
 - _strip_empty_caption_sections drop empty [Front]/[Back] caption sections
@@ -31,7 +32,6 @@ Code map (public-facing entry points marked PUBLIC):
 - _ensure_provenance_keyword    guarantee one provider/model provenance keyword
 - _should_run_archival_upload   gate Files-API upload by provider
 - _normalized_error_payload     build a provider-normalized error record
-- _is_run_fatal                 does this error describe the run, not one photo?
 - analyze_photo                 PUBLIC: full pipeline for one front(+back) photo
 - analyze_group_parts           PUBLIC: analyze ordered parts (front/back/pages)
 - analyze_group_front_back      PUBLIC: convenience wrapper over analyze_group_parts
