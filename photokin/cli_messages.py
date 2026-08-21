@@ -32,7 +32,7 @@ Code map:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 #: A problem line and the remedy line that follows it, in that order.
 UsageMessage = tuple[str, str]
@@ -441,6 +441,24 @@ def write_bundle_contradiction(flag: str, value: str) -> UsageMessage:
         f"`{flag} {value}` was also given.",
         "drop one; --changeset true alone records the proposed writes without "
         "applying them",
+    )
+
+
+def verbose_bundle_contradiction(flag: str, value: str) -> UsageMessage:
+    """``-v`` was given beside a flag that contradicts what it expands to.
+
+    Args:
+        flag: The contradicting flag, ``--debug-dump-llm-request`` or
+            ``--debug-dump-hydration``.
+        value: The value it carried.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        "`-v` means --debug-dump-llm-request true --debug-dump-hydration true, "
+        f"but `{flag} {value}` was also given.",
+        "drop one, or set the flag to true to agree with -v",
     )
 
 
@@ -955,6 +973,20 @@ class RunPlan:
     model: str
     dry_run: bool
     suggested_command: str | None = None
+
+    def as_dict(self) -> dict:
+        """Return every field as a plain JSON-serializable dict.
+
+        The machine-readable twin of :meth:`render`: a caller that watches
+        the results NDJSON rather than stderr (a fire-and-forget subprocess
+        launch, which cannot see stderr at all) gets the same plan, in the
+        ``run: plan`` envelope record, as one dict rather than a block of
+        prose it would otherwise have to parse back apart.
+
+        Returns:
+            Every field of this plan, by name.
+        """
+        return asdict(self)
 
     def render(self) -> str:
         """Return the whole summary block as one multi-line string.

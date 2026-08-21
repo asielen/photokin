@@ -263,10 +263,15 @@ class _CliTestCase(unittest.TestCase):
         self.package_logger.setLevel(self._original_level)
 
     def _remove_cli_handlers(self) -> None:
-        """Detach every handler this CLI installs, from both logger scopes."""
+        """Detach every handler this CLI installs, from both logger scopes.
+
+        Both the stderr handler and the optional --log-file/-v one: leaving
+        the latter attached across tests holds an open file handle into a
+        temp directory a later test may already have cleaned up.
+        """
         for logger in (self.package_logger, self.root_logger):
             for handler in list(logger.handlers):
-                if handler.get_name() == cli._LOG_HANDLER_NAME:
+                if handler.get_name() in (cli._LOG_HANDLER_NAME, cli._LOG_FILE_HANDLER_NAME):
                     logger.removeHandler(handler)
                     handler.close()
 
@@ -1261,8 +1266,11 @@ class TestTheGatesAreLiftedForEveryInputType(_WriteFixtureTestCase):
         self.assertEqual(stdout, "")
         with open(out_path, "r", encoding="utf-8") as handle:
             written = [json.loads(line) for line in handle if line.strip()]
+        # Per-file records only: the file also carries the run envelope
+        # (run: start/plan/complete), which has no "path" of its own.
+        per_file = [record for record in written if "path" in record]
         self.assertEqual(
-            [record["path"] for record in written],
+            [record["path"] for record in per_file],
             [image, os.path.join(folder, "box3_025-back.jpg")],
         )
 
