@@ -12,7 +12,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List
 
-from .errors import ProviderApiError, model_not_found_message
+from .errors import (
+    ProviderApiError,
+    extract_provider_message,
+    extract_retry_after,
+    model_not_found_message,
+)
 
 try:
     import openai
@@ -67,7 +72,13 @@ def call_openai_compat_model(
     try:
         return tuned.chat.completions.create(**request_payload)
     except openai.RateLimitError as exc:
-        raise ProviderApiError("rate_limit", str(exc), status_code=429) from exc
+        raise ProviderApiError(
+            "rate_limit",
+            str(exc),
+            status_code=429,
+            provider_message=extract_provider_message(exc),
+            retry_after=extract_retry_after(exc),
+        ) from exc
     except openai.NotFoundError as exc:
         raise ProviderApiError(
             "model_not_found",
@@ -85,9 +96,19 @@ def call_openai_compat_model(
                 model_not_found_message("OpenRouter", model, "--openrouter-model", "OPENROUTER_MODEL"),
                 status_code=getattr(exc, "status_code", None),
             ) from exc
-        raise ProviderApiError("invalid_input", msg, status_code=getattr(exc, "status_code", None)) from exc
+        raise ProviderApiError(
+            "invalid_input",
+            msg,
+            status_code=getattr(exc, "status_code", None),
+            provider_message=extract_provider_message(exc),
+        ) from exc
     except openai.APIStatusError as exc:
-        raise ProviderApiError("api_status", str(exc), status_code=getattr(exc, "status_code", None)) from exc
+        raise ProviderApiError(
+            "api_status",
+            str(exc),
+            status_code=getattr(exc, "status_code", None),
+            provider_message=extract_provider_message(exc),
+        ) from exc
 
 
 def extract_openai_compat_output_text(resp: Any) -> str:

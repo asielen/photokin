@@ -46,17 +46,30 @@ Code map:
 """
 
 import argparse
+import contextlib
+import importlib.metadata
+import io
 import json
 import logging
 import os
 import sys
 import tempfile
+import threading
 import traceback
 from dataclasses import dataclass
 from typing import NoReturn
 
 from . import cli_messages, utils
 from .utils import Config, normalize_path
+from .canonical import (
+    CANONICAL_DATE_TAG,
+    CANONICAL_DESCRIPTION_TAG,
+    CANONICAL_KEYWORDS_TAG,
+    CANONICAL_LOCATION_TAGS,
+    CANONICAL_TITLE_TAG,
+    CANONICAL_USER_COMMENT_TAG,
+)
+from .changeset import SCHEMA_VERSION as _CHANGESET_SCHEMA_VERSION
 from .core import (
     build_folder_manifest,
     build_manifest_buckets,
@@ -82,6 +95,207 @@ logger = logging.getLogger("photokin.cli")
 
 # Tag on the handler this module installs, so repeated main() calls reuse it.
 _LOG_HANDLER_NAME = "photokin-cli-stderr"
+# Tag on the optional --log-file/-v duplicate handler, same reuse reason.
+_LOG_FILE_HANDLER_NAME = "photokin-cli-logfile"
+
+# Bumped whenever a record's shape changes in a way a consumer could care
+# about -- a new top-level key, a renamed one, a changed meaning for an
+# existing one. Adding an *optional* key that is simply absent when there is
+# nothing to say (``provider_message``, say) does not by itself require a
+# bump; changing what an existing key means always does. Mirrors
+# ``changeset.SCHEMA_VERSION`` -- the one other place this package
+# schema-versions an NDJSON stream -- but is independent of it: the two
+# streams (results, changeset) evolve on their own schedules.
+_NDJSON_SCHEMA_VERSION = 2
+
+# Guards every physical append to a results NDJSON file. One process runs one
+# main() at a time, but a background writer (a heartbeat, were one added) and
+# the main thread could otherwise interleave two writes into one corrupted
+# line; a single process-wide lock is simpler than threading one through
+# every call site that can append.
+_ndjson_write_lock = threading.Lock()
+
+
+def _append_ndjson_record(path: str, record: dict, *, batch_id: str | None = None) -> None:
+    """Append one schema-stamped record to an NDJSON destination.
+
+    Every write to a results NDJSON file goes through this -- the run
+    envelope (``run: start/plan/fatal/complete/cancelled``) and every
+    per-file result/error record from ``core.process_manifest_stream`` alike
+    -- so ``schema_version`` and ``batch_id`` never have to be remembered at
+    more than one call site.
+
+    Args:
+        path: The NDJSON file to append to. Must already exist; this never
+            creates or truncates it.
+        record: The record to write. Mutated in place (two keys are added)
+            rather than copied, since every caller already treats the dict as
+            disposable -- built fresh for this one call.
+        batch_id: ``--batch-id``, when the run was given one.
+    """
+    if batch_id:
+        record.setdefault("batch_id", batch_id)
+    record.setdefault("schema_version", _NDJSON_SCHEMA_VERSION)
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with _ndjson_write_lock, open(path, "a", encoding="utf-8") as handle:
+        handle.write(line)
+
+
+class _RunEnvelope:
+    """The open run-level NDJSON envelope for the results file, if any.
+
+    A module-level singleton (see :data:`_active_run_envelope`) rather than a
+    value threaded through every pre-flight helper's signature: a refusal can
+    come from any of the many small functions scattered across this module
+    (``_resolve_input``, ``_resolve_provider``, ``_preflight_exiftool``, ...),
+    and centralizing the envelope here is what lets every one of them become
+    observable in the results file without a signature change to each --
+    ``_exit_with_usage_error`` just checks whether one is active.
+    ``_configure_logging``'s handler is the same kind of process-lifetime
+    state, scoped the same way, for the same reason.
+
+    Only ever constructed by :func:`_open_run_envelope_if_fresh` or
+    :func:`_open_run_envelope_deferred`, both of which write the opening
+    ``run: start`` record as part of opening it -- so by the time one of
+    these exists, ``run: start`` is already on the stream.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def append(self, record: dict, *, batch_id: str | None = None) -> None:
+        """Append one envelope or per-file record to this run's file."""
+        _append_ndjson_record(self.path, record, batch_id=batch_id)
+
+
+#: The run's open envelope, or None when no fresh ``.ndjson`` destination has
+#: been opened for it yet (no ``--output-file``, a non-``.ndjson`` extension,
+#: or a pre-existing file deferred per :func:`_open_run_envelope_deferred`'s
+#: own docstring). Reset at the top of every :func:`main` call so repeated
+#: in-process calls -- the test suite's own pattern -- never leak one run's
+#: envelope into the next.
+_active_run_envelope: "_RunEnvelope | None" = None
+
+
+def _open_run_envelope_if_fresh(out_path: str | None, *, batch_id: str | None) -> None:
+    """Open the run's NDJSON envelope immediately if the destination is new.
+
+    Called as early as argparse allows -- right after ``args.output_file`` is
+    known, before any other pre-flight check -- so every refusal after this
+    point has somewhere to land a ``run: fatal`` record instead of leaving a
+    fire-and-forget caller staring at a file that never appeared.
+
+    A *pre-existing* destination is left untouched here: opening it would
+    truncate it immediately, and a refused run's caller may still need
+    whatever a previous run wrote there. See
+    :func:`_open_run_envelope_deferred` for where that file gets its own
+    ``run: start``, once every check has passed and overwriting it is exactly
+    what the run was already going to do.
+
+    Args:
+        out_path: ``args.output_file``, or ``None``.
+        batch_id: ``--batch-id``, when the run was given one.
+    """
+    global _active_run_envelope
+    if not out_path or not out_path.lower().endswith(".ndjson") or os.path.exists(out_path):
+        return
+    open(out_path, "w", encoding="utf-8").close()
+    _active_run_envelope = _RunEnvelope(out_path)
+    _active_run_envelope.append({"run": "start"}, batch_id=batch_id)
+
+
+def _open_run_envelope_deferred(out_path: str | None, *, batch_id: str | None) -> None:
+    """Open the envelope now, for a destination that pre-existed at parse time.
+
+    Every pre-flight check has passed by the time this runs, so truncating
+    the previous run's file here is exactly what the run was already going
+    to do -- this only additionally gives that file the same ``run: start``
+    record a fresh destination got immediately. A no-op if the fresh-file
+    path already opened one, or if the destination still isn't a usable
+    ``.ndjson`` path (a ``.json`` destination, or none at all).
+
+    Args:
+        out_path: ``args.output_file``, or ``None``.
+        batch_id: ``--batch-id``, when the run was given one.
+    """
+    global _active_run_envelope
+    if _active_run_envelope is not None:
+        return
+    if not out_path or not out_path.lower().endswith(".ndjson"):
+        return
+    open(out_path, "w", encoding="utf-8").close()
+    _active_run_envelope = _RunEnvelope(out_path)
+    _active_run_envelope.append({"run": "start"}, batch_id=batch_id)
+
+
+def _build_capabilities(ap: argparse.ArgumentParser) -> dict:
+    """Describe this build's contract: version, schema, tags, providers, flags.
+
+    Meant to replace an import-probe heuristic (importing some internal
+    symbol and trusting a pip version pin to mean the rest still matches)
+    with a real, versioned answer a caller can gate a run on. The
+    ``XMP:dc:`` -> ``XMP-dc:`` tag rename showed the cost of the
+    alternative: a mismatched pair silently dropped keywords, title and
+    caption instead of failing detectably, because nothing on either side
+    stated a contract the other could check against.
+
+    Args:
+        ap: The fully-built argument parser. ``flags`` is read live off it
+            via its (underscore-private, but stable and widely relied on)
+            ``_actions``, so the list can never drift from what argparse
+            actually accepts the way a hand-maintained one could.
+
+    Returns:
+        A JSON-serializable dict.
+    """
+    try:
+        version = importlib.metadata.version("photokin")
+    except importlib.metadata.PackageNotFoundError:
+        version = "unknown"
+    flags = sorted(
+        {opt for action in ap._actions for opt in action.option_strings if opt.startswith("--")}
+    )
+    return {
+        "version": version,
+        "ndjson_schema_version": _NDJSON_SCHEMA_VERSION,
+        "changeset_schema_version": _CHANGESET_SCHEMA_VERSION,
+        "canonical_tags": {
+            "ai_caption": CANONICAL_USER_COMMENT_TAG,
+            "caption": CANONICAL_DESCRIPTION_TAG,
+            "keywords": CANONICAL_KEYWORDS_TAG,
+            "title": CANONICAL_TITLE_TAG,
+            "date_guess": CANONICAL_DATE_TAG,
+            "location_guess": dict(CANONICAL_LOCATION_TAGS),
+        },
+        "providers": list(_PROVIDER_CHOICES),
+        "flags": flags,
+    }
+
+
+def _scan_argv_for_output_file(argv: list[str]) -> str | None:
+    """Best-effort peek at ``--output-file`` before argparse has run.
+
+    Argparse can reject the rest of ``argv`` -- an unknown flag, a bad choice
+    value -- before this module ever learns the output destination the normal
+    way, and when it does, it exits straight out of ``parse_args()`` with a
+    usage message on stderr that a fire-and-forget launch never sees. This
+    lets that one failure mode still land in the results file: a linear
+    scan, not real parsing, so argv it can't make sense of just yields
+    ``None`` rather than raising a second error of its own.
+
+    Args:
+        argv: The raw argument list, before ``ap.parse_args`` sees it.
+
+    Returns:
+        The value following (or joined by ``=`` to) ``--output-file``, or
+        ``None`` if the token never appears.
+    """
+    for i, token in enumerate(argv):
+        if token == "--output-file" and i + 1 < len(argv):
+            return argv[i + 1]
+        if token.startswith("--output-file="):
+            return token.split("=", 1)[1]
+    return None
 
 #: What each input kind is called in a message. The plan summary uses the same
 #: words without the article, so "what it was detected as" reads identically
@@ -191,8 +405,53 @@ def _configure_logging() -> None:
     package_logger.addHandler(handler)
 
 
+def _attach_log_file_handler(path: str) -> None:
+    """Duplicate every log line into *path*, in addition to stderr.
+
+    stderr is exactly what a fire-and-forget subprocess launch throws away --
+    the plugin's own launch shape discards it entirely -- so the plan
+    summary, every WARNING, and the "Batch completed" line are otherwise
+    invisible to a caller that only watches the results file. A second
+    handler on the same logger costs one open file descriptor and changes
+    nothing about what already goes to stderr.
+
+    Truncates on open, matching every other destination this module
+    manages (``--output-file``, the changeset): the file always reflects the
+    run that just wrote it, not an accumulation across runs sharing a path.
+    Reused rather than duplicated on a second in-process ``main()`` call, the
+    same way :func:`_configure_logging` reuses its own handler.
+
+    Args:
+        path: Where to write the duplicate log.
+    """
+    package_logger = logging.getLogger("photokin")
+    level = package_logger.level or logging.INFO
+    for existing in package_logger.handlers:
+        if existing.get_name() == _LOG_FILE_HANDLER_NAME:
+            package_logger.removeHandler(existing)
+            existing.close()
+    # FileHandler does not create its own parent directory -- unlike the
+    # debug-dump writers, which mkdir lazily on first use, this is attached
+    # long before anything else would have created --debug-dump-dir (-v's
+    # own default even points here directly).
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    handler = logging.FileHandler(path, mode="w", encoding="utf-8")
+    handler.set_name(_LOG_FILE_HANDLER_NAME)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    package_logger.addHandler(handler)
+
+
 def _exit_with_usage_error(problem: str, remedy: str) -> NoReturn:
     """Report a usage error as a problem line plus a ``Try:`` line, then exit 2.
+
+    Also closes the run's NDJSON envelope with a ``run: fatal`` record, when
+    one is open (see :data:`_active_run_envelope`) -- this is the one place
+    every pre-flight refusal in the module already passes through, which is
+    what lets the envelope cover all of them without a change at each call
+    site.
 
     Args:
         problem: What the CLI saw, stated in a single line.
@@ -202,19 +461,38 @@ def _exit_with_usage_error(problem: str, remedy: str) -> NoReturn:
         SystemExit: Always, with exit code 2.
     """
     logger.error("%s\nTry: %s", problem, remedy)
+    if _active_run_envelope is not None:
+        _active_run_envelope.append({"run": "fatal", "error": {"type": "usage_error", "message": problem}})
     sys.exit(2)
 
 
 def _interactive_prompt() -> list[str]:
-    """Prompt the user for image paths and return extra argv tokens."""
+    """Prompt the user for image paths and return extra argv tokens.
+
+    A blank front-image answer, an interrupt (Ctrl+C), or closed stdin (Ctrl+D
+    on macOS/Linux, Ctrl+Z then Enter on Windows, or an empty piped stdin) all
+    mean "nothing to run" and exit 0 quietly -- none should raise.
+    """
 
     print("Interactive mode: Provide image paths for analysis.")
-    front = normalize_path(input("Front image path (blank to quit): "))
-    if not front:
+    try:
+        front_raw = input("Front image path (blank to quit): ")
+    except (EOFError, KeyboardInterrupt):
+        print("\nNo file provided. Exiting.")
+        raise SystemExit(0)
+    # Checked before normalizing: normalize_path("") is "." (the current
+    # directory via os.path.normpath), which is truthy -- a blank answer would
+    # otherwise silently become `photokin .`, folder input over the cwd.
+    if not front_raw.strip():
         print("No file provided. Exiting.")
         raise SystemExit(0)
-    back_raw = input("Back image path (optional, blank if none): ")
-    back = normalize_path(back_raw) if back_raw else None
+    front = normalize_path(front_raw)
+    try:
+        back_raw = input("Back image path (optional, blank if none): ")
+    except (EOFError, KeyboardInterrupt):
+        back_raw = ""
+        print("")
+    back = normalize_path(back_raw) if back_raw.strip() else None
     extra = [front]
     if back:
         extra.extend(["--back", back])
@@ -607,6 +885,80 @@ def _refuse_generate_manifest_write_flags(args: argparse.Namespace) -> None:
             )
 
 
+#: The one definition of what ``-v`` means, same shape as :data:`_WRITE_BUNDLE`
+#: and for the same reason: the expansion, the contradiction check and the
+#: ``--generate-manifest`` refusal all read it, so a third dump flag is one
+#: dict entry rather than three edits in three functions.
+_VERBOSE_BUNDLE: dict[str, _WriteBundleMember] = {
+    "debug_dump_llm_request": _WriteBundleMember("true", "dump", "--debug-dump-llm-request true"),
+    "debug_dump_hydration": _WriteBundleMember("true", "dump", "--debug-dump-hydration true"),
+}
+
+
+def _resolve_verbose_bundle(args: argparse.Namespace) -> tuple[str, str]:
+    """Expand ``-v`` and reject any explicit flag that contradicts it.
+
+    Mirrors :func:`_resolve_write_bundle` for the debug-dump flags ``-v`` is
+    shorthand for: an explicit ``--debug-dump-llm-request false`` beside
+    ``-v`` is a contradiction to refuse, not a value to silently pick between.
+    ``--log-file`` is deliberately not a member -- it takes a path, not a
+    fixed value, so there is nothing for ``-v`` to compare an explicit one
+    against; ``-v``'s own default for it is filled in separately, once the
+    directory it belongs beside is known.
+
+    Args:
+        args: The parsed namespace. Both bundle destinations default to
+            ``None`` there, so "unset" is distinguishable from an explicit
+            value that happens to agree with the expansion.
+
+    Returns:
+        ``(debug_dump_llm_request, debug_dump_hydration)``, each ``"true"``
+        or ``"false"``.
+
+    Raises:
+        SystemExit: With code 2 when ``-v`` is given beside a contradicting flag.
+    """
+    values: dict[str, str | None] = {dest: getattr(args, dest) for dest in _VERBOSE_BUNDLE}
+    if args.verbose:
+        for dest, member in _VERBOSE_BUNDLE.items():
+            given = values[dest]
+            if given is not None and given != member.value:
+                _exit_with_usage_error(
+                    *cli_messages.verbose_bundle_contradiction(_flag_spelling(dest), given)
+                )
+            values[dest] = member.value if given is None else given
+    return values["debug_dump_llm_request"] or "false", values["debug_dump_hydration"] or "false"
+
+
+def _refuse_generate_manifest_verbose_flags(args: argparse.Namespace) -> None:
+    """Refuse ``-v`` and its dump flags beside ``--generate-manifest``.
+
+    ``--generate-manifest`` makes no model call, so there is nothing for a
+    debug-dump flag to dump -- the same reasoning
+    :func:`_refuse_generate_manifest_write_flags` applies to ``-w``, applied
+    to the sibling bundle. ``--log-file`` is not refused here: unlike the
+    dump flags, a log still means something without a model call -- the
+    "wrote manifest for N files" line still goes somewhere.
+
+    Args:
+        args: The parsed namespace, before ``-v``'s expansion is written back.
+
+    Raises:
+        SystemExit: With code 2 for the first conflicting flag found.
+    """
+    if args.verbose:
+        _exit_with_usage_error(
+            *cli_messages.generate_manifest_with_write_flag("-v", "dump", "-v")
+        )
+    for dest, member in _VERBOSE_BUNDLE.items():
+        if getattr(args, dest) == member.value:
+            _exit_with_usage_error(
+                *cli_messages.generate_manifest_with_write_flag(
+                    f"{_flag_spelling(dest)} {member.value}", member.verb, member.replay
+                )
+            )
+
+
 def _derive_changeset_path(resolved: ResolvedInput, out_path: str | None) -> str:
     """Return where the changeset goes: ``dirname(--output-file or input)``.
 
@@ -646,6 +998,7 @@ def _apply_common_cfg(cfg: Config, args: argparse.Namespace, *, manifest: dict |
         manifest=manifest,
     )
     cfg.debug_dump_llm_request = args.debug_dump_llm_request == "true"
+    cfg.debug_dump_hydration = args.debug_dump_hydration == "true"
     cfg.debug_dump_dir = args.debug_dump_dir or os.path.join(os.getcwd(), "debug")
     cfg.run_batch_id = args.batch_id
 
@@ -1151,6 +1504,7 @@ def _apply_exiftool_changeset(
     changeset_path: str | None,
     out_path: str | None,
     strict: bool = False,
+    batch_id: str | None = None,
 ) -> bool:
     """Apply routed fields from a changeset using ExifTool and append a status record.
 
@@ -1160,6 +1514,8 @@ def _apply_exiftool_changeset(
         out_path: The run's output destination, used to route the status record.
         strict: Whether a total write failure should be reported to the caller.
             False for manifest input, which keeps the plug-in's contract.
+        batch_id: ``--batch-id``, stamped onto the status record the same way
+            every other record in this file gets it.
 
     Returns:
         True when the run should be treated as failed: writes were requested,
@@ -1217,18 +1573,11 @@ def _apply_exiftool_changeset(
     if warnings:
         logger.warning("[ExifTool] Warnings: %s", json.dumps(warnings, ensure_ascii=False))
 
-    status_line = json.dumps(
-        {
-            "run": "exiftool_apply",
-            "summary": exif_summary,
-        },
-        ensure_ascii=False,
-    )
+    status_record = {"run": "exiftool_apply", "summary": exif_summary}
     if out_path and out_path.lower().endswith(".ndjson"):
-        with open(out_path, "a", encoding="utf-8") as file_handle:
-            file_handle.write(status_line + "\n")
+        _append_ndjson_record(out_path, status_record, batch_id=batch_id)
     else:
-        logger.info("[ExifTool] Apply status: %s", status_line)
+        logger.info("[ExifTool] Apply status: %s", json.dumps(status_record, ensure_ascii=False))
 
     # Reported after the status record is written, not instead of it: the
     # summary is how a caller finds out which files failed and why, and it has
@@ -1239,10 +1588,22 @@ def _apply_exiftool_changeset(
 def main() -> None:
     """CLI entry point: resolve one input, state the plan, then run it."""
 
+    global _active_run_envelope
+    # A repeated in-process main() call -- the test suite's own pattern --
+    # must not inherit the previous call's envelope.
+    _active_run_envelope = None
     _configure_logging()
     try:
         argv = sys.argv[1:]
         if not argv:
+            # The interactive prompt is for a human at a keyboard. A headless
+            # launcher (a plugin's subprocess call, a script, a scheduled task)
+            # whose argument list came out empty -- e.g. a quoting bug that ate
+            # every token -- is not that, and blocking it on a stdin read it
+            # can never answer just trades one silent hang for another. Route
+            # it to the usual usage error instead.
+            if not sys.stdin.isatty():
+                _exit_with_usage_error(*cli_messages.no_input_and_not_interactive())
             argv = _interactive_prompt()
 
         defaults = Config()
@@ -1270,6 +1631,14 @@ def main() -> None:
             "--manifest",
             default=None,
             help="Alias for a manifest INPUT; asserts the path is a .json manifest file.",
+        )
+        ap.add_argument(
+            "--capabilities",
+            action="store_true",
+            help="Print this build's version, NDJSON/changeset schema versions, "
+                 "canonical ExifTool tag mapping, providers and flags as JSON, "
+                 "then exit -- before any input is required. For a caller that "
+                 "wants to check compatibility rather than guess at it.",
         )
 
         ap.add_argument("--back", help="Path to the back image (single-photo input only)", default=None)
@@ -1362,15 +1731,48 @@ def main() -> None:
                  "not already carry; nothing is written. Mirrors -w / --write.",
         )
         ap.add_argument(
+            "-v", "--verbose",
+            action="store_true",
+            dest="verbose",
+            help="Shorthand for --debug-dump-llm-request true --debug-dump-hydration "
+                 "true, plus a default --log-file beside the other dumps: everything "
+                 "this run could leave behind for debugging, in one folder.",
+        )
+        ap.add_argument(
             "--debug-dump-llm-request",
             choices=["true", "false"],
             default=None,
             help="Write full LLM request payload dumps to disk before each LLM call",
         )
         ap.add_argument(
+            "--debug-dump-hydration",
+            choices=["true", "false"],
+            default=None,
+            help="Write each group's assembled metadata to disk before it is merged "
+                 "into a prompt -- what -r read plus whatever the manifest supplied, "
+                 "one step upstream of the LLM-request dump",
+        )
+        ap.add_argument(
             "--debug-dump-dir",
             default=None,
-            help="Directory for LLM request dump artifacts (default: <manifest/output-dir>/debug)",
+            help="Directory for LLM request/hydration dump artifacts (default: "
+                 "<manifest/output-dir>/debug)",
+        )
+        ap.add_argument(
+            "--log-file",
+            default=None,
+            help="Duplicate the run's log output into this file, in addition to "
+                 "stderr -- stderr is what a fire-and-forget subprocess launch "
+                 "throws away (default: none, or <debug-dump-dir>/<batch-id>.log "
+                 "under -v)",
+        )
+        ap.add_argument(
+            "--cancel-file",
+            default=None,
+            help="Poll for this path before each group starts (and, once created, "
+                 "for the rest of the run); its existence means stop, applying "
+                 "ExifTool writes to whatever completed and exiting cleanly rather "
+                 "than mid-batch.",
         )
         ap.add_argument(
             "--dry-run",
@@ -1394,7 +1796,59 @@ def main() -> None:
             help="Path to the ExifTool executable (default: env EXIFTOOL_PATH, else auto-detect)",
         )
 
-        args = ap.parse_args(argv)
+        # Best-effort candidate destination, scanned before argparse can reject
+        # the rest of argv -- an unknown flag or a bad choice value exits
+        # straight out of parse_args() with a usage message on stderr, which a
+        # fire-and-forget launch never sees. Capturing it here is what lets
+        # that one failure mode still land in the results file.
+        candidate_output = _scan_argv_for_output_file(argv)
+        parse_stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(parse_stderr):
+                args = ap.parse_args(argv)
+        except SystemExit as exc:
+            sys.stderr.write(parse_stderr.getvalue())
+            # exc.code is 0/None for --help, which is not a failure and has
+            # nothing to report; batch_id is unknown this early, so this one
+            # record goes out without it rather than guessing at argv a
+            # second time.
+            if (
+                exc.code not in (0, None)
+                and candidate_output
+                and candidate_output.lower().endswith(".ndjson")
+            ):
+                _open_run_envelope_if_fresh(candidate_output, batch_id=None)
+                if _active_run_envelope is not None:
+                    _active_run_envelope.append(
+                        {
+                            "run": "fatal",
+                            "error": {
+                                "type": "usage_error",
+                                "message": parse_stderr.getvalue().strip() or "invocation was rejected",
+                            },
+                        }
+                    )
+            raise
+
+        # Before any input is required, same as --help: a caller checking
+        # compatibility should not have to point this at a real photo first.
+        if args.capabilities:
+            print(json.dumps(_build_capabilities(ap), indent=2, ensure_ascii=False))
+            return
+
+        # The run envelope opens as early as physically possible -- right
+        # after the output destination is known -- so every pre-flight
+        # refusal from here on can be observed by a caller that only watches
+        # this file, instead of looking like the run never started. Skipped
+        # under --dry-run (that flag promises no destination is touched --
+        # see the return below, and the envelope is a destination like any
+        # other) and under --generate-manifest, which is refused outright
+        # beside --output-file (_refuse_generate_manifest_write_flags): there
+        # is no results file for that combination to ever open, envelope or
+        # not, so opening one here would create a file the run's own
+        # contract says can never exist.
+        if not args.dry_run and not args.generate_manifest:
+            _open_run_envelope_if_fresh(args.output_file, batch_id=args.batch_id)
 
         if args.process_all_variants:
             logger.warning(
@@ -1427,6 +1881,7 @@ def main() -> None:
         # true", whose own refusal then said to drop it again.
         if args.generate_manifest:
             _refuse_generate_manifest_write_flags(args)
+            _refuse_generate_manifest_verbose_flags(args)
 
         # Before the write-bundle guards: an unwritable tag name is wrong however
         # the run is configured, and saying so is more use than "add --changeset
@@ -1437,6 +1892,12 @@ def main() -> None:
         changeset_requested = changeset_flag == "true"
         if exiftool_write == "true" and not changeset_requested:
             _exit_with_usage_error(*cli_messages.write_needs_changeset())
+
+        # -v's expansion is written back the same way -w's is, above: every
+        # downstream reader (here, _apply_common_cfg and, for manifest input,
+        # _apply_manifest_debug_settings) sees one resolved value instead of
+        # re-deriving the bundle.
+        args.debug_dump_llm_request, args.debug_dump_hydration = _resolve_verbose_bundle(args)
 
         out_path = args.output_file
         if out_path and not out_path.lower().endswith((".ndjson", ".json")):
@@ -1466,6 +1927,18 @@ def main() -> None:
         )
         _apply_common_cfg(cfg, args, manifest=loaded_manifest)
 
+        # An *explicit* --log-file attaches immediately: it names its own
+        # path, needs nothing from cfg.debug_dump_dir, and --generate-manifest
+        # does not refuse it (unlike the dump flags -- a log still means
+        # something without a model call, if only the "wrote manifest" line).
+        # -v's own *default* for this flag is different: it needs
+        # cfg.debug_dump_dir's final value, which for manifest input is not
+        # settled until _apply_manifest_debug_settings runs, below -- so that
+        # half waits and, as a consequence, only ever fires on the full
+        # analysis path, matching the dump flags -v also turns on.
+        if args.log_file:
+            _attach_log_file_handler(args.log_file)
+
         # GENERATE-MANIFEST: describe the input's grouping and stop, before any
         # provider client can be built.
         if args.generate_manifest:
@@ -1489,6 +1962,26 @@ def main() -> None:
             _apply_manifest_debug_settings(
                 cfg, args, loaded_manifest, out_path or resolved.path
             )
+
+        # -v's own default for --log-file, deferred to here (an explicit
+        # --log-file already attached above, before the generate-manifest
+        # branch): cfg.debug_dump_dir only holds its final value once
+        # _apply_manifest_debug_settings above has had its chance to replace
+        # _apply_common_cfg's plain default with a manifest-relative one, so
+        # reading it any earlier sends the default log file to the wrong
+        # directory whenever --output-file points somewhere else. A
+        # consequence worth naming: this means -v's log file, unlike an
+        # explicit one, is only ever attached on the full analysis path --
+        # this code is never reached for --generate-manifest, which returned
+        # above -- matching the dump flags -v also turns on, which
+        # --generate-manifest already refuses outright.
+        if args.verbose and not args.log_file:
+            # cfg.debug_dump_dir is always set by _apply_common_cfg above by
+            # this point; the fallback here only mirrors that function's own
+            # default rather than assuming the invariant across the call.
+            debug_dir = cfg.debug_dump_dir or os.path.join(os.getcwd(), "debug")
+            args.log_file = os.path.join(debug_dir, f"{args.batch_id or 'run'}.log")
+            _attach_log_file_handler(args.log_file)
 
         # Every destination is validated before the first truncating open:
         # those opens destroy the previous run's artifacts, so a later abort
@@ -1552,21 +2045,36 @@ def main() -> None:
         logger.info("%s", plan.render())
         if args.dry_run:
             # Nothing below this line has run, so no destination has been
-            # truncated and the previous run's artifacts are byte-identical.
+            # truncated and the previous run's artifacts are byte-identical --
+            # including the run envelope, which was never opened for exactly
+            # this reason (see the --dry-run guard above _open_run_envelope_if_fresh).
             return
 
-        ndjson_writer = None
-        if out_path and out_path.lower().endswith(".ndjson"):
-            # Stream one line per finished photo.
-            open(out_path, "w", encoding="utf-8").close()
+        # Every pre-flight check has now passed. A pre-existing destination
+        # was deliberately left untouched by _open_run_envelope_if_fresh
+        # above, to protect it from exactly the refusal this run did not hit;
+        # now that the run is committing to overwrite it anyway (a fresh
+        # destination already got this at parse time), it gets the same
+        # envelope.
+        _open_run_envelope_deferred(out_path, batch_id=args.batch_id)
+        if _active_run_envelope is not None:
+            _active_run_envelope.append({"run": "plan", "plan": plan.as_dict()}, batch_id=args.batch_id)
 
+        ndjson_writer = None
+        run_event_writer = None
+        if out_path and out_path.lower().endswith(".ndjson"):
+            # The envelope above already created (or, for a fresh
+            # destination, already truncated at parse time) this file -- no
+            # separate truncating open needed here.
             def ndjson_writer(line: str) -> None:
                 """Append one finished record to the NDJSON output."""
-                record = json.loads(line)
-                if args.batch_id:
-                    record["batch_id"] = args.batch_id
-                with open(out_path, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                _append_ndjson_record(out_path, json.loads(line), batch_id=args.batch_id)
+
+            def run_event_writer(event: dict) -> None:
+                """Append one run-level progress event to the NDJSON output."""
+                record = {"run": "progress"}
+                record.update(event)
+                _append_ndjson_record(out_path, record, batch_id=args.batch_id)
 
         changeset_writer = None
         if changeset_path:
@@ -1576,6 +2084,14 @@ def main() -> None:
                 """Append one proposed-write record to the changeset."""
                 with open(changeset_path, "a", encoding="utf-8") as handle:
                     handle.write(line + "\n")
+
+        should_cancel = None
+        if args.cancel_file:
+            cancel_path = args.cancel_file
+
+            def should_cancel() -> bool:
+                """True once the plugin's cancel-file sentinel appears."""
+                return os.path.exists(cancel_path)
 
         data = process_manifest_stream(
             manifest=manifest_doc,
@@ -1588,6 +2104,8 @@ def main() -> None:
             # Folder and single-photo input keep Phase A's failure contract;
             # manifest input keeps the plug-in's.
             strict_run_failures=resolved.kind != "manifest",
+            should_cancel=should_cancel,
+            run_event_writer=run_event_writer,
         )
         if not out_path:
             print(json.dumps(data, indent=2 if cfg.pretty_json else None, ensure_ascii=False))
@@ -1603,9 +2121,27 @@ def main() -> None:
             changeset_path=changeset_path,
             out_path=out_path,
             strict=resolved.kind != "manifest",
+            batch_id=args.batch_id,
         )
         if nothing_written:
             _exit_with_usage_error(*cli_messages.every_write_failed())
+
+        if _active_run_envelope is not None:
+            # The terminal record: a caller that only watches this file --
+            # never holding a process handle to poll, for a fire-and-forget
+            # subprocess launch -- can treat its presence as "the run is
+            # over" without guessing from the NDJSON line count, which used
+            # to be the only signal and breaks the moment per-file emission
+            # ever changes shape.
+            _active_run_envelope.append(
+                {
+                    "run": "cancelled" if data.get("cancelled") else "complete",
+                    "files_recorded": len(data.get("results") or {}),
+                    "groups_failed": data.get("groups_failed", 0),
+                    "files_unsent": data.get("files_unsent", 0),
+                },
+                batch_id=args.batch_id,
+            )
 
     except SystemExit:
         raise
@@ -1615,6 +2151,14 @@ def main() -> None:
         if error_type not in SELF_EXPLANATORY_ERROR_TYPES:
             err["traceback"] = traceback.format_exception(e.__class__, e, e.__traceback__)
         logger.error("%s", json.dumps(err, ensure_ascii=False))
+        if _active_run_envelope is not None:
+            # Reachable only once args.parse_args() has already succeeded (a
+            # failed parse raises SystemExit, caught above instead), so
+            # args.batch_id is always available here.
+            _active_run_envelope.append(
+                {"run": "fatal", "error": {"type": error_type, "message": str(e)}},
+                batch_id=args.batch_id,
+            )
         sys.exit(2)
 
 

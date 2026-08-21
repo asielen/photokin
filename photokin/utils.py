@@ -124,6 +124,7 @@ class Config:
     photo_context_text: str | None = None
     photo_context_file: str | None = None
     debug_dump_llm_request: bool = False
+    debug_dump_hydration: bool = False
     debug_dump_dir: str | None = None
     run_batch_id: str | None = None
     # Library-only: the CLI never sets this. Its ``--dry-run`` prints the plan

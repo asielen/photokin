@@ -315,10 +315,15 @@ class _CliTestCase(_GroupByTestCase):
         self._remove_cli_handlers()
 
     def _remove_cli_handlers(self) -> None:
-        """Detach every handler ``cli.main`` installed, from both logger scopes."""
+        """Detach every handler ``cli.main`` installed, from both logger scopes.
+
+        Both the stderr handler and the optional --log-file/-v one: leaving
+        the latter attached across tests holds an open file handle into a
+        temp directory a later test may already have cleaned up.
+        """
         for logger in (logging.getLogger("photokin"), logging.getLogger()):
             for handler in list(logger.handlers):
-                if handler.get_name() == cli._LOG_HANDLER_NAME:
+                if handler.get_name() in (cli._LOG_HANDLER_NAME, cli._LOG_FILE_HANDLER_NAME):
                     logger.removeHandler(handler)
                     handler.close()
 

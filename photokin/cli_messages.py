@@ -32,7 +32,7 @@ Code map:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 #: A problem line and the remedy line that follows it, in that order.
 UsageMessage = tuple[str, str]
@@ -331,6 +331,23 @@ def no_input_given() -> UsageMessage:
     return ("no input was given.", f"name one: {_INPUT_EXAMPLES}")
 
 
+def no_input_and_not_interactive() -> UsageMessage:
+    """No arguments at all, and stdin is not a terminal to prompt on.
+
+    The interactive prompt is a courtesy for a human at a keyboard; a
+    subprocess launcher (a plugin, a script, a scheduled task) with a mangled
+    or empty argument list is not that, and blocking it on a stdin read it
+    can never answer is worse than a usage error it can log and act on.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        "no input was given, and there is no terminal to prompt on.",
+        f"name one: {_INPUT_EXAMPLES}",
+    )
+
+
 def alias_is_not_a_directory(value: str) -> UsageMessage:
     """``--folder`` asserts a directory, and the path is not one.
 
@@ -424,6 +441,24 @@ def write_bundle_contradiction(flag: str, value: str) -> UsageMessage:
         f"`{flag} {value}` was also given.",
         "drop one; --changeset true alone records the proposed writes without "
         "applying them",
+    )
+
+
+def verbose_bundle_contradiction(flag: str, value: str) -> UsageMessage:
+    """``-v`` was given beside a flag that contradicts what it expands to.
+
+    Args:
+        flag: The contradicting flag, ``--debug-dump-llm-request`` or
+            ``--debug-dump-hydration``.
+        value: The value it carried.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        "`-v` means --debug-dump-llm-request true --debug-dump-hydration true, "
+        f"but `{flag} {value}` was also given.",
+        "drop one, or set the flag to true to agree with -v",
     )
 
 
@@ -938,6 +973,20 @@ class RunPlan:
     model: str
     dry_run: bool
     suggested_command: str | None = None
+
+    def as_dict(self) -> dict:
+        """Return every field as a plain JSON-serializable dict.
+
+        The machine-readable twin of :meth:`render`: a caller that watches
+        the results NDJSON rather than stderr (a fire-and-forget subprocess
+        launch, which cannot see stderr at all) gets the same plan, in the
+        ``run: plan`` envelope record, as one dict rather than a block of
+        prose it would otherwise have to parse back apart.
+
+        Returns:
+            Every field of this plan, by name.
+        """
+        return asdict(self)
 
     def render(self) -> str:
         """Return the whole summary block as one multi-line string.

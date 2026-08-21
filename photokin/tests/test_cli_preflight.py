@@ -160,10 +160,17 @@ class _CliTestCase(unittest.TestCase):
         self.package_logger.setLevel(self._original_level)
 
     def _remove_cli_handlers(self) -> None:
-        """Detach every handler this CLI installs, from both logger scopes."""
+        """Detach every handler this CLI installs, from both logger scopes.
+
+        Both the stderr handler and the optional --log-file/-v one: leaving
+        the latter attached across tests holds an open file handle into
+        whatever temp directory the test that created it already cleaned
+        up, which is a Windows PermissionError waiting for the next test
+        that touches the same path, not just a descriptor leak.
+        """
         for logger in (self.package_logger, self.root_logger):
             for handler in list(logger.handlers):
-                if handler.get_name() == cli._LOG_HANDLER_NAME:
+                if handler.get_name() in (cli._LOG_HANDLER_NAME, cli._LOG_FILE_HANDLER_NAME):
                     logger.removeHandler(handler)
                     handler.close()
 
@@ -394,7 +401,13 @@ class TestOutputFileForEveryInputType(_CliTestCase):
         self.assertIsNone(code)
         self.assertEqual(stdout, "", "a run with --output-file writes the file, not stdout")
         with open(out_path, "r", encoding="utf-8") as handle:
-            self.assertEqual(json.loads(handle.read()), {"path": "box3_025.jpg", "status": "ok"})
+            lines = [json.loads(line) for line in handle if line.strip()]
+        # Per-file records only: the file also carries the run envelope
+        # (run: start/plan/complete), which has no "path" of its own.
+        per_file = [record for record in lines if "path" in record]
+        self.assertEqual(
+            per_file, [{"path": "box3_025.jpg", "status": "ok", "schema_version": 2}]
+        )
 
     def test_single_photo_input_writes_an_aggregate_json_output_file(self) -> None:
         folder = self.make_folder()
@@ -1971,6 +1984,296 @@ class TestProviderResolution(_CliTestCase):
             )
         self.assertIsNone(code)
         self.assertTrue(os.path.exists(dest))
+
+
+class TestEmptyArgvRouting(_CliTestCase):
+    """Empty argv goes to the interactive prompt only when stdin is a terminal.
+
+    A headless launcher -- a plugin's subprocess call, a script, a scheduled
+    task -- whose argument list came out empty (a quoting bug that ate every
+    token, for one) is not a human at a keyboard. Routing it into a stdin
+    read it can never answer trades one silent hang for another; it should
+    get the same usage error any other malformed invocation gets.
+    """
+
+    def test_non_tty_stdin_is_a_usage_error_not_a_prompt(self):
+        with patch("sys.stdin.isatty", return_value=False), patch(
+            "photokin.cli._interactive_prompt"
+        ) as prompt:
+            code, _stdout, stderr = self.run_cli([])
+        prompt.assert_not_called()
+        self.assertEqual(code, 2)
+        self.assertIn("no terminal to prompt on", stderr)
+
+    def test_tty_stdin_still_prompts(self):
+        with patch("sys.stdin.isatty", return_value=True), patch(
+            "photokin.cli._interactive_prompt", side_effect=SystemExit(0)
+        ) as prompt:
+            code, _stdout, _stderr = self.run_cli([])
+        prompt.assert_called_once()
+        self.assertEqual(code, 0)
+
+
+def _ndjson_lines(path: str) -> list[dict]:
+    """Parse every line of an NDJSON file, in order."""
+    with open(path, "r", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _envelope_records(lines: list[dict]) -> list[dict]:
+    """The ``run: ...`` records among *lines*, in order."""
+    return [rec for rec in lines if "run" in rec]
+
+
+class TestRunEnvelope(_CliTestCase):
+    """Every pre-flight refusal, and every real run, is now visible in the
+    results NDJSON to a caller that never sees stderr -- a fire-and-forget
+    subprocess launch with its output discarded, which cannot tell "still
+    running" from "already failed" any other way.
+    """
+
+    def test_a_fresh_destination_gets_start_before_any_preflight_runs(self):
+        """Even a refusal that fires before the model would ever be reached
+        (an unwritable ExifTool tag, here) leaves run: start + run: fatal
+        behind -- not a file that simply never appeared."""
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        code, _stdout, _stderr = self.run_cli(
+            [folder, "--output-file", out_path, "--exiftool-fields", "XMP:dc:Description"]
+        )
+        self.assertEqual(code, 2)
+        records = _envelope_records(_ndjson_lines(out_path))
+        self.assertEqual(records[0]["run"], "start")
+        self.assertEqual(records[-1]["run"], "fatal")
+        self.assertIn("XMP:dc:Description", records[-1]["error"]["message"])
+
+    def test_a_successful_run_ends_with_plan_then_complete(self):
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        stream = Mock(
+            return_value={"results": {}, "errors": {}, "groups_failed": 0, "files_unsent": 0, "cancelled": False}
+        )
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, _stderr = self.run_cli([folder, "--output-file", out_path])
+        self.assertIsNone(code)
+        records = _envelope_records(_ndjson_lines(out_path))
+        self.assertEqual([r["run"] for r in records], ["start", "plan", "complete"])
+        self.assertEqual(records[-1]["files_recorded"], 0)
+        self.assertEqual(records[-1]["groups_failed"], 0)
+
+    def test_a_cancelled_run_ends_with_cancelled_not_complete(self):
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        stream = Mock(
+            return_value={"results": {}, "errors": {}, "groups_failed": 0, "files_unsent": 0, "cancelled": True}
+        )
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, _stderr = self.run_cli([folder, "--output-file", out_path])
+        self.assertIsNone(code)
+        records = _envelope_records(_ndjson_lines(out_path))
+        self.assertEqual(records[-1]["run"], "cancelled")
+
+    def test_every_record_is_schema_stamped(self):
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+
+        def _stream(*, ndjson_writer=None, **_ignored):
+            ndjson_writer(json.dumps({"path": "a.jpg", "status": "ok"}))
+            return {"results": {}, "errors": {}, "groups_failed": 0, "files_unsent": 0, "cancelled": False}
+
+        with patch("photokin.cli.process_manifest_stream", _stream):
+            self.run_cli([folder, "--output-file", out_path])
+        lines = _ndjson_lines(out_path)
+        self.assertTrue(lines, "expected at least one record")
+        self.assertTrue(all(rec.get("schema_version") == cli._NDJSON_SCHEMA_VERSION for rec in lines))
+
+    def test_batch_id_is_stamped_on_envelope_records_too(self):
+        """Not just per-file records -- --batch-id used to only reach those."""
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        stream = Mock(
+            return_value={"results": {}, "errors": {}, "groups_failed": 0, "files_unsent": 0, "cancelled": False}
+        )
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli([folder, "--output-file", out_path, "--batch-id", "b17"])
+        records = _envelope_records(_ndjson_lines(out_path))
+        self.assertTrue(all(rec.get("batch_id") == "b17" for rec in records))
+
+    def test_dry_run_never_touches_the_destination(self):
+        """--dry-run's existing promise: this includes the envelope, which is
+        a destination like any other -- not an exception to the rule."""
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        with open(out_path, "w", encoding="utf-8") as handle:
+            handle.write("PREVIOUS RUN\n")
+        stream = Mock()
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, _stderr = self.run_cli([folder, "--output-file", out_path, "--dry-run"])
+        self.assertIsNone(code)
+        stream.assert_not_called()
+        with open(out_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "PREVIOUS RUN\n")
+
+    def test_generate_manifest_beside_output_file_never_opens_an_envelope(self):
+        """--output-file is refused outright beside --generate-manifest --
+        the combination must not create the file it names before refusing it."""
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        manifest_path = os.path.join(folder, "manifest.json")
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--generate-manifest", manifest_path, "--output-file", out_path]
+        )
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_path))
+
+    def test_a_preexisting_destination_survives_a_refusal_untouched(self):
+        """The pinned contract from before the envelope existed, still true:
+        a refusal must not destroy what a previous run left behind."""
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        with open(out_path, "w", encoding="utf-8") as handle:
+            handle.write("PREVIOUS RUN\n")
+        code, _stdout, _stderr = self.run_cli(
+            [folder, "--output-file", out_path, "--exiftool-fields", "XMP:dc:Description"]
+        )
+        self.assertEqual(code, 2)
+        with open(out_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "PREVIOUS RUN\n")
+
+    def test_a_preexisting_destination_gets_the_envelope_once_the_run_commits(self):
+        """The other half of the deferred-open design: once every check has
+        passed, the run is about to overwrite this file anyway, so it gets
+        the same run: start a fresh destination got immediately."""
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "results.ndjson")
+        with open(out_path, "w", encoding="utf-8") as handle:
+            handle.write("PREVIOUS RUN\n")
+        stream = Mock(
+            return_value={"results": {}, "errors": {}, "groups_failed": 0, "files_unsent": 0, "cancelled": False}
+        )
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, _stderr = self.run_cli([folder, "--output-file", out_path])
+        self.assertIsNone(code)
+        records = _envelope_records(_ndjson_lines(out_path))
+        self.assertEqual([r["run"] for r in records], ["start", "plan", "complete"])
+
+
+class TestVerboseBundle(_CliTestCase):
+    """``-v`` bundles the two debug-dump flags, mirroring how ``-w`` bundles
+    ``--changeset``/``--exiftool-write``."""
+
+    def test_expands_to_both_dump_flags(self):
+        folder = self.make_folder()
+        # -v's own default --log-file lands under the cwd-relative
+        # --debug-dump-dir default for folder input; without isolating cwd
+        # this would leak a real debug/ directory into the repository.
+        self.enter_folder(folder)
+        stream = Mock(return_value={"results": {}, "errors": {}})
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli([folder, "-v"])
+        cfg = stream.call_args.kwargs["cfg"]
+        self.assertTrue(cfg.debug_dump_llm_request)
+        self.assertTrue(cfg.debug_dump_hydration)
+
+    def test_explicit_false_contradicts_v(self):
+        folder = self.make_folder()
+        code, _stdout, stderr = self.run_cli([folder, "-v", "--debug-dump-hydration", "false"])
+        self.assertEqual(code, 2)
+        self.assertIn("-v", stderr)
+        self.assertIn("--debug-dump-hydration false", stderr)
+
+    def test_refused_beside_generate_manifest(self):
+        folder = self.make_folder()
+        manifest_path = os.path.join(folder, "manifest.json")
+        code, _stdout, stderr = self.run_cli([folder, "--generate-manifest", manifest_path, "-v"])
+        self.assertEqual(code, 2)
+        self.assertIn("-v", stderr)
+
+    def test_v_defaults_the_log_file_beside_the_other_dumps(self):
+        """Folder input's own --debug-dump-dir default is cwd-relative (a
+        pre-existing behavior, not something -v changes) -- enter_folder
+        makes that cwd the scratch folder instead of wherever pytest runs
+        from, which would otherwise leak a real debug/ directory into the
+        repository on every test run."""
+        folder = self.make_folder()
+        self.enter_folder(folder)
+        stream = Mock(return_value={"results": {}, "errors": {}})
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli([folder, "-v", "--batch-id", "b1"])
+        log_path = os.path.join(folder, "debug", "b1.log")
+        self.assertTrue(os.path.isfile(log_path), f"expected a log file at {log_path}")
+
+    def test_explicit_log_file_is_not_overridden_by_v(self):
+        folder = self.make_folder()
+        custom_log = os.path.join(folder, "mine.log")
+        stream = Mock(return_value={"results": {}, "errors": {}})
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli([folder, "-v", "--log-file", custom_log])
+        self.assertTrue(os.path.isfile(custom_log))
+
+    def test_explicit_log_file_works_without_v_too(self):
+        folder = self.make_folder()
+        custom_log = os.path.join(folder, "mine.log")
+        stream = Mock(return_value={"results": {}, "errors": {}})
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli([folder, "--log-file", custom_log])
+        self.assertTrue(os.path.isfile(custom_log))
+
+    def test_explicit_log_file_creates_its_parent_directory(self):
+        """Regression: logging.FileHandler does not do this on its own."""
+        folder = self.make_folder()
+        nested_log = os.path.join(folder, "nested", "deep", "mine.log")
+        stream = Mock(return_value={"results": {}, "errors": {}})
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, _stderr = self.run_cli([folder, "--log-file", nested_log])
+        self.assertIsNone(code)
+        self.assertTrue(os.path.isfile(nested_log))
+
+
+class TestCancelFile(_CliTestCase):
+    """``--cancel-file`` is threaded through to ``process_manifest_stream`` as
+    ``should_cancel``, and its file existence is the only thing that trips it."""
+
+    def test_cancel_file_becomes_a_should_cancel_callable(self):
+        folder = self.make_folder()
+        cancel_path = os.path.join(folder, "CANCEL")
+        stream = Mock(return_value={"results": {}, "errors": {}})
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli([folder, "--cancel-file", cancel_path])
+        should_cancel = stream.call_args.kwargs["should_cancel"]
+        self.assertFalse(should_cancel())
+        with open(cancel_path, "w", encoding="utf-8") as handle:
+            handle.write("")
+        self.assertTrue(should_cancel())
+
+    def test_no_flag_means_no_cancellation_support(self):
+        folder = self.make_folder()
+        stream = Mock(return_value={"results": {}, "errors": {}})
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli([folder])
+        self.assertIsNone(stream.call_args.kwargs["should_cancel"])
+
+
+class TestCapabilities(_CliTestCase):
+    """``--capabilities`` answers a compatibility check before any input is
+    required, the same way ``--help`` does."""
+
+    def test_prints_json_and_exits_without_requiring_input(self):
+        code, stdout, _stderr = self.run_cli(["--capabilities"])
+        self.assertIsNone(code)
+        payload = json.loads(stdout)
+        self.assertIn("version", payload)
+        self.assertEqual(payload["ndjson_schema_version"], cli._NDJSON_SCHEMA_VERSION)
+        self.assertIn("--verbose", payload["flags"])
+        self.assertIn("--cancel-file", payload["flags"])
+        self.assertEqual(payload["canonical_tags"]["caption"], "XMP-dc:Description")
+        self.assertIn("anthropic", payload["providers"])
+
+    def test_does_not_call_the_model(self):
+        stream = Mock()
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli(["--capabilities"])
+        stream.assert_not_called()
 
 
 if __name__ == "__main__":

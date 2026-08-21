@@ -705,3 +705,89 @@ python -m pytest
 ```
 
 Runs `photokin/tests/` and `tests/`, which `pyproject.toml` sets as the test paths. Python 3.11+.
+
+## Integrating photokin as a subprocess
+
+Everything above is for a human at a terminal. This section is for the other kind of caller: a plugin or script that launches `photokin` (or `python -m photokin.cli`) as a subprocess, cannot read a return value, and often cannot even read stderr — the Lightroom plugin this was built for launches fire-and-forget (`start /B` on Windows, output discarded) and learns what happened only from the files photokin wrote. Everything here exists to make that mode of use safe and observable.
+
+### The problem this solves
+
+Without what follows, a launcher watching only `--output-file` has one signal: did the file appear, and does it have as many lines as the manifest has items. That answers "it worked" but not "it is still running" versus "it already failed" versus "it will never appear" — an unknown flag, a bad manifest, a missing provider key, and a dead ExifTool binary all look identical: no file, forever. The pieces below close that gap.
+
+### The run envelope
+
+Whenever `--output-file` names a `.ndjson` destination, the file carries `run: ...` records interleaved with the normal per-file `path`/`status` records — the same file, not a second one, so a caller tailing it sees everything in one stream:
+
+| `run` value | When | Carries |
+|---|---|---|
+| `start` | As early as the destination is known — before almost every pre-flight check, including ones that used to leave no trace at all (an unknown flag, an unwritable ExifTool tag, a missing or ambiguous provider, a missing ExifTool binary, a malformed manifest) | Nothing beyond the envelope fields below |
+| `plan` | Once every pre-flight check has passed, right after the plan summary is logged | `plan`: the same fields as the stderr plan summary, as a dict (`input_kind`, `file_count`, `provider`, `model`, ... — see `RunPlan` in `cli_messages.py`) |
+| `progress` | Once per group, right before it starts | `group`, `index`, `of` — a liveness signal for a group whose single model call may run for minutes with nothing else on the stream to show it hasn't died |
+| `exiftool_apply` | After `-w` applies the changeset, if one was written | `summary`: files seen/written, tags written, errors, warnings |
+| `complete` | The run finished (whether or not every group succeeded — "every group failed" is not a fatal error in manifest mode; see [When calls fail](#when-calls-fail)) | `files_recorded`, `groups_failed`, `files_unsent` |
+| `cancelled` | The run stopped early via `--cancel-file` (below) | Same three fields, counting only what completed before the stop |
+| `fatal` | Any refusal or unrecoverable error, at any point after `start` | `error`: `{"type": ..., "message": ...}` |
+
+A run always ends with exactly one of `complete`, `cancelled`, or `fatal` — a caller can wait for any of the three as the definitive "done" signal, rather than inferring completion from the line count, which breaks the moment per-file emission ever changes shape (this happened once already, before the envelope existed).
+
+Two destinations are deliberately exempt. `--dry-run` never opens the envelope — that flag's whole point is that nothing is touched, and the envelope is a destination like any other. `--generate-manifest` beside `--output-file` is refused outright before either can be written (see [All flags](#output)), so there is never a results file for it to open.
+
+One safety property carries over unchanged: a **pre-existing** `--output-file` is left completely untouched by a refusal. The envelope opens immediately only for a destination that does not exist yet; for one that does, it opens only once every check has passed and the run is committing to overwrite it anyway — at that point it gets the same `start`/`plan` records a fresh destination got immediately.
+
+Every record — envelope and per-file alike — carries `schema_version` (currently `2`) and, when `--batch-id` was given, `batch_id`. `schema_version` bumps whenever a record's shape changes in a way a consumer could care about; see `--capabilities` below for a caller that wants to check compatibility rather than discover it the hard way, the way `photokin/README.md`'s `## Providers` section describes an older mismatch doing.
+
+Per-file error payloads also carry two optional fields beyond the `type`/`message` documented under [When calls fail](#when-calls-fail): `provider_message` (the provider's own error text, extracted from the SDK's structured response rather than read off a Python exception's `str()`, which for these SDKs is often the whole body rendered as a dict repr) and `retry_after` (seconds, when the provider's response included one — reliably available for OpenAI and Anthropic, not for Gemini).
+
+### Cancelling a run in progress: `--cancel-file PATH`
+
+Photokin polls for this path once before each group starts (never mid-group — a group is one model call under the default `object` grouping, so there is no narrower point to check). Once the file exists, the run stops cleanly: whatever completed is kept, `-w`'s ExifTool apply still runs over it, the envelope closes with `run: cancelled` instead of `run: complete`, and the process exits 0. Nothing is spent on groups that hadn't started yet.
+
+```bash
+photokin batch.json -rw --output-file results.ndjson --cancel-file results.ndjson.CANCEL
+# from another process, at any point:
+touch results.ndjson.CANCEL   # or: New-Item on Windows
+```
+
+### Debugging a run: `-v` and its parts
+
+`-v` / `--verbose` bundles three things — the same relationship `-w` has to `--changeset`/`--exiftool-write` — so a caller that wants everything a run could leave behind for debugging asks for it with one flag instead of three:
+
+| Flag | On its own | Under `-v` |
+|---|---|---|
+| `--debug-dump-llm-request {true,false}` | Write the full provider request payload (assembled prompt, images) to disk before each model call | `true` |
+| `--debug-dump-hydration {true,false}` | Write each group's assembled metadata to disk before it is merged into a prompt — what `-r` read plus whatever the manifest supplied, one step upstream of the request dump | `true` |
+| `--log-file PATH` | Duplicate the run's log output into this file, in addition to stderr | Defaults to `<debug-dump-dir>/<batch-id or "run">.log` if not given explicitly |
+
+All three dumps land in `--debug-dump-dir` (default `./debug`, or `<manifest/output-dir>/debug` for manifest input), one folder per run holding everything: the LLM requests, the pre-prompt metadata, and now the log. An explicit value for any of the three individual flags always wins over what `-v` would otherwise set, and an explicit value that contradicts `-v` (`-v --debug-dump-hydration false`) is refused rather than silently picked between, the same as `-w` beside an explicit `--changeset false`. Like the write bundle, none of the three do anything useful without a model call, so all three are refused beside `--generate-manifest` — except a truly *explicit* `--log-file`, which still attaches, since even a `--generate-manifest` run has something worth logging.
+
+### Checking compatibility: `--capabilities`
+
+```bash
+photokin --capabilities
+```
+
+Prints this build's contract as JSON and exits, before any input is required — the same way asking for help does:
+
+```json
+{
+  "version": "0.3.0",
+  "ndjson_schema_version": 2,
+  "changeset_schema_version": 1,
+  "canonical_tags": {
+    "ai_caption": "EXIF:UserComment",
+    "caption": "XMP-dc:Description",
+    "keywords": "XMP-dc:Subject",
+    "title": "XMP-dc:Title",
+    "date_guess": "EXIF:DateTimeOriginal",
+    "location_guess": {"country": "IPTC:Country-PrimaryLocationName", "state": "IPTC:Province-State", "city": "IPTC:City", "sublocation": "IPTC:Sub-location"}
+  },
+  "providers": ["openai", "anthropic", "gemini", "openrouter"],
+  "flags": ["--back", "--batch-id", "..."]
+}
+```
+
+Meant to replace an install-time probe (importing some internal symbol and trusting a pip version pin to mean everything else still matches) with a real, versioned answer a launcher can gate a run on instead of discovering a mismatch mid-batch. `canonical_tags` in particular is worth checking before a batch: an earlier photokin release wrote the wrong ExifTool tag spelling entirely (`XMP:dc:Description` instead of the writable `XMP-dc:Description`), which silently dropped every caption it tried to write rather than failing — a `--capabilities` check catches that class of mismatch instead of losing data quietly. `flags` is read live off the argument parser, so it can never drift from what the installed build actually accepts.
+
+### A clean refusal for a headless launcher: empty or malformed argv
+
+Running `photokin` with no arguments at all normally prompts on stdin — a courtesy for a human at a keyboard. A subprocess launcher has no keyboard, so `photokin` checks `sys.stdin.isatty()` first: with no terminal attached, an empty argument list is a usage error (exit 2) instead of a stdin read that would just hang. Separately, an argument list argparse cannot parse at all (an unknown flag, most often the result of a quoting bug upstream) still exits 2 with nothing on `--output-file` to read — argparse rejects the whole invocation before this module ever learns what the destination was meant to be — but a best-effort scan for `--output-file` in the raw arguments means even this earliest failure usually still lands a `run: start` + `run: fatal` pair in the results file, rather than leaving no trace anywhere a launcher can see.

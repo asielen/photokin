@@ -45,7 +45,10 @@ class TestHydratorInjection(unittest.TestCase):
         manifest = {"items": []}
         cfg = utils.Config(dry_run=True)
         result = core.process_manifest_stream(manifest=manifest, cfg=cfg)
-        self.assertEqual(result, {"results": {}, "errors": {}})
+        self.assertEqual(
+            result,
+            {"results": {}, "errors": {}, "groups_failed": 0, "files_unsent": 0, "cancelled": False},
+        )
 
 
 class TestHydrateItemMetadata(unittest.TestCase):
