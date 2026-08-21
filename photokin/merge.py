@@ -12,7 +12,13 @@ record and a report of what it overrode/unioned, so callers can log decisions.
 
 Key domain rules encoded here:
 - Keywords union (original first), case-insensitive de-dup, spelling preserved.
-- Original title/caption/date/location win when present.
+- Original caption/location win when present; an original title wins only where
+  the model returned none, since a title the model returns was read off the
+  print while a file's own title is as likely to be scanner boilerplate.
+- The original date is evidence, not truth: it drives the correction heuristic
+  and fills ``dateTimeOriginal`` when that heuristic declines, but it no longer
+  overwrites the model's ``date_guess`` at confidence 1.0 -- on a scan it is the
+  scan date, not the capture date.
 - A reviewed ``DATE:`` keyword is a human "hands off the date" signal that
   suppresses the date-correction heuristic.
 
@@ -175,10 +181,27 @@ def _standardize_location_guess(loc_guess: Dict[str, Any] | None) -> Dict[str, A
 
 
 def merge_record_with_original(
-    record: Dict[str, Any], original: Dict[str, Any], config: Config
+    record: Dict[str, Any],
+    original: Dict[str, Any],
+    config: Config,
+    *,
+    original_title_from_file: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Merge an AI-generated metadata record with the original metadata.
+
+    Args:
+        record: The model's record for this file.
+        original: The file's original metadata, already merged from its own
+            source and its group's.
+        config: Run configuration supplying the date-override thresholds.
+        original_title_from_file: Whether ``original["title"]`` may have been
+            read out of the file's own tags rather than supplied by the caller.
+            It is the whole of the difference in the title rule below; see that
+            rule for why. Nothing here can work it out, so it arrives as a claim
+            the caller made: ``-r`` sets it and no other CLI flag does, and an
+            embedder driving ``process_manifest_stream`` sets it only if its own
+            hydrator read a file. Merely running a hydrator is not the claim.
 
     Returns:
         (merged_record, merge_report)
@@ -186,10 +209,15 @@ def merge_record_with_original(
     High-level behavior:
     - Keywords: union original + AI (original first, de-duplicated).
     - Caption: keep original caption as "caption_original" if present.
-    - Title: prefer original title when it exists.
-    - Date/location:
-        * If original has an explicit "date" or "location", they override AI.
-        * Otherwise, we consider AI's date_guess/location_guess as proposals.
+    - Title: the original wins, except that a title which may have come out of
+      the file itself does not outrank one the model transcribed off the object.
+    - Location: an explicit original "location" overrides AI.
+    - Date: an explicit original "date" is recorded as "date_original" and fills
+      "dateTimeOriginal" when nothing else has, but it never overwrites the
+      model's "date_guess". It is the file's EXIF:DateTimeOriginal, which on a
+      scan is the day the print was scanned; treating that as the capture date
+      at confidence 1.0 destroyed the inference the model was paid for. What
+      reaches the file is unchanged: the fix-up below still decides that.
     - DateTimeOriginal fix-up (config-driven):
         * If there is NO existing DATE: keyword,
         * and AI has a high-confidence date_guess,
@@ -321,10 +349,27 @@ def merge_record_with_original(
         if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
             logger.warning("Skipping date override heuristics: %s", exc)
 
-    # --- Title: prefer original -------------------------------------------
+    # --- Title: the original wins, unless it may be the file's own ---------
+    #
+    # The model returns a title only when one is legibly printed on the object
+    # ("Include a title only if clearly indicated in the text on the image",
+    # image_rules.txt), so a title it returns was read off the print. A title
+    # -r read out of XMP:Title is as likely to be scanner boilerplate --
+    # "Scanned Image", the bare filename -- as a human's words, and boilerplate
+    # that outranked a transcription would make reading the file strictly worse
+    # than not reading it. So under -r the original yields to a model title.
+    #
+    # A title the *caller* supplied is different evidence and keeps its old
+    # precedence outright: a manifest title is one a human typed into Lightroom,
+    # a title an embedder's own hydrator pulled out of a genealogy database is
+    # the same thing by a longer route, and this branch is the only thing
+    # standing between either of them and the model's transcription overwriting
+    # it in the file. Narrowing the rule for those too would lose human data to
+    # fix a problem it does not have, which is why the two are separated rather
+    # than decided once.
     t = (original.get("title") or "").strip()
-    if t:
-        if t != (merged.get("title") or ""):
+    if t and not (original_title_from_file and (merged.get("title") or "").strip()):
+        if t != (merged.get("title") or "").strip():
             merged["title"] = t
             report["overrides"].append("title")
 
@@ -336,15 +381,22 @@ def merge_record_with_original(
         # Lightroom caption can be inspected here.
         merged["caption_original"] = c
 
-    # --- Date: prefer explicit original "date" field if present -----------
+    # --- Date: the original is evidence, not truth -------------------------
     #
-    # If the original metadata has an explicit "date" field (e.g. from EXIF
-    # Date or a manual tag), we treat that as fully authoritative and
-    # overwrite date_guess entirely.
+    # An original "date" is the file's EXIF:DateTimeOriginal, and on a flatbed
+    # scan that is the day the print was scanned, not the day the photograph
+    # was taken. Stamping it over date_guess at confidence 1.0 asserted the
+    # scan date as the capture date and discarded "circa 1952, confidence 0.7"
+    # with it. The model's inference now survives in the record; the original
+    # keeps every job it had in deciding what reaches the FILE. It has already
+    # driven the gap heuristic above, and it fills dateTimeOriginal here when
+    # that heuristic declined -- which is what stops an unendorsed inference
+    # from being proposed against a date the file already holds.
     d = (original.get("date") or "").strip()
     if d:
-        merged["date_guess"] = {"iso": d, "confidence": 1.0}
-        report["overrides"].append("date_guess")
+        merged["date_original"] = d
+        if not str(merged.get("dateTimeOriginal") or "").strip():
+            merged["dateTimeOriginal"] = d
 
     # --- Location: prefer original when present ---------------------------
     loc_parts = _structured_location_from_original(original)

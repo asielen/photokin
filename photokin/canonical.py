@@ -28,9 +28,31 @@ from typing import Any, Dict, Tuple
 
 from .utils import Config
 
-CANONICAL_KEYWORDS_TAG = "XMP:dc:Subject"
-CANONICAL_TITLE_TAG = "XMP:dc:Title"
-CANONICAL_DESCRIPTION_TAG = "XMP:dc:Description"
+# Spelled ``XMP-dc:`` (hyphen), not ``XMP:dc:`` (second colon) and not bare
+# ``XMP:``. The three spellings are not interchangeable to ExifTool:
+#
+# - ``XMP:dc:Subject``  is rejected outright -- "Sorry, XMP:dc:Subject doesn't
+#   exist or isn't writable", exit 1, nothing written. ExifTool's tag syntax is
+#   ``FAMILY:TAG`` with at most one separator; the second colon is not a
+#   namespace qualifier it understands. This is what these three constants said
+#   until the writability test below was added, which is why ``-w`` could not
+#   put a keyword, title or caption into a file at all.
+# - ``XMP:Description``  works, but names the family-0 group and leaves the
+#   namespace implicit; it would resolve to a different tag if a non-dc
+#   namespace ever defined the same leaf name.
+# - ``XMP-dc:Description``  works and is unambiguous. It is also the spelling
+#   ExifTool itself prints back under ``-G1``, so the constant here matches what
+#   a user sees when they inspect the file they just wrote.
+#
+# The read path (``exiftool/manifest.py``'s DEFAULT_EXIFTOOL_FIELDS) asks for
+# the bare ``XMP:Description`` form deliberately -- as a *read* target it is the
+# tolerant spelling -- and the two address the same underlying tag, so a ``-r``
+# run sees what a ``-w`` run wrote. There is a test that holds this line:
+# ``test_canonical_tags_are_writable.py`` drives the real ExifTool binary
+# against a real image for every tag defined in this module.
+CANONICAL_KEYWORDS_TAG = "XMP-dc:Subject"
+CANONICAL_TITLE_TAG = "XMP-dc:Title"
+CANONICAL_DESCRIPTION_TAG = "XMP-dc:Description"
 CANONICAL_USER_COMMENT_TAG = "EXIF:UserComment"
 CANONICAL_DATE_TAG = "EXIF:DateTimeOriginal"
 

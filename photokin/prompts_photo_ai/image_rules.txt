@@ -102,6 +102,9 @@ SHORT CODES & WRITING ON IMAGE
 TITLE
 • Include a title only if clearly indicated in the text on the image (front or back)
 • If unclear, set title to null
+• A title in the provided metadata may be scanner boilerplate ("Scanned Image",
+  the bare filename) rather than a human's words. It is not text on the image,
+  so it does not satisfy the rule above.
 
 LOCATION GUESS
 • Goal: infer location helpfully but conservatively. Prefer explicit text
@@ -144,6 +147,12 @@ When available, prefer evidence in this order:
 3) Filename-embedded dates (e.g., PXL_YYYYMMDD_..., IMG_YYYYMMDD_..., YYYY-MM-DD in name/path)
 4) Visual style clues (clothing, cars, film type) — use broader dates and lower confidence
 5) Known event/landmark time bounds (rare, only if clearly supportable by the photo)
+
+Evidence #2 counts as a capture date only for a photo that is genuinely a
+modern digital original. On a scanned print, slide, negative, or paper
+document, a provided dateTimeOriginal is the DIGITIZATION date — the day the
+object was scanned — not the day the photograph was taken. Date such an item
+from #1, #3 and #4, and never report the scan year as the capture year.
 
 If a written date is partial or occasion-based (for example "Xmas 1944"),
 do not convert it to an exact calendar day unless an explicit capture

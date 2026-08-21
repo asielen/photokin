@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from photokin import core, utils
 from photokin.exiftool import ExiftoolConfig
-from photokin.exiftool.hydrate import hydrate_user_comments, make_manifest_hydrator
+from photokin.exiftool.hydrate import hydrate_item_metadata, make_manifest_hydrator
 
 
 class TestHydratorInjection(unittest.TestCase):
@@ -48,7 +48,7 @@ class TestHydratorInjection(unittest.TestCase):
         self.assertEqual(result, {"results": {}, "errors": {}})
 
 
-class TestHydrateUserComments(unittest.TestCase):
+class TestHydrateItemMetadata(unittest.TestCase):
     def _items(self):
         return [
             {"path": "/photos/a.jpg", "metadata": {"userComment": ""}},
@@ -67,16 +67,19 @@ class TestHydrateUserComments(unittest.TestCase):
             "photokin.exiftool.hydrate.resolve_exiftool_path",
             return_value="/fake/exiftool",
         ), patch("photokin.exiftool.manifest.run_exiftool_json", return_value=records) as run_mock:
-            hydrate_user_comments(items, ExiftoolConfig())
+            hydrate_item_metadata(items, ExiftoolConfig())
 
         self.assertEqual(items[0]["metadata"]["userComment"], "From file A")
         self.assertEqual(items[1]["metadata"]["userComment"], "Keep me")
         self.assertEqual(items[2]["metadata"]["userComment"], "From file C")
-        # Only the items missing a userComment are queried. ExifTool is given
-        # normalize_path() output, which is platform-dependent, so normalize the
-        # expected paths the same way.
+        # C3 reads five tags rather than one, so an item holding a userComment
+        # is still queried for the other four; only an item holding all five is
+        # skipped outright. ExifTool is given normalize_path() output, which is
+        # platform-dependent, so normalize the expected paths the same way.
         queried = run_mock.call_args.kwargs["files"]
-        expected = sorted(utils.normalize_path(p) for p in ("/photos/a.jpg", "/photos/c.jpg"))
+        expected = sorted(
+            utils.normalize_path(p) for p in ("/photos/a.jpg", "/photos/b.jpg", "/photos/c.jpg")
+        )
         self.assertEqual(sorted(queried), expected)
 
     def test_noop_when_binary_missing(self):
@@ -85,7 +88,7 @@ class TestHydrateUserComments(unittest.TestCase):
             "photokin.exiftool.hydrate.resolve_exiftool_path",
             side_effect=FileNotFoundError("not found"),
         ), self.assertLogs("photokin.exiftool.hydrate", level="WARNING") as logs:
-            hydrate_user_comments(items, ExiftoolConfig())
+            hydrate_item_metadata(items, ExiftoolConfig())
         self.assertEqual(items[0]["metadata"]["userComment"], "")
         self.assertIn("not found", logs.output[0])
 
@@ -98,7 +101,7 @@ class TestHydrateUserComments(unittest.TestCase):
             "photokin.exiftool.manifest.run_exiftool_json",
             side_effect=RuntimeError("boom"),
         ), self.assertLogs("photokin.exiftool.hydrate", level="WARNING") as logs:
-            hydrate_user_comments(items, ExiftoolConfig())
+            hydrate_item_metadata(items, ExiftoolConfig())
         self.assertEqual(items[0]["metadata"]["userComment"], "")
         self.assertIn("boom", logs.output[0])
 

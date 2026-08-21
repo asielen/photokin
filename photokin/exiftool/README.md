@@ -4,8 +4,16 @@ ExifTool integration on top of the core library. It exists because the
 Lightroom SDK cannot reliably read or write some fields — most importantly
 `EXIF:UserComment` — so the pipeline uses ExifTool for exactly those gaps:
 
-- **Read (hydration)**: before analysis, fill manifest items whose
-  `userComment` is missing by reading `EXIF:UserComment` from the files.
+- **Read (hydration)**: before analysis, and only when the CLI was given `-r`,
+  fill each item's metadata from the file itself — `EXIF:DateTimeOriginal`,
+  `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject`, the set
+  `DEFAULT_EXIFTOOL_FIELDS` declares — for every input type, filling only the
+  keys the item does not already carry. `XMP:Subject` is read because
+  `merge.py`'s date-correction heuristic treats a `DATE:` keyword as a human
+  "hands off the date" signal, and reading the date without its interlock would
+  re-date a print an archivist has already dated by hand. A file list too long
+  for one command line is split across several ExifTool invocations rather than
+  failing as a unit.
 - **Write (apply)**: after analysis, write selected changeset fields directly
   into the files (or sidecars), so they survive even where Lightroom can't
   write them.
@@ -21,9 +29,11 @@ layer entirely.
 - `fetch.py` — `ensure_exiftool()`: download the official ExifTool on demand
   (Windows) into the cache dir; run via `python -m photokin.exiftool.fetch`.
 - `manifest.py` — standalone ExifTool→manifest reader (details below).
-- `hydrate.py` — `hydrate_user_comments(items, cfg)` and
+- `hydrate.py` — `hydrate_item_metadata(items, cfg)` and
   `make_manifest_hydrator(cfg)` (returns a callable for
-  `core.process_manifest_stream(metadata_hydrator=...)`).
+  `core.process_manifest_stream(metadata_hydrator=...)`). The tag-to-key pairs
+  it fills are derived from `manifest.DEFAULT_EXIFTOOL_FIELDS` and
+  `manifest._TAG_TO_MANIFEST_KEY` rather than restated.
 - `apply.py` — `apply_changeset(changeset_path, cfg, ...)` and the CLI.
 
 ## Configuration
@@ -80,13 +90,22 @@ system `PATH`.
 
 ## Hydration semantics
 
-`hydrate_user_comments` is best-effort and conservative:
+`hydrate_item_metadata` is best-effort and conservative:
 
-- only queries files whose manifest metadata lacks a non-empty `userComment`;
-- never overwrites a value Lightroom provided;
-- non-fatal if ExifTool can't be found or fails to run: logs a `WARNING` via
-  the standard `logging` module and returns without raising, rather than
-  breaking the manifest pipeline.
+- only queries files whose item metadata lacks at least one of the five keys,
+  and fills only the keys that are actually missing or empty;
+- never overwrites a value Lightroom or `--meta` provided;
+- stores values verbatim — `dateTimeOriginal` keeps ExifTool's colon form,
+  which is what the merge and canonical layers both read;
+- creates an item's `metadata` object only when something was really read, so a
+  file with no metadata leaves its item byte-identical;
+- skips an item naming a `metadata_path`, since an inline dict would shadow the
+  sidecar the caller pointed at;
+- non-fatal if ExifTool fails to run: logs a `WARNING` via the standard
+  `logging` module and returns without raising, rather than breaking the
+  pipeline. The *request* is not best-effort — the CLI resolves the binary
+  before the first model call and exits 2 when `-r` cannot be honored, so this
+  path is for a mid-run failure on a file rather than for a missing install.
 
 ## Apply semantics
 

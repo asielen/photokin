@@ -75,7 +75,7 @@ ai_caption REQUIREMENTS
 • Do NOT invent an analysis date in the header. The calling program may inject a date later.
 • Must end with:
   "Inferred date: <date_guess.iso> (confidence <0.xx>; evidence: <brief evidence list>)."
-  Evidence must be explicit (handwritten date, provided EXIF, filename timestamp, etc.). Avoid arbitrary years.
+  Evidence must be explicit (handwritten date, provided EXIF from a digital original, filename timestamp, etc.). Avoid arbitrary years.
 • If evidence is weak, the inferred date may use a decade, broad range,
   or "unknown", with low confidence. Do not force a specific year,
   month, or day.

@@ -85,7 +85,8 @@ approximate or categorical rather than precise.
 
 For `location_guess` and `date_guess`:
 1. Explicit written text on the item
-2. PHOTO_CONTEXT / explicit supplied metadata (GPS, IPTC, EXIF dates)
+2. PHOTO_CONTEXT / explicit supplied metadata (GPS, IPTC, and EXIF dates
+   from a digital original)
 3. Recognizable landmarks or strong visual evidence
 4. Broad visual style clues
 

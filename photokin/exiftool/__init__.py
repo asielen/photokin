@@ -7,13 +7,13 @@ discovery. See README.md in this directory.
 
 from .apply import apply_changeset
 from .config import ExiftoolConfig
-from .hydrate import hydrate_user_comments, make_manifest_hydrator
+from .hydrate import hydrate_item_metadata, make_manifest_hydrator
 from .locate import resolve_exiftool_path
 
 __all__ = [
     "ExiftoolConfig",
     "apply_changeset",
-    "hydrate_user_comments",
+    "hydrate_item_metadata",
     "make_manifest_hydrator",
     "resolve_exiftool_path",
 ]

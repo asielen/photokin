@@ -39,6 +39,7 @@ import io
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -48,7 +49,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, ClassVar
 from unittest.mock import patch
 
-from photokin import cli, utils
+from photokin import cli, cli_messages, utils
+from photokin.exiftool.manifest import DEFAULT_EXIFTOOL_FIELDS
 
 #: Blanked rather than removed: each of these is read through a falsy-default
 #: lookup, so an empty value pins the documented default whatever the developer's
@@ -525,45 +527,65 @@ class TestAliasesAndPositionalsAgree(_CliTestCase):
     """``--folder``/``--manifest`` assert a type where a positional infers one.
 
     They are permanent aliases rather than a deprecation, so the contract is that
-    the run either way is the same run. The one visible difference is the
-    detection line, which only a positional earns -- an alias inferred nothing,
-    so it has nothing to report.
+    the run either way is the same run. Exactly two lines may differ, and both
+    differ for the same reason -- they quote the invocation rather than describe
+    the run. The detection line is one: only a positional earns it, because an
+    alias inferred nothing and so has nothing to report. The plan's advisory note
+    is the other: it hands back the command that was typed with ``-rw`` added, so
+    a caller who asserted the type keeps asserting it. Every row of the plan that
+    describes the *run* is still compared line for line, as are the stream's
+    arguments, which is where "the same run" is really pinned.
     """
 
-    def _stream_kwargs(self, argv: list[str]) -> tuple[dict[str, Any], list[str]]:
-        """Run *argv* and return the stream's arguments plus the plan block.
+    def _stream_kwargs(self, argv: list[str]) -> tuple[dict[str, Any], list[str], list[str]]:
+        """Run *argv* and return the stream's arguments and the plan, split in two.
 
         Args:
             argv: Arguments after the program name.
 
         Returns:
-            ``(keyword arguments minus the hydrator, plan summary lines)``.
+            ``(keyword arguments minus the hydrator, the rows describing the run,
+            the advisory note's lines)``.
         """
         stream = _StreamSpy()
         with patch("photokin.cli.process_manifest_stream", stream):
             code, _stdout, stderr = self.run_cli(argv)
         self.assertIsNone(code, stderr)
-        return stream.kwargs_without_hydrator(), self.plan_block(stderr)
+        block = self.plan_block(stderr)
+        start = next((i for i, line in enumerate(block) if line.startswith("  note ")), len(block))
+        return stream.kwargs_without_hydrator(), block[:start], block[start:]
 
     def test_a_folder_runs_identically_through_both_spellings(self) -> None:
         folder = self.make_folder("box3_025.jpg", "box3_025-back.jpg")
 
-        positional, positional_plan = self._stream_kwargs([folder])
-        alias, alias_plan = self._stream_kwargs(["--folder", folder])
+        positional, positional_plan, positional_note = self._stream_kwargs([folder])
+        alias, alias_plan, alias_note = self._stream_kwargs(["--folder", folder])
 
         self.assertEqual(positional, alias)
         self.assertEqual(positional_plan, alias_plan)
         self.assertNotEqual(positional_plan, [])
+        # The note is the one row that quotes the caller back, so it is the one
+        # row that may differ -- by the alias itself, and by nothing else.
+        self.assertEqual(positional_note[:-1], alias_note[:-1])
+        self.assertEqual(
+            alias_note[-1].strip(),
+            positional_note[-1].strip().replace("photokin ", "photokin --folder ", 1),
+        )
 
     def test_a_manifest_runs_identically_through_both_spellings(self) -> None:
         folder = self.make_folder()
         manifest_path = _write_manifest(folder, [{"path": os.path.join(folder, "box3_025.jpg")}])
 
-        positional, positional_plan = self._stream_kwargs([manifest_path])
-        alias, alias_plan = self._stream_kwargs(["--manifest", manifest_path])
+        positional, positional_plan, positional_note = self._stream_kwargs([manifest_path])
+        alias, alias_plan, alias_note = self._stream_kwargs(["--manifest", manifest_path])
 
         self.assertEqual(positional, alias)
         self.assertEqual(positional_plan, alias_plan)
+        self.assertEqual(positional_note[:-1], alias_note[:-1])
+        self.assertEqual(
+            alias_note[-1].strip(),
+            positional_note[-1].strip().replace("photokin ", "photokin --manifest ", 1),
+        )
         # The hydrator is manifest-only, and it is the argument the comparison
         # above had to drop, so its presence is asserted separately for both.
         self.assertEqual(positional["strict_run_failures"], False)
@@ -791,6 +813,97 @@ class TestTheMessageMatrix(_CliTestCase):
             "written; add -w (or --changeset true --exiftool-write true) to apply those tags.",
             stderr,
         )
+
+    def test_an_unwritable_tag_spelling_is_refused_before_the_first_model_call(self) -> None:
+        # The opposite of the inert case above: this flag is *wrong*, not merely
+        # idle. Left to run, ExifTool answers "doesn't exist or isn't writable /
+        # Nothing to do" once per file -- after the whole batch has been analysed
+        # and paid for -- and the run still exited 0. So it is a usage error, and
+        # the stream must not be entered.
+        folder = self.make_folder()
+        stream = _StreamSpy()
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "-w", "--exiftool-fields", "XMP:dc:Description"]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertFalse(stream.called, "a run that cannot write must not call the model")
+        self.assertEqual(
+            self.usage_error(stderr),
+            [
+                "[ERROR] ExifTool cannot write `XMP:dc:Description`.",
+                "Try: use `XMP-dc:Description` instead -- the same tag, spelled the way "
+                "ExifTool wants it",
+            ],
+        )
+
+    def test_the_refusal_names_the_tag_the_user_typed_not_a_canned_example(self) -> None:
+        # Each rejected tag must be echoed back with its own correction, or the
+        # message is a lecture rather than an answer.
+        folder = self.make_folder()
+
+        for bad, good in (
+            ("XMP:dc:Subject", "XMP-dc:Subject"),
+            ("XMP:dc:Title", "XMP-dc:Title"),
+            ("XMP:photoshop:Headline", "XMP-photoshop:Headline"),
+        ):
+            with self.subTest(tag=bad):
+                with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+                    code, _stdout, stderr = self.run_cli(
+                        [folder, "-w", "--exiftool-fields", bad]
+                    )
+                self.assertEqual(code, 2)
+                # The tag the user typed, echoed back verbatim, and its own
+                # correction. Asserted on the tags rather than on the sentence
+                # around them: the wording is free to get shorter, the two tags
+                # are what make the message an answer instead of a lecture.
+                self.assertIn(f"`{bad}`", stderr)
+                self.assertIn(f"use `{good}` instead", stderr)
+
+    def test_a_bad_spelling_is_caught_even_beside_valid_tags(self) -> None:
+        # The flag takes a list, and one bad entry in it writes nothing for that
+        # tag while the others succeed -- the partial failure hardest to notice.
+        folder = self.make_folder()
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "-w", "--exiftool-fields", "EXIF:UserComment,XMP:dc:Description"]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("`XMP:dc:Description`", stderr)
+
+    def test_valid_multi_group_spellings_are_not_refused(self) -> None:
+        """The bound: ``family0:family1:tag`` is legitimate ExifTool syntax.
+
+        Measured against 13.10, ``EXIF:IFD0:Model`` writes and
+        ``EXIF-IFD0:Model`` does not -- the exact inverse of the XMP case -- so
+        a guard that keyed on "has a second colon" would refuse working input.
+        Without this test the refusal could be widened to that rule and stay
+        green.
+
+        ``XMP:xmp:Rating`` is the same trap from the other direction: it is a
+        two-colon *XMP* spelling, the exact shape the guard exists to catch,
+        and it still writes -- because ``xmp`` collides with the family-0
+        group name rather than naming a real family-1 group. A guard that
+        keyed on "XMP, two colons" alone would refuse this one too.
+        """
+        folder = self.make_folder()
+
+        for good in (
+            "EXIF:IFD0:Model",
+            "XMP-dc:Description",
+            "XMP:Description",
+            "XMP:xmp:Rating",
+        ):
+            with self.subTest(tag=good):
+                with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+                    _code, _stdout, stderr = self.run_cli(
+                        [folder, "-w", "--exiftool-fields", good, "--dry-run"]
+                    )
+                self.assertNotIn("ExifTool cannot write", stderr)
 
     def test_the_same_flag_is_silent_once_there_is_something_to_write(self) -> None:
         folder, image, _manifest = self._fixture()
@@ -1270,11 +1383,22 @@ class TestThePlanPrecedesTheFirstModelCall(_CliTestCase):
                 f"[INFO] {_PLAN_HEADER}",
                 f"  input     : {os.path.abspath(folder)} (folder, 3 file(s) in 2 group(s), "
                 "group-by object)",
+                "  read      : none (-r not given)",
                 "  output    : stdout",
                 "  changeset : none (--changeset false)",
                 "  write     : none",
                 "  provider  : Claude",
                 f"  model     : {utils.resolve_claude_model('haiku')}",
+                # This run asked for nothing, so the block ends by naming the run
+                # that does something. The provider and model the caller typed are
+                # carried into it: a suggestion that dropped them would describe a
+                # different run from the seven rows above it.
+                "  note      : this run only prints results - your photos are not read or",
+                "              changed. For the normal archival run:",
+                "                  "
+                + cli_messages.normal_run_command(
+                    [folder, "--provider", "anthropic", "--claude-model", "haiku"]
+                ),
             ],
         )
 
@@ -1320,6 +1444,465 @@ class TestThePlanPrecedesTheFirstModelCall(_CliTestCase):
         # path opens its destination with a truncating "w".
         with open(out_path, "rb") as handle:
             self.assertEqual(handle.read(), b"PREVIOUS RUN CONTENT\n")
+
+
+class TestThePlanAdvisesTheNormalRun(_CliTestCase):
+    """The plan's last row tells a do-nothing run what the archival run is.
+
+    ``photokin <input>`` with no other flag analyzes, prints JSON and leaves the
+    files alone. That is the documented way to check the wiring and the first two
+    cases here hold it to exactly that, because the note is an addition to that
+    run and not a replacement for it.
+
+    The rest is about the one line a reader will copy. A suggestion is only worth
+    printing if it works, so these cases do not stop at asserting its text: they
+    take the string back out of stderr, lex it the way a shell would, and run it,
+    then assert the resulting plan reads and writes and names the same input. A
+    hint that parses but describes a different run is the failure being guarded
+    against, which is why the whole argv is carried into it rather than the input
+    token alone.
+    """
+
+    #: Every flag that means "I have already said what I want". ``--changeset``
+    #: and ``--exiftool-write`` appear at *both* values, not just ``true``:
+    #: ``false`` is a decision too, and ``-w`` beside either is refused outright,
+    #: which the last case in this class executes rather than asserts.
+    _DECLARATIONS: ClassVar[dict[str, list[str]]] = {
+        "-r": ["-r"],
+        "-w": ["-w"],
+        "--dry-run": ["--dry-run"],
+        "--changeset true": ["--changeset", "true"],
+        "--changeset false": ["--changeset", "false"],
+        "--exiftool-write false": ["--exiftool-write", "false"],
+        "--output-sidecars": ["--output-sidecars"],
+    }
+
+    def note_lines(self, stderr: str) -> list[str]:
+        """Return the note's three lines, or an empty list when it was not printed.
+
+        Args:
+            stderr: The whole stderr capture.
+
+        Returns:
+            The ``note`` row and its two continuation lines.
+        """
+        block = self.plan_block(stderr)
+        start = next((i for i, line in enumerate(block) if line.startswith("  note ")), None)
+        return [] if start is None else block[start:]
+
+    def suggested_command(self, stderr: str) -> str:
+        """Return the command the note offers, stripped of its indent.
+
+        Args:
+            stderr: The whole stderr capture.
+
+        Returns:
+            The command line, starting with ``photokin``.
+        """
+        lines = self.note_lines(stderr)
+        self.assertTrue(lines, f"no note was printed: {stderr!r}")
+        self.assertEqual(len(lines), 3, f"the note is not three lines: {lines!r}")
+        return lines[-1].strip()
+
+    def paste(self, command: str, exiftool_path: str) -> tuple[int | None, str]:
+        """Run *command* the way a shell would, and return its code and stderr.
+
+        ``shlex`` in POSIX mode is the strictest of the three lexers the rendering
+        has to satisfy -- it is the one that treats a bare backslash as an escape,
+        so a Windows path that survives it round-trips through cmd.exe and
+        PowerShell too.
+
+        Args:
+            command: The suggested command, program word included.
+            exiftool_path: A binary for ``--exiftool-path``. Appended rather than
+                expected on PATH: the suggestion is a real ``-rw`` run and the
+                write half of it is refused up front when no ExifTool resolves,
+                which is a property of the sandbox and not of the hint.
+
+        Returns:
+            The exit code and stderr of the pasted run.
+        """
+        program, *tokens = shlex.split(command, posix=True)
+        self.assertEqual(program, "photokin")
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()), patch(
+            "photokin.cli._apply_exiftool_changeset", return_value=False
+        ):
+            code, _stdout, stderr = self.run_cli([*tokens, "--exiftool-path", exiftool_path])
+        return code, stderr
+
+    def contents(self, folder: str) -> dict[str, bytes]:
+        """Return every file in *folder* by name, as bytes.
+
+        Args:
+            folder: The directory to read.
+
+        Returns:
+            A mapping of filename to content, for comparison across a run.
+        """
+        files = {}
+        for name in os.listdir(folder):
+            with open(os.path.join(folder, name), "rb") as handle:
+                files[name] = handle.read()
+        return files
+
+    def test_a_bare_run_still_prints_json_and_changes_nothing(self) -> None:
+        """The run the note is attached to is untouched by having a note."""
+        folder = self.make_folder("box3_025.jpg", "box3_025-back.jpg")
+        before = self.contents(folder)
+        payload = {"results": {"box3_025.jpg": {"keywords": ["portrait"]}}, "errors": {}}
+
+        with patch("photokin.cli.process_manifest_stream", lambda **_kw: payload):
+            code, stdout, stderr = self.run_cli([folder])
+
+        self.assertIsNone(code)
+        self.assertEqual(json.loads(stdout), payload)
+        # The advice is a diagnostic, so it goes where every diagnostic goes and
+        # cannot corrupt the JSON the plugin parses off stdout.
+        self.assertIn("For the normal archival run:", stderr)
+        self.assertNotIn("For the normal archival run:", stdout)
+        self.assertEqual(before, self.contents(folder))
+
+    def test_every_input_mode_is_offered_the_command_it_would_paste(self) -> None:
+        folder = self.make_folder("box3_025.jpg", "box3_025-back.jpg")
+        image = os.path.join(folder, "box3_025.jpg")
+        back = os.path.join(folder, "box3_025-back.jpg")
+        manifest_path = _write_manifest(folder, [{"path": image}])
+        # Expected commands are built with the real quoting rule rather than
+        # hardcoded quotes: whether a token needs `"..."` around it depends on
+        # what characters it holds (see cli_messages._quote_token), and a
+        # temp-dir path on POSIX never does while the same path on Windows
+        # always does (it contains a backslash). What this test asserts is the
+        # *wiring* -- that each input mode's tokens reach the suggestion at
+        # all, and in the right shape (e.g. --back survives as a flag, not as
+        # a second input) -- which is orthogonal to the quoting rule itself;
+        # quoting's own edge cases (spaces, `$`, a trailing backslash) are
+        # covered directly in test_message_style.py.
+        expected = {
+            "folder": ([folder], cli_messages.normal_run_command([folder])),
+            "folder alias": (
+                ["--folder", folder],
+                cli_messages.normal_run_command(["--folder", folder]),
+            ),
+            "single photo": ([image], cli_messages.normal_run_command([image])),
+            # The one case a reconstruction from resolved values would get wrong:
+            # the back is not the input, it is a flag on it.
+            "single photo with a back": (
+                [image, "--back", back],
+                cli_messages.normal_run_command([image, "--back", back]),
+            ),
+            "manifest": ([manifest_path], cli_messages.normal_run_command([manifest_path])),
+            "manifest alias": (
+                ["--manifest", manifest_path],
+                cli_messages.normal_run_command(["--manifest", manifest_path]),
+            ),
+        }
+
+        for mode, (argv, command) in expected.items():
+            with self.subTest(mode=mode):
+                with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+                    _code, _stdout, stderr = self.run_cli(argv)
+
+                self.assertEqual(
+                    self.note_lines(stderr),
+                    [
+                        "  note      : this run only prints results - your photos are not "
+                        "read or",
+                        "              changed. For the normal archival run:",
+                        f"                  {command}",
+                    ],
+                )
+
+    def test_the_suggested_command_runs_and_does_what_it_says(self) -> None:
+        """Paste it back: it must parse, read, write, and name the same input."""
+        folder = self.make_folder("box3_025.jpg", "box3_025-back.jpg")
+        image = os.path.join(folder, "box3_025.jpg")
+        back = os.path.join(folder, "box3_025-back.jpg")
+        manifest_path = _write_manifest(folder, [{"path": image}])
+        exiftool_path = _write_bytes(os.path.join(self.scratch(), "exiftool.exe"), b"")
+        invocations = {
+            "folder": [folder],
+            "folder alias": ["--folder", folder],
+            "single photo": [image],
+            "single photo with a back": [image, "--back", back],
+            "manifest": [manifest_path],
+            # Carried-over flags are the point: the pasted run must still be
+            # Claude on haiku at pair granularity, not the defaults.
+            "flags the caller chose": [
+                folder, "--provider", "anthropic", "--claude-model", "haiku",
+                "--group-by", "pair",
+            ],
+        }
+
+        for mode, argv in invocations.items():
+            with self.subTest(mode=mode):
+                with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+                    _code, _stdout, stderr = self.run_cli(argv)
+                planned = [line for line in self.plan_block(stderr) if line.startswith("  input")]
+
+                code, pasted = self.paste(self.suggested_command(stderr), exiftool_path)
+
+                self.assertIsNone(code, f"the suggested command was refused: {pasted!r}")
+                self.assertIn(
+                    "  read      : ExifTool " + ", ".join(DEFAULT_EXIFTOOL_FIELDS), pasted
+                )
+                self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+                # Same input, same grouping, same provider: everything the first
+                # plan said, which is what makes it a next step and not a
+                # different run.
+                self.assertEqual(
+                    planned,
+                    [line for line in self.plan_block(pasted) if line.startswith("  input")],
+                )
+                self.assertEqual(self.note_lines(pasted), [], "the -rw run advised itself")
+
+    def test_a_path_with_spaces_survives_the_round_trip(self) -> None:
+        """The quoting is not decoration; an unquoted path would lex into two tokens."""
+        root = self.scratch()
+        folder = os.path.join(root, "Family Scans 1948")
+        os.makedirs(folder)
+        front = _write_bytes(os.path.join(folder, "card 009.jpg"))
+        back = _write_bytes(os.path.join(folder, "card 009-back.jpg"))
+        exiftool_path = _write_bytes(os.path.join(root, "exiftool.exe"), b"")
+
+        for mode, argv in (
+            ("folder", [folder]),
+            ("single photo with a back", [front, "--back", back]),
+        ):
+            with self.subTest(mode=mode):
+                with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+                    _code, _stdout, stderr = self.run_cli(argv)
+                command = self.suggested_command(stderr)
+
+                self.assertEqual(shlex.split(command, posix=True), ["photokin", *argv, "-rw"])
+                code, pasted = self.paste(command, exiftool_path)
+                self.assertIsNone(code, f"the suggested command was refused: {pasted!r}")
+                self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+
+    def test_a_trailing_separator_survives_the_round_trip(self) -> None:
+        """``C:\\Scans\\`` is how a path arrives from Explorer, and it is the shape
+        the two quoting conventions disagree about: the closing quote pairs with
+        that backslash on Windows and is escaped by it in POSIX. Doubling the run
+        is read as one separator by both."""
+        folder = self.make_folder() + os.sep
+        exiftool_path = _write_bytes(os.path.join(self.scratch(), "exiftool.exe"), b"")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            _code, _stdout, stderr = self.run_cli([folder])
+        command = self.suggested_command(stderr)
+
+        self.assertEqual(shlex.split(command, posix=True), ["photokin", folder, "-rw"])
+        code, pasted = self.paste(command, exiftool_path)
+        self.assertIsNone(code, f"the suggested command was refused: {pasted!r}")
+        self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+
+    def test_a_run_that_has_already_declared_itself_is_not_advised(self) -> None:
+        folder = self.make_folder()
+        exiftool_path = _write_bytes(os.path.join(self.scratch(), "exiftool.exe"), b"")
+        cases = dict(
+            self._DECLARATIONS,
+            **{"--output-file": ["--output-file", os.path.join(self.scratch(), "results.json")]},
+        )
+
+        for label, flags in cases.items():
+            with self.subTest(flag=label):
+                with patch("photokin.cli.process_manifest_stream", _StreamSpy()), patch(
+                    "photokin.cli._apply_exiftool_changeset", return_value=False
+                ):
+                    code, _stdout, stderr = self.run_cli(
+                        [folder, *flags, "--exiftool-path", exiftool_path]
+                    )
+
+                self.assertIsNone(code)
+                # The plan itself still prints; only its last row is withheld, so
+                # a silent note cannot be mistaken for a silent run.
+                self.assertIn(_PLAN_HEADER, stderr)
+                self.assertEqual(self.note_lines(stderr), [])
+
+    def test_generate_manifest_prints_no_plan_at_all_so_there_is_nothing_to_suppress(
+        self,
+    ) -> None:
+        """Named here because the suppression list looks incomplete without it.
+
+        ``--generate-manifest`` writes its file and returns above the plan, so the
+        row a suppressor would remove is never built. This is what makes an entry
+        for it in ``_suggest_the_normal_run`` dead code rather than defence.
+        """
+        folder = self.make_folder()
+        out_path = os.path.join(self.scratch(), "scans-manifest.json")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli([folder, "--generate-manifest", out_path])
+
+        self.assertIsNone(code)
+        self.assertEqual(self.plan_block(stderr), [])
+        self.assertNotIn("For the normal archival run:", stderr)
+
+    def test_the_note_does_not_depend_on_stdout_being_a_terminal(self) -> None:
+        """A redirect moves the JSON, not the advice, so it must not move the advice.
+
+        Pinned because it is a decision and not an accident: the note lives on
+        stderr, and the tests below capture stdout into a ``StringIO`` that is
+        never a terminal. Had the note been gated on ``isatty`` the entire suite
+        would be exercising the silent branch while reading as coverage.
+        """
+        folder = self.make_folder()
+        rendered = {}
+
+        for label, isatty in (("piped", False), ("terminal", True)):
+            # ``run_cli`` redirects stdout into a StringIO, so patching that
+            # class is what a run actually asks when it asks about its terminal.
+            with patch("photokin.cli.process_manifest_stream", _StreamSpy()), patch.object(
+                sys.stdout.__class__, "isatty", lambda _self, answer=isatty: answer, create=True
+            ):
+                _code, _stdout, stderr = self.run_cli([folder])
+            rendered[label] = self.note_lines(stderr)
+
+        self.assertTrue(rendered["piped"])
+        self.assertEqual(rendered["piped"], rendered["terminal"])
+
+    def test_a_path_no_shell_can_carry_withholds_the_hint_entirely(self) -> None:
+        """Silence beats a command that would run against the wrong folder.
+
+        ``$`` expands inside the double quotes of a POSIX shell and of
+        PowerShell, so ``"scans $HOME"`` would paste as a path that does not
+        exist. There is no rendering that is right in cmd.exe and in both of the
+        others, so no rendering is offered.
+        """
+        root = self.scratch()
+        folder = os.path.join(root, "scans $HOME")
+        os.makedirs(folder)
+        _write_bytes(os.path.join(folder, "box3_025.jpg"))
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, stdout, stderr = self.run_cli([folder])
+
+        self.assertIsNone(code)
+        self.assertIn(_PLAN_HEADER, stderr)
+        self.assertEqual(self.note_lines(stderr), [])
+        # Withholding the hint withholds nothing else: the run itself is normal.
+        self.assertNotEqual(stdout, "")
+
+    def test_the_two_declarations_that_would_have_produced_a_broken_command(self) -> None:
+        """Why ``--changeset false`` suppresses even though it writes nothing.
+
+        The suppression list treats ``--changeset``/``--exiftool-write`` as
+        decisions at either value. This executes the alternative: appending
+        ``-rw`` to the command those runs typed is not merely redundant, it is
+        refused, so the hint would have been a command that exits 2.
+        """
+        folder = self.make_folder()
+        exiftool_path = _write_bytes(os.path.join(self.scratch(), "exiftool.exe"), b"")
+
+        for flag in ("--changeset", "--exiftool-write"):
+            with self.subTest(flag=flag):
+                with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+                    code, _stdout, stderr = self.run_cli(
+                        [folder, flag, "false", "-rw", "--exiftool-path", exiftool_path]
+                    )
+
+                self.assertEqual(code, 2)
+                self.assertIn(
+                    "[ERROR] `-w` means --changeset true --exiftool-write true, but "
+                    f"`{flag} false` was also given.",
+                    stderr,
+                )
+
+
+class TestTheQuotingRuleWithholdsRatherThanCorrupts(unittest.TestCase):
+    """Direct coverage of ``cli_messages.normal_run_command``'s quoting rule.
+
+    The CLI-level tests above only exercise it through real, mostly
+    special-character-free temp paths, so the rule's own edge cases -- the
+    ones its docstring makes specific, measured claims about -- had no direct
+    coverage of their own before this class.
+    """
+
+    def test_an_ordinary_path_is_not_quoted(self) -> None:
+        self.assertEqual(
+            cli_messages.normal_run_command(["/tmp/scans/box3_025.jpg"]),
+            "photokin /tmp/scans/box3_025.jpg -rw",
+        )
+
+    def test_a_windows_path_survives_a_posix_shlex_round_trip(self) -> None:
+        for raw in ("C:\\Scans\\Photos", "C:\\Scans\\"):
+            with self.subTest(path=raw):
+                command = cli_messages.normal_run_command([raw])
+                self.assertIsNotNone(command)
+                self.assertEqual(shlex.split(command)[1], raw)
+
+    def test_a_unc_path_withholds_the_hint_rather_than_corrupting_it(self) -> None:
+        """A leading double backslash is not the trailing case the doubling rule covers.
+
+        Quoted and then parsed by a POSIX shell -- exactly what a WSL prompt or
+        any POSIX ``paste()`` of a suggested command does -- ``\\\\`` inside
+        double quotes is itself an escape for one literal backslash, so a UNC
+        prefix would silently collapse from two backslashes to one and stop
+        naming the same share. No suggestion is offered instead.
+        """
+        unc = "\\\\server\\share\\folder"
+        self.assertIsNone(cli_messages.normal_run_command([unc]))
+
+
+class TestTheCombinedShortFlagIsTheDocumentedNormalRun(_CliTestCase):
+    """``-rw`` sets both halves, and keeps doing so.
+
+    ``README.md`` names ``photokin <folder> -rw`` as the normal run, and nothing
+    in the CLI implements it: argparse groups single-character options for free,
+    so ``-rw`` is ``-r -w`` only for as long as BOTH stay ``store_true``. Give
+    ``-r`` an argument one day -- ``-r TAGS`` for a custom read set is an easy
+    thing to want -- and ``-rw`` silently becomes ``-r "w"``. The write half
+    vanishes, no error is raised, and the documented command quietly stops
+    writing anything. That failure is invisible without a case that asserts both
+    halves of the grouped form, which is what this is.
+    """
+
+    def _plan_row(self, stderr: str, label: str) -> str:
+        """Return the plan summary row named *label*, without its label."""
+        for line in stderr.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(f"{label} ") or stripped.startswith(f"{label}:"):
+                return stripped.split(":", 1)[1].strip()
+        return ""
+
+    def _rows_for(self, argv: list[str]) -> tuple[str, str]:
+        """Run *argv* under --dry-run and return its ``read`` and ``changeset`` rows."""
+        exiftool_path = _write_bytes(os.path.join(self.scratch(), "exiftool.exe"), b"")
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli(
+                [*argv, "--exiftool-path", exiftool_path, "--dry-run"]
+            )
+        # None is this harness's clean return: main() fell off the end without
+        # raising SystemExit.
+        self.assertIsNone(code, stderr)
+        return self._plan_row(stderr, "read"), self._plan_row(stderr, "changeset")
+
+    def test_the_grouped_form_matches_the_two_flags_written_out(self) -> None:
+        """``-rw`` is ``-r -w``, and ``-wr`` is too."""
+        folder = self.make_folder()
+        expected = self._rows_for([folder, "-r", "-w"])
+        # Asserted against the spelled-out pair rather than against literals, so
+        # the case survives any later rewording of the plan rows themselves.
+        for grouped in ("-rw", "-wr"):
+            with self.subTest(grouped=grouped):
+                self.assertEqual(self._rows_for([folder, grouped]), expected)
+
+    def test_each_half_of_the_grouped_form_really_took_effect(self) -> None:
+        """Non-vacuity: the two rows differ from a run that asked for neither.
+
+        Comparing ``-rw`` only against ``-r -w`` would still pass if both were
+        parsed as nothing at all, so each row is also held against the run that
+        genuinely asked for nothing.
+        """
+        folder = self.make_folder()
+        read_row, changeset_row = self._rows_for([folder, "-rw"])
+        idle_read, idle_changeset = self._rows_for([folder])
+
+        self.assertIn("ExifTool", read_row, "the -r half of -rw did not take effect")
+        self.assertNotEqual(read_row, idle_read)
+        self.assertNotIn(
+            "none", changeset_row, "the -w half of -rw did not take effect"
+        )
+        self.assertNotEqual(changeset_row, idle_changeset)
 
 
 if __name__ == "__main__":

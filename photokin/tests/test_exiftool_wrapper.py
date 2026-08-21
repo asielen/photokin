@@ -30,13 +30,13 @@ class TestExiftoolConfig(unittest.TestCase):
     def test_from_env_reads_environment(self):
         env = {
             "EXIFTOOL_WRITE_ENABLED": "false",
-            "EXIFTOOL_FIELDS": "EXIF:UserComment, XMP:dc:Description",
+            "EXIFTOOL_FIELDS": "EXIF:UserComment, XMP-dc:Description",
             "EXIFTOOL_PATH": "/opt/exiftool",
         }
         with patch.dict(os.environ, env, clear=False):
             cfg = ExiftoolConfig.from_env()
         self.assertFalse(cfg.enabled)
-        self.assertEqual(cfg.fields, ("EXIF:UserComment", "XMP:dc:Description"))
+        self.assertEqual(cfg.fields, ("EXIF:UserComment", "XMP-dc:Description"))
         self.assertEqual(cfg.path, "/opt/exiftool")
 
     def test_from_env_defaults_when_unset(self):
@@ -124,6 +124,80 @@ class TestApplyChangeset(unittest.TestCase):
         ):
             summary = apply_changeset(path, cfg)
         self.assertEqual(len(summary["errors"]), 1)
+
+    def test_an_unwritable_field_is_warned_about_and_never_attempted(self):
+        """"Nothing will be written for this tag" has to be true, not aspirational.
+
+        Direct library callers (the Lightroom plugin among them) never pass
+        through the CLI's own pre-flight refusal, so this warning is their only
+        guard against the old ``XMP:dc:`` colon form. Warning once and then
+        still handing the tag to ExifTool per file would reproduce, once per
+        file, the exact "doesn't exist or isn't writable" noise the warning
+        exists to replace -- so the field must actually drop out of what gets
+        written, alongside any field that is fine.
+        """
+        path = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {
+                        "set": {
+                            "EXIF:UserComment": "Hello",
+                            "XMP:dc:Description": "A caption",
+                        }
+                    },
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment", "XMP:dc:Description"))
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
+            run_mock.return_value = type(
+                "Result", (), {"returncode": 0, "stdout": "", "stderr": ""}
+            )()
+            summary = apply_changeset(path, cfg)
+        self.assertTrue(
+            any("XMP:dc:Description" in w.get("tag", "") for w in summary["warnings"])
+        )
+        self.assertEqual(summary["tags_written"], 1)
+        written_cmd = run_mock.call_args[0][0]
+        self.assertTrue(any(arg.startswith("-EXIF:UserComment=") for arg in written_cmd))
+        self.assertFalse(any(arg.startswith("-XMP:dc:Description=") for arg in written_cmd))
+
+    def test_a_subprocess_error_on_one_file_does_not_abort_the_batch(self):
+        """One bad file is a per-file error, not a reason to lose the rest.
+
+        ``subprocess.run`` can fail to even start for reasons beyond a missing
+        binary -- a non-executable file, a permissions error -- and those must
+        be caught exactly like ``FileNotFoundError`` is: recorded against that
+        file, with the files before and after it still written and reported.
+        """
+        path = self._write_changeset(
+            [
+                {"path": "/photos/a.jpg", "proposed_changes": {"set": {"EXIF:UserComment": "A"}}},
+                {"path": "/photos/b.jpg", "proposed_changes": {"set": {"EXIF:UserComment": "B"}}},
+                {"path": "/photos/c.jpg", "proposed_changes": {"set": {"EXIF:UserComment": "C"}}},
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        ok_result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        def _run(cmd, **_kw):
+            if "/photos/b.jpg" in cmd:
+                raise PermissionError("not executable")
+            return ok_result
+
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run", side_effect=_run):
+            summary = apply_changeset(path, cfg)
+        self.assertEqual(summary["files_seen"], 3)
+        self.assertEqual(summary["files_written"], 2)
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertEqual(summary["errors"][0]["path"], "/photos/b.jpg")
 
 
 class TestExifDatetimeNormalization(unittest.TestCase):

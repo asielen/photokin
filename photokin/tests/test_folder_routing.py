@@ -322,11 +322,11 @@ class _CliTestCase(_FolderRoutingTestCase):
         """
         stdout, stderr = io.StringIO(), io.StringIO()
         code: int | None = None
-        # Hydration is manifest mode's and does nothing to either input here --
-        # neither a folder item nor a generated one carries a ``metadata`` dict,
-        # which is all ``hydrate_user_comments`` acts on, and B2 leaves folder
-        # hydration to Phase C. Stubbed so the run does not go looking for an
-        # ExifTool binary whose presence differs between machines.
+        # Since C3 the hydrator reaches every input kind, but only under ``-r``,
+        # which no case in this module passes -- so it is never constructed and
+        # never called here. Stubbed anyway, so that a case which does reach for
+        # it cannot go looking for an ExifTool binary whose presence differs
+        # between machines.
         with (
             patch.dict(os.environ, _NEUTRAL_ENV),
             patch.object(sys, "argv", ["photokin", *argv]),

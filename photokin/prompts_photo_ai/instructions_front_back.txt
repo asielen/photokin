@@ -233,7 +233,7 @@ Date inference requirement:
   – Set "date_guess.confidence" between 0.0 and 1.0
   – End ai_caption with a single sentence:
       "Inferred date: <iso> (confidence <0.xx>; evidence: <brief evidence list>)."
-    Evidence must be explicit (e.g., "handwritten date on back", "EXIF capture date provided", "filename timestamp PXL_20230815...", "period clothing suggests 1940s").
+    Evidence must be explicit (e.g., "handwritten date on back", "EXIF capture date provided (digital original)", "filename timestamp PXL_20230815...", "period clothing suggests 1940s").
 
 If you only have broad evidence (e.g., "looks modern"):
 • Use a decade (e.g., "2020s") or a broad range, and use a conservative confidence.

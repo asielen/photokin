@@ -251,17 +251,48 @@ photokin ...
 
 ## Folders and batches
 
+**The normal run is `-rw`.** Two commands cover almost everything:
+
+```
+photokin C:\Users\YourName\Pictures\Scans\ -rw
+photokin box3_017.jpg --back box3_017-back.jpg -rw
+```
+
+That is: group every scan of one physical object together, read the metadata those files already hold, analyze each object once, and write the result back to **every** file in the group. All three of those are what you get by default — `--group-by object` is the default granularity, and the write reaches each group member rather than just the front. On a group of five files (a print, its back, a crop, a rescan and *its* back) one model call produces five sets of proposed writes, identical except that the `back` keyword lands only on the two backs and `negative` only on a negative.
+
+The `-r` half is what makes the run *safe* rather than merely informed, for the reason spelled out under [Setting up ExifTool](#setting-up-exiftool): the date-correction rule can only protect a date it has read, so `-w` without `-r` lets a mediocre guess overwrite a good value.
+
+**The run with no flags at all still works, and now tells you this.** `photokin C:\Scans` analyzes, prints the JSON to your terminal and touches nothing — that is the "check it's wired up" run and it is not going away. Its plan summary just ends with one extra row naming the next step, built from the command you actually typed so you can paste it straight back:
+
+```
+[INFO] Plan for this run:
+  input     : C:\Scans (folder, 12 file(s) in 5 group(s), group-by object)
+  read      : none (-r not given)
+  output    : stdout
+  changeset : none (--changeset false)
+  write     : none
+  provider  : ChatGPT
+  model     : gpt-4o
+  note      : this run only prints results - your photos are not read or
+              changed. For the normal archival run:
+                  photokin "C:\Scans" -rw
+```
+
+Whatever else you typed comes along — a `--provider`, a `--back`, a `--group-by` — so the suggested command is the run you just planned plus the two flags, not a different one. It appears only when you have said nothing either way: `-r`, `-w`, `--dry-run`, `--changeset`, `--exiftool-write`, `--output-file`, `--output-sidecars` and `--generate-manifest` each mean you have already decided, and the row stays quiet. (The quoting is real, not decoration: a path is wrapped in `"` when any shell would otherwise split or expand it, and a trailing `\` is doubled because a lone one would escape the closing quote. Paths holding `$`, `` ` ``, `%`, `!` or `"` get no suggestion at all rather than a wrong one.)
+
 Point it at a folder and it works through everything in it (non-recursive). Filename suffixes group scans of the same physical object automatically — `photo-a.jpg` / `photo-b.jpg` are variants, `photo-back.jpg` is the reverse side, `album-page1.jpg` / `album-page2.jpg` are pages of one document — and each group is analyzed together as one object.
 
 Folder and manifest input are read by the same grouper, so anything one handles the other handles identically. A set with no plain front scan in it is analyzed like any other object — nothing but pages (`album-page1.jpg`, `album-page2.jpg`), nothing but a negative, or nothing but a back (`box3_030-back.jpg`, where the front was never scanned or lives in another folder). Every page of a document goes to the model in one call, and every scan of a print goes in one call with its siblings. Albums, multi-page documents, negative-only scans and loose backs no longer need a manifest. (Earlier releases grouped those sets correctly and then skipped them, warning per group; that limitation is gone.)
 
 **How much is one object: `--group-by {object,pair,none}`.** Granularity is a single axis, defaulting to `object`. On `box3_025.jpg`, `box3_025-back.jpg`, `box3_025b.jpg`, `box3_025b-back.jpg`, `box3_025c.jpg`:
 
-| Value | Group key | On that five-file set |
-|---|---|---|
-| `object` (default) | the print | 1 call, 5 images; every scan shares one analysis |
-| `pair` | the print plus the variant letter | 3 calls, 5 images; each rescan judged on its own merits |
-| `none` | the file | 5 calls, 5 images; every file alone, backs separated from fronts |
+| Value | Group key | On that five-file set | What each call sees |
+|---|---|---|---|
+| `object` (default) | the print | 1 call, 5 images; every scan shares one analysis | every image of the object, and the metadata read from all of them |
+| `pair` | the print plus the variant letter | 3 calls, 5 images; each rescan judged on its own merits | one front with its own back; other variants invisible to it |
+| `none` | the file | 5 calls, 5 images; every file alone, backs separated from fronts | one image and its own metadata, no other context at all |
+
+Writes go to **every** file in the group at all three settings — the granularity decides what is analyzed together, never who gets written to.
 
 `object` is the default because scans of one print are one print: a shared date and location is the wanted answer, not three opinions to reconcile. `pair` costs one call per rescan and gives each its own verdict; on ordinary input — a group with no variant letters at all — it is identical to `object`, group id included. `none` is an **escape hatch for when filenames lie**, not a normal mode. It is the most expensive and the lowest quality: a back analyzed alone is handwriting with no photo attached, caption, date and location inference all lean on seeing the front, a multipage document is split into unrelated pages, and every crop becomes its own object and is analyzed as one. Reach for it when the grammar has mis-grouped something and you want the files judged individually; not otherwise.
 
@@ -310,6 +341,10 @@ photokin ./scans/ --generate-manifest scans-manifest.json
 
 It writes the manifest the folder run would have used — same files, same order — and exits without calling the model, so it costs nothing and doubles as a way to check the grouping before committing to a batch. Edit it (add `is_back`, `group`, existing `metadata`) and feed it straight back: `photokin scans-manifest.json`.
 
+Add `-r` and the document also captures what ExifTool read out of the files. A plain replay (`photokin scans-manifest.json`) then launches ExifTool not at all — every value it needs is already in the document.
+
+Replaying *with* `-r` is what reproduces the original result exactly, because the document records the values but not that they came out of a file, and the title rule below turns on precisely that distinction. That costs a little more than nothing: the pre-flight insists an ExifTool binary exists, and `-r` re-reads any file whose recorded metadata is missing even one of the five tags — which is the normal case, since most files do not carry all five. Only a file that held the complete set replays without a subprocess.
+
 ## Manifest mode
 
 A manifest is a JSON file listing exactly what to process — an `items` array where each entry needs only a `path`. The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. Note the underscore in `box3_017_back.jpg`: the filename grammar reads only the hyphenated `-back`, so it is the `is_back` flag that folds the two files into one group and one model call rather than two unrelated photos.
@@ -357,6 +392,89 @@ For auditing, `--changeset true` emits a changeset NDJSON alongside the results:
 python -m photokin.exiftool --changeset results_changeset.ndjson --enabled [--dry-run]
 ```
 
+## Captions
+
+The caption is the one field where photokin has to reconcile what you already wrote with what the model just said, and where it writes the same text into several files at once. This section is what it does and why.
+
+### The shape
+
+Take a print you scanned twice, and scanned the back of the second time — `box3_017.jpg`, `box3_017b.jpg`, `box3_017b-back.jpg` — where each file already carries its own caption. Every one of those three files comes out holding this:
+
+```
+[Photo A] Caption A
+[Photo B] Caption B
+[Back] Back of Photo B
+[AI Analysis]: Two people outside a bakery.
+```
+
+Not a third of it each: the whole thing, byte for byte, in all three. That is the point of it. Those three files are one physical photograph, and which of them you happen to open a year from now is an accident of how you were browsing. Opening any one of them should tell you the whole story of the object — that there were two scans, that one of them has writing on the back, and what that writing says — rather than the fragment that particular file was scanned with.
+
+### The labels
+
+A label is only added when it distinguishes something, and the variant letter is decided for each role separately. Three cases cover nearly everything:
+
+**Two photos and one back.** The photos need telling apart, the back does not, so the back is bare:
+
+```
+[Photo A] Caption A
+[Photo B] Caption B
+[Back] Back of Photo B
+```
+
+**One photo and its back.** There is only one of each, so neither carries a letter:
+
+```
+[Photo] Ruth and Sam
+[Back] pencil note
+```
+
+**A lone scan with no back.** Nothing to tell apart, so nothing is labelled and your caption is left exactly as you typed it:
+
+```
+Grandma on the porch
+[AI Analysis]: Two people outside a bakery.
+```
+
+That last case is the overwhelmingly common one, and it is deliberately left alone — an archive of loose prints with no variants in it never grows a single bracket.
+
+The letters are the letters on disk. `box3_017b.jpg` is `[Photo B]` because the file says `b`. The bare `box3_017.jpg` beside it is `[Photo A]`, because that is what it is: a bare scan is variant A, which is precisely why the *second* scan of a print is lettered `b` and not `a`. With no lettered sibling in the group there is nothing to disambiguate, so no letter is invented — a print and its own crop both come out as `[Photo]`.
+
+### How it is built, and the surprise in it
+
+The block is assembled once for the whole group and then written to every file in it. Concretely: photokin reads each file's existing caption while it still knows which file it came off — that is the only moment the attribution is free — labels it accordingly, merges the labelled pieces from across the group into one block, appends this run's analysis, and hands the same result to every member.
+
+"Existing caption" means whatever the run was given: the `XMP:Description` in the file itself under `-r`, or a `caption` you put in a manifest item's `metadata`. Without either, there is nothing to merge and the block is just the analysis line — which is another reason the normal run is `-rw`.
+
+**This means a caption you typed on one file will appear on its siblings.** If you wrote "Ruth and Sam outside the bakery" on the front scan only, after a run the back scan holds it too, as `[Photo] Ruth and Sam outside the bakery`. That is intended and it is the whole feature, but it will surprise you the first time, so: if you do not want two scans sharing captions, they are not one object as far as photokin is concerned — put them in different groups, or run with `--group-by none`, which analyses and captions every file entirely on its own.
+
+The order of the block is the group's own order — photos before backs, variant A before variant B — and never the order your files happened to be listed in, so the same folder produces the same block on every run and on every machine.
+
+### What happens to a caption you already have
+
+Nothing you wrote is ever deleted. Beyond that there are three cases, and they are decided per section rather than on the caption as a whole:
+
+- **Identical, or near enough.** Nothing changes. Two files of a group very often hold the same caption typed twice, and photokin writes it once instead of once per file.
+- **Materially different.** The existing caption is kept and the new content is added beside it, each under its own label.
+- **A partial version of the block.** Say a file already holds `[Photo A]` from an earlier run and the group has since gained a second scan. The `[Photo B]` line is filled in and the `[Photo A]` line is left exactly as it is.
+
+That third case is the reason any of this is labelled. Merging happens **per section, never whole-string** — and the labels are what make a section a thing that can be found at all. Each labelled section is settled on its own text, so a change in one cannot disturb another. Compare a whole-string approach, which would find old and new unequal and then have to choose between appending the entire old block again or overwriting it — either way, touching lines it had no business touching.
+
+**"Near enough" means punctuation, spacing, quoting and capitalisation.** A trailing full stop, a curly apostrophe against a straight one, an em dash for a hyphen, a stray inner comma — those are one caption typed twice, and the second is dropped. **Anything that changes a word is kept**, including changes that look tiny: `bakery, 1948` against `bakery, 1949` is a different caption, and so is `Ruth and Sam` against `Ruth and Edith`. If you reword a caption and want the old one gone, delete it yourself; photokin will not guess that a rewrite was meant to replace rather than accompany, because guessing wrong there loses something you cannot get back.
+
+For the curious, the deciding comparison is on the words: two captions with the same word sequence are one caption however they are punctuated. A `difflib` similarity ratio of 0.998 sits behind that as a second gate, for a difference too small to be a word — a stray character in a long block. It is set that high on purpose. Measured against real caption pairs, no ratio can separate cosmetic from material on its own: a changed *year* inside a 300-character analysis scores 0.9967, while a changed *quote mark* in a short caption scores 0.9091, so any threshold loose enough to catch the second would throw away the first. 0.998 clears every material difference measured, which is what makes it structurally unable to be the thing that loses your correction.
+
+### No second model call
+
+None of the merging above costs an API call. The structural part is deterministic string work: the block is labelled, so it is keyed, so merging it is a matter of matching sections rather than of judgement.
+
+The judgement that genuinely needs a model — whether two differently worded captions mean the same thing, and which parts of an existing caption are worth keeping — already happens in the analysis call you are already paying for. With `-r`, the caption a file already holds is forwarded to the model as context, and `photokin/prompts_photo_ai/instructions_front_back.txt:261-276` instructs it to evaluate that caption before writing: preserve unique human context (names, events, places, dates, relationships), feel free to replace text that merely re-describes the image or that an earlier run generated, and return a merged whole. So the semantic decision is made once, in the call that was already going to happen.
+
+### Running it twice does not grow your captions
+
+Under `-rw`, the block photokin writes into a file is exactly what the next run reads back out of it. That is a real trap — an earlier release of photokin appended another copy of the caption on every pass — so it is now a property the test suite pins directly: run `-rw` three times over the same folder and the caption is byte-identical after the first run.
+
+Two things make that true. Labelled lines are recognised as photokin's own output and taken as they are, never labelled a second time. And the `[AI Analysis]` section is regenerated rather than accumulated: everything from that marker to the end of the caption is the previous run's analysis, so a model that rewords itself between runs replaces its old paragraph instead of adding a second one. Everything above the marker is yours and is never touched.
+
 ## API keys
 
 Keys are plain environment variables, one per provider. Photokin reads them when it builds the provider client and nowhere else. They never end up in results, changesets, or debug dumps.
@@ -381,26 +499,43 @@ You only need the key for the provider you're actually calling. And since a batc
 
 ## Setting up ExifTool
 
-ExifTool is optional, and can be both used for reading initial values from the photos (so you don't just overwrite everything) and also write to the photos after. Before analysis, it reads `EXIF:UserComment` straight out of the files so a comment already living in an image rides along to the model as context (hydration). After analysis, it writes approved changeset fields back into the files or their sidecars (apply).
+ExifTool is optional, and can be both used for reading initial values from the photos (so you don't just overwrite everything) and also write to the photos after. With `-r`, it reads `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` straight out of the files before analysis, so a note, a caption, a title, a date or a keyword already living in an image rides along to the model as context (hydration). After analysis, `-w` writes approved changeset fields back into the files or their sidecars (apply).
 
-Those two halves have different reach, which is worth knowing before you count on the first. Hydration runs for **manifest input only**, and only for items that already carry a `metadata` object whose `userComment` is missing or empty — a folder or single-photo run is never hydrated, because turning that on would change the prompt, the cost and the output of every existing folder run. Apply works for every input type.
+The two halves mirror each other: both are explicit opt-ins, neither implies the other, and both work for folder, manifest and single-photo input alike. `-r` fills only what the input does not already carry, so a value from a manifest item or from `--meta` is never overridden, and it writes nothing anywhere. Reading the whole set rather than one tag is deliberate — knowing what a file already holds is how the run knows what *not* to change. Every run's plan summary names the read set, so `read : none (-r not given)` is visible before the first model call.
+
+`-r` is worth knowing about for two non-obvious reasons. The first is dates. The date-correction heuristic compares the file's own `EXIF:DateTimeOriginal` against the model's inference and rewrites it only when they disagree by a wide margin — the rule that fixes a 2019 scan date on a 1952 print while leaving a modern photo alone. Without a date read out of the file there is nothing to compare against, so in folder mode that heuristic never fired at all. `-r` is what makes it live. The file's date is treated as evidence rather than as truth: it drives that comparison and fills `dateTimeOriginal` when the comparison declines, but it no longer overwrites the model's `date_guess`, which on a flatbed scan would assert the day you scanned the print as the day the photograph was taken.
+
+The second is titles. Scanner software routinely writes "Scanned Image" or the bare filename into `XMP:Title`, so a title read out of a file is not the same evidence as a title you typed — under `-r`, a title the model transcribed off the print wins, and the file's own is kept only when the model returned none. A title supplied by a manifest item or by `--meta` is unaffected and still beats the model outright: a human wrote that one, and letting a transcription overwrite it would lose data rather than junk. The distinction is provenance, not content — the same string wins or loses depending on where it came from.
 
 Where each result field lands when written:
 
 | Result field | Tag |
 |---|---|
 | `ai_caption` (the AI analysis) | `EXIF:UserComment` |
-| `caption` (the verbatim transcription) | `XMP:dc:Description` |
-| `keywords` | `XMP:dc:Subject` |
-| `title` | `XMP:dc:Title` |
+| `caption` (the verbatim transcription) | `XMP-dc:Description` |
+| `keywords` | `XMP-dc:Subject` |
+| `title` | `XMP-dc:Title` |
 | `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` |
 | `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location` |
 
+Those are the spellings to pass to `--exiftool-fields`, verbatim. The XMP ones are hyphenated (`XMP-dc:Description`) because that is the form ExifTool writes and the form it prints back under `-G1`; the colon form `XMP:dc:Description` is **not** writable — ExifTool answers "doesn't exist or isn't writable" and writes nothing. Earlier versions of photokin used the colon form internally, so a command copied from an older changeset or an older copy of these docs will name it; a run that does is now stopped before its first model call with the correct spelling quoted, rather than analysing the whole batch and writing none of it. Note that reading is more forgiving than writing — `-r` asks for the bare `XMP:Description`, which resolves to the same tag.
+
 **Setup.** On Windows, run `python -m photokin.exiftool.fetch` once — it downloads the official ExifTool distribution from the project's SourceForge host and verifies it against the SHA256 exiftool.org publishes, into `~/.photokin/bin`, no system install needed. On macOS/Linux install it yourself: `brew install exiftool` or `apt install libimage-exiftool-perl`. At runtime the binary is found in this order: an explicit `--exiftool-path` / `EXIFTOOL_PATH`, then the downloaded copy in `~/.photokin/bin`, then whatever `exiftool` is on your `PATH`.
 
-If none is found, hydration is skipped with a warning and the analysis still runs. A *requested write* is treated differently: the binary is resolved before the first model call, so `-w` with no ExifTool anywhere exits 2 immediately rather than analyzing the whole batch and only then discovering it cannot write any of it.
+If none is found, a run that asked for one stops before it costs anything: `-r` and `-w` both resolve the binary before the first model call, so either flag with no ExifTool anywhere exits 2 immediately rather than analyzing the whole batch and only then discovering it cannot read or write any of it. Once that check passes, a mid-run failure on a single file — a lock, a corrupt image, a timeout — is a warning on both sides and the analysis still runs.
 
 **Writing during a run.** Nothing is written into your files unless you ask for it: `--exiftool-write` defaults to `false`, and a changeset on its own only records what *would* be written. `-w` is the one-flag spelling of `--changeset true --exiftool-write true` — record the proposed writes and apply them — and works for folder, manifest and single-photo input alike. Spelled out, that is `--changeset true --exiftool-write true` — those two flags and no others, with `--exiftool-fields` left at its `EXIF:UserComment` default; `--exiftool-write true` is required rather than a confirmation of the default. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults. Every run prints a plan summary before its first model call naming the write set, so "nothing will be written" is visible up front; `--dry-run` prints that summary and stops.
+
+**When writes fail.** A run that asked to write, saw files, and wrote *none* of them exits 2 and says so — that shape is always a setting that is wrong for every file (an unwritable `--exiftool-fields` tag, a read-only folder, a binary that will not run), so a script moving on to the next box of scans should stop. A *partial* failure exits 0: some files were written, so the settings were right, and one locked or corrupt file among many is ordinary. Either way the per-file reasons are logged as `[ExifTool] Errors:` before the run ends. Manifest mode is the exception and always exits 0, because it is the Lightroom plug-in's contract and the plug-in reads the per-item records rather than the exit status.
+
+**Use `-rw`, not `-w`.** The two short flags combine the way any short flags do, so `photokin C:\Scans\ -rw` is the whole normal run: read what the files already hold, then write the results back. Prefer it over bare `-w`, which is genuinely the more dangerous of the two. The date-correction heuristic can only protect a date by *comparing* against it, so with nothing read there is nothing to compare and a mediocre guess overwrites a good value. Measured, on a modern photo already carrying a correct `2019:08:14` against a model guessing 2005 at confidence 0.72:
+
+```
+photokin <folder> -w     proposes  EXIF:DateTimeOriginal = 2005-06-15    # overwrites a correct date
+photokin <folder> -rw    proposes  nothing                               # 14-year gap is under the threshold
+```
+
+`-w` alone is still the right flag when the files genuinely hold nothing worth reading — a folder of fresh scans straight off the scanner, where every read would come back empty and `-r` only costs you a subprocess.
 
 **Know where it lands before you start a batch.** Both halves of `-w` reach into your photo directory. The changeset is written beside the *input* unless `--output-file` redirects it, so `photokin ./scans/ -w` drops `scans_changeset.ndjson` **inside `./scans/`** and then edits the images there in place. Photo directories are often cloud-synced, network-mounted or read-only, and none of those is a good place to discover this: give `--output-file` a path somewhere you control and the changeset follows it, or run `--dry-run` first, which prints the exact changeset path it would use and stops.
 
@@ -460,7 +595,7 @@ type instead of detecting it; passing a positional *and* an alias is an error.
 | Flag                                               | What it does |
 |----------------------------------------------------|---|
 | `--group-by {object,pair,none}`                    | Grouping granularity, the one axis (default `object`). `object`: every scan of one print is one object and shares a single analysis. `pair`: each rescan — print plus variant letter — is analyzed on its own. `none`: every file alone. See below |
-| `--date-confidence-threshold X`                    | Minimum model confidence before a date guess is applied, 0-1 (default 0.7) |
+| `--date-confidence-threshold X`                    | Minimum model confidence before a date guess is written into a file that has no date, 0-1 (default 0.6). Replacing a date the file already holds is governed separately and costs more; see below |
 | `--location-confidence-threshold X`                | Same, for location guesses (default 0.7) |
 | `--no-update-vocab`                                | Don't append newly proposed keywords to the vocabulary file |
 
@@ -477,14 +612,17 @@ type instead of detecting it; passing a positional *and* an alias is an error.
 | `--changeset {true,false}` | Emit a changeset NDJSON of proposed file writes, for every input type (default `false`) |
 | `--dry-run`                | Print the plan summary and stop, before the first model call. Nothing is analyzed and no destination is touched. Beside `--generate-manifest`, reports the grouping it would write and leaves the file alone |
 
-### ExifTool write-back
+### ExifTool read and write-back
 
 | Flag                            | What it does |
 |---------------------------------|---|
+| `-r`, `--read`                  | Before analysis, read `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` out of the files and send them to the model, for every input type. Only fills what the input does not already carry; nothing is written. Mirrors `-w` |
 | `-w`, `--write`                 | Shorthand for `--changeset true --exiftool-write true`: record the proposed writes and apply them. An explicit flag that contradicts it is an error rather than a guess |
 | `--exiftool-write {true,false}` | Apply changeset fields to the files after analysis (default `false`; nothing is written without an explicit opt-in) |
 | `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write (default `EXIF:UserComment`) |
 | `--exiftool-path PATH`          | ExifTool binary to use (default: auto-detect) |
+
+`-r` is the read half and `-w` the write half; the short letters are deliberately symmetrical, and they combine as `-rw` (or `-wr`) exactly like any other pair of short flags — that combined form is the one to reach for, for the reason given above. `-R` is **reserved** for the recursive-folder flag that is still deferred (it changes grouping semantics across directories and interacts with write safety, so it gets its own change), and must not be spent on anything else.
 
 ### Debug
 

@@ -36,7 +36,7 @@ from datetime import date, datetime
 from json import JSONDecodeError
 from typing import Any, Iterable
 
-from .config import ExiftoolConfig, parse_fields
+from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
 from .locate import resolve_exiftool_path
 
 logger = logging.getLogger(__name__)
@@ -174,6 +174,33 @@ def apply_changeset(
     allowed_fields = tuple(fields) if fields is not None else cfg.fields
     allowed_fields = tuple(field.strip() for field in allowed_fields if field.strip())
 
+    # Say once, up front, what ExifTool would otherwise say once per file as
+    # "Sorry, ... doesn't exist or isn't writable / Nothing to do" -- a message
+    # that names no remedy and, repeated across a batch, reads like a problem
+    # with the files rather than with the tag name. The CLI rejects this
+    # spelling in pre-flight; this is the same guard for direct library callers
+    # (the Lightroom plugin among them), which never pass through that path.
+    # The tag is also dropped from ``allowed_fields`` below: the warning says
+    # "nothing will be written for this tag", so leaving it in would still
+    # hand it to ExifTool once per file and reproduce, per file, the very
+    # message this warning exists to say once instead.
+    unwritable_fields = set()
+    for field in allowed_fields:
+        better = suggest_writable_spelling(field)
+        if better:
+            unwritable_fields.add(field)
+            summary["warnings"].append(
+                {
+                    "tag": field,
+                    "warning": (
+                        f"{field!r} is not a writable ExifTool tag name; use "
+                        f"{better!r} instead. Nothing will be written for this tag."
+                    ),
+                }
+            )
+    if unwritable_fields:
+        allowed_fields = tuple(f for f in allowed_fields if f not in unwritable_fields)
+
     with open(changeset_path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
@@ -226,8 +253,15 @@ def apply_changeset(
             cmd = _build_exiftool_command(exiftool, cfg, tags_to_write, path)
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            except FileNotFoundError as exc:
-                summary["errors"].append({"path": path, "error": f"ExifTool not found: {exc}"})
+            except (OSError, ValueError) as exc:
+                # OSError covers FileNotFoundError (binary went missing
+                # mid-batch) and PermissionError (an unexecutable binary, a
+                # locked file) alike; ValueError covers subprocess's own
+                # argument validation (an embedded NUL byte in a bad path).
+                # Per-file, like every other failure in this loop: a batch of
+                # 500 does not abort on file 3, and the files already written
+                # before it stay written and stay reported.
+                summary["errors"].append({"path": path, "error": f"ExifTool failed to start: {exc}"})
                 continue
 
             if result.returncode != 0:

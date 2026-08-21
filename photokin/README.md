@@ -82,6 +82,19 @@ For `error_type` values whose message is already the full explanation (`SELF_EXP
 
 Every successful response gets one stamp on the way out: the effective model is read from `response.model` (falling back to the requested model), and keyword provenance is normalized to exactly one marker — `<ProviderName> <ResolvedModelName> Analyzed` — so you can always tell, years later, which model wrote a given analysis.
 
+One field of the record is a property of the **group** rather than of the file it is keyed under. `caption` is a single labelled block built from every file's own existing caption plus this run's analysis, and every record in the group carries it byte-identically:
+
+```
+[Photo A] Caption A
+[Photo B] Caption B
+[Back] Back of Photo B
+[AI Analysis]: Two people outside a bakery.
+```
+
+Two consequences for an embedder. A caption your hydrator supplies for one item will appear in its siblings' records — that is deliberate, and `--group-by none` is the way to opt out of it. And the block is designed to be fed back in: pass a previous run's `caption` to the next run's hydrator and it is recognised, not re-labelled and not appended to, so a repeated enrichment pass is a fixed point rather than unbounded growth. The block's shape, the label rules and the merge rules are documented for users in the root [README](../README.md#captions); the record's own caption is what the write-back applies to `XMP-dc:Description`, so an embedder that renders records itself sees the same text.
+
+`caption_original` sits beside it and holds the prior caption unlabelled and unmerged, for a consumer that wants an input rather than the block. Read it as evidence, not as provenance: it is `merge_original_sources(this file, the group)`, so a file that carried no caption of its own reports whichever one the group scan settled on — the front print's, usually — rather than nothing.
+
 ## Configuration
 
 All the knobs mentioned above live on one dataclass, `utils.Config` (core fields only — ExifTool settings live in `photokin.exiftool.ExiftoolConfig`):
@@ -90,7 +103,7 @@ All the knobs mentioned above live on one dataclass, `utils.Config` (core fields
 - Prompts/vocab: `prompts_dir`, `vocab_path`, `forbidden_path`, `metadata_forward_path`, `no_update_vocab`, `fail_on_forbidden`
 - Grouping: `group_by` (default `object`; see [Grouping](#grouping) above)
 - Imaging: `jpeg_quality` (default 80), `max_edge` (default 1024)
-- Thresholds: `date_confidence_threshold`, `location_confidence_threshold` (both default 0.7), plus `date_override_*` policies used by `merge.py`
+- Thresholds: `date_confidence_threshold` (0.6, to fill a date a file lacks), `location_confidence_threshold` (0.7), plus the `date_override_*` policies used by `merge.py` -- `date_override_confidence_threshold` is 0.7, deliberately at or above the write gate, because replacing a date the file already holds destroys something while filling an empty one cannot
 - Context: `photo_context_text`, `photo_context_file` (authoritative context forwarded to the model, capped at 200 KB)
 - Output: `pretty_json`
 - Debug: `debug_dump_llm_request`, `debug_dump_dir`, `run_batch_id`, `dry_run`
@@ -103,7 +116,9 @@ Two of those are library-only, with no flag behind them. `pretty_json` indents t
 
 ## Embedding it yourself
 
-If you're calling the library from your own code rather than the CLI, the seam is `core.process_manifest_stream`. Set `cfg.group_by` to one of `photokin.utils.GROUP_BY_VALUES` to choose the granularity; an unknown value raises `ValueError` before the first group. It returns `{"results": {path: record}, "errors": {path: payload}}` with one entry per file, the two disjoint — every file of a failed group carries that group's payload, bar one already recorded before the group raised part-way through — and it accepts an optional `metadata_hydrator: Callable[[list[dict]], None]` that runs on the manifest items after loading and before grouping. The CLI passes `photokin.exiftool.make_manifest_hydrator(...)` there; you can pass your own callable — pull existing metadata from a database, a sidecar format, anywhere — or omit it entirely. The core itself never touches ExifTool, which is the whole point of the seam.
+If you're calling the library from your own code rather than the CLI, the seam is `core.process_manifest_stream`. Set `cfg.group_by` to one of `photokin.utils.GROUP_BY_VALUES` to choose the granularity; an unknown value raises `ValueError` before the first group. It returns `{"results": {path: record}, "errors": {path: payload}}` with one entry per file, the two disjoint — every file of a failed group carries that group's payload, bar one already recorded before the group raised part-way through — and it accepts an optional `metadata_hydrator: Callable[[list[dict]], None]` that runs on the manifest items after loading and before grouping. The CLI passes `photokin.exiftool.make_manifest_hydrator(...)` there, for folder, manifest and single-photo input alike, and only when `-r` was given — that hydrator reads `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject`, fills only the keys an item's metadata is missing or holds empty, and creates the `metadata` object only when it actually read something. You can pass your own callable instead — pull existing metadata from a database, a sidecar format, anywhere — or omit it entirely. The core itself never touches ExifTool, which is the whole point of the seam.
+
+Passing your own hydrator does **not** narrow title precedence. A title it supplies still beats the model's, exactly as an inline manifest title does: your database holds a human's words, and the model's title is a transcription of whatever is printed on the object. What narrows the rule is a separate keyword-only argument, `titles_may_be_from_files: bool = False` — your statement that the values the hydrator supplied came out of the files' own tags, where an `XMP:Title` is as likely to say "Scanned Image" as anything a person wrote. It reads nothing itself and changes nothing else; the CLI sets it from `-r`, and if you hydrate from a file yourself you should set it too.
 
 ## Tests
 

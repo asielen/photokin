@@ -371,11 +371,23 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
     and the same canned reply used here. The capture was repeated to confirm it
     is deterministic before it was written down.
 
-    One difference is out of scope and stated here rather than hidden: a
-    *model-emitted* ``Negative`` keyword now leaves the group-wide pool, where
+    Two differences are out of scope and stated here rather than hidden.
+
+    A *model-emitted* ``Negative`` keyword now leaves the group-wide pool, where
     f4153ae kept it on every file. That is C1's marker rule
     (``_split_keywords_for_merge``) and is intended, so this fixture's reply does
     not contain one.
+
+    The ``caption`` is the other, and it is the whole subject of C3's caption
+    block: a group's captions are now merged into one labelled block written to
+    every file of it. f4153ae wrote "[Front] A caption" onto the lone scan and
+    "[Back] A caption" onto BOTH files of the pair -- including the front, which
+    is the mislabelling the block replaces. What every file gets here instead is
+    "[AI Analysis]: A caption", because these placeholders hold no captions of
+    their own: the analysis is the only section there is, and it is labelled so
+    that a later ``-r`` can tell photokin's own output from a human's prose. The
+    caption is therefore the one field of this golden that is *expected* to
+    differ from f4153ae; every other byte still has to survive.
     """
 
     _FIXTURE: ClassVar[tuple[str, ...]] = (
@@ -430,12 +442,13 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
     }
 
     #: Captured from f4153ae: the complete per-file record set, paths shortened
-    #: to basenames. Note the front's caption is the pair's caption, ``[Back]``
-    #: label and all -- the pair path builds one per-variant caption block and
-    #: lands it on both files, which is exactly what f4153ae did.
+    #: to basenames -- with the ``caption`` field updated to C3's block, for the
+    #: reason the class docstring gives. One caption still lands on every file of
+    #: the pair, as it did in f4153ae; what changed is that it no longer claims
+    #: the front is a back.
     _F4153AE_RECORDS: ClassVar[dict[str, dict[str, object]]] = {
         "box3_025-back.jpg": {
-            "caption": "[Back] A caption",
+            "caption": "[AI Analysis]: A caption",
             "keywords": ["family", "PC-R-123", "back"],
             "location_guess": _LOCATION,
             "date_guess": _DATE,
@@ -445,7 +458,7 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
             "_merge": _NO_MERGE,
         },
         "box3_025.jpg": {
-            "caption": "[Back] A caption",
+            "caption": "[AI Analysis]: A caption",
             "keywords": ["family", "PC-R-123"],
             "location_guess": _LOCATION,
             "date_guess": _DATE,
@@ -455,7 +468,7 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
             "_merge": _NO_MERGE,
         },
         "box3_040.jpg": {
-            "caption": "[Front] A caption",
+            "caption": "[AI Analysis]: A caption",
             "keywords": ["family", "PC-R-123"],
             "location_guess": _LOCATION,
             "date_guess": _DATE,

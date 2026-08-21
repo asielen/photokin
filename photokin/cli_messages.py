@@ -24,8 +24,9 @@ Code map:
 - positional_and_alias, two_aliases, no_input_given, alias_*  input selection
 - flag_*, write_*, output_file_extension                      flag combinations
 - generate_manifest_*                                         --generate-manifest
-- output_*, exiftool_not_found                                pre-flight (verbatim)
+- output_*, exiftool_not_found, exiftool_field_is_not_writable  pre-flight (verbatim)
 - detected_as, exiftool_fields_with_no_write                  notes, not errors
+- normal_run_command  PUBLIC: the ``-rw`` run to advise, rebuilt from the argv
 - RunPlan           PUBLIC: the plan summary printed before the first model call
 """
 
@@ -463,8 +464,8 @@ def generate_manifest_with_manifest_input() -> UsageMessage:
         The problem line and the remedy line, in that order.
     """
     return (
-        "--generate-manifest describes how folder or single-photo input would be "
-        "grouped, but --manifest input is already a manifest.",
+        "--generate-manifest turns a folder into a manifest, and this input "
+        "is already one.",
         "drop --generate-manifest, or point it at a folder: "
         "photokin --folder ./scans/ --generate-manifest out.json",
     )
@@ -596,8 +597,11 @@ def output_destination_not_writable(role: str, out_path: str, reason: str) -> Us
     Returns:
         The problem line and the remedy line, in that order.
     """
+    # Reason first, path last: the reason is short and is what the reader acts
+    # on, while the path can be any length and so belongs at the end where it
+    # cannot push anything off the line.
     return (
-        f"{role} destination is not writable: {out_path} ({_one_line(reason)})",
+        f"{role} cannot be written -- {_one_line(reason)}:\n  {out_path}",
         "point --output-file at a writable directory",
     )
 
@@ -612,12 +616,63 @@ def exiftool_not_found(configured_path: str) -> UsageMessage:
     Returns:
         The problem line and the remedy line, in that order.
     """
-    configured = f" (configured path: {configured_path})" if configured_path else ""
+    # The configured path goes on its own line rather than into a parenthetical:
+    # a Windows path is routinely 80+ characters and swallows the sentence it
+    # sits inside, which is the one thing the reader needs to be able to skim.
+    configured = f"\n  looked for it at: {configured_path}" if configured_path else ""
     return (
-        "--changeset true needs ExifTool to write the results, "
-        f"but no ExifTool binary was found{configured}.",
-        "run `python -m photokin.exiftool.fetch` to download one, install ExifTool "
-        "system-wide, or re-run with --exiftool-write false",
+        f"no ExifTool found, and writing needs it.{configured}",
+        "run `python -m photokin.exiftool.fetch` to install one, "
+        "or drop -w to analyze without writing",
+    )
+
+
+def exiftool_not_found_for_read(configured_path: str) -> UsageMessage:
+    """Reads were requested and no ExifTool binary resolves.
+
+    A read that cannot run fails quietly -- the batch is analyzed and paid for
+    with a strictly worse prompt -- so it is caught up front, exactly as a
+    requested write is. Writes are reported first when both are broken, since
+    their remedy fixes the read too.
+
+    Args:
+        configured_path: The path ``--exiftool-path``/``EXIFTOOL_PATH`` named,
+            or an empty string when neither was set.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    # Same shape as exiftool_not_found, deliberately: a reader who has hit one
+    # of these recognizes the other at a glance instead of reading it afresh.
+    configured = f"\n  looked for it at: {configured_path}" if configured_path else ""
+    return (
+        f"no ExifTool found, and -r needs it to read your files.{configured}",
+        "run `python -m photokin.exiftool.fetch` to install one, "
+        "or drop -r to analyze without reading",
+    )
+
+
+def every_write_failed() -> UsageMessage:
+    """Writes were requested, files were seen, and not one was written.
+
+    Reported as a usage error rather than left to the exit status, because the
+    run has otherwise succeeded loudly -- the analysis ran, the results printed,
+    the changeset was written -- and the one thing the user asked for silently
+    did not happen. Partial failure is deliberately not routed here: some files
+    did get their metadata, and one locked or corrupt file is ordinary. Zero of
+    many is not ordinary; every file failed for the same reason, and that reason
+    is a setting rather than a photo.
+
+    The per-file reasons are in the ``[ExifTool] Errors:`` record logged just
+    above, which is why this line does not try to restate them.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        "nothing was written -- every file ExifTool tried failed.",
+        "see the ExifTool errors above; the usual causes are an unwritable "
+        "`--exiftool-fields` tag or a read-only folder",
     )
 
 
@@ -652,10 +707,137 @@ def exiftool_fields_with_no_write(value: str) -> str:
     )
 
 
+def exiftool_field_is_not_writable(bad: str, good: str) -> tuple[str, str]:
+    """Reject a tag spelling ExifTool cannot write, naming the one it can.
+
+    Caught before the first model call rather than at apply time on purpose.
+    ExifTool's own answer to this spelling is "Sorry, ... doesn't exist or isn't
+    writable" followed by "Nothing to do", reported once per file after the
+    whole batch has been analysed and paid for -- so the run costs full price
+    and writes nothing. One line up front is worth more than an accurate
+    post-mortem.
+
+    Args:
+        bad: The tag exactly as the user typed it.
+        good: The writable spelling for the same tag.
+
+    Returns:
+        A ``(problem, remedy)`` pair for :func:`_exit_with_usage_error`.
+    """
+    # What ExifTool would have said, and why the run would have cost full price
+    # before saying it, are both in the docstring above rather than in the
+    # message: the reader needs the tag and the spelling that works, and a
+    # second clause explaining the mechanism only delays both.
+    return (
+        f"ExifTool cannot write `{bad}`.",
+        f"use `{good}` instead -- the same tag, spelled the way ExifTool wants it",
+    )
+
+
+# === The normal run, rebuilt so it can be pasted ===
+
+#: What a token may hold and still be pasted back bare. A whitelist on purpose:
+#: cmd.exe, PowerShell and the POSIX shells disagree about which characters are
+#: special, and everything outside this set is quoted rather than reasoned about.
+#: The backslash is deliberately absent -- to a POSIX shell a bare ``C:\Scans`` is
+#: ``C:Scans`` and a bare ``C:\Scans\`` swallows the next token, so every Windows
+#: path is quoted. Measured in all three shells; see :func:`_quote_token`.
+_BARE_TOKEN_EXTRAS = "_@+=:,./-"
+
+#: Characters no single rendering carries safely into all three shells at once,
+#: measured rather than assumed: ``$`` and a backtick expand inside POSIX and
+#: PowerShell double quotes, ``%`` expands inside cmd's, ``!`` is history
+#: expansion in an interactive bash (``bash: !ns: event not found``), ``"`` ends
+#: the quoting, and a newline is a second command. A token holding one of these
+#: withholds the whole hint. That is the point: a suggested command that does
+#: something other than what it reads is worse than no suggestion at all, and
+#: these are rare enough in a scan folder that silence costs nothing.
+_UNPASTEABLE = frozenset('"$`%!\n\r')
+
+
+def _quote_token(token: str) -> str:
+    """Return one argv element ready to be pasted back into a shell.
+
+    Double quotes are the one form that makes a metacharacter literal in cmd.exe,
+    PowerShell and a POSIX shell alike, so the rendering does not have to guess
+    which shell the reader is in. Their single disagreement is a trailing
+    backslash: Windows pairs it with the closing quote and POSIX escapes the
+    quote with it, and doubling that run is read correctly by both. (Windows
+    PowerShell 5.1 passes the doubled run through as two separators when the
+    token has no space in it; Windows collapses repeated separators, so the run
+    is unchanged -- measured, same plan and same file count either way.)
+
+    Args:
+        token: One argv element, exactly as the user typed it.
+
+    Returns:
+        The token bare when nothing in it is special to any shell, quoted
+        otherwise.
+    """
+    if token and all(char.isalnum() or char in _BARE_TOKEN_EXTRAS for char in token):
+        return token
+    trailing = len(token) - len(token.rstrip("\\"))
+    return '"' + token + "\\" * trailing + '"'
+
+
+def normal_run_command(tokens: list[str]) -> str | None:
+    """Return the archival run for *tokens*: the same command, plus ``-rw``.
+
+    The whole argv is carried over rather than the input path alone. A run that
+    named a provider, a model or a grouping keeps naming it, so the suggestion
+    cannot quietly describe a different run from the one just planned -- which is
+    the exact failure a hint like this exists to avoid. Nothing can contradict the
+    two added flags either, because the caller withholds the hint for any run that
+    already spelled a write flag out.
+
+    The program is named ``photokin`` rather than reflected from ``sys.argv[0]``,
+    matching every other example in this module: a caller launching
+    ``python -m photokin.cli`` gets the spelling the documentation uses.
+
+    Args:
+        tokens: The argv the run parsed, without the program name.
+
+    Returns:
+        The command line, or None when some token cannot be rendered safely for
+        every shell -- in which case there is no hint at all.
+    """
+    if any(_UNPASTEABLE & set(token) for token in tokens):
+        return None
+    # A UNC path (``\\server\share``) is the one shape _quote_token's own
+    # doubling rule does not cover: that rule is proven only for a *trailing*
+    # backslash, and a *leading* double backslash is different -- inside a
+    # POSIX double-quoted string ``\\`` is itself an escape for one literal
+    # backslash, so a UNC prefix collapses from two to one on that shell and
+    # silently stops being a UNC path. Measured: every other Windows path
+    # shape (a bare path, one with a trailing backslash) survives a POSIX
+    # shlex round trip unchanged; only this one does not.
+    if any(token.startswith("\\\\") for token in tokens):
+        return None
+    return " ".join(["photokin", *(_quote_token(token) for token in tokens), "-rw"])
+
+
 # === The plan summary ===
 
-#: Width of the summary's label column, sized to its longest label.
+#: Width of the summary's label column, sized to its longest label. ``changeset``
+#: and ``--dry-run`` are both exactly this wide; ``note`` fits inside it, so the
+#: advisory row needed no change here.
 _LABEL_WIDTH = 9
+
+#: Where a value starts: the two-space margin, the label column and the ``" : "``
+#: between them. Derived from :data:`_LABEL_WIDTH` rather than written out, so a
+#: value that runs onto a second line cannot drift out of alignment with the
+#: first if the column is ever resized.
+_VALUE_INDENT = " " * (2 + _LABEL_WIDTH + len(" : "))
+
+#: The advisory row's prose, wrapped by hand. ``textwrap`` is deliberately not
+#: used: the row's last line is the command the reader copies, and a wrapper
+#: wide enough to fold this prose would fold a long path across two lines too,
+#: producing a hint that breaks the moment it is pasted. Hand-wrapping the prose
+#: and never wrapping the command makes that impossible rather than unlikely.
+_NORMAL_RUN_NOTE = (
+    "this run only prints results - your photos are not read or\n"
+    "changed. For the normal archival run:"
+)
 
 
 @dataclass(frozen=True)
@@ -678,12 +860,20 @@ class RunPlan:
         file_count: How many files the run will send.
         group_count: How many groups they form at this granularity.
         group_by: The granularity itself.
+        read: The rendered read set, or a ``none (...)`` clause. Stated on every
+            run for the same reason the write line is: hydration used to happen
+            unasked in manifest mode, and this is where a caller sees that it
+            now takes ``-r``.
         output: The rendered destination clause, or ``"stdout"``.
         changeset: The rendered changeset path, or a ``none (...)`` clause.
         write: The rendered write set, or a ``none (...)`` clause.
         provider: The provider's display name.
         model: The concrete model string the adapter will send.
         dry_run: Whether the run stops after printing this.
+        suggested_command: The ``-rw`` run to advise, from
+            :func:`normal_run_command`, or None to print no advice. Held as the
+            command rather than as the finished sentence so the wording around it
+            stays in this module and cannot be forged by a caller.
     """
 
     input_location: str
@@ -691,19 +881,22 @@ class RunPlan:
     file_count: int
     group_count: int
     group_by: str
+    read: str
     output: str
     changeset: str
     write: str
     provider: str
     model: str
     dry_run: bool
+    suggested_command: str | None = None
 
     def render(self) -> str:
         """Return the whole summary block as one multi-line string.
 
         Returns:
-            Six lines, or seven under ``--dry-run``, emitted as a single log
-            record so nothing can be interleaved into the middle of it.
+            Seven rows, plus one under ``--dry-run`` and three more lines when a
+            command is being advised, emitted as a single log record so nothing
+            can be interleaved into the middle of it.
         """
         rows = [
             (
@@ -711,6 +904,8 @@ class RunPlan:
                 f"{self.input_location} ({self.input_kind}, {self.file_count} file(s) "
                 f"in {self.group_count} group(s), group-by {self.group_by})",
             ),
+            # Reading precedes everything it affects, so it is stated first.
+            ("read", self.read),
             ("output", self.output),
             ("changeset", self.changeset),
             ("write", self.write),
@@ -719,5 +914,15 @@ class RunPlan:
         ]
         if self.dry_run:
             rows.append(("--dry-run", "stopping here; no model call, and nothing written."))
-        lines = [f"  {label.ljust(_LABEL_WIDTH)} : {value}" for label, value in rows]
+        if self.suggested_command:
+            # Last, under the rows it is drawing a conclusion from: the reader has
+            # just been told the run reads nothing and writes nothing, and this
+            # says what to type instead. The command carries its own indent so it
+            # stands out from the prose above it as the part to copy.
+            rows.append(("note", f"{_NORMAL_RUN_NOTE}\n    {self.suggested_command}"))
+        lines = []
+        for label, value in rows:
+            first, *rest = value.split("\n")
+            lines.append(f"  {label.ljust(_LABEL_WIDTH)} : {first}")
+            lines.extend(f"{_VALUE_INDENT}{line}" for line in rest)
         return "\n".join(["Plan for this run:", *lines])
