@@ -44,10 +44,12 @@ The only step that changes per vendor is the model call itself — prompts, imag
 
 | Provider | `--provider` / `LLM_PROVIDER` | Model setting | API key env |
 |---|---|---|---|
-| OpenAI (ChatGPT) | `openai` (default) | `--openai-model` / `OPENAI_MODEL` (default `gpt-4o`) | `OPENAI_API_KEY` |
+| OpenAI (ChatGPT) | `openai` | `--openai-model` / `OPENAI_MODEL` (default `gpt-4o`) | `OPENAI_API_KEY` |
 | Anthropic (Claude) | `anthropic` (alias: `claude`) | `--claude-model` / `CLAUDE_MODEL`: `sonnet` or `haiku` alias, or full `claude-*` id via env | `ANTHROPIC_API_KEY` |
 | Google (Gemini) | `gemini` (alias: `google`) | `--gemini-model` / `GEMINI_MODEL` (default `gemini-2.5-flash`) | `GEMINI_API_KEY` |
 | OpenRouter (Kimi, Grok, Qwen, …) | `openrouter` | `--openrouter-model` / `OPENROUTER_MODEL` (default `moonshotai/kimi-k3`) | `OPENROUTER_API_KEY` |
+
+There is no hardcoded default provider at the CLI: it resolves `--provider`, then `LLM_PROVIDER`, then the one provider whose SDK is importable (`utils.installed_provider_sdks`), and exits 2 asking for a choice when zero or several are installed and nothing chose. OpenRouter rides the `openai` package and so is never auto-selected. A bare `utils.Config()` is the embedder surface and keeps its `openai` fallback for compatibility — an embedder that wants the CLI's behavior passes a provider explicitly or sets `LLM_PROVIDER`.
 
 Claude aliases resolve via `CLAUDE_MODELS` in `utils.py` (`sonnet` → `claude-sonnet-4-6`, `haiku` → `claude-haiku-4-5-20251001`; default alias `sonnet`). The one place prompt content does vary by provider: Gemini gets an extra JSON-syntax guardrail appended, paired with Gemini-specific JSON repair in `utils._cleanup_model_json` — it earned both.
 
@@ -71,12 +73,13 @@ Four vendors means four exception zoos, so every provider failure is normalized 
 - `content_filter` — Gemini blocked the response
 - `missing_dependency` — provider selected but its SDK is not installed
 - `missing_api_key` — provider selected but its API key env var is not set
+- `model_not_found` — the provider does not serve the requested model id (retired, renamed, or mistyped — OpenRouter slugs especially churn). The message names the per-run flag and set-once env var to pick a current model, and the upgrade path for when photokin's own pinned default is the stale one. Detected as a 404 on every provider, plus OpenRouter's 400 "not a valid model ID" shape.
 
-Manifest-stream error payloads carry the normalized type/message and the HTTP status code when available. `missing_dependency` and `missing_api_key` are both raised eagerly in `core._build_provider_client`, before any request is attempted, so neither costs a request.
+Manifest-stream error payloads carry the normalized type/message and the HTTP status code when available. `missing_dependency` and `missing_api_key` are both raised eagerly in `core._build_provider_client`, before any request is attempted, so neither costs a request. `model_not_found` is only discoverable on the first model call — a 404 costs nothing, but it cannot be caught pre-flight.
 
-What happens next differs by mode, and it is worth knowing which you are in. Folder and single-photo mode ask the shared stream for their own failure contract (`process_manifest_stream(..., strict_run_failures=True)`): those two error types are treated as properties of the run rather than of one photo (`_RUN_FATAL_ERROR_TYPES`), so the first group to hit one aborts the batch with a single fatal error, and a run in which no group succeeded re-raises its first failure instead of returning an empty result. Manifest mode keeps the opposite default — it records one error entry per item and exits 0, so a manifest run with no API key produces a full set of `missing_api_key` records rather than one failure. Read the records, not just the exit status. The asymmetry was weighed in Phase C and kept: manifest mode is the Lightroom plugin's contract, and the plugin reads the per-item records, so failing the batch would tell it less than the records already do.
+What happens next differs by mode, and it is worth knowing which you are in. Folder and single-photo mode ask the shared stream for their own failure contract (`process_manifest_stream(..., strict_run_failures=True)`): those three error types are treated as properties of the run rather than of one photo (`_RUN_FATAL_ERROR_TYPES`), so the first group to hit one aborts the batch with a single fatal error, and a run in which no group succeeded re-raises its first failure instead of returning an empty result. For `model_not_found` that abort is the point: the model is constant for the run, so without it a 500-photo batch would fail all 500 groups identically before reporting anything. Manifest mode keeps the opposite default — it records one error entry per item and exits 0, so a manifest run with no API key produces a full set of `missing_api_key` records rather than one failure. Read the records, not just the exit status. The asymmetry was weighed in Phase C and kept: manifest mode is the Lightroom plugin's contract, and the plugin reads the per-item records, so failing the batch would tell it less than the records already do.
 
-For `error_type` values whose message is already the full explanation (`SELF_EXPLANATORY_ERROR_TYPES` in `photokin.errors` — the two above, plus `rate_limit`, `overloaded`, `invalid_input`/`invalid_request`, `api_status`, `length`), both the CLI's top-level fatal error and manifest-stream per-item error records omit the traceback; anything else keeps it, since an unrecognized failure is exactly when a traceback earns its keep.
+For `error_type` values whose message is already the full explanation (`SELF_EXPLANATORY_ERROR_TYPES` in `photokin.errors` — the three above, plus `rate_limit`, `overloaded`, `invalid_input`/`invalid_request`, `api_status`, `length`), both the CLI's top-level fatal error and manifest-stream per-item error records omit the traceback; anything else keeps it, since an unrecognized failure is exactly when a traceback earns its keep.
 
 ## When calls succeed
 

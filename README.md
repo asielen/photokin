@@ -1,6 +1,6 @@
 # photokin
 
-Run scanned photos and documents through a vision model and gets archival metadata back: a verbatim transcription of whatever is written on the front or back, a scene caption, keywords, and deliberately cautious date/location guesses - as JSON, NDJSON streams, or changesets that ExifTool can write into the files.
+Run scanned photos and documents through a vision model and get archival metadata back: a verbatim transcription of whatever is written on the front or back, a scene caption, keywords, and deliberately cautious date/location guesses - as JSON, NDJSON streams, or metadata written straight into the files with ExifTool.
 
 Compatible with OpenAI, Anthropic, Gemini, and OpenRouter API keys.
 
@@ -13,11 +13,17 @@ I have inherited thousands of family photos and documents. While I would love to
 ```bash
 pip install "photokin[openai]"          # or [anthropic] / [gemini] / [all]
 export OPENAI_API_KEY=sk-...            # setx on Windows
+python -m photokin.exiftool.fetch       # sets up ExifTool, on any OS
 
-photokin scan_042.jpg --back scan_042_back.jpg
+photokin scan_042.jpg --back scan_042-back.jpg
 ```
 
-That's a good first command to confirm everything's wired up correctly: it only reads the images and prints one JSON document to your terminal, keyed by image path — one entry per file, so the back gets its own record — and nothing is written to `scan_042.jpg` or `scan_042_back.jpg` themselves. (Writing metadata into the files is a separate, explicit opt-in step; see [Setting up ExifTool](#setting-up-exiftool) below.) Abridged output:
+Two notes on the install lines:
+
+- **ExifTool is part of a normal install.** It is how photokin reads the metadata your files already hold and how it writes results back into them — the whole archival workflow runs through it, so set it up unless you're embedding photokin in a tool that has its own metadata writer. The fetch command works on every OS: it downloads the official ExifTool release into `~/.photokin/bin`, verified against the SHA256 that exiftool.org publishes, with no system install needed — and on macOS/Linux it skips the download when an ExifTool is already installed (`brew install exiftool` counts).
+- **photokin runs with the provider you installed.** With exactly one provider SDK installed, it is used automatically — no flag needed. With more than one (say, `[all]`), pick per run with `--provider anthropic`, or set it once with the `LLM_PROVIDER` environment variable and never type it again — see [Set your defaults once](#set-your-defaults-once), which also covers setting a default model. OpenRouter is the one exception: it shares OpenAI's SDK, so it always takes an explicit `--provider openrouter`.
+
+That `photokin` command is a good first run to confirm everything's wired up correctly: it only reads the images and prints one JSON document to your terminal, keyed by image path — one entry per file, so the back gets its own record — and nothing is written to `scan_042.jpg` or `scan_042-back.jpg` themselves. (Writing metadata into the files is a separate, explicit opt-in step; see [Reading and writing your files](#reading-and-writing-your-files) below.) Abridged output:
 
 ```json
 {
@@ -30,7 +36,7 @@ That's a good first command to confirm everything's wired up correctly: it only 
       "location_guess": {"country": "France", "city": "Le Mans", "confidence": 0.9},
       "date_guess": {"iso": "1944-11-27", "confidence": 0.95, "pattern": "Y!M!D!"}
     },
-    "scan_042_back.jpg": { "keywords": ["...", "back"], "...": "..." }
+    "scan_042-back.jpg": { "keywords": ["...", "back"], "...": "..." }
   },
   "errors": {}
 }
@@ -39,6 +45,8 @@ That's a good first command to confirm everything's wired up correctly: it only 
 The transcription (`caption`) and the interpretation (`ai_caption`) are kept strictly separate — the model is not allowed to "improve" what's actually written on the object. That separation is most of the reason this tool exists.
 
 The `back` in that second record's keywords is photokin's own, not the model's. Every file gets at most one keyword naming which part of the object it is: `back` on a reverse side, `negative` on a negative, and nothing on a front. They are the one thing not shared across a group — everything else in a group's analysis is — so you can always tell which file is which afterwards. See [Naming conventions](#folders-and-batches) for how a part is decided and for the rule that leaves a `back` or `Negative` you applied yourself exactly where it is.
+
+When the output looks right, the run you'll actually archive with is the same command plus `-rw`: read the metadata the files already hold, analyze with that context, and write the results back into the files. That pair of flags, and how whole folders are grouped and processed, is covered in [Folders and batches](#folders-and-batches).
 
 New to Python, or starting from a completely bare machine? See the full [Windows Quick Start](#windows-quick-start) or [macOS Quick Start](#macos-quick-start) walkthroughs below.
 
@@ -66,8 +74,6 @@ Pick a folder to hold your virtual environment and any manifest/output files. Th
 mkdir C:\Users\YourName\photokin-work
 cd C:\Users\YourName\photokin-work
 ```
-
-One thing does not land here by default: a changeset is written beside the *input*, so `--changeset true` on a photo folder drops the `.ndjson` inside that folder. Pass `--output-file` a path in this folder and the changeset follows it.
 
 ### 3. Create and activate a virtual environment
 
@@ -113,9 +119,9 @@ setx ANTHROPIC_API_KEY "sk-ant-..."
 
 Note that `setx` doesn't affect your *current* window — open a new terminal to pick it up.
 
-### 6. (Optional) Set up ExifTool
+### 6. Set up ExifTool
 
-Only needed if you want photokin to write metadata into the image files themselves:
+ExifTool is what lets photokin read the metadata already in your files and write results back into them — the normal archival workflow needs it:
 
 ```powershell
 python -m photokin.exiftool.fetch
@@ -123,21 +129,25 @@ python -m photokin.exiftool.fetch
 
 This downloads the official ExifTool binary into `~/.photokin/bin` — no separate system install required.
 
-Installing it does not turn writing on. Nothing is written to your files unless you add `-w` to a run, so the commands in step 7 still only read. See [Setting up ExifTool](#setting-up-exiftool) for what `-w` writes and where.
+Installing it does not turn writing on. Nothing is written to your files unless you add `-w` to a run, so the commands in step 7 still only read. See [Reading and writing your files](#reading-and-writing-your-files) for what `-w` writes and where.
 
 ### 7. Run it
 
 Give it the full path to the photo — you're in `photokin-work`, not in your pictures folder, and the type is detected from the path you pass:
 
 ```powershell
-photokin C:\Users\YourName\Pictures\scan_042.jpg --back C:\Users\YourName\Pictures\scan_042_back.jpg --provider anthropic
+photokin C:\Users\YourName\Pictures\scan_042.jpg --back C:\Users\YourName\Pictures\scan_042-back.jpg
 ```
 
 or against a whole folder:
 
 ```powershell
-photokin C:\Users\YourName\Pictures\Scans\ --provider anthropic > results.json
+photokin C:\Users\YourName\Pictures\Scans\ > results.json
 ```
+
+No `--provider` flag needed: you installed exactly one provider SDK in step 4, so photokin uses it. If you later install a second one, pick per run with `--provider anthropic`, or set it once with `setx LLM_PROVIDER anthropic` (new terminals pick it up) — see [Set your defaults once](#set-your-defaults-once).
+
+These runs only print results. When the output looks right, the normal archival run is the same command plus `-rw` — read what the files already hold, write the results back — covered in [Folders and batches](#folders-and-batches).
 
 ### Coming back later
 
@@ -173,8 +183,6 @@ Pick a folder to hold your virtual environment and any manifest/output files. Th
 mkdir ~/photokin-work
 cd ~/photokin-work
 ```
-
-One thing does not land here by default: a changeset is written beside the *input*, so `--changeset true` on a photo folder drops the `.ndjson` inside that folder. Pass `--output-file` a path in this folder and the changeset follows it.
 
 ### 3. Create and activate a virtual environment
 
@@ -213,31 +221,35 @@ echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
 
 Open a new terminal window (or run `source ~/.zshrc`) to pick it up.
 
-### 6. (Optional) Set up ExifTool
+### 6. Set up ExifTool
 
-Only needed if you want photokin to write metadata into the image files themselves. Install it with Homebrew:
+ExifTool is what lets photokin read the metadata already in your files and write results back into them — the normal archival workflow needs it:
 
 ```bash
-brew install exiftool
+python -m photokin.exiftool.fetch
 ```
 
-No Homebrew? Grab the installer package from exiftool.org instead. (`python -m photokin.exiftool.fetch` is a Windows-only convenience and does nothing here.)
+The fetch command uses an ExifTool you already have when one is on your `PATH`; otherwise it downloads the official ExifTool distribution into `~/.photokin/bin`, verified against the SHA256 that exiftool.org publishes, and runs it on the `perl` every Mac ships with. If you prefer a system install, `brew install exiftool` works just as well — run the fetch command afterwards and it will simply confirm the one it found.
 
-Installing it does not turn writing on. Nothing is written to your files unless you add `-w` to a run, so the commands in step 7 still only read. See [Setting up ExifTool](#setting-up-exiftool) for what `-w` writes and where.
+Installing it does not turn writing on. Nothing is written to your files unless you add `-w` to a run, so the commands in step 7 still only read. See [Reading and writing your files](#reading-and-writing-your-files) for what `-w` writes and where.
 
 ### 7. Run it
 
 Give it the full path to the photo — you're in `photokin-work`, not in your pictures folder, and the type is detected from the path you pass:
 
 ```bash
-photokin ~/Pictures/scan_042.jpg --back ~/Pictures/scan_042_back.jpg --provider anthropic
+photokin ~/Pictures/scan_042.jpg --back ~/Pictures/scan_042-back.jpg
 ```
 
 or against a whole folder:
 
 ```bash
-photokin ~/Pictures/Scans/ --provider anthropic > results.json
+photokin ~/Pictures/Scans/ > results.json
 ```
+
+No `--provider` flag needed: you installed exactly one provider SDK in step 4, so photokin uses it. If you later install a second one, pick per run with `--provider anthropic`, or set it once by adding `export LLM_PROVIDER=anthropic` to your `~/.zshrc` — see [Set your defaults once](#set-your-defaults-once).
+
+These runs only print results. When the output looks right, the normal archival run is the same command plus `-rw` — read what the files already hold, write the results back — covered in [Folders and batches](#folders-and-batches).
 
 ### Coming back later
 
@@ -260,9 +272,9 @@ photokin box3_017.jpg --back box3_017-back.jpg -rw
 
 That is: group every scan of one physical object together, read the metadata those files already hold, analyze each object once, and write the result back to **every** file in the group. All three of those are what you get by default — `--group-by object` is the default granularity, and the write reaches each group member rather than just the front. On a group of five files (a print, its back, a crop, a rescan and *its* back) one model call produces five sets of proposed writes, identical except that the `back` keyword lands only on the two backs and `negative` only on a negative.
 
-The `-r` half is what makes the run *safe* rather than merely informed, for the reason spelled out under [Setting up ExifTool](#setting-up-exiftool): the date-correction rule can only protect a date it has read, so `-w` without `-r` lets a mediocre guess overwrite a good value.
+The `-r` half is what makes the run *safe* rather than merely informed, for the reason spelled out under [Reading and writing your files](#reading-and-writing-your-files): the date-correction rule can only protect a date it has read, so `-w` without `-r` lets a mediocre guess overwrite a good value.
 
-**The run with no flags at all still works, and now tells you this.** `photokin C:\Scans` analyzes, prints the JSON to your terminal and touches nothing — that is the "check it's wired up" run and it is not going away. Its plan summary just ends with one extra row naming the next step, built from the command you actually typed so you can paste it straight back:
+**The run with no flags at all still works, and tells you this.** `photokin C:\Scans` analyzes, prints the JSON to your terminal and touches nothing — that is the "check it's wired up" run and it is not going away. Its plan summary just ends with one extra row naming the next step, built from the command you actually typed — whatever else you passed (a `--provider`, a `--back`, a `--group-by`) comes along — so you can paste it straight back:
 
 ```
 [INFO] Plan for this run:
@@ -278,9 +290,11 @@ The `-r` half is what makes the run *safe* rather than merely informed, for the 
                   photokin "C:\Scans" -rw
 ```
 
-Whatever else you typed comes along — a `--provider`, a `--back`, a `--group-by` — so the suggested command is the run you just planned plus the two flags, not a different one. It appears only when you have said nothing either way: `-r`, `-w`, `--dry-run`, `--changeset`, `--exiftool-write`, `--output-file`, `--output-sidecars` and `--generate-manifest` each mean you have already decided, and the row stays quiet. (The quoting is real, not decoration: a path is wrapped in `"` when any shell would otherwise split or expand it, and a trailing `\` is doubled because a lone one would escape the closing quote. Paths holding `$`, `` ` ``, `%`, `!` or `"` get no suggestion at all rather than a wrong one.)
+The row appears only when you have said nothing either way: any explicit read, write, changeset or output flag means you have already decided, and it stays quiet.
 
 Point it at a folder and it works through everything in it (non-recursive). Filename suffixes group scans of the same physical object automatically — `photo-a.jpg` / `photo-b.jpg` are variants, `photo-back.jpg` is the reverse side, `album-page1.jpg` / `album-page2.jpg` are pages of one document — and each group is analyzed together as one object.
+
+A folder run prints one aggregate JSON to stdout, shaped `{"results": {...}, "errors": {...}}` with **one entry per file** — every image in the folder appears in exactly one of the two, backs, variant scans, album pages, negatives and crops included. A record names the whole group it belongs to under `all_variant_files`, so you can still tell which files were scanned together and which of them the model was shown. Per-group diagnostics, the plan summary and the closing summary go to stderr, so read both. (To route results to a file instead, see [--output-file](#advanced-usage).)
 
 Folder and manifest input are read by the same grouper, so anything one handles the other handles identically. A set with no plain front scan in it is analyzed like any other object — nothing but pages (`album-page1.jpg`, `album-page2.jpg`), nothing but a negative, or nothing but a back (`box3_030-back.jpg`, where the front was never scanned or lives in another folder). Every page of a document goes to the model in one call, and every scan of a print goes in one call with its siblings. Albums, multi-page documents, negative-only scans and loose backs no longer need a manifest. (Earlier releases grouped those sets correctly and then skipped them, warning per group; that limitation is gone.)
 
@@ -323,74 +337,47 @@ Writes go to **every** file in the group at all three settings — the granulari
 >
 > Files that are recorded but not sent are exactly three kinds: a crop that yielded its parent's slot, the loser of two files claiming the same slot (the extension pair above), and a file displaced out of a slot something more specific already held. All three are named in a warning, listed in the record — crops under `all_variant_files.crops`, the other two under `all_variant_files.displaced` — and counted in the same closing number, so the summary can never read as clean while a warning says otherwise.
 
-## Folder mode
+## Reading and writing your files
 
-```bash
-photokin ./scans/ --provider anthropic > results.json
-```
+ExifTool handles both directions: with `-r`, photokin reads `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` straight out of the files before analysis, so a note, a caption, a title, a date or a keyword already living in an image rides along to the model as context (hydration). After analysis, `-w` writes approved changeset fields back into the files or their sidecars (apply).
 
-Folder mode prints one aggregate JSON to stdout, shaped `{"results": {...}, "errors": {...}}` with **one entry per file** — every image in the folder appears in exactly one of the two, backs, variant scans, album pages, negatives and crops included. A record names the whole group it belongs to under `all_variant_files`, so you can still tell which files were scanned together and which of them the model was shown. Per-group diagnostics, the plan summary and the closing summary go to stderr, so read both.
+The two halves mirror each other: both are explicit opt-ins, neither implies the other, and both work for folder, manifest and single-photo input alike. `-r` fills only what the input does not already carry, so a value from a manifest item or from `--meta` is never overridden, and it writes nothing anywhere. Reading the whole set rather than one tag is deliberate — knowing what a file already holds is how the run knows what *not* to change. Every run's plan summary names the read set, so `read : none (-r not given)` is visible before the first model call.
 
-`--output-file` is not a manifest-only flag: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end — for a folder, a manifest or one photo alike. With it, stdout stays empty.
+`-r` is worth knowing about for two non-obvious reasons. The first is dates. The date-correction heuristic compares the file's own `EXIF:DateTimeOriginal` against the model's inference and rewrites it only when they disagree by a wide margin — the rule that fixes a 2019 scan date on a 1952 print while leaving a modern photo alone. Without a date read out of the file there is nothing to compare against, so in folder mode that heuristic never fired at all. `-r` is what makes it live. The file's date is treated as evidence rather than as truth: it drives that comparison and fills `dateTimeOriginal` when the comparison declines, but it no longer overwrites the model's `date_guess`, which on a flatbed scan would assert the day you scanned the print as the day the photograph was taken.
 
-For bigger or more repeatable jobs a manifest is worth writing, and `--generate-manifest` turns a folder into exactly that file:
+The second is titles. Scanner software routinely writes "Scanned Image" or the bare filename into `XMP:Title`, so a title read out of a file is not the same evidence as a title you typed — under `-r`, a title the model transcribed off the print wins, and the file's own is kept only when the model returned none. A title supplied by a manifest item or by `--meta` is unaffected and still beats the model outright: a human wrote that one, and letting a transcription overwrite it would lose data rather than junk. The distinction is provenance, not content — the same string wins or loses depending on where it came from.
 
-```bash
-photokin ./scans/ --generate-manifest scans-manifest.json
-```
+Where each result field lands when written:
 
-It writes the manifest the folder run would have used — same files, same order — and exits without calling the model, so it costs nothing and doubles as a way to check the grouping before committing to a batch. Edit it (add `is_back`, `group`, existing `metadata`) and feed it straight back: `photokin scans-manifest.json`.
-
-Add `-r` and the document also captures what ExifTool read out of the files. A plain replay (`photokin scans-manifest.json`) then launches ExifTool not at all — every value it needs is already in the document.
-
-Replaying *with* `-r` is what reproduces the original result exactly, because the document records the values but not that they came out of a file, and the title rule below turns on precisely that distinction. That costs a little more than nothing: the pre-flight insists an ExifTool binary exists, and `-r` re-reads any file whose recorded metadata is missing even one of the five tags — which is the normal case, since most files do not carry all five. Only a file that held the complete set replays without a subprocess.
-
-## Manifest mode
-
-A manifest is a JSON file listing exactly what to process — an `items` array where each entry needs only a `path`. The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. Note the underscore in `box3_017_back.jpg`: the filename grammar reads only the hyphenated `-back`, so it is the `is_back` flag that folds the two files into one group and one model call rather than two unrelated photos.
-
-batch.json:
-```json
-{
-  "items": [
-    {"path": "scans/box3_017.jpg"},
-    {"path": "scans/box3_017_back.jpg", "is_back": true}
-  ],
-  "photo_context_text": "Church family photos, mostly New Jersey, 1930s-1950s."
-}
-```
-
-```bash
-photokin batch.json --output-file results.ndjson --changeset true
-```
-
-Flags are optional when the filename already says the same thing; they exist so files that don't follow the naming conventions can still be grouped correctly. An explicit flag always beats the filename, in both directions and including when the two contradict each other — anything else would leave the flag inert in exactly the situation it is there for. Every override that changes what the filename implied is logged, so a typo is visible rather than silent.
-
-| Key | Effect |
+| Result field | Tag |
 |---|---|
-| `is_back` | `true` marks the reverse side, `false` marks the front. `true` also repairs the group key by stripping a trailing `back` token, which is what puts `box3_017_back.jpg` in the same group as `box3_017.jpg`. |
-| `is_crop` | `true` marks a cropped derivative, so the file is recorded with its group but not analyzed; `false` unmarks a file whose name ends in `-crop`. |
-| `version` | The variant id, replacing any letter read off the filename. Any string, not just one letter; empty means no variant. |
-| `group` | The group key outright, for names the grammar cannot parse at all. `base_id` is accepted as an alias and loses to `group` when both are given. |
-| `preferred` | Breaks a tie between two files claiming the same slot — the same side of the same variant — so the one you name is the one sent and the other is recorded and warned about. It chooses between candidates; it cannot create a place for one. See below. |
+| `ai_caption` (the AI analysis) | `EXIF:UserComment` |
+| `caption` (the verbatim transcription) | `XMP-dc:Description` |
+| `keywords` | `XMP-dc:Subject` |
+| `title` | `XMP-dc:Title` |
+| `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` |
+| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location` |
 
-`is_back` and `is_crop` may be written as JSON `true`/`false`, as `0`/`1`, or as the strings `"true"`, `"false"`, `"yes"`, `"no"`. A `null` value means "not specified" and leaves the filename in charge.
+Those are the spellings to pass to `--exiftool-fields`, verbatim. The XMP ones are hyphenated (`XMP-dc:Description`) because that is the form ExifTool writes and the form it prints back under `-G1`; the colon form `XMP:dc:Description` is **not** writable — ExifTool answers "doesn't exist or isn't writable" and writes nothing. Earlier versions of photokin used the colon form internally, so a command copied from an older changeset or an older copy of these docs will name it; a run that does is now stopped before its first model call with the correct spelling quoted, rather than analysing the whole batch and writing none of it. Note that reading is more forgiving than writing — `-r` asks for the bare `XMP:Description`, which resolves to the same tag.
 
-`preferred` is the exception and does not read that grammar: it is plain truthiness, so any non-empty string sets it and `"preferred": "false"` means **true**. Write it as a JSON `true`, or leave the key out entirely.
+**Setup.** One command on every OS: `python -m photokin.exiftool.fetch`. On Windows it downloads the official ExifTool distribution from the project's SourceForge host and verifies it against the SHA256 exiftool.org publishes, into `~/.photokin/bin` — no system install needed. On macOS/Linux it prefers an ExifTool you already have (`brew install exiftool` and `apt install libimage-exiftool-perl` both count), and otherwise downloads the official pure-Perl distribution the same verified way; that copy runs on the system `perl`, which macOS and nearly every Linux ship with. At runtime the binary is found in this order: an explicit `--exiftool-path` / `EXIFTOOL_PATH`, then the downloaded copy in `~/.photokin/bin`, then whatever `exiftool` is on your `PATH`.
 
-`preferred` used to pick the one file of a group that got analyzed. There is no longer one — under `object` every scan of the group is sent — so what survives is the narrower job above: deciding which of two files contesting one slot travels. It also still nominates the file the group's analysis is filed under.
+If none is found, a run that asked for one stops before it costs anything: `-r` and `-w` both resolve the binary before the first model call, so either flag with no ExifTool anywhere exits 2 immediately rather than analyzing the whole batch and only then discovering it cannot read or write any of it. Once that check passes, a mid-run failure on a single file — a lock, a corrupt image, a timeout — is a warning on both sides and the analysis still runs.
 
-Two shapes leave `preferred` with nothing to pick. A crop is a supporting view of its parent, so it yields the parent's place whenever the parent is listed — marking the crop `preferred` does not promote a derivative over the original it was cut from, and the crop is recorded rather than analyzed. Likewise a file that is untagged in a group whose front side is already claimed, such as a plain `album.jpg` beside an explicit `album-page1.jpg`: there is no part left for it to travel in, and `preferred` cannot make one. Both cases are warnings naming the file, and both are listed in the result record — crops under `all_variant_files.crops`, the rest under `all_variant_files.displaced` — so nothing disappears quietly.
+**Writing during a run.** Nothing is written into your files unless you ask for it: `--exiftool-write` defaults to `false`, and a changeset on its own only records what *would* be written. `-w` is the one-flag spelling of `--changeset true --exiftool-write true` — record the proposed writes and apply them — and works for folder, manifest and single-photo input alike. Spelled out, that is `--changeset true --exiftool-write true` — those two flags and no others, with `--exiftool-fields` left at its `EXIF:UserComment` default; `--exiftool-write true` is required rather than a confirmation of the default. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults. Every run prints a plan summary before its first model call naming the write set, so "nothing will be written" is visible up front; `--dry-run` prints that summary and stops.
 
-## Existing metadata aware enrichment
+**When writes fail.** A run that asked to write, saw files, and wrote *none* of them exits 2 and says so — that shape is always a setting that is wrong for every file (an unwritable `--exiftool-fields` tag, a read-only folder, a binary that will not run), so a script moving on to the next box of scans should stop. A *partial* failure exits 0: some files were written, so the settings were right, and one locked or corrupt file among many is ordinary. Either way the per-file reasons are logged as `[ExifTool] Errors:` before the run ends. Manifest mode is the exception and always exits 0, because it is the Lightroom plug-in's contract and the plug-in reads the per-item records rather than the exit status.
 
-Items may have existing `metadata` (face tags, existing captions and comments) that can be forwarded to the model as context. Additionally, you can supply `photo_context_text` as free-text additional context to a single photo or a folder. Such as "these photos are all part of a wedding album." The model treats it as truth for the whole batch. Both make a real difference on hard photos.
+**Use `-rw`, not `-w`.** The two short flags combine the way any short flags do, so `photokin C:\Scans\ -rw` is the whole normal run: read what the files already hold, then write the results back. Prefer it over bare `-w`, which is genuinely the more dangerous of the two. The date-correction heuristic can only protect a date by *comparing* against it, so with nothing read there is nothing to compare and a mediocre guess overwrites a good value. Measured, on a modern photo already carrying a correct `2019:08:14` against a model guessing 2005 at confidence 0.72:
 
-For auditing, `--changeset true` emits a changeset NDJSON alongside the results: a record of proposed field writes that the ExifTool wrapper can apply to the actual files, either in the same run (`-w`, or `--exiftool-write true --exiftool-fields EXIF:UserComment`) or later and separately. It lands in `dirname(--output-file or input)` and is named `<stem>_changeset.ndjson`, where the stem is the output file's own (minus a trailing `_results`) or, with no `--output-file`, the input's — so the `--output-file results.ndjson` run above writes `results_changeset.ndjson`, and `photokin ./scans/ --changeset true` writes `scans_changeset.ndjson` inside the folder:
-
-```bash
-python -m photokin.exiftool --changeset results_changeset.ndjson --enabled [--dry-run]
 ```
+photokin <folder> -w     proposes  EXIF:DateTimeOriginal = 2005-06-15    # overwrites a correct date
+photokin <folder> -rw    proposes  nothing                               # 14-year gap is under the threshold
+```
+
+`-w` alone is still the right flag when the files genuinely hold nothing worth reading — a folder of fresh scans straight off the scanner, where every read would come back empty and `-r` only costs you a subprocess.
+
+**Know where it lands before you start a batch.** Both halves of `-w` reach into your photo directory. The changeset is written beside the *input* unless `--output-file` redirects it, so `photokin ./scans/ -w` drops `scans_changeset.ndjson` **inside `./scans/`** and then edits the images there in place. Photo directories are often cloud-synced, network-mounted or read-only, and none of those is a good place to discover this: give `--output-file` a path somewhere you control and the changeset follows it, or run `--dry-run` first, which prints the exact changeset path it would use and stops. (What a changeset is, and how to apply one later and separately, is covered under [Advanced usage](#advanced-usage).)
 
 ## Captions
 
@@ -497,49 +484,27 @@ To make it stick across sessions, add the `export` line to your shell profile (`
 
 You only need the key for the provider you're actually calling. And since a batch run makes one paid API call per photo group, it's worth using a key with a spend cap set in the provider's dashboard — a typo in a folder path is a lot cheaper that way.
 
-## Setting up ExifTool
+## Advanced usage
 
-ExifTool is optional, and can be both used for reading initial values from the photos (so you don't just overwrite everything) and also write to the photos after. With `-r`, it reads `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` straight out of the files before analysis, so a note, a caption, a title, a date or a keyword already living in an image rides along to the model as context (hydration). After analysis, `-w` writes approved changeset fields back into the files or their sidecars (apply).
+Everything below is opt-in machinery for auditing, redirecting output, and bigger or more repeatable jobs. None of it is needed for the normal `-rw` run.
 
-The two halves mirror each other: both are explicit opt-ins, neither implies the other, and both work for folder, manifest and single-photo input alike. `-r` fills only what the input does not already carry, so a value from a manifest item or from `--meta` is never overridden, and it writes nothing anywhere. Reading the whole set rather than one tag is deliberate — knowing what a file already holds is how the run knows what *not* to change. Every run's plan summary names the read set, so `read : none (-r not given)` is visible before the first model call.
+### Previewing a run: --dry-run
 
-`-r` is worth knowing about for two non-obvious reasons. The first is dates. The date-correction heuristic compares the file's own `EXIF:DateTimeOriginal` against the model's inference and rewrites it only when they disagree by a wide margin — the rule that fixes a 2019 scan date on a 1952 print while leaving a modern photo alone. Without a date read out of the file there is nothing to compare against, so in folder mode that heuristic never fired at all. `-r` is what makes it live. The file's date is treated as evidence rather than as truth: it drives that comparison and fills `dateTimeOriginal` when the comparison declines, but it no longer overwrites the model's `date_guess`, which on a flatbed scan would assert the day you scanned the print as the day the photograph was taken.
+`--dry-run` prints the plan summary — input, grouping, read set, write set, and the exact output and changeset paths the run would use — and stops before the first model call. Nothing is analyzed, nothing is written, nothing is spent. It is the way to check where a batch's writes and changesets would land before committing to it. Beside `--generate-manifest`, it reports the grouping that would be written and leaves the file alone.
 
-The second is titles. Scanner software routinely writes "Scanned Image" or the bare filename into `XMP:Title`, so a title read out of a file is not the same evidence as a title you typed — under `-r`, a title the model transcribed off the print wins, and the file's own is kept only when the model returned none. A title supplied by a manifest item or by `--meta` is unaffected and still beats the model outright: a human wrote that one, and letting a transcription overwrite it would lose data rather than junk. The distinction is provenance, not content — the same string wins or loses depending on where it came from.
+### Redirecting output: --output-file and sidecars
 
-Where each result field lands when written:
+`--output-file` works for every input type — a folder, a manifest or one photo: a `.ndjson` path streams one record per finished photo (you can watch progress, and a crash doesn't lose completed work), while a `.json` path writes a single aggregate object atomically at the end. With it, stdout stays empty.
 
-| Result field | Tag |
-|---|---|
-| `ai_caption` (the AI analysis) | `EXIF:UserComment` |
-| `caption` (the verbatim transcription) | `XMP-dc:Description` |
-| `keywords` | `XMP-dc:Subject` |
-| `title` | `XMP-dc:Title` |
-| `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` |
-| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location` |
+The changeset follows the output file: a changeset is otherwise written beside the *input*, so `--changeset true` on a photo folder drops the `.ndjson` inside that folder — pass `--output-file` a path in a folder you control and the changeset lands there instead.
 
-Those are the spellings to pass to `--exiftool-fields`, verbatim. The XMP ones are hyphenated (`XMP-dc:Description`) because that is the form ExifTool writes and the form it prints back under `-G1`; the colon form `XMP:dc:Description` is **not** writable — ExifTool answers "doesn't exist or isn't writable" and writes nothing. Earlier versions of photokin used the colon form internally, so a command copied from an older changeset or an older copy of these docs will name it; a run that does is now stopped before its first model call with the correct spelling quoted, rather than analysing the whole batch and writing none of it. Note that reading is more forgiving than writing — `-r` asks for the bare `XMP:Description`, which resolves to the same tag.
+`--output-sidecars` additionally writes a per-photo sidecar JSON next to each image (default off).
 
-**Setup.** On Windows, run `python -m photokin.exiftool.fetch` once — it downloads the official ExifTool distribution from the project's SourceForge host and verifies it against the SHA256 exiftool.org publishes, into `~/.photokin/bin`, no system install needed. On macOS/Linux install it yourself: `brew install exiftool` or `apt install libimage-exiftool-perl`. At runtime the binary is found in this order: an explicit `--exiftool-path` / `EXIFTOOL_PATH`, then the downloaded copy in `~/.photokin/bin`, then whatever `exiftool` is on your `PATH`.
+### Changesets: an audit trail for writes
 
-If none is found, a run that asked for one stops before it costs anything: `-r` and `-w` both resolve the binary before the first model call, so either flag with no ExifTool anywhere exits 2 immediately rather than analyzing the whole batch and only then discovering it cannot read or write any of it. Once that check passes, a mid-run failure on a single file — a lock, a corrupt image, a timeout — is a warning on both sides and the analysis still runs.
+`--changeset true` emits a changeset NDJSON alongside the results: a record of proposed field writes that the ExifTool wrapper can apply to the actual files, either in the same run (`-w`, or `--exiftool-write true --exiftool-fields EXIF:UserComment`) or later and separately. It lands in `dirname(--output-file or input)` and is named `<stem>_changeset.ndjson`, where the stem is the output file's own (minus a trailing `_results`) or, with no `--output-file`, the input's — so a `--output-file results.ndjson` run writes `results_changeset.ndjson`, and `photokin ./scans/ --changeset true` writes `scans_changeset.ndjson` inside the folder.
 
-**Writing during a run.** Nothing is written into your files unless you ask for it: `--exiftool-write` defaults to `false`, and a changeset on its own only records what *would* be written. `-w` is the one-flag spelling of `--changeset true --exiftool-write true` — record the proposed writes and apply them — and works for folder, manifest and single-photo input alike. Spelled out, that is `--changeset true --exiftool-write true` — those two flags and no others, with `--exiftool-fields` left at its `EXIF:UserComment` default; `--exiftool-write true` is required rather than a confirmation of the default. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults. Every run prints a plan summary before its first model call naming the write set, so "nothing will be written" is visible up front; `--dry-run` prints that summary and stops.
-
-**When writes fail.** A run that asked to write, saw files, and wrote *none* of them exits 2 and says so — that shape is always a setting that is wrong for every file (an unwritable `--exiftool-fields` tag, a read-only folder, a binary that will not run), so a script moving on to the next box of scans should stop. A *partial* failure exits 0: some files were written, so the settings were right, and one locked or corrupt file among many is ordinary. Either way the per-file reasons are logged as `[ExifTool] Errors:` before the run ends. Manifest mode is the exception and always exits 0, because it is the Lightroom plug-in's contract and the plug-in reads the per-item records rather than the exit status.
-
-**Use `-rw`, not `-w`.** The two short flags combine the way any short flags do, so `photokin C:\Scans\ -rw` is the whole normal run: read what the files already hold, then write the results back. Prefer it over bare `-w`, which is genuinely the more dangerous of the two. The date-correction heuristic can only protect a date by *comparing* against it, so with nothing read there is nothing to compare and a mediocre guess overwrites a good value. Measured, on a modern photo already carrying a correct `2019:08:14` against a model guessing 2005 at confidence 0.72:
-
-```
-photokin <folder> -w     proposes  EXIF:DateTimeOriginal = 2005-06-15    # overwrites a correct date
-photokin <folder> -rw    proposes  nothing                               # 14-year gap is under the threshold
-```
-
-`-w` alone is still the right flag when the files genuinely hold nothing worth reading — a folder of fresh scans straight off the scanner, where every read would come back empty and `-r` only costs you a subprocess.
-
-**Know where it lands before you start a batch.** Both halves of `-w` reach into your photo directory. The changeset is written beside the *input* unless `--output-file` redirects it, so `photokin ./scans/ -w` drops `scans_changeset.ndjson` **inside `./scans/`** and then edits the images there in place. Photo directories are often cloud-synced, network-mounted or read-only, and none of those is a good place to discover this: give `--output-file` a path somewhere you control and the changeset follows it, or run `--dry-run` first, which prints the exact changeset path it would use and stops.
-
-**Writing later, with an audit step.** Since the changeset NDJSON is a plain record of proposed writes, you can inspect it first and apply it separately:
+Since the changeset is a plain record of proposed writes, you can inspect it first and apply it separately:
 
 ```bash
 python -m photokin.exiftool --changeset results_changeset.ndjson --enabled --dry-run   # counts what would be written
@@ -547,6 +512,59 @@ python -m photokin.exiftool --changeset results_changeset.ndjson --enabled      
 ```
 
 The standalone applier also takes `--fields` to narrow which tags may be written, `--write-sidecar-only` to write `.xmp` sidecars instead of touching the originals, `--no-overwrite-original` to keep ExifTool's `_original` backup files, and `--output summary.json` for a machine-readable result. Date tags (`EXIF:DateTimeOriginal`, `EXIF:CreateDate`) are normalized to EXIF's `YYYY:MM:DD HH:MM:SS` format on the way in; unparseable dates become warnings, not writes.
+
+### Manifest mode
+
+A manifest is a JSON file listing exactly what to process — an `items` array where each entry needs only a `path`. For bigger or more repeatable jobs a manifest is worth writing, and `--generate-manifest` turns a folder into exactly that file:
+
+```bash
+photokin ./scans/ --generate-manifest scans-manifest.json
+```
+
+It writes the manifest the folder run would have used — same files, same order — and exits without calling the model, so it costs nothing and doubles as a way to check the grouping before committing to a batch. Edit it (add `is_back`, `group`, existing `metadata`) and feed it straight back: `photokin scans-manifest.json`.
+
+The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. Note the underscore in `box3_017_back.jpg`: the filename grammar reads only the hyphenated `-back`, so it is the `is_back` flag that folds the two files into one group and one model call rather than two unrelated photos.
+
+batch.json:
+```json
+{
+  "items": [
+    {"path": "scans/box3_017.jpg"},
+    {"path": "scans/box3_017_back.jpg", "is_back": true}
+  ],
+  "photo_context_text": "Church family photos, mostly New Jersey, 1930s-1950s."
+}
+```
+
+```bash
+photokin batch.json --output-file results.ndjson --changeset true
+```
+
+Flags are optional when the filename already says the same thing; they exist so files that don't follow the naming conventions can still be grouped correctly. An explicit flag always beats the filename, in both directions and including when the two contradict each other — anything else would leave the flag inert in exactly the situation it is there for. Every override that changes what the filename implied is logged, so a typo is visible rather than silent.
+
+| Key | Effect |
+|---|---|
+| `is_back` | `true` marks the reverse side, `false` marks the front. `true` also repairs the group key by stripping a trailing `back` token, which is what puts `box3_017_back.jpg` in the same group as `box3_017.jpg`. |
+| `is_crop` | `true` marks a cropped derivative, so the file is recorded with its group but not analyzed; `false` unmarks a file whose name ends in `-crop`. |
+| `version` | The variant id, replacing any letter read off the filename. Any string, not just one letter; empty means no variant. |
+| `group` | The group key outright, for names the grammar cannot parse at all. `base_id` is accepted as an alias and loses to `group` when both are given. |
+| `preferred` | Breaks a tie between two files claiming the same slot — the same side of the same variant — so the one you name is the one sent and the other is recorded and warned about. It chooses between candidates; it cannot create a place for one. See below. |
+
+`is_back` and `is_crop` may be written as JSON `true`/`false`, as `0`/`1`, or as the strings `"true"`, `"false"`, `"yes"`, `"no"`. A `null` value means "not specified" and leaves the filename in charge.
+
+`preferred` is the exception and does not read that grammar: it is plain truthiness, so any non-empty string sets it and `"preferred": "false"` means **true**. Write it as a JSON `true`, or leave the key out entirely.
+
+`preferred` used to pick the one file of a group that got analyzed. There is no longer one — under `object` every scan of the group is sent — so what survives is the narrower job above: deciding which of two files contesting one slot travels. It also still nominates the file the group's analysis is filed under.
+
+Two shapes leave `preferred` with nothing to pick. A crop is a supporting view of its parent, so it yields the parent's place whenever the parent is listed — marking the crop `preferred` does not promote a derivative over the original it was cut from, and the crop is recorded rather than analyzed. Likewise a file that is untagged in a group whose front side is already claimed, such as a plain `album.jpg` beside an explicit `album-page1.jpg`: there is no part left for it to travel in, and `preferred` cannot make one. Both cases are warnings naming the file, and both are listed in the result record — crops under `all_variant_files.crops`, the rest under `all_variant_files.displaced` — so nothing disappears quietly.
+
+**Replaying a manifest.** Add `-r` to a manifest run and the output document also captures what ExifTool read out of the files. A plain replay (`photokin scans-manifest.json`) then launches ExifTool not at all — every value it needs is already in the document.
+
+Replaying *with* `-r` is what reproduces the original result exactly, because the document records the values but not that they came out of a file, and the title rule under [Reading and writing your files](#reading-and-writing-your-files) turns on precisely that distinction. That costs a little more than nothing: the pre-flight insists an ExifTool binary exists, and `-r` re-reads any file whose recorded metadata is missing even one of the five tags — which is the normal case, since most files do not carry all five. Only a file that held the complete set replays without a subprocess.
+
+### Existing metadata aware enrichment
+
+Items may have existing `metadata` (face tags, existing captions and comments) that can be forwarded to the model as context. Additionally, you can supply `photo_context_text` as free-text additional context to a single photo or a folder. Such as "these photos are all part of a wedding album." The model treats it as truth for the whole batch. Both make a real difference on hard photos.
 
 ## All flags
 
@@ -570,7 +588,7 @@ type instead of detecting it; passing a positional *and* an alias is an error.
 
 | Flag                                              | What it does |
 |---------------------------------------------------|---|
-| `--provider {openai,anthropic,gemini,openrouter}` | Which backend to call (default `openai`) |
+| `--provider {openai,anthropic,gemini,openrouter}` | Which backend to call. Default: `LLM_PROVIDER` if set, else the one provider whose SDK is installed; with several installed the choice is required. See [Providers](#providers) |
 | `--openai-model NAME`                             | OpenAI model (default `gpt-4o`) |
 | `--claude-model NAME`                             | Claude model alias (`sonnet` or `haiku`); resolves to a current model id (default `sonnet`) |
 | `--gemini-model NAME`                             | Gemini model (default `gemini-2.5-flash`) |
@@ -633,7 +651,41 @@ type instead of detecting it; passing a positional *and* an alias is an error.
 
 ## Providers
 
-OpenAI (default), Anthropic, Gemini, and OpenRouter (any vision-capable slug — Kimi, Grok, Qwen, ...). Select with `--provider` or `LLM_PROVIDER`. Only the SDK for the provider you use needs to be installed, and only that provider's key needs to be set.
+OpenAI, Anthropic, Gemini, and OpenRouter (any vision-capable slug — Kimi, Grok, Qwen, ...). Only the SDK for the provider you use needs to be installed, and only that provider's key needs to be set.
+
+**Which provider a run uses** is decided in this order: the `--provider` flag, else the `LLM_PROVIDER` environment variable, else the provider whose SDK is installed. With exactly one SDK installed there is nothing to say — installing `photokin[anthropic]` was already the choice. With several installed (or none) and nothing chosen, the run stops with exit 2 before spending anything, and the error says how to choose. OpenRouter is the one provider never picked automatically: it speaks the OpenAI-compatible API through the `openai` SDK, so install the `[openai]` extra, set `OPENROUTER_API_KEY`, and select it explicitly.
+
+### Set your defaults once
+
+The provider and each provider's model have an environment variable behind the flag, so a machine that always uses the same setup never types either:
+
+| Setting | Flag (per run) | Env var (set once) | Default |
+|---|---|---|---|
+| Provider | `--provider` | `LLM_PROVIDER` | the one installed SDK |
+| OpenAI model | `--openai-model` | `OPENAI_MODEL` | `gpt-4o` |
+| Claude model | `--claude-model` | `CLAUDE_MODEL` | `sonnet` |
+| Gemini model | `--gemini-model` | `GEMINI_MODEL` | `gemini-2.5-flash` |
+| OpenRouter model | `--openrouter-model` | `OPENROUTER_MODEL` | `moonshotai/kimi-k3` |
+
+Flags beat env vars, which beat the defaults. The whole set-and-forget setup is the API key plus these two variables. On Windows (new terminals pick them up):
+
+```powershell
+setx ANTHROPIC_API_KEY "sk-ant-..."
+setx LLM_PROVIDER anthropic
+setx CLAUDE_MODEL haiku          # optional - sonnet is the default
+```
+
+On macOS/Linux, the same three as `export` lines in `~/.zshrc` or `~/.bashrc`:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+export LLM_PROVIDER=anthropic
+export CLAUDE_MODEL=haiku        # optional - sonnet is the default
+```
+
+After that, `photokin ./scans/ -rw` is the entire command, every time. (`CLAUDE_MODEL` also accepts a full `claude-*` model id, not just the `sonnet`/`haiku` aliases — useful for a model newer than photokin's pins.)
+
+Providers retire and rename models over time — OpenRouter slugs especially come and go. When that happens to the model a run asked for (or to photokin's own pinned default), the run stops on the **first** model call with a `model_not_found` error naming the flag and env var to pick a current one, rather than failing every photo in the batch the same way.
 
 ## Layout
 
