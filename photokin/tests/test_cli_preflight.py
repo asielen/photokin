@@ -46,6 +46,9 @@ _NEUTRAL_ENV: dict[str, str] = {
     "EXIFTOOL_PATH": "",
     "EXIFTOOL_WRITE_ENABLED": "",
     "EXIFTOOL_FIELDS": "",
+    # Pinned rather than blanked: with no provider chosen the CLI reads the
+    # installed SDKs, which differ between machines.
+    "LLM_PROVIDER": "openai",
 }
 
 #: The first line of the plan summary, which every run now prints before the
@@ -1878,6 +1881,77 @@ class TestARunThatWroteNothingSaysSo(_CliTestCase):
         self.assertNotIn("nothing was written", stderr)
         # And the records the plug-in reads are still there.
         self.assertIn("[ExifTool] Errors:", stderr)
+
+
+class TestProviderResolution(_CliTestCase):
+    """--provider resolution: flag, then LLM_PROVIDER, then the installed SDK.
+
+    There is no hardcoded default provider. ``_NEUTRAL_ENV`` pins
+    ``LLM_PROVIDER`` for every other test in this file, so each case here
+    removes it and states its own detection result.
+    """
+
+    def test_the_one_installed_sdk_is_the_default(self):
+        folder = self.make_folder()
+        with patch("photokin.utils.installed_provider_sdks", return_value=["anthropic"]):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--dry-run"], env={"LLM_PROVIDER": None}
+            )
+        self.assertIsNone(code)
+        self.assertIn("provider  : Claude", stderr)
+
+    def test_multiple_installed_sdks_require_a_choice(self):
+        folder = self.make_folder()
+        with patch(
+            "photokin.utils.installed_provider_sdks", return_value=["openai", "anthropic"]
+        ):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--dry-run"], env={"LLM_PROVIDER": None}
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("more than one provider SDK is installed (openai, anthropic)", stderr)
+        # The remedy is a real, pasteable choice, not a placeholder.
+        self.assertIn("--provider openai", stderr)
+        self.assertIn("LLM_PROVIDER", stderr)
+
+    def test_no_installed_sdk_names_the_install(self):
+        folder = self.make_folder()
+        with patch("photokin.utils.installed_provider_sdks", return_value=[]):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--dry-run"], env={"LLM_PROVIDER": None}
+            )
+        self.assertEqual(code, 2)
+        self.assertIn('pip install "photokin[openai]"', stderr)
+
+    def test_env_choice_quiets_the_requirement(self):
+        folder = self.make_folder()
+        with patch(
+            "photokin.utils.installed_provider_sdks", return_value=["openai", "anthropic"]
+        ):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--dry-run"], env={"LLM_PROVIDER": "anthropic"}
+            )
+        self.assertIsNone(code)
+        self.assertIn("provider  : Claude", stderr)
+
+    def test_flag_beats_env(self):
+        folder = self.make_folder()
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--dry-run", "--provider", "openai"], env={"LLM_PROVIDER": "anthropic"}
+        )
+        self.assertIsNone(code)
+        self.assertIn("provider  : ChatGPT", stderr)
+
+    def test_generate_manifest_needs_no_provider(self):
+        """--generate-manifest never calls a model, so it must not demand one."""
+        folder = self.make_folder()
+        dest = os.path.join(folder, "scans-manifest.json")
+        with patch("photokin.utils.installed_provider_sdks", return_value=[]):
+            code, _stdout, _stderr = self.run_cli(
+                [folder, "--generate-manifest", dest], env={"LLM_PROVIDER": None}
+            )
+        self.assertIsNone(code)
+        self.assertTrue(os.path.exists(dest))
 
 
 if __name__ == "__main__":

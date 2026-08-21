@@ -8,7 +8,7 @@ import mimetypes
 from typing import Any, Callable, Dict, List
 from urllib.parse import urlparse
 
-from .errors import ProviderApiError
+from .errors import ProviderApiError, model_not_found_message
 
 try:
     import anthropic
@@ -161,6 +161,15 @@ def call_claude_model(
         raise ProviderApiError("rate_limit", str(exc), status_code=429) from exc
     except anthropic.BadRequestError as exc:
         raise ProviderApiError("invalid_input", str(exc), status_code=getattr(exc, "status_code", None)) from exc
+    except anthropic.NotFoundError as exc:
+        # A 404 on the Messages API means the model id itself was rejected --
+        # the id is usually photokin's pinned default, so say how to move on
+        # from it rather than echoing the SDK's bare "not_found_error".
+        raise ProviderApiError(
+            "model_not_found",
+            model_not_found_message("Anthropic", model, "--claude-model", "CLAUDE_MODEL"),
+            status_code=404,
+        ) from exc
     except anthropic.APIStatusError as exc:
         err_type = "overloaded" if getattr(exc, "status_code", None) == 529 else "api_status"
         raise ProviderApiError(err_type, str(exc), status_code=getattr(exc, "status_code", None)) from exc

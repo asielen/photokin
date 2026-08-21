@@ -5,25 +5,20 @@ import os
 import sys
 import unittest
 
-# Allow running standalone even when heavy deps (openai, etc.) are absent.
-# Import the functions directly from the utils module file.
+# Allow running this file directly (python test_json_cleanup.py), where the
+# repo root is not on sys.path. This used to bypass the package __init__ via a
+# spec_from_file_location copy registered as "photokin.utils" -- but executing
+# utils.py imports the photokin package anyway, and every provider SDK import
+# is lazy, so the bypass bought nothing. What it cost was real: the duplicate
+# module replaced sys.modules["photokin.utils"] for the rest of the pytest
+# process, so a later patch("photokin.utils.X") patched the copy while cli and
+# core kept calling the original.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PKG = os.path.dirname(_HERE)
-_PY = os.path.dirname(_PKG)
+_PY = os.path.dirname(os.path.dirname(_HERE))
 if _PY not in sys.path:
     sys.path.insert(0, _PY)
 
-# We need to bypass the package __init__ (which pulls in core → openai).
-# Import the module directly via importlib.
-import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location("photokin.utils", os.path.join(_PKG, "utils.py"))
-_mod = _ilu.module_from_spec(_spec)
-sys.modules[_spec.name] = _mod  # required for @dataclass introspection
-_spec.loader.exec_module(_mod)
-
-_cleanup_model_json = _mod._cleanup_model_json
-_extract_json_payload = _mod._extract_json_payload
-parse_with_retry = _mod.parse_with_retry
+from photokin.utils import _cleanup_model_json, _extract_json_payload, parse_with_retry
 
 
 class TestCleanupModelJson(unittest.TestCase):

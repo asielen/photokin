@@ -231,6 +231,10 @@ class TestProviderRuntimeBehavior(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 45)
         self.assertEqual(usage["total_tokens"], 168)
 
+    @unittest.skipUnless(
+        "gemini" in utils.installed_provider_sdks(),
+        "needs the google-genai SDK: the assertion is about the real client's config",
+    )
     def test_gemini_client_has_a_request_timeout_configured(self):
         # Regression test: google-genai has no default request timeout,
         # observed in practice as generate_content() hanging indefinitely
@@ -244,6 +248,125 @@ class TestProviderRuntimeBehavior(unittest.TestCase):
         http_options = client._api_client._http_options
         self.assertIsNotNone(http_options.timeout)
         self.assertGreater(http_options.timeout, 0)
+
+
+class TestModelNotFound(unittest.TestCase):
+    """A retired or renamed model id becomes a model_not_found that says how to move on."""
+
+    def test_claude_404_maps_to_model_not_found(self):
+        import anthropic
+        import httpx
+
+        from photokin import api_claude
+        from photokin.errors import ProviderApiError
+
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        sdk_exc = anthropic.NotFoundError(
+            "model: claude-sonnet-0-0",
+            response=httpx.Response(404, request=request),
+            body=None,
+        )
+        client = types.SimpleNamespace(
+            messages=types.SimpleNamespace(stream=lambda **kwargs: (_ for _ in ()).throw(sdk_exc))
+        )
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_claude.call_claude_model(client, "claude-sonnet-0-0", [], [])
+        err = ctx.exception
+        self.assertEqual(err.error_type, "model_not_found")
+        self.assertEqual(err.status_code, 404)
+        self.assertIn("claude-sonnet-0-0", str(err))
+        self.assertIn("--claude-model", str(err))
+        self.assertIn("CLAUDE_MODEL", str(err))
+
+    def test_openrouter_invalid_slug_400_maps_to_model_not_found(self):
+        """OpenRouter reports an unknown slug as a 400, not a 404."""
+        from photokin import api_openai_compat
+        from photokin.errors import ProviderApiError
+
+        class _FakeStatusError(Exception):
+            status_code = 400
+
+        mod = types.ModuleType("openai")
+        mod.RateLimitError = type("RateLimitError", (Exception,), {})
+        mod.NotFoundError = type("NotFoundError", (Exception,), {})
+        mod.BadRequestError = _FakeStatusError
+        mod.APIStatusError = type("APIStatusError", (Exception,), {})
+
+        sdk_exc = _FakeStatusError("moonshotai/kimi-k2 is not a valid model ID")
+
+        class _Completions:
+            def create(self, **kwargs):
+                raise sdk_exc
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(
+                chat=types.SimpleNamespace(completions=_Completions())
+            )
+        )
+        with patch.object(api_openai_compat, "openai", mod):
+            with self.assertRaises(ProviderApiError) as ctx:
+                api_openai_compat.call_openai_compat_model(client, "moonshotai/kimi-k2", [], [])
+        err = ctx.exception
+        self.assertEqual(err.error_type, "model_not_found")
+        self.assertIn("--openrouter-model", str(err))
+        self.assertIn("OPENROUTER_MODEL", str(err))
+
+    def test_message_names_model_and_both_knobs(self):
+        from photokin.errors import model_not_found_message
+
+        message = model_not_found_message("Anthropic", "claude-x", "--claude-model", "CLAUDE_MODEL")
+        self.assertIn("claude-x", message)
+        self.assertIn("--claude-model", message)
+        self.assertIn("CLAUDE_MODEL", message)
+        self.assertIn("upgrading photokin", message)
+
+    def test_model_not_found_is_self_explanatory_and_run_fatal(self):
+        """No traceback noise, and a batch aborts on the first group instead of
+        failing every remaining group with the same dead model."""
+        self.assertIn("model_not_found", SELF_EXPLANATORY_ERROR_TYPES)
+        self.assertIn("model_not_found", core._RUN_FATAL_ERROR_TYPES)
+
+
+class TestInstalledSdkDetection(unittest.TestCase):
+    """installed_provider_sdks reports importable SDKs without importing them."""
+
+    def test_detects_only_importable_sdks(self):
+        def fake_find_spec(module):
+            return object() if module == "anthropic" else None
+
+        with patch("photokin.utils.importlib.util.find_spec", side_effect=fake_find_spec):
+            self.assertEqual(utils.installed_provider_sdks(), ["anthropic"])
+
+    def test_missing_parent_package_reads_as_absent(self):
+        """find_spec("google.genai") raises when "google" itself is missing."""
+
+        def fake_find_spec(module):
+            if module == "google.genai":
+                raise ModuleNotFoundError("No module named 'google'")
+            return object()
+
+        with patch("photokin.utils.importlib.util.find_spec", side_effect=fake_find_spec):
+            self.assertEqual(utils.installed_provider_sdks(), ["openai", "anthropic"])
+
+    def test_openrouter_is_never_auto_detected(self):
+        """OpenRouter rides the openai SDK, so detection cannot tell them apart."""
+        self.assertNotIn("openrouter", utils.PROVIDER_SDK_MODULES)
+
+
+class TestMissingSdkMessage(unittest.TestCase):
+    """The missing-dependency message points at the SDK the user does have."""
+
+    def test_names_the_installed_alternative(self):
+        with patch("photokin.utils.installed_provider_sdks", return_value=["anthropic"]):
+            message = core._missing_sdk_message("OpenAI", "openai", "openai")
+        self.assertIn('pip install "photokin[openai]"', message)
+        self.assertIn("--provider anthropic", message)
+
+    def test_stays_short_with_nothing_installed(self):
+        with patch("photokin.utils.installed_provider_sdks", return_value=[]):
+            message = core._missing_sdk_message("OpenAI", "openai", "openai")
+        self.assertIn('pip install "photokin[openai]"', message)
+        self.assertNotIn("--provider", message)
 
 
 if __name__ == "__main__":

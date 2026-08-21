@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List
 
-from .errors import ProviderApiError
+from .errors import ProviderApiError, model_not_found_message
 
 try:
     import openai
@@ -94,6 +94,14 @@ def call_openai_model(
         raise ProviderApiError("invalid_input", msg, status_code=getattr(exc, "status_code", None)) from exc
     except openai.RateLimitError as exc:
         raise ProviderApiError("rate_limit", str(exc), status_code=429) from exc
+    except openai.NotFoundError as exc:
+        # A 404 here means the model id itself was rejected -- often photokin's
+        # own pinned default, so say how to move on from it.
+        raise ProviderApiError(
+            "model_not_found",
+            model_not_found_message("OpenAI", model, "--openai-model", "OPENAI_MODEL"),
+            status_code=404,
+        ) from exc
     except openai.APIStatusError as exc:
         raise ProviderApiError("api_status", str(exc), status_code=getattr(exc, "status_code", None)) from exc
 

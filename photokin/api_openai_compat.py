@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List
 
-from .errors import ProviderApiError
+from .errors import ProviderApiError, model_not_found_message
 
 try:
     import openai
@@ -68,8 +68,24 @@ def call_openai_compat_model(
         return tuned.chat.completions.create(**request_payload)
     except openai.RateLimitError as exc:
         raise ProviderApiError("rate_limit", str(exc), status_code=429) from exc
+    except openai.NotFoundError as exc:
+        raise ProviderApiError(
+            "model_not_found",
+            model_not_found_message("OpenRouter", model, "--openrouter-model", "OPENROUTER_MODEL"),
+            status_code=404,
+        ) from exc
     except openai.BadRequestError as exc:
-        raise ProviderApiError("invalid_input", str(exc), status_code=getattr(exc, "status_code", None)) from exc
+        # OpenRouter answers an unknown slug with a 400 ("<slug> is not a valid
+        # model ID") rather than a 404, and slugs there are renamed routinely --
+        # surface that as the model problem it is, not a generic invalid input.
+        msg = str(exc)
+        if "not a valid model" in msg.lower():
+            raise ProviderApiError(
+                "model_not_found",
+                model_not_found_message("OpenRouter", model, "--openrouter-model", "OPENROUTER_MODEL"),
+                status_code=getattr(exc, "status_code", None),
+            ) from exc
+        raise ProviderApiError("invalid_input", msg, status_code=getattr(exc, "status_code", None)) from exc
     except openai.APIStatusError as exc:
         raise ProviderApiError("api_status", str(exc), status_code=getattr(exc, "status_code", None)) from exc
 

@@ -6,7 +6,7 @@ import base64
 import logging
 from typing import Any, Callable, Dict, List
 
-from .errors import ProviderApiError
+from .errors import ProviderApiError, model_not_found_message
 
 try:
     from google.api_core import exceptions as google_api_exceptions
@@ -109,11 +109,25 @@ def call_gemini_model(
         if google_api_exceptions is not None:
             if isinstance(exc, google_api_exceptions.ResourceExhausted):
                 raise ProviderApiError("rate_limit", message, status_code=429) from exc
+            if isinstance(exc, google_api_exceptions.NotFound):
+                raise ProviderApiError(
+                    "model_not_found",
+                    model_not_found_message("Gemini", model, "--gemini-model", "GEMINI_MODEL"),
+                    status_code=404,
+                ) from exc
             if isinstance(exc, google_api_exceptions.InvalidArgument):
                 raise ProviderApiError("invalid_input", message, status_code=400) from exc
 
         if "429" in message or "RESOURCE_EXHAUSTED" in message:
             raise ProviderApiError("rate_limit", message, status_code=429) from exc
+        # An unknown model surfaces as "404 NOT_FOUND ... models/<id> is not
+        # found for API version ..." from the google-genai SDK.
+        if "404" in message or "NOT_FOUND" in message:
+            raise ProviderApiError(
+                "model_not_found",
+                model_not_found_message("Gemini", model, "--gemini-model", "GEMINI_MODEL"),
+                status_code=404,
+            ) from exc
         if "400" in message or "INVALID_ARGUMENT" in message:
             raise ProviderApiError("invalid_input", message, status_code=400) from exc
 
