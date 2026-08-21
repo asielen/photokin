@@ -1942,6 +1942,25 @@ class TestProviderResolution(_CliTestCase):
         self.assertIsNone(code)
         self.assertIn("provider  : ChatGPT", stderr)
 
+    def test_env_choice_is_case_insensitive(self):
+        folder = self.make_folder()
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--dry-run"], env={"LLM_PROVIDER": "Anthropic"}
+        )
+        self.assertIsNone(code)
+        self.assertIn("provider  : Claude", stderr)
+
+    def test_unrecognized_env_value_is_a_usage_error(self):
+        """A typo'd LLM_PROVIDER must not fall through to a silent OpenAI guess --
+        the exact guess the whole flag/env/installed-SDK order exists to avoid."""
+        folder = self.make_folder()
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--dry-run"], env={"LLM_PROVIDER": "chatgpt-4"}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("LLM_PROVIDER=`chatgpt-4`", stderr)
+        self.assertIn("openai, anthropic, gemini, openrouter", stderr)
+
     def test_generate_manifest_needs_no_provider(self):
         """--generate-manifest never calls a model, so it must not demand one."""
         folder = self.make_folder()

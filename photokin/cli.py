@@ -723,6 +723,15 @@ def _writes_are_planned(ecfg: ExiftoolConfig, *, changeset_requested: bool) -> b
     return changeset_requested and ecfg.enabled and bool(ecfg.fields)
 
 
+#: Same set the ``--provider`` flag enforces via argparse ``choices``. ``LLM_PROVIDER``
+#: bypasses that argparse check (it is never parsed as a flag value), so
+#: ``_resolve_provider`` re-validates it against this list itself -- otherwise a
+#: typo'd env var would fall through ``normalize_provider``'s permissive default
+#: and run OpenAI silently, the exact guess this whole resolution order exists
+#: to avoid.
+_PROVIDER_CHOICES = ("openai", "anthropic", "gemini", "openrouter")
+
+
 def _resolve_provider(flag_value: str | None) -> str:
     """Resolve the provider for this run: flag, then ``LLM_PROVIDER``, then the installed SDK.
 
@@ -742,13 +751,17 @@ def _resolve_provider(flag_value: str | None) -> str:
 
     Raises:
         SystemExit: With code 2 when nothing chose a provider and zero or
-            several SDKs are installed.
+            several SDKs are installed, or when ``LLM_PROVIDER`` names something
+            that is not one of ``_PROVIDER_CHOICES``.
     """
     if flag_value:
         return flag_value
     env_value = (os.getenv("LLM_PROVIDER") or "").strip()
     if env_value:
-        return env_value
+        normalized = env_value.lower()
+        if normalized not in _PROVIDER_CHOICES:
+            _exit_with_usage_error(*cli_messages.invalid_llm_provider_env(env_value))
+        return normalized
     installed = utils.installed_provider_sdks()
     if len(installed) == 1:
         return installed[0]
@@ -1284,7 +1297,7 @@ def main() -> None:
         # distinguishable from the default and the warning can fire at all.
         ap.add_argument("--update-policy", choices=["master_exact", "merge_per_variant"],
                         default=None, help=argparse.SUPPRESS)
-        ap.add_argument("--provider", choices=["openai", "anthropic", "gemini", "openrouter"], default=None,
+        ap.add_argument("--provider", choices=list(_PROVIDER_CHOICES), default=None,
                         help="LLM provider backend to use (default: LLM_PROVIDER, else the one "
                              "provider whose SDK is installed; with several installed this flag "
                              "is required)")

@@ -311,6 +311,97 @@ class TestModelNotFound(unittest.TestCase):
         self.assertIn("--openrouter-model", str(err))
         self.assertIn("OPENROUTER_MODEL", str(err))
 
+    def test_openai_404_maps_to_model_not_found(self):
+        import httpx
+        import openai
+
+        from photokin import api_openai
+        from photokin.errors import ProviderApiError
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        sdk_exc = openai.NotFoundError(
+            "model not found", response=httpx.Response(404, request=request), body=None
+        )
+
+        class _Responses:
+            def create(self, **kwargs):
+                raise sdk_exc
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(responses=_Responses())
+        )
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_openai.call_openai_model(client, "gpt-nonexistent", [], [])
+        err = ctx.exception
+        self.assertEqual(err.error_type, "model_not_found")
+        self.assertEqual(err.status_code, 404)
+        self.assertIn("gpt-nonexistent", str(err))
+        self.assertIn("--openai-model", str(err))
+        self.assertIn("OPENAI_MODEL", str(err))
+
+    def test_openai_notfound_on_image_url_fallback_retry_also_maps(self):
+        """A BadRequestError about the image_url shape triggers a reformatted
+        retry; if that retry ALSO 404s, it must not be swallowed as a generic
+        api_status by the retry's own narrower except clauses."""
+        import httpx
+        import openai
+
+        from photokin import api_openai
+        from photokin.errors import ProviderApiError
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        bad_request_exc = openai.BadRequestError(
+            "Invalid type for 'input[0].content[1].image_url': expected an "
+            "object, but got a string instead.",
+            response=httpx.Response(400, request=request),
+            body=None,
+        )
+        not_found_exc = openai.NotFoundError(
+            "model not found", response=httpx.Response(404, request=request), body=None
+        )
+        calls: list = []
+
+        class _Responses:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                raise bad_request_exc if len(calls) == 1 else not_found_exc
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(responses=_Responses())
+        )
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_openai.call_openai_model(
+                client,
+                "gpt-nonexistent",
+                [{"type": "input_text", "text": "describe"}],
+                ["data:image/jpeg;base64,aGk="],
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(ctx.exception.error_type, "model_not_found")
+
+    def test_gemini_404_maps_to_model_not_found(self):
+        from google.genai import errors as genai_errors
+
+        from photokin import api_gemini
+        from photokin.errors import ProviderApiError
+
+        sdk_exc = genai_errors.ClientError(
+            404, {"error": {"code": 404, "status": "NOT_FOUND", "message": "not found"}}
+        )
+        client = types.SimpleNamespace(
+            models=types.SimpleNamespace(
+                generate_content=lambda **kwargs: (_ for _ in ()).throw(sdk_exc)
+            )
+        )
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_gemini.call_gemini_model(client, "gemini-nonexistent", [], [])
+        err = ctx.exception
+        self.assertEqual(err.error_type, "model_not_found")
+        self.assertEqual(err.status_code, 404)
+        self.assertIn("gemini-nonexistent", str(err))
+        self.assertIn("--gemini-model", str(err))
+        self.assertIn("GEMINI_MODEL", str(err))
+
     def test_message_names_model_and_both_knobs(self):
         from photokin.errors import model_not_found_message
 

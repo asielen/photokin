@@ -606,6 +606,25 @@ def output_destination_not_writable(role: str, out_path: str, reason: str) -> Us
     )
 
 
+def invalid_llm_provider_env(value: str) -> UsageMessage:
+    """``LLM_PROVIDER`` is set to a value no provider recognizes.
+
+    A typo here (``LLM_PROVIDER=antropic``) would otherwise fall through
+    ``normalize_provider``'s permissive default and run OpenAI silently --
+    exactly the guess this whole resolution order exists to avoid.
+
+    Args:
+        value: The unrecognized ``LLM_PROVIDER`` value.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"LLM_PROVIDER=`{value}` is not a provider photokin knows.",
+        "set it to one of openai, anthropic, gemini, openrouter, or unset it and pass --provider",
+    )
+
+
 def no_provider_sdk_installed() -> UsageMessage:
     """No --provider was given and no provider SDK is importable.
 
