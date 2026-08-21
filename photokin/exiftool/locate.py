@@ -5,9 +5,9 @@ runtime in this order:
 
 1. an explicitly configured path (``ExiftoolConfig.path`` / ``EXIFTOOL_PATH``);
 2. a copy previously downloaded by ``photokin.exiftool.fetch`` into the cache
-   dir (``~/.photokin/bin/exiftool/<platform>``) — on Windows the plugin's setup
-   flow provisions this;
-3. a system ExifTool on ``PATH`` (the norm on macOS/Linux).
+   dir (``~/.photokin/bin/exiftool/<platform>``), which the fetcher can
+   provision on any OS;
+3. a system ExifTool on ``PATH``.
 
 Code map:
 - _default_exiftool_cache_dir      writable cache dir the downloader targets
@@ -43,7 +43,9 @@ def _platform_exiftool_relpath() -> tuple[str, str] | None:
         return ("win", "exiftool.exe")
     if sys.platform == "darwin" or system == "darwin":
         return ("mac", "exiftool")
-    # Linux (and anything else) is not auto-provisioned; use system PATH.
+    if system == "linux":
+        return ("linux", "exiftool")
+    # Anything else is not auto-provisioned; use system PATH.
     return None
 
 
@@ -65,7 +67,7 @@ def _cached_exiftool_is_complete(exe_path: Path, subdir: str) -> bool:
 
     ExifTool is not a single self-contained file:
     - Windows ``exiftool.exe`` needs a sibling ``exiftool_files`` directory.
-    - the macOS Perl script needs a sibling ``lib/Image/ExifTool.pm`` tree.
+    - the macOS/Linux Perl script needs a sibling ``lib/Image/ExifTool.pm`` tree.
 
     If those are missing the binary can't run, so resolution should skip it and
     fall back to system PATH instead of returning a broken path.
@@ -73,7 +75,7 @@ def _cached_exiftool_is_complete(exe_path: Path, subdir: str) -> bool:
     parent = exe_path.parent
     if subdir == "win":
         return (parent / "exiftool_files").is_dir()
-    if subdir == "mac":
+    if subdir in ("mac", "linux"):
         return (parent / "lib" / "Image" / "ExifTool.pm").is_file()
     return True
 
@@ -136,7 +138,7 @@ def resolve_exiftool_path(cfg: ExiftoolConfig | None = None) -> str:
         return system_exiftool
 
     raise FileNotFoundError(
-        "ExifTool not found. On Windows, run Install/Update Requirements to download it; "
-        "on macOS/Linux install it (e.g. `brew install exiftool`) or set the ExifTool path "
-        "in plugin settings.\nDownload: https://exiftool.org"
+        "ExifTool not found.\n"
+        "run `python -m photokin.exiftool.fetch` to download it, or install it yourself "
+        "(https://exiftool.org) and retry."
     )
