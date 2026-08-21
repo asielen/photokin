@@ -331,6 +331,23 @@ def no_input_given() -> UsageMessage:
     return ("no input was given.", f"name one: {_INPUT_EXAMPLES}")
 
 
+def no_input_and_not_interactive() -> UsageMessage:
+    """No arguments at all, and stdin is not a terminal to prompt on.
+
+    The interactive prompt is a courtesy for a human at a keyboard; a
+    subprocess launcher (a plugin, a script, a scheduled task) with a mangled
+    or empty argument list is not that, and blocking it on a stdin read it
+    can never answer is worse than a usage error it can log and act on.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        "no input was given, and there is no terminal to prompt on.",
+        f"name one: {_INPUT_EXAMPLES}",
+    )
+
+
 def alias_is_not_a_directory(value: str) -> UsageMessage:
     """``--folder`` asserts a directory, and the path is not one.
 

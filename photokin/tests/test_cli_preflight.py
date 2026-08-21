@@ -1973,5 +1973,33 @@ class TestProviderResolution(_CliTestCase):
         self.assertTrue(os.path.exists(dest))
 
 
+class TestEmptyArgvRouting(_CliTestCase):
+    """Empty argv goes to the interactive prompt only when stdin is a terminal.
+
+    A headless launcher -- a plugin's subprocess call, a script, a scheduled
+    task -- whose argument list came out empty (a quoting bug that ate every
+    token, for one) is not a human at a keyboard. Routing it into a stdin
+    read it can never answer trades one silent hang for another; it should
+    get the same usage error any other malformed invocation gets.
+    """
+
+    def test_non_tty_stdin_is_a_usage_error_not_a_prompt(self):
+        with patch("sys.stdin.isatty", return_value=False), patch(
+            "photokin.cli._interactive_prompt"
+        ) as prompt:
+            code, _stdout, stderr = self.run_cli([])
+        prompt.assert_not_called()
+        self.assertEqual(code, 2)
+        self.assertIn("no terminal to prompt on", stderr)
+
+    def test_tty_stdin_still_prompts(self):
+        with patch("sys.stdin.isatty", return_value=True), patch(
+            "photokin.cli._interactive_prompt", side_effect=SystemExit(0)
+        ) as prompt:
+            code, _stdout, _stderr = self.run_cli([])
+        prompt.assert_called_once()
+        self.assertEqual(code, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1260,6 +1260,14 @@ def main() -> None:
     try:
         argv = sys.argv[1:]
         if not argv:
+            # The interactive prompt is for a human at a keyboard. A headless
+            # launcher (a plugin's subprocess call, a script, a scheduled task)
+            # whose argument list came out empty -- e.g. a quoting bug that ate
+            # every token -- is not that, and blocking it on a stdin read it
+            # can never answer just trades one silent hang for another. Route
+            # it to the usual usage error instead.
+            if not sys.stdin.isatty():
+                _exit_with_usage_error(*cli_messages.no_input_and_not_interactive())
             argv = _interactive_prompt()
 
         defaults = Config()
