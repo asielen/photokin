@@ -206,15 +206,32 @@ def _exit_with_usage_error(problem: str, remedy: str) -> NoReturn:
 
 
 def _interactive_prompt() -> list[str]:
-    """Prompt the user for image paths and return extra argv tokens."""
+    """Prompt the user for image paths and return extra argv tokens.
+
+    A blank front-image answer, an interrupt (Ctrl+C), or closed stdin (Ctrl+D
+    on macOS/Linux, Ctrl+Z then Enter on Windows, or an empty piped stdin) all
+    mean "nothing to run" and exit 0 quietly -- none should raise.
+    """
 
     print("Interactive mode: Provide image paths for analysis.")
-    front = normalize_path(input("Front image path (blank to quit): "))
-    if not front:
+    try:
+        front_raw = input("Front image path (blank to quit): ")
+    except (EOFError, KeyboardInterrupt):
+        print("\nNo file provided. Exiting.")
+        raise SystemExit(0)
+    # Checked before normalizing: normalize_path("") is "." (the current
+    # directory via os.path.normpath), which is truthy -- a blank answer would
+    # otherwise silently become `photokin .`, folder input over the cwd.
+    if not front_raw.strip():
         print("No file provided. Exiting.")
         raise SystemExit(0)
-    back_raw = input("Back image path (optional, blank if none): ")
-    back = normalize_path(back_raw) if back_raw else None
+    front = normalize_path(front_raw)
+    try:
+        back_raw = input("Back image path (optional, blank if none): ")
+    except (EOFError, KeyboardInterrupt):
+        back_raw = ""
+        print("")
+    back = normalize_path(back_raw) if back_raw.strip() else None
     extra = [front]
     if back:
         extra.extend(["--back", back])
