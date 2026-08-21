@@ -43,6 +43,7 @@ from __future__ import annotations
 # union_keywords,
 # merge_original_sources, dedupe_captions_with_source, extract_usage.
 import base64
+import importlib.util
 import io
 import json
 import logging
@@ -138,6 +139,39 @@ CLAUDE_MODELS: Dict[str, str] = {
 }
 
 DEFAULT_CLAUDE_MODEL = "sonnet"
+
+
+#: Providers photokin can auto-select, mapped to the module their SDK installs.
+#: OpenRouter is deliberately absent: it calls through the ``openai`` package,
+#: so its presence is indistinguishable from OpenAI's -- selecting it takes an
+#: explicit ``--provider``/``LLM_PROVIDER``.
+PROVIDER_SDK_MODULES: Dict[str, str] = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "gemini": "google.genai",
+}
+
+
+def installed_provider_sdks() -> list[str]:
+    """Return the providers whose SDK is importable, in ``PROVIDER_SDK_MODULES`` order.
+
+    Detection is by ``find_spec`` rather than by importing: nothing here needs
+    the SDKs executed, only known present or absent.
+
+    Returns:
+        Provider identifiers with an installed SDK; possibly empty.
+    """
+    installed: list[str] = []
+    for provider, module in PROVIDER_SDK_MODULES.items():
+        try:
+            if importlib.util.find_spec(module) is not None:
+                installed.append(provider)
+        except (ImportError, ValueError):
+            # find_spec raises for a missing parent package ("google.genai"
+            # with no "google") or a module whose __spec__ is unset; both mean
+            # "not usable here", which is all this function reports.
+            continue
+    return installed
 
 
 def normalize_provider(provider: str | None) -> str:

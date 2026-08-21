@@ -606,6 +606,55 @@ def output_destination_not_writable(role: str, out_path: str, reason: str) -> Us
     )
 
 
+def invalid_llm_provider_env(value: str) -> UsageMessage:
+    """``LLM_PROVIDER`` is set to a value no provider recognizes.
+
+    A typo here (``LLM_PROVIDER=antropic``) would otherwise fall through
+    ``normalize_provider``'s permissive default and run OpenAI silently --
+    exactly the guess this whole resolution order exists to avoid.
+
+    Args:
+        value: The unrecognized ``LLM_PROVIDER`` value.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"LLM_PROVIDER=`{value}` is not a provider photokin knows.",
+        "set it to one of openai, anthropic, gemini, openrouter, or unset it and pass --provider",
+    )
+
+
+def no_provider_sdk_installed() -> UsageMessage:
+    """No --provider was given and no provider SDK is importable.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        "no provider SDK is installed, so there is no backend to call.",
+        'install one: pip install "photokin[openai]" (or [anthropic] / [gemini])',
+    )
+
+
+def multiple_provider_sdks_installed(installed: list[str]) -> UsageMessage:
+    """No --provider was given and more than one provider SDK is importable.
+
+    The remedy names a real choice off the installed list rather than a
+    placeholder, so it can be pasted as-is.
+
+    Args:
+        installed: The providers whose SDK is present, in detection order.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"more than one provider SDK is installed ({', '.join(installed)}), and the run won't guess which to call.",
+        f"pick one per run with --provider {installed[0]}, or set LLM_PROVIDER once to make it the default",
+    )
+
+
 def exiftool_not_found(configured_path: str) -> UsageMessage:
     """Writes were requested and no ExifTool binary resolves.
 

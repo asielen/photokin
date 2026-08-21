@@ -89,6 +89,9 @@ _NEUTRAL_ENV: dict[str, str] = {
     "EXIFTOOL_PATH": "",
     "EXIFTOOL_WRITE_ENABLED": "",
     "EXIFTOOL_FIELDS": "",
+    # Pinned rather than blanked: with no provider chosen the CLI reads the
+    # installed SDKs, which differ between machines.
+    "LLM_PROVIDER": "openai",
 }
 
 

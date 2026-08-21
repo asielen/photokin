@@ -27,7 +27,7 @@ layer entirely.
 - `config.py` — `ExiftoolConfig` dataclass + `ExiftoolConfig.from_env()`.
 - `locate.py` — `resolve_exiftool_path()`: binary discovery.
 - `fetch.py` — `ensure_exiftool()`: download the official ExifTool on demand
-  (Windows) into the cache dir; run via `python -m photokin.exiftool.fetch`.
+  into the cache dir, on any OS; run via `python -m photokin.exiftool.fetch`.
 - `manifest.py` — standalone ExifTool→manifest reader (details below).
 - `hydrate.py` — `hydrate_item_metadata(items, cfg)` and
   `make_manifest_hydrator(cfg)` (returns a callable for
@@ -69,22 +69,28 @@ Perl distribution into a `py3-none-any` package installed on every platform).
 3. System `PATH` (`which exiftool`).
 
 A cached copy is only used when its runtime dependencies sit alongside it (the
-Windows `exiftool.exe` needs its sibling `exiftool_files/` directory; a macOS
-Perl script would need a sibling `lib/Image/ExifTool.pm` tree); otherwise the
-incomplete copy is skipped and resolution falls back to system `PATH` rather
+Windows `exiftool.exe` needs its sibling `exiftool_files/` directory; the
+macOS/Linux Perl script needs a sibling `lib/Image/ExifTool.pm` tree); otherwise
+the incomplete copy is skipped and resolution falls back to system `PATH` rather
 than returning a path that would fail at runtime.
 
 ### Provisioning (`fetch.py`)
 
-The Lightroom plugin's "Install/Update Requirements" flow runs
-`python -m photokin.exiftool.fetch` after installing the package. On **Windows**
-this downloads the official self-contained ExifTool release archive from the
-project's SourceForge host, verifies its SHA256 (against an offline pin in
-`KNOWN_SHA256` when set, else the checksum file exiftool.org publishes —
-`checksums-<version>.txt` first, then the unversioned `checksums.txt`), and
-extracts it into the cache as `exiftool.exe` + `exiftool_files/`. On
-**macOS/Linux** it is a no-op — install a system ExifTool
-(`brew install exiftool`, `apt install libimage-exiftool-perl`).
+`python -m photokin.exiftool.fetch` provisions an ExifTool on any OS (the
+Lightroom plugin's "Install/Update Requirements" flow runs it after installing
+the package). Every download is verified by SHA256 — against an offline pin in
+`KNOWN_SHA256` when set, else the checksum file exiftool.org publishes
+(`checksums-<version>.txt` first, then the unversioned `checksums.txt`).
+
+On **Windows** it downloads the official self-contained ExifTool release
+archive from the project's SourceForge host and extracts it into the cache as
+`exiftool.exe` + `exiftool_files/`. On **macOS/Linux** it first prefers an
+already-cached copy, then a system ExifTool on `PATH`; with neither, it
+downloads the official pure-Perl distribution (`Image-ExifTool-<version>.tar.gz`)
+into the cache as `exiftool` + `lib/`, rewrites the script's shebang to
+`env perl` and marks it executable — it runs on the system `perl`, which macOS
+and nearly every Linux ship with. With no `perl` at all it points at the system
+package (`brew install exiftool`, `apt install libimage-exiftool-perl`) instead.
 Provisioning is best-effort: any failure leaves resolution to fall back to
 system `PATH`.
 

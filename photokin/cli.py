@@ -723,6 +723,53 @@ def _writes_are_planned(ecfg: ExiftoolConfig, *, changeset_requested: bool) -> b
     return changeset_requested and ecfg.enabled and bool(ecfg.fields)
 
 
+#: Same set the ``--provider`` flag enforces via argparse ``choices``. ``LLM_PROVIDER``
+#: bypasses that argparse check (it is never parsed as a flag value), so
+#: ``_resolve_provider`` re-validates it against this list itself -- otherwise a
+#: typo'd env var would fall through ``normalize_provider``'s permissive default
+#: and run OpenAI silently, the exact guess this whole resolution order exists
+#: to avoid.
+_PROVIDER_CHOICES = ("openai", "anthropic", "gemini", "openrouter")
+
+
+def _resolve_provider(flag_value: str | None) -> str:
+    """Resolve the provider for this run: flag, then ``LLM_PROVIDER``, then the installed SDK.
+
+    There is deliberately no hardcoded fallback. A machine with exactly one
+    provider SDK installed runs with that provider -- installing ``[anthropic]``
+    is already a choice, and asking for it again on every command line taught
+    nothing. A machine with several SDKs gets a usage error rather than a
+    guess, because any guess spends money with a provider the user may not
+    have meant. OpenRouter shares OpenAI's SDK and so is never auto-selected;
+    it always takes an explicit flag or env value.
+
+    Args:
+        flag_value: The ``--provider`` value, or None when the flag was not given.
+
+    Returns:
+        The provider identifier this run should use.
+
+    Raises:
+        SystemExit: With code 2 when nothing chose a provider and zero or
+            several SDKs are installed, or when ``LLM_PROVIDER`` names something
+            that is not one of ``_PROVIDER_CHOICES``.
+    """
+    if flag_value:
+        return flag_value
+    env_value = (os.getenv("LLM_PROVIDER") or "").strip()
+    if env_value:
+        normalized = env_value.lower()
+        if normalized not in _PROVIDER_CHOICES:
+            _exit_with_usage_error(*cli_messages.invalid_llm_provider_env(env_value))
+        return normalized
+    installed = utils.installed_provider_sdks()
+    if len(installed) == 1:
+        return installed[0]
+    if not installed:
+        _exit_with_usage_error(*cli_messages.no_provider_sdk_installed())
+    _exit_with_usage_error(*cli_messages.multiple_provider_sdks_installed(installed))
+
+
 def _preflight_exiftool(
     ecfg: ExiftoolConfig, *, changeset_requested: bool, read_requested: bool = False
 ) -> None:
@@ -1250,8 +1297,10 @@ def main() -> None:
         # distinguishable from the default and the warning can fire at all.
         ap.add_argument("--update-policy", choices=["master_exact", "merge_per_variant"],
                         default=None, help=argparse.SUPPRESS)
-        ap.add_argument("--provider", choices=["openai", "anthropic", "gemini", "openrouter"], default=defaults.provider,
-                        help="LLM provider backend to use")
+        ap.add_argument("--provider", choices=list(_PROVIDER_CHOICES), default=None,
+                        help="LLM provider backend to use (default: LLM_PROVIDER, else the one "
+                             "provider whose SDK is installed; with several installed this flag "
+                             "is required)")
         ap.add_argument("--openai-model", default=defaults.model,
                         help="OpenAI model name (default: %(default)s)")
         ap.add_argument("--claude-model", choices=["sonnet", "haiku"], default=defaults.claude_model_name,
@@ -1393,9 +1442,17 @@ def main() -> None:
         if out_path and not out_path.lower().endswith((".ndjson", ".json")):
             _exit_with_usage_error(*cli_messages.output_file_extension(out_path))
 
+        # After the flag guards above (a wrong flag is wrong whatever the
+        # provider) and skipped for --generate-manifest, which never calls a
+        # model and so has no business demanding a provider choice.
+        if not args.generate_manifest:
+            args.provider = _resolve_provider(args.provider)
+
         cfg = Config(
             model=args.openai_model,
-            provider=args.provider,
+            # The generate-manifest path leaves the provider unresolved; the
+            # literal here only keeps the dataclass field a string it never reads.
+            provider=args.provider or "openai",
             provider_name=utils.provider_display_name(args.provider),
             claude_model_name=args.claude_model,
             gemini_model_name=args.gemini_model,

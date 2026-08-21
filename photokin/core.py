@@ -89,8 +89,11 @@ _EMPTY_CAPTION_MARKERS = (
     "n/a",
 )
 # ProviderApiError types that describe the run rather than one photo, so a batch
-# loop must abort on them instead of isolating the same failure per group.
-_RUN_FATAL_ERROR_TYPES = frozenset({"missing_api_key", "missing_dependency"})
+# loop must abort on them instead of isolating the same failure per group. The
+# first two are raised before any request; model_not_found is only discoverable
+# on the first call, but the model is constant for the run, so every later group
+# would fail the same way.
+_RUN_FATAL_ERROR_TYPES = frozenset({"missing_api_key", "missing_dependency", "model_not_found"})
 
 
 def _build_llm_dump_writer(
@@ -427,6 +430,32 @@ def _missing_api_key_message(provider_label: str, env_var: str) -> str:
     )
 
 
+def _missing_sdk_message(display_name: str, package: str, extra: str) -> str:
+    """Message for a selected provider whose SDK is not importable.
+
+    Names the SDKs that ARE installed when there are any: the user who
+    installed only ``[anthropic]`` and landed on another provider needs
+    ``--provider anthropic`` far more often than a second SDK.
+
+    Args:
+        display_name: The provider's user-facing name.
+        package: The pip distribution the provider needs.
+        extra: The photokin extra that installs it.
+
+    Returns:
+        The full missing-dependency message.
+    """
+    message = (
+        f"{display_name} provider selected but the {package} package is not installed. "
+        f'Run: pip install "photokin[{extra}]"'
+    )
+    installed = utils.installed_provider_sdks()
+    if installed:
+        alternatives = " or ".join(f"--provider {name}" for name in installed)
+        message += f" - or switch to the SDK you already have: {alternatives}"
+    return message
+
+
 def _build_provider_client(config: utils.Config):
     """Build provider SDK client using the selected provider and API key env var.
 
@@ -443,7 +472,7 @@ def _build_provider_client(config: utils.Config):
         except ImportError as exc:
             raise ProviderApiError(
                 "missing_dependency",
-                'Anthropic provider selected but the anthropic package is not installed. Run: pip install "photokin[anthropic]"',
+                _missing_sdk_message("Anthropic", "anthropic", "anthropic"),
             ) from exc
         api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
         if not api_key:
@@ -456,7 +485,7 @@ def _build_provider_client(config: utils.Config):
         except ImportError as exc:
             raise ProviderApiError(
                 "missing_dependency",
-                'Gemini provider selected but the google-genai package is not installed. Run: pip install "photokin[gemini]"',
+                _missing_sdk_message("Gemini", "google-genai", "gemini"),
             ) from exc
         api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
         if not api_key:
@@ -476,7 +505,7 @@ def _build_provider_client(config: utils.Config):
         except ImportError as exc:
             raise ProviderApiError(
                 "missing_dependency",
-                'OpenRouter provider selected but the openai package is not installed. Run: pip install "photokin[openai]"',
+                _missing_sdk_message("OpenRouter", "openai", "openai"),
             ) from exc
         api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
         if not api_key:
@@ -492,7 +521,7 @@ def _build_provider_client(config: utils.Config):
     except ImportError as exc:
         raise ProviderApiError(
             "missing_dependency",
-            'OpenAI provider selected but the openai package is not installed. Run: pip install "photokin[openai]"',
+            _missing_sdk_message("OpenAI", "openai", "openai"),
         ) from exc
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
