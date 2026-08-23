@@ -247,17 +247,16 @@ def _strip_empty_caption_sections(caption: str) -> str:
     return "\n".join(kept_sections).strip()
 
 
-#: The label the caption block puts on this run's analysis. Everything from this
-#: marker to the end of a caption is a previous run's output: the block photokin
-#: writes is what the next ``-r`` run reads back as the file's own caption, so
-#: the analysis has to be findable in it or it would be re-read as human prose,
-#: re-labelled, and kept beside the fresh one on every pass.
+#: A caption an older photokin release wrote may still carry an "[AI Analysis]"
+#: tail glued on from a previous run -- that release's own interpretation, not a
+#: human's words. ``_split_caption_sections`` matches on this to drop that tail
+#: when reading an existing caption back in, so an already-contaminated file is
+#: cleaned up the next time it is read rather than having the stale analysis
+#: treated as a caption section and merged forward forever.
 #:
-#: Matched loosely on the way in. ``inject_analysis_date`` rewrites the marker to
-#: "[AI Analysis on 1952-06-01]:" in ``ai_caption``, and ``output_format.txt``
-#: tells the model to open with this exact string -- which it also does in
-#: ``caption`` often enough that both spellings have to be recognized.
-_CAPTION_AI_LABEL = "[AI Analysis]:"
+#: Matched loosely: ``inject_analysis_date`` rewrites the marker to
+#: "[AI Analysis on 1952-06-01]:" in ``ai_caption``, so both spellings have to be
+#: recognized.
 _CAPTION_AI_MARKER_RE = re.compile(r"^\s*\[AI Analysis\b[^\]]*\]\s*:?", re.IGNORECASE)
 
 #: A caption line that already carries one of our own section labels. ``Front``
@@ -867,8 +866,14 @@ def analyze_photo(
         if config.fail_on_forbidden:
             raise SystemExit(2)
 
-    # New keywords → TOML (reuse the already-loaded vocab data)
-    new_kws = [k for k in (record.get("keywords") or []) if k not in known_keywords]
+    # New keywords → TOML (reuse the already-loaded vocab data). The provenance
+    # tag is auto-added by this tool, not proposed content, so (like the
+    # forbidden-word check above) it is exempt rather than treated as an
+    # unproposed keyword every single run.
+    new_kws = [
+        k for k in (record.get("keywords") or [])
+        if k not in known_keywords and not (isinstance(k, str) and k.strip().endswith(" Analyzed"))
+    ]
     proposed_raw = record.get("proposed_new_keywords")
     if not isinstance(proposed_raw, list):
         logger.warning('"proposed_new_keywords" missing or invalid; skipping vocab updates.')
@@ -904,9 +909,7 @@ def analyze_photo(
 
                 p = proposed_map.get(k)
                 if not p:
-                    logger.warning(
-                        'New keyword "%s" missing from "proposed_new_keywords"; skipping.', k
-                    )
+                    logger.info('Keyword "%s" was used on this photo but not added to the vocabulary.', k)
                     continue
 
                 section = (p.get("section") or "").strip()
@@ -1182,7 +1185,13 @@ def analyze_group_parts(
         if config.fail_on_forbidden:
             raise SystemExit(2)
 
-    new_kws = [k for k in kws if isinstance(k, str) and k not in known_keywords]
+    # The provenance tag is auto-added by this tool, not proposed content, so
+    # (like the forbidden-word check above) it is exempt rather than treated
+    # as an unproposed keyword every single run.
+    new_kws = [
+        k for k in kws
+        if isinstance(k, str) and k not in known_keywords and not k.strip().endswith(" Analyzed")
+    ]
     proposed_raw = record.get("proposed_new_keywords")
     if not isinstance(proposed_raw, list):
         logger.warning('"proposed_new_keywords" missing or invalid; skipping vocab updates.')
@@ -1221,9 +1230,7 @@ def analyze_group_parts(
 
                 p = proposed_map.get(k)
                 if not p:
-                    logger.warning(
-                        'New keyword "%s" missing from "proposed_new_keywords"; skipping.', k
-                    )
+                    logger.info('Keyword "%s" was used on this photo but not added to the vocabulary.', k)
                     continue
 
                 section = (p.get("section") or "").strip()
@@ -2683,6 +2690,24 @@ def process_manifest_stream(
             own_metadata = [utils.load_item_metadata(it) or {} for it in group]
             caption_sections: list[list[str]] = []
             accepted_texts: list[str] = []
+
+            def _absorb_caption(text: str, label: str) -> None:
+                """Split *text* into labelled sections and fold them into
+                ``caption_sections``, section by section, never whole-string.
+                Filling in a missing "[Photo B]" therefore cannot disturb the
+                "[Photo A]" already accepted, and a source holding the same
+                caption -- or a trivially reworded copy of it -- adds nothing
+                rather than adding a near-twin line."""
+                for _key, body in _split_caption_sections(text, label):
+                    section_text = _caption_section_text(body)
+                    if any(
+                        _captions_are_near_identical(seen, section_text)
+                        for seen in accepted_texts
+                    ):
+                        continue
+                    accepted_texts.append(section_text)
+                    caption_sections.append(body)
+
             for entry, entry_meta in sorted(
                 zip(group, own_metadata), key=lambda pair: _slot_rank_key(pair[0])
             ):
@@ -2690,49 +2715,29 @@ def process_manifest_stream(
                 if not existing_caption:
                     continue
                 label = _label_for(entry["is_back"], entry["version"], entry.get("page_num"))
-                for _key, body in _split_caption_sections(existing_caption, label):
-                    # Section by section, never whole-string. Filling in a
-                    # missing "[Photo B]" therefore cannot disturb the
-                    # "[Photo A]" already written, and a sibling holding the same
-                    # caption -- or a trivially reworded copy of it -- adds
-                    # nothing rather than adding a near-twin line.
-                    text = _caption_section_text(body)
-                    if any(
-                        _captions_are_near_identical(seen, text) for seen in accepted_texts
-                    ):
-                        continue
-                    accepted_texts.append(text)
-                    caption_sections.append(body)
+                _absorb_caption(existing_caption, label)
 
-            # --- This run's analysis, appended last -----------------------------
+            # --- This run's own transcription, merged in last --------------------
+            #
+            # ``caption`` is this run's verbatim transcription and nothing else.
+            # ``ai_caption`` -- the model's interpretation -- is never merged into
+            # the caption block; it reaches EXIF:UserComment on its own, via
+            # canonical.py's own mapping.
             #
             # One analysis per group either way -- both payload branches append
-            # exactly one entry to ``analyses`` -- so the caption block no longer
-            # forks on ``group_payload``. That fork is what left the default
-            # ``--group-by object`` path unlabelled while pair and none labelled,
-            # and it is also what labelled a FRONT file's caption "[Back]"
-            # whenever its variant happened to have a back.
-            analysis_lines: list[str] = []
+            # exactly one entry to ``analyses`` -- so this step no longer forks
+            # on ``group_payload``. A group payload's transcription already
+            # carries its own [Front]/[Back]/[Page N] headers (see the prompt
+            # built in ``analyze_group_parts``), so it is split and filed under
+            # those exactly as a pre-existing per-file caption would be; a lone
+            # scan's plain, unbracketed transcription is filed unlabelled.
             if analyses:
                 record0 = analyses[0][0]
-                analysis_text = _strip_empty_caption_sections(
-                    (record0.get("caption") or record0.get("ai_caption") or "").strip()
+                fresh_caption = _strip_empty_caption_sections(
+                    (record0.get("caption") or "").strip()
                 )
-                supplied_marker = _CAPTION_AI_MARKER_RE.match(analysis_text)
-                if supplied_marker:
-                    # The model is told to open with this marker and does so in
-                    # the caption field too, so strip its copy rather than
-                    # stacking a second one in front of it.
-                    analysis_text = analysis_text[supplied_marker.end():].lstrip()
-                if analysis_text:
-                    body_lines = analysis_text.splitlines()
-                    if len(body_lines) == 1:
-                        analysis_lines = [f"{_CAPTION_AI_LABEL} {body_lines[0].strip()}"]
-                    else:
-                        # A group payload comes back carrying its own
-                        # [Front]/[Back] headers, so the marker takes a line of
-                        # its own rather than being glued onto one of them.
-                        analysis_lines = [_CAPTION_AI_LABEL, *body_lines]
+                if fresh_caption:
+                    _absorb_caption(fresh_caption, "")
 
             # --- The block ------------------------------------------------------
             #
@@ -2742,7 +2747,7 @@ def process_manifest_stream(
             # shown from landing that line twice.
             caption_block_lines: list[str] = []
             seen_lines: set[str] = set()
-            for line in [ln for body in caption_sections for ln in body] + analysis_lines:
+            for line in [ln for body in caption_sections for ln in body]:
                 key = " ".join(line.split()).lower()
                 if not key:
                     # A blank line is the author's paragraph break, not a

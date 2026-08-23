@@ -391,11 +391,12 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
     every file of it. f4153ae wrote "[Front] A caption" onto the lone scan and
     "[Back] A caption" onto BOTH files of the pair -- including the front, which
     is the mislabelling the block replaces. What every file gets here instead is
-    "[AI Analysis]: A caption", because these placeholders hold no captions of
-    their own: the analysis is the only section there is, and it is labelled so
-    that a later ``-r`` can tell photokin's own output from a human's prose. The
-    caption is therefore the one field of this golden that is *expected* to
-    differ from f4153ae; every other byte still has to survive.
+    the bare "A caption", because these placeholders hold no captions of their
+    own: the model's transcription is the only content there is, and with
+    nothing else in the group to tell it apart from it earns no section label
+    of its own, the same as any other lone scan's caption. The caption is
+    therefore the one field of this golden that is *expected* to differ from
+    f4153ae; every other byte still has to survive.
     """
 
     _FIXTURE: ClassVar[tuple[str, ...]] = (
@@ -456,7 +457,7 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
     #: the front is a back.
     _F4153AE_RECORDS: ClassVar[dict[str, dict[str, object]]] = {
         "box3_025-back.jpg": {
-            "caption": "[AI Analysis]: A caption",
+            "caption": "A caption",
             "keywords": ["family", "PC-R-123", "back"],
             "location_guess": _LOCATION,
             "date_guess": _DATE,
@@ -466,7 +467,7 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
             "_merge": _NO_MERGE,
         },
         "box3_025.jpg": {
-            "caption": "[AI Analysis]: A caption",
+            "caption": "A caption",
             "keywords": ["family", "PC-R-123"],
             "location_guess": _LOCATION,
             "date_guess": _DATE,
@@ -476,7 +477,7 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
             "_merge": _NO_MERGE,
         },
         "box3_040.jpg": {
-            "caption": "[AI Analysis]: A caption",
+            "caption": "A caption",
             "keywords": ["family", "PC-R-123"],
             "location_guess": _LOCATION,
             "date_guess": _DATE,

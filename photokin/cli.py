@@ -1022,6 +1022,7 @@ def _apply_common_cfg(cfg: Config, args: argparse.Namespace, *, manifest: dict |
     cfg.debug_dump_hydration = args.debug_dump_hydration == "true"
     cfg.debug_dump_dir = args.debug_dump_dir or os.path.join(os.getcwd(), "debug")
     cfg.run_batch_id = args.batch_id
+    cfg.pretty_json = args.pretty_json == "true"
 
 
 def _apply_manifest_debug_settings(
@@ -1260,8 +1261,8 @@ def _write_generated_manifest(manifest: dict, out_path: str) -> None:
     """Write *manifest* to *out_path*, atomically and always pretty-printed.
 
     Pretty regardless of ``Config.pretty_json``, which the other two JSON writes
-    honor: this file exists to be read and hand edited. (There is no
-    ``--pretty-json`` flag; the field is library-only.) Written through a
+    honor: this file exists to be read and hand edited, so it does not follow
+    ``--pretty-json`` the way they do. Written through a
     sibling temp file and ``os.replace`` so an
     interrupted write never leaves a truncated manifest behind, matching how the
     aggregate ``.json`` output is written. ``os.replace`` overwrites an existing
@@ -1712,6 +1713,15 @@ def main() -> None:
 
         ap.add_argument("--output-file",
                         help="Path to write results, for every input type. If it ends with .ndjson, writes one JSON object per line as items complete; if .json, writes a single JSON object at the end. Without it, results go to stdout.")
+        ap.add_argument(
+            "--pretty-json",
+            choices=["true", "false"],
+            default="true",
+            help="Indent the stdout result document (and an aggregate .json --output-file) "
+                 "for human reading (default: true). Pass false for compact single-line "
+                 "output, e.g. when a script parses stdout itself rather than reading it "
+                 "with a JSON library.",
+        )
         ap.add_argument("--output-sidecars", action="store_true",
                         help="Also emit per-photo sidecar JSON next to each image")
         ap.add_argument(

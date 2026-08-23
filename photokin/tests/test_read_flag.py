@@ -1138,12 +1138,14 @@ class TestTheChangesetDiffIsNeutralExceptWhereTheReadLands(_ReadFlagTestCase):
     }
 
     #: What a previous photokin run left in ``XMP:Description``: the file's own
-    #: caption with this very analysis appended, under the marker that tells the
-    #: next read which half it wrote. Re-reading it must reproduce it exactly,
-    #: which is what makes the description propose nothing below. This file is a
-    #: lone scan with no back, so its own caption earns no section label -- there
-    #: is nothing in the group to tell it apart from.
-    JOINED_CAPTION = "Grandma on the porch\n[AI Analysis]: Two men beside a car"
+    #: caption with this run's matching transcription appended beneath it.
+    #: ``REPLY["caption"]`` is the same text on every call, so re-reading it
+    #: reproduces it exactly -- the fresh line matches the one already there and
+    #: is deduplicated rather than added again -- which is what makes the
+    #: description propose nothing below. This file is a lone scan with no
+    #: back, so its own caption earns no section label -- there is nothing in
+    #: the group to tell it apart from.
+    JOINED_CAPTION = "Grandma on the porch\nTwo men beside a car"
 
     #: The model's whole answer as canonical writes, which is what every row
     #: proposes before the file gets a say. Spelled once so each row below reads
@@ -1153,7 +1155,7 @@ class TestTheChangesetDiffIsNeutralExceptWhereTheReadLands(_ReadFlagTestCase):
         "EXIF:UserComment": "print, deckled edge",
         "IPTC:Country-PrimaryLocationName": "United States",
         "IPTC:Province-State": "Ohio",
-        "XMP-dc:Description": "[AI Analysis]: Two men beside a car",
+        "XMP-dc:Description": "Two men beside a car",
         "XMP-dc:Title": "Wedding Day 1952",
     }
 

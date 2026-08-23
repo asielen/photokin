@@ -391,10 +391,11 @@ Take a print you scanned twice, and scanned the back of the second time — `box
 [Photo A] Caption A
 [Photo B] Caption B
 [Back] Back of Photo B
-[AI Analysis]: Two people outside a bakery.
 ```
 
 Not a third of it each: the whole thing, byte for byte, in all three. That is the point of it. Those three files are one physical photograph, and which of them you happen to open a year from now is an accident of how you were browsing. Opening any one of them should tell you the whole story of the object — that there were two scans, that one of them has writing on the back, and what that writing says — rather than the fragment that particular file was scanned with.
+
+This block is what gets written to `XMP-dc:Description`, and it is *only* transcription — human-typed captions and the model's own reading of whatever text is actually on the object, merged together. The model's own interpretation of the scene never appears here: that's the separate `ai_caption` field (see [Reading and writing your files](#reading-and-writing-your-files)), and it goes to `EXIF:UserComment` on its own. If the object has nothing legible on it at all, the block above is just empty and Description is left alone.
 
 ### The labels
 
@@ -419,7 +420,6 @@ A label is only added when it distinguishes something, and the variant letter is
 
 ```
 Grandma on the porch
-[AI Analysis]: Two people outside a bakery.
 ```
 
 That last case is the overwhelmingly common one, and it is deliberately left alone — an archive of loose prints with no variants in it never grows a single bracket.
@@ -428,9 +428,9 @@ The letters are the letters on disk. `box3_017b.jpg` is `[Photo B]` because the 
 
 ### How it is built, and the surprise in it
 
-The block is assembled once for the whole group and then written to every file in it. Concretely: photokin reads each file's existing caption while it still knows which file it came off — that is the only moment the attribution is free — labels it accordingly, merges the labelled pieces from across the group into one block, appends this run's analysis, and hands the same result to every member.
+The block is assembled once for the whole group and then written to every file in it. Concretely: photokin reads each file's existing caption while it still knows which file it came off — that is the only moment the attribution is free — labels it accordingly, merges the labelled pieces from across the group into one block together with this run's own transcription of the same object, and hands the same result to every member.
 
-"Existing caption" means whatever the run was given: the `XMP:Description` in the file itself under `-r`, or a `caption` you put in a manifest item's `metadata`. Without either, there is nothing to merge and the block is just the analysis line — which is another reason the normal run is `-rw`.
+"Existing caption" means whatever the run was given: the `XMP:Description` in the file itself under `-r`, or a `caption` you put in a manifest item's `metadata`. Without either, there is nothing pre-existing to merge and the block is just this run's own transcription — which is another reason the normal run is `-rw`.
 
 **This means a caption you typed on one file will appear on its siblings.** If you wrote "Ruth and Sam outside the bakery" on the front scan only, after a run the back scan holds it too, as `[Photo] Ruth and Sam outside the bakery`. That is intended and it is the whole feature, but it will surprise you the first time, so: if you do not want two scans sharing captions, they are not one object as far as photokin is concerned — put them in different groups, or run with `--group-by none`, which analyses and captions every file entirely on its own.
 
@@ -460,7 +460,9 @@ The judgement that genuinely needs a model — whether two differently worded ca
 
 Under `-rw`, the block photokin writes into a file is exactly what the next run reads back out of it. That is a real trap — an earlier release of photokin appended another copy of the caption on every pass — so it is now a property the test suite pins directly: run `-rw` three times over the same folder and the caption is byte-identical after the first run.
 
-Two things make that true. Labelled lines are recognised as photokin's own output and taken as they are, never labelled a second time. And the `[AI Analysis]` section is regenerated rather than accumulated: everything from that marker to the end of the caption is the previous run's analysis, so a model that rewords itself between runs replaces its old paragraph instead of adding a second one. Everything above the marker is yours and is never touched.
+Two things make that true. Labelled lines are recognised as photokin's own output and taken as they are, never labelled a second time. And this run's own transcription is judged by the same "near enough" rule as any other caption (see above): when the model reads the same text the same way again — the ordinary case for genuine transcription — the line it returns matches the one already in the block and is dropped rather than added a second time.
+
+That is a deliberate change from an earlier release, which glued the model's separate interpretation onto the end of this same block under an `[AI Analysis]:` marker and unconditionally regenerated it on every run, discarding whatever had been there before. That marker never belonged in Description in the first place — it was the model's own reading of the *scene*, not of the object's *text*, and it is now written only to `EXIF:UserComment`, where it belongs. Un-discarding it also removed the free idempotency that regeneration gave it: this run's transcription is caption content now, so if the model's own reading of the object genuinely changes between runs, the new line is kept beside the old one rather than silently replacing it — the same "never guess that a rewrite means replace" principle that governs every other caption edit. A caption an older release already wrote is not left contaminated: the stale `[AI Analysis]` tail is recognised and stripped the next time the file is read, rather than being kept as if it were a caption section.
 
 ## API keys
 
@@ -624,6 +626,7 @@ type instead of detecting it; passing a positional *and* an alias is an error.
 | Flag                       | What it does |
 |----------------------------|---|
 | `--output-file PATH`       | `.ndjson` streams one record per finished photo; `.json` writes one aggregate object atomically. Works for every input type; without it, results go to stdout |
+| `--pretty-json {true,false}` | Indent the stdout result document (and an aggregate `.json` `--output-file`) for human reading (default `true`). Pass `false` for compact single-line output, e.g. when a script parses stdout itself rather than reading it with a JSON library |
 | `--output-sidecars`        | Also write a per-photo sidecar JSON next to each image (default off) |
 | `--generate-manifest PATH` | Write the manifest folder or single-photo input would be grouped into, then exit without calling the model (not valid with manifest input) |
 | `--batch-id ID`            | Identifier added to each record on the `.ndjson` streaming path, and used to name debug-dump files. It does not appear in the aggregate `.json` or on stdout |

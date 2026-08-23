@@ -280,8 +280,11 @@ class _CaptionBlockTestCase(unittest.TestCase):
     #: runs differed without saying where.
     maxDiff = None
 
-    #: This run's analysis, held fixed everywhere, so any difference between two
-    #: blocks comes from the files rather than from the model.
+    #: This run's own transcription (the model's ``caption`` reply), held fixed
+    #: everywhere, so any difference between two blocks comes from the files
+    #: rather than from the model. Named for what it stood in for before this
+    #: run's own transcription and the model's separate ``ai_caption``
+    #: interpretation were pulled apart into Description and UserComment.
     ANALYSIS = "Two people outside a bakery."
 
     def blocks(
@@ -373,7 +376,7 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
             "[Photo A] Caption A\n"
             "[Photo B] Caption B\n"
             "[Back] Back of Photo B\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_the_default_grouping_is_where_this_had_to_start_working(self):
@@ -392,7 +395,7 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
         # in it.
         self.assertEqual(
             self.one_block({"box3_030.jpg": "Grandma on the porch"}),
-            f"Grandma on the porch\n[AI Analysis]: {self.ANALYSIS}",
+            f"Grandma on the porch\n{self.ANALYSIS}",
         )
 
     def test_a_single_variant_with_a_back_is_labelled_without_letters(self):
@@ -402,7 +405,7 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
             ),
             "[Photo] Ruth and Sam\n"
             "[Back] pencil note\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_the_letter_is_decided_per_role_so_a_lone_back_keeps_none(self):
@@ -439,7 +442,7 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
             "[Photo B] front B\n"
             "[Back A] back A\n"
             "[Back B] back B\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_the_unlettered_scan_is_variant_a_only_beside_a_lettered_one(self):
@@ -459,7 +462,7 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
             ),
             "[Photo] the print\n"
             "[Photo] the detail\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_a_real_variant_a_keeps_the_letter_to_itself(self):
@@ -476,7 +479,7 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
             "[Photo] the unlettered scan\n"
             "[Photo A] the a scan\n"
             "[Photo B] the b scan\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_a_front_is_never_labelled_as_the_back(self):
@@ -506,7 +509,7 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
                 }
             ),
             "[Photo] Ruth and Sam outside the bakery\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_pages_are_told_apart_by_number_not_a_letter_none_of_them_have(self):
@@ -531,7 +534,7 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
             "[Photo 1] Dear Ruth,\n"
             "[Photo 2] I hope this finds you well.\n"
             "[Photo 3] Love, Sam\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
 
@@ -558,7 +561,7 @@ class TestTheCaptionUpdateRules(_CaptionBlockTestCase):
             ),
             "[Photo A] Ruth and Sam outside the bakery\n"
             "[Photo B] Ruth and Edith outside the bakery\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_a_partial_block_has_only_its_missing_section_filled_in(self):
@@ -573,13 +576,13 @@ class TestTheCaptionUpdateRules(_CaptionBlockTestCase):
         self.assertEqual(
             self.one_block(
                 {
-                    "box3_041.jpg": f"[Photo A] Caption A\n[AI Analysis]: {self.ANALYSIS}",
+                    "box3_041.jpg": "[Photo A] Caption A",
                     "box3_041b.jpg": "Caption B",
                 }
             ),
             "[Photo A] Caption A\n"
             "[Photo B] Caption B\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_a_change_in_one_section_cannot_disturb_another(self):
@@ -616,7 +619,7 @@ class TestTheCaptionUpdateRules(_CaptionBlockTestCase):
                 }
             ),
             "[Photo A] Grandma on the porch, Ohio, summer 1948\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
     def test_multi_line_prose_takes_one_label_for_the_whole_run(self):
@@ -633,7 +636,7 @@ class TestTheCaptionUpdateRules(_CaptionBlockTestCase):
             "[Photo A] Grandma on the porch.\n"
             "\n"
             "Ohio, summer 1948.\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
 
@@ -685,7 +688,7 @@ class TestNearIdenticalCaptionsAreNotDuplicated(_CaptionBlockTestCase):
             with self.subTest(differing_by=label):
                 self.assertEqual(
                     self._pair_block(first, second),
-                    f"[Photo A] {first}\n[AI Analysis]: {self.ANALYSIS}",
+                    f"[Photo A] {first}\n{self.ANALYSIS}",
                     "a caption differing only in punctuation, quoting or case "
                     "was written a second time; the block gains a near-twin "
                     "line on every run that way",
@@ -697,7 +700,7 @@ class TestNearIdenticalCaptionsAreNotDuplicated(_CaptionBlockTestCase):
                 self.assertEqual(
                     self._pair_block(first, second),
                     f"[Photo A] {first}\n[Photo B] {second}\n"
-                    f"[AI Analysis]: {self.ANALYSIS}",
+                    f"{self.ANALYSIS}",
                     "a caption that says something different was discarded as a "
                     "restatement. Losing a correction someone typed cannot be "
                     "undone; carrying an extra line can",
@@ -848,7 +851,7 @@ class TestTheCaptionBlockIsPermutationInvariant(_CaptionBlockTestCase):
             "[Photo B] the rescan\n"
             "[Back A] pencil on the back\n"
             "[Back B] pencil on the rescan's back\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
         )
 
 
@@ -968,19 +971,19 @@ class TestCaptionJoinIsIdempotent(_CaptionBlockTestCase):
                     self.assertNotIn("[Photo] [Photo", block)
                     self.assertNotIn("[Back] [Back", block)
                     self.assertEqual(block.count("[Photo A]"), 1)
-                    self.assertEqual(block.count("[AI Analysis]:"), 1)
 
-    def test_the_analysis_section_is_replaced_rather_than_accumulated(self):
-        """One analysis per block, however many times the run happens.
+    def test_a_reworded_transcription_is_kept_beside_not_silently_replaced(self):
+        """This run's own transcription is caption content now, not disposable analysis.
 
-        Everything from the ``[AI Analysis]`` marker to the end of a caption is a
-        previous run's output, and it is regenerated rather than kept beside the
-        new one. Without that, a model that reworded itself between passes --
-        the normal case in the field, where the reply is not a frozen stub --
-        would add a paragraph to every photograph on every run, and the
-        stability above would be an artifact of the test's fixed reply. The
-        prompt tells the model the same thing about a caption it is shown
-        (CAPTION MERGE BEHAVIOR rule 3: an earlier AI caption may be replaced).
+        Nothing marks it as regenerable the way the old ``[AI Analysis]`` tail
+        did, so a model that returns different wording on a later pass -- OCR
+        settling on a clearer reading of the same handwriting, say -- is judged
+        by the same rule (b) as any other materially different caption: kept
+        beside what is already there, never silently dropped. Losing a real
+        correction because it looked like a reword is the failure this
+        architecture exists to avoid; the price is that two genuinely distinct
+        readings from two different runs both survive rather than the second
+        quietly overwriting the first.
         """
         settled = self.one_block({"box3_017.jpg": "Caption A"})
 
@@ -989,17 +992,17 @@ class TestCaptionJoinIsIdempotent(_CaptionBlockTestCase):
         )["box3_017.jpg"]
 
         self.assertEqual(
-            reworded, "Caption A\n[AI Analysis]: Two people outside a bakery in Ohio."
+            reworded,
+            f"Caption A\n{self.ANALYSIS}\nTwo people outside a bakery in Ohio.",
         )
-        self.assertEqual(reworded.count("[AI Analysis]"), 1)
 
-    def test_the_original_is_kept_and_the_analysis_appended(self):
-        # A lone scan with no back earns no section label of its own; the
-        # analysis is labelled because it must be, so the next read can tell
-        # this run's output from the human's prose.
+    def test_the_original_is_kept_and_this_runs_transcription_appended(self):
+        # A lone scan with no back earns no section label of its own, and
+        # neither does this run's own transcription -- it is filed the same
+        # way a human's caption would be.
         self.assertEqual(
             self._caption(self.ORIGINAL),
-            f"{self.ORIGINAL}\n[AI Analysis]: {self.GENERATED}",
+            f"{self.ORIGINAL}\n{self.GENERATED}",
         )
 
     def test_re_reading_the_join_returns_it_unchanged(self):
@@ -1009,13 +1012,13 @@ class TestCaptionJoinIsIdempotent(_CaptionBlockTestCase):
 
     def test_a_file_with_no_original_caption_is_stable_too(self):
         first = self._caption("")
-        self.assertEqual(first, f"[AI Analysis]: {self.GENERATED}")
+        self.assertEqual(first, self.GENERATED)
         self.assertEqual(self._caption(first), first)
 
     def test_a_multi_paragraph_caption_keeps_its_breaks_and_is_stable(self):
         original = "Grandma on the porch.\n\nOhio, summer 1948."
         once = self._caption(original)
-        self.assertEqual(once, f"{original}\n[AI Analysis]: {self.GENERATED}")
+        self.assertEqual(once, f"{original}\n{self.GENERATED}")
         self.assertEqual(self._caption(once), once)
 
     def test_a_block_an_older_release_wrote_is_kept_rather_than_re_labelled(self):
@@ -1046,7 +1049,7 @@ class TestCaptionJoinIsIdempotent(_CaptionBlockTestCase):
             once,
             f"[Front] {self.GENERATED}\n"
             "[Back] pencil on the back\n"
-            f"[AI Analysis]: {self.ANALYSIS}",
+            f"{self.ANALYSIS}",
             "a line an older release labelled was attributed a second time; "
             f'"[Photo] [Front] ..." is the doubling this prevents: {once!r}',
         )
