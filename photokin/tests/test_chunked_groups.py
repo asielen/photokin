@@ -27,6 +27,7 @@ from typing import Any
 from unittest.mock import patch
 
 from photokin import core, utils
+from photokin.errors import ProviderApiError
 
 _CHUNK_NOTE_MARKER = "CHUNK NOTE:"
 _CONSOLIDATION_MARKER = "CONSOLIDATION PASS"
@@ -819,6 +820,394 @@ class TestCaptionOnlyChunksAreJoinedInPayloadOrderNotCallOrder(_ChunkedGroupTest
             "[Page 9]\nninth page\n"
             "[Back]\n[Address]\nMom and Dad\n[Postmark]\nLE MANS",
         )
+
+
+class TestAFailedConsolidationCallFallsBackToTheChunkAnswers(_ChunkedGroupTestCase):
+    """A rate limit on the cheap last call must not discard every paid-for chunk.
+
+    Before, ``_run_consolidation``'s call to ``call_model`` was unguarded: a
+    ``ProviderApiError`` on the text-only consolidation call -- the one call
+    in a chunked group's sequence that carries no images -- propagated out of
+    ``analyze_group_parts`` uncaught. By the time that call is made the group
+    has already spent every chunk call it was going to spend; letting the
+    failure escape sent the whole group to the batch loop's per-group failure
+    handler, which discarded every successfully completed, already-billed
+    chunk answer along with it.
+    """
+
+    def test_the_group_still_returns_a_usable_record_folded_from_the_chunks(self) -> None:
+        parts = self.page_parts(6)
+        calls: list[_Call] = []
+
+        def _call_model(
+            client: object,
+            model: str,
+            prompt_items: list[dict],
+            urls: list[str],
+            provider: str | None = None,
+            dump_request: Any = None,
+        ) -> _StubResponse:
+            call = _Call(
+                images=[url for url in urls if url],
+                texts=[
+                    item.get("text", "") for item in prompt_items if isinstance(item, dict)
+                ],
+            )
+            calls.append(call)
+            if call.is_consolidation:
+                raise ProviderApiError("rate_limit", "Too many requests")
+            return _StubResponse(len(calls) - 1)
+
+        def _extract_output_text(resp: _StubResponse, provider: str | None = None) -> str:
+            call = calls[resp.index]
+            return json.dumps(_chunk_reply(self.labels_of(call)))
+
+        def _build_data_url(path: str, quality: int, max_edge: int | None) -> tuple[str, int, dict]:
+            return (
+                f"data:{os.path.basename(path)}",
+                4,
+                {"mime": "image/jpeg", "width": 10, "height": 10, "resized": False},
+            )
+
+        with (
+            self.assertLogs("photokin.core", level="WARNING") as logged,
+            patch("photokin.core._build_provider_client", return_value=object()),
+            patch("photokin.core._should_run_archival_upload", return_value=False),
+            patch("photokin.core.call_model", _call_model),
+            patch("photokin.core.extract_output_text", _extract_output_text),
+            patch("photokin.core.get_response_model", return_value="test-model"),
+            patch("photokin.utils.build_data_url_and_size", _build_data_url),
+        ):
+            data = core.analyze_group_parts(parts=parts, config=self.config(4))
+
+        record = next(iter(data["result"].values()))
+        # Two page chunks (budget 4 over 6 pages) plus the failed consolidation
+        # call, which still happened and was still billed.
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(calls[-1].is_consolidation)
+        self.assertEqual(len(record["transcriptions"]), 6)
+        self.assertTrue(record["caption"].startswith("[Page 1]\ntext of Page 1"))
+        self.assertIn("Document", record["keywords"])
+        self.assertTrue(
+            any("consolidation pass could not be made" in line for line in logged.output),
+            logged.output,
+        )
+
+
+class TestTheUnattributedFenceIsAlwaysSortedLast(unittest.TestCase):
+    """``[Unattributed]`` is a boundary to the reorderer, not ordinary text.
+
+    The fence has two halves and they fail differently. Writing the label is
+    what stops unattributed text from being read as the previous page's
+    transcription; teaching ``_reorder_caption_sections`` to RECOGNIZE it is
+    what stops the reorderer from carrying that text along with whichever
+    section happens to precede it and depositing it in the middle of the
+    document. Today the emit path appends the fence last, so the second half
+    changes nothing there and no end-to-end test can see it -- which is exactly
+    why it is pinned here, on the function's own contract, rather than left to
+    a caller's current habits to protect.
+    """
+
+    def test_orphan_text_travels_to_the_end_rather_than_with_its_neighbour(self) -> None:
+        caption = (
+            "[Page 1]\na\n"
+            "[Unattributed]\nORPHAN\n"
+            "[Page 2]\nb"
+        )
+        # Without the fence being recognized, ORPHAN is part of Page 1's
+        # section and rides with it -- landing before Page 2 and reading as
+        # page one's own text.
+        self.assertEqual(
+            core._reorder_caption_sections(caption, ["Page 1", "Page 2"]),
+            "[Page 1]\na\n[Page 2]\nb\n[Unattributed]\nORPHAN",
+        )
+
+    def test_it_sorts_after_every_named_part_however_they_arrive(self) -> None:
+        caption = (
+            "[Front]\nf\n"
+            "[Unattributed]\nORPHAN\n"
+            "[Page 1]\na"
+        )
+        self.assertEqual(
+            core._reorder_caption_sections(caption, ["Page 1", "Front"]),
+            "[Page 1]\na\n[Front]\nf\n[Unattributed]\nORPHAN",
+        )
+
+
+class TestABareUnmappedCaptionIsFencedNotAttributedToThePriorPage(_ChunkedGroupTestCase):
+    """A caption-only chunk's bare text cannot be read as the prior page's own words.
+
+    Before, an unmapped chunk's caption was concatenated straight after the
+    last synthesized "[Page N]" section with no label of its own -- so a
+    reader, and the sidecar writer that slices the caption by part label,
+    read it as that page's transcription. It is now fenced under
+    ``_UNATTRIBUTED_LABEL``, which ``_reorder_caption_sections`` always sorts
+    last, so the false attribution cannot happen.
+    """
+
+    def test_the_bare_caption_is_fenced_under_unattributed_and_stays_separate(self) -> None:
+        parts = self.page_parts(4)
+
+        def _reply(index: int, call: _Call) -> Any:
+            if call.is_consolidation:
+                return _consolidation_reply()
+            labels = self.labels_of(call)
+            if labels and labels[0] == "Page 1":
+                return _chunk_reply(labels)
+            # The second chunk ignores "transcriptions" entirely and answers
+            # with a bare caption -- no bracket labels of any kind.
+            return {
+                "result": {
+                    "k": {
+                        "keywords": ["Document"],
+                        "title": "second block",
+                        "category": "Document",
+                        "ai_caption": "[AI Analysis]: a",
+                        "caption": "bare unattributed text with no section label",
+                        "date_guess": {"iso": "1944", "confidence": 0.4, "pattern": "Y!"},
+                        "location_guess": {"country": "France", "confidence": 0.3},
+                        "proposed_new_keywords": [],
+                    }
+                }
+            }
+
+        with self.assertLogs("photokin.core", level="WARNING") as logged:
+            record, calls = self.run_group(parts, 2, _reply)
+
+        self.assertEqual(len(calls), 3)  # two page chunks + consolidation
+        self.assertEqual(
+            record["caption"],
+            "[Page 1]\ntext of Page 1\n[Page 2]\ntext of Page 2\n"
+            "[Unattributed]\nbare unattributed text with no section label",
+        )
+        # The load-bearing property: the bare text does not run on directly
+        # after the last labelled section's text with nothing between them.
+        self.assertNotIn("text of Page 2\nbare unattributed", record["caption"])
+        self.assertTrue(
+            any(
+                "answered with 'caption' instead of 'transcriptions'" in line
+                for line in logged.output
+            ),
+            logged.output,
+        )
+
+
+class TestConsolidationInputCarriesACaptionOnlyChunksText(_ChunkedGroupTestCase):
+    """The consolidation pass reasons over a block's text even when it skipped the map.
+
+    Before, a block that answered with ``caption`` and no ``transcriptions``
+    contributed nothing to the consolidation payload: its pages showed
+    ``"transcription": null`` in ``parts`` and its text appeared nowhere else
+    in the input, so the consolidation call judged the whole document's
+    title, date and page order without ever having seen that block's text.
+    """
+
+    def test_the_caption_only_blocks_text_reaches_the_consolidation_prompt(self) -> None:
+        parts = self.page_parts(4)
+        marker_text = "the caption-only block's own evidence text"
+
+        def _reply(index: int, call: _Call) -> Any:
+            if call.is_consolidation:
+                return _consolidation_reply()
+            labels = self.labels_of(call)
+            if labels and labels[0] == "Page 1":
+                return _chunk_reply(labels)
+            return {
+                "result": {
+                    "k": {
+                        "keywords": ["Document"],
+                        "title": "second block",
+                        "category": "Document",
+                        "ai_caption": "[AI Analysis]: a",
+                        "caption": marker_text,
+                        "date_guess": {"iso": "1944", "confidence": 0.4, "pattern": "Y!"},
+                        "location_guess": {"country": "France", "confidence": 0.3},
+                        "proposed_new_keywords": [],
+                    }
+                }
+            }
+
+        _record, calls = self.run_group(parts, 2, _reply)
+
+        consolidation = calls[-1]
+        self.assertTrue(consolidation.is_consolidation)
+        payload_text = next(
+            text for text in consolidation.texts if text.startswith(_CONSOLIDATION_INPUT_MARKER)
+        )
+        payload = json.loads(payload_text.split("\n", 1)[1])
+        self.assertIn(marker_text, payload_text)
+        second_block = payload["provisional_metadata_by_block"][1]
+        self.assertEqual(second_block["unattributed_transcription"], marker_text)
+
+
+class TestAWrongTypedConsolidatedFieldIsDroppedNotApplied(_ChunkedGroupTestCase):
+    """A mistyped consolidated field cannot displace the chunk-derived answer.
+
+    Before, every field the consolidation pass sent replaced the folded
+    chunk value unconditionally. ``"keywords": "Document"`` -- a bare string,
+    valid JSON -- replaced the whole unioned keyword LIST with one truthy
+    string that nothing downstream could read as a keyword set.
+    """
+
+    def test_the_folded_keywords_list_survives_a_bare_string_reply(self) -> None:
+        parts = self.page_parts(6)
+
+        def _reply(index: int, call: _Call) -> Any:
+            if call.is_consolidation:
+                reply = _consolidation_reply()
+                reply["result"]["k"]["keywords"] = "Document"
+                reply["result"]["k"]["date_guess"] = "1944-11-27"
+                return reply
+            return _chunk_reply(self.labels_of(call))
+
+        with self.assertLogs("photokin.core", level="WARNING") as logged:
+            record, calls = self.run_group(parts, 4, _reply)
+
+        self.assertEqual(len(calls), 3)
+        self.assertIsInstance(record["keywords"], list)
+        self.assertIn("Document", record["keywords"])
+        # Chunk-derived, not the string the consolidation pass sent: the union
+        # of both chunks' own "Block <label>" keyword survives.
+        self.assertIn("Block Page 1", record["keywords"])
+        self.assertIn("Block Page 5", record["keywords"])
+        self.assertIsInstance(record["date_guess"], dict)
+        self.assertTrue(
+            any(
+                "returned keywords as str rather than list" in line
+                for line in logged.output
+            ),
+            logged.output,
+        )
+        self.assertTrue(
+            any(
+                "returned date_guess as str rather than dict" in line
+                for line in logged.output
+            ),
+            logged.output,
+        )
+
+    def test_every_consolidated_field_is_type_checked_not_just_the_two(self) -> None:
+        # Testing two of the six entries would leave a typo in any of the other
+        # four free to accept a mistyped value and overwrite an answer that came
+        # from a call which actually saw the pages. Each field is offered a
+        # value of the wrong type in turn and must be refused.
+        wrong_value: dict[type, Any] = {
+            list: "a bare string",
+            str: ["a list"],
+            dict: "a bare string",
+        }
+        for field, expected in sorted(core._CONSOLIDATED_FIELD_TYPES.items()):
+            with self.subTest(field=field):
+                parts = self.page_parts(6)
+
+                def _reply(
+                    index: int,
+                    call: _Call,
+                    _field: str = field,
+                    _wrong: Any = wrong_value[expected],
+                ) -> Any:
+                    if call.is_consolidation:
+                        reply = _consolidation_reply()
+                        reply["result"]["k"][_field] = _wrong
+                        return reply
+                    return _chunk_reply(self.labels_of(call))
+
+                with self.assertLogs("photokin.core", level="WARNING") as logged:
+                    record, _calls = self.run_group(parts, 4, _reply)
+
+                self.assertIsInstance(record[field], expected)
+                self.assertTrue(
+                    any(f"returned {field} as" in line for line in logged.output),
+                    logged.output,
+                )
+
+
+class TestOnlyTheFinalChunkIsToldItIsLast(_ChunkedGroupTestCase):
+    """A false "the object continues" claim on the final chunk biases away from truth.
+
+    Before, every chunk call -- including the last -- was told the object
+    continues beyond it and that another block finishes its trailing
+    sentence. Both claims are false for the last chunk, and telling it so
+    discouraged the model from reporting a genuinely abrupt ending or a
+    missing final sheet, exactly the evidence the page-order pass needs and
+    that no later call exists to recover.
+    """
+
+    def test_the_last_chunk_alone_is_told_it_is_last(self) -> None:
+        parts = self.page_parts(9)
+
+        def _reply(index: int, call: _Call) -> Any:
+            if call.is_consolidation:
+                return _consolidation_reply()
+            return _chunk_reply(self.labels_of(call))
+
+        _record, calls = self.run_group(parts, 3, _reply)
+
+        chunk_calls = [call for call in calls if not call.is_consolidation]
+        self.assertEqual(len(chunk_calls), 3)
+
+        for call in chunk_calls[:-1]:
+            self.assertIn("The object continues beyond these images.", call.prompt)
+            self.assertNotIn("This is the LAST block", call.prompt)
+
+        last = chunk_calls[-1]
+        self.assertNotIn("The object continues beyond these images.", last.prompt)
+        self.assertIn("This is the LAST block of the object.", last.prompt)
+        self.assertIn(
+            "transcribe it exactly as it stops -- that is evidence about the object",
+            last.prompt,
+        )
+
+
+class TestPageOrderFlagsAreFilteredAgainstTheFrozenVocabulary(_ChunkedGroupTestCase):
+    """A hallucinated page-order flag must not reach the record or a sidecar.
+
+    Before, any non-empty string in a ``page_order`` entry's ``flags`` list
+    survived into the record verbatim, and from there into sidecar YAML
+    frontmatter -- a downstream reader had no way to tell a real flag from
+    invented text. Only the four values the contract defines
+    (``out_of_order``, ``missing_page_before``, ``missing_page_after``,
+    ``duplicate_page``) may survive.
+    """
+
+    def test_only_the_recognized_flag_survives_beside_a_hallucinated_one(self) -> None:
+        parts = self.page_parts(4)
+        verdict = {
+            "Page 2": {"page": 2, "flags": ["out_of_order", "made_up_flag"]},
+        }
+
+        def _reply(index: int, call: _Call) -> Any:
+            if call.is_consolidation:
+                return _consolidation_reply(verdict)
+            return _chunk_reply(self.labels_of(call))
+
+        record, _calls = self.run_group(parts, 2, _reply)
+
+        self.assertEqual(
+            record["page_order"], {"Page 2": {"page": 2, "flags": ["out_of_order"]}}
+        )
+
+    def test_every_flag_the_contract_defines_survives(self) -> None:
+        # The filter is only half a guard if it is tested from one side. A typo
+        # in any single entry of the frozen set would start silently dropping a
+        # legal finding -- page order is exactly the kind of quiet verdict
+        # nobody would notice going missing -- so each is exercised in turn.
+        for flag in sorted(core._PAGE_ORDER_FLAGS):
+            with self.subTest(flag=flag):
+                parts = self.page_parts(4)
+
+                def _reply(index: int, call: _Call, _flag: str = flag) -> Any:
+                    if call.is_consolidation:
+                        return _consolidation_reply(
+                            {"Page 2": {"page": 2, "flags": [_flag]}}
+                        )
+                    return _chunk_reply(self.labels_of(call))
+
+                record, _calls = self.run_group(parts, 2, _reply)
+
+                self.assertEqual(
+                    record["page_order"], {"Page 2": {"page": 2, "flags": [flag]}}
+                )
 
 
 if __name__ == "__main__":

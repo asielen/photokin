@@ -1490,6 +1490,26 @@ def _render_read_clause(read_requested: bool) -> str:
     return "none (-r not given)"
 
 
+def _render_sidecar_clause(sidecar_md: str) -> str:
+    """Describe what ``--sidecar-md`` will create, for the plan summary.
+
+    Args:
+        sidecar_md: The resolved mode, one of :data:`utils.SIDECAR_MD_VALUES`.
+
+    Returns:
+        A one-line clause naming what gets written and where, or a
+        ``none (...)`` clause saying which flag value said no.
+    """
+    if sidecar_md == utils.SIDECAR_MD_ALL:
+        return "<image stem>.md beside every analyzed image except crops (--sidecar-md all)"
+    if sidecar_md == utils.SIDECAR_MD_AUTO:
+        return (
+            "<image stem>.md beside each image of a group the model calls "
+            "Document or Postcard (--sidecar-md auto)"
+        )
+    return "none (--sidecar-md off)"
+
+
 def _render_write_clause(
     ecfg: ExiftoolConfig,
     *,
@@ -2100,6 +2120,7 @@ def main() -> None:
             provider=cfg.provider_name,
             model=utils.resolve_model_for_provider(cfg),
             dry_run=args.dry_run,
+            sidecars=_render_sidecar_clause(cfg.sidecar_md),
             suggested_command=suggested_command,
         )
         logger.info("%s", plan.render())

@@ -6,6 +6,14 @@ every part's transcription, the files it came from, the page number those
 filenames imply, and the provisional metadata each block's reader produced.
 Your job is to reconcile those blocks into one answer for the whole object.
 
+Some parts may show a null transcription. That means their block wrote its text
+as one undivided passage instead of per part, and you will find that passage as
+"unattributed_transcription" on the block itself in
+"provisional_metadata_by_block". Read it as evidence about exactly the parts
+that block lists under "parts_seen" -- it is the only record of those pages --
+but do not try to split it back out into individual parts, and never guess
+which page a given sentence in it came from.
+
 The instructions above that describe looking at images do not apply to this
 request; there is nothing to look at. Everything else above still applies
 unchanged: the preferred vocabulary, the category list, the keyword rules, the

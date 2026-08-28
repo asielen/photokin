@@ -66,11 +66,16 @@ class _StubAnalyzers:
     run while each group's category and transcriptions are set independently.
     That is exactly what auto mode's per-group gate needs to be tested against:
     one run, several groups, several verdicts.
+
+    A ``category_map`` value is typed as ``str | list[str]`` rather than
+    plain ``str`` so a test can stage the one reply shape the auto gate has
+    to survive without raising: a model answering ``category`` as a JSON
+    list rather than a string.
     """
 
     def __init__(
         self,
-        category_map: dict[str, str] | None = None,
+        category_map: dict[str, str | list[str]] | None = None,
         default_category: str = "Portrait",
         transcriptions_map: dict[str, dict[str, str]] | None = None,
     ) -> None:
@@ -178,7 +183,7 @@ class _SidecarMdTestCase(unittest.TestCase):
         folder: str,
         *,
         sidecar_md: str,
-        category_map: dict[str, str] | None = None,
+        category_map: dict[str, str | list[str]] | None = None,
         default_category: str = "Portrait",
         transcriptions_map: dict[str, dict[str, str]] | None = None,
         group_by: str = utils.GROUP_BY_OBJECT,
@@ -443,6 +448,86 @@ class TestSidecarMdStemCollisionAcrossExtensions(_SidecarMdTestCase):
                 "share one sidecar destination" in line
                 and "box3_025.tif" in line
                 and "box3_025.jpg" in line
+                for line in logged.output
+            ),
+            logged.output,
+        )
+
+
+class TestSidecarMdAutoGateSurvivesANonStringCategory(_SidecarMdTestCase):
+    """A model that answers ``category`` as a list must not fail the whole group.
+
+    Before, the auto gate tested ``category in SIDECAR_AUTO_CATEGORIES``
+    directly. ``["Document"]`` is valid JSON but unhashable, so the frozenset
+    membership test raised ``TypeError`` -- inside the per-group ``try``, after
+    the analysis was already paid for -- failing the entire group over a
+    sidecar it could simply have declined to write.
+    """
+
+    def test_a_list_valued_category_does_not_fail_the_group(self) -> None:
+        folder = self.copy_fixture_folder()
+
+        result, _rec = self.run_folder(
+            folder,
+            sidecar_md=utils.SIDECAR_MD_AUTO,
+            default_category="Portrait",
+            category_map={"box3_025": ["Document"]},
+        )
+
+        self.assertEqual(result["errors"], {})
+        self.assertTrue(result["results"])
+        # The gate declines rather than raises: a non-string category is not
+        # a member of SIDECAR_AUTO_CATEGORIES, so nothing is written for it,
+        # but the group's analysis still lands.
+        self.assertEqual(self.md_files(folder), set())
+        self.assertIn(
+            os.path.join(folder, "box3_025.jpg"), result["results"],
+            "the group with a list-valued category failed instead of merely "
+            "declining its sidecar",
+        )
+
+
+class TestSidecarCollisionAcrossGroupsIsCaught(_SidecarMdTestCase):
+    """Two separate groups that both resolve to one sidecar destination.
+
+    Before, the collision guard was scoped to one group's own file list, so
+    it caught a collision between two members of the SAME group (rank
+    settled the owner there) but not between two files that are each their
+    own group under ``--group-by none`` -- ``scan.jpg`` and ``scan.tif`` both
+    write ``scan.md``, and the second group's write silently erased the
+    first's with nothing said about it.
+    """
+
+    def test_two_separate_groups_sharing_a_stem_write_only_one_sidecar(self) -> None:
+        folder = os.path.join(self.work, "scans")
+        os.makedirs(folder)
+        jpg_path = os.path.join(folder, "scan.jpg")
+        tif_path = os.path.join(folder, "scan.tif")
+        for path in (jpg_path, tif_path):
+            with open(path, "w", encoding="utf-8"):
+                pass
+
+        with self.assertLogs("photokin.core", level="WARNING") as logged:
+            result, _rec = self.run_folder(
+                folder, sidecar_md=utils.SIDECAR_MD_ALL, group_by=utils.GROUP_BY_NONE
+            )
+
+        self.assertEqual(result["errors"], {})
+        self.assertEqual(
+            {os.path.basename(p) for p in result["results"]}, {"scan.jpg", "scan.tif"}
+        )
+        # Context, not the catch: both files resolve to one destination either
+        # way, so exactly one .md exists whether the collision is detected or
+        # not. What the broken build did was overwrite silently, so the warning
+        # below is what actually discriminates -- and it is the point. A
+        # clobbered sidecar is recoverable by re-running; a clobbered sidecar
+        # nobody was told about is not, because nobody knows to look.
+        self.assertEqual(self.md_files(folder), {"scan.md"})
+        self.assertTrue(
+            any(
+                "share one sidecar destination" in line
+                and "scan.tif" in line
+                and "scan.jpg" in line
                 for line in logged.output
             ),
             logged.output,
