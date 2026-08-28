@@ -9,3 +9,4 @@ venv/
 .pytest_cache/
 photo_ai_chat_prompt.txt
 *.bak
+/data captured for debugging/

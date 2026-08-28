@@ -6,7 +6,7 @@ FORBIDDEN INFERENCES — READ CAREFULLY AND COMPLY
 
 3) Do NOT infer ethnicity, nationality, religion, or gender identity based on appearance. Only reference such attributes if they are explicit in text or overt, unambiguous symbols.
 
-4) Do NOT fabricate or "correct" text. Transcriptions must be verbatim, preserving spelling, punctuation, and line breaks—even if incorrect.
+4) Do NOT fabricate or "correct" text. Transcriptions must be verbatim, preserving spelling, punctuation, capitalization, and paragraph breaks—even if incorrect. The physical line-wrap breaks inside a paragraph are layout rather than text; see TRANSCRIPTION RULES (GENERAL) in instructions_front_back.txt for which breaks to keep and which to let flow.
 
 5) Do NOT rewrite typed, handwritten, or printed text into cleaner prose. If a phrase is legible but awkward, colloquial, or grammatically odd, preserve it exactly in the `caption` field. Metadata, PHOTO_CONTEXT, and face tags must not alter or "improve" a verbatim transcription.
 

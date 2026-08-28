@@ -1,0 +1,121 @@
+CONSOLIDATION PASS — TEXT ONLY, NO IMAGES
+
+This request carries no images. The object was read in several blocks, each
+block a separate request over a contiguous run of its pages. You are now given
+every part's transcription, the files it came from, the page number those
+filenames imply, and the provisional metadata each block's reader produced.
+Your job is to reconcile those blocks into one answer for the whole object.
+
+The instructions above that describe looking at images do not apply to this
+request; there is nothing to look at. Everything else above still applies
+unchanged: the preferred vocabulary, the category list, the keyword rules, the
+forbidden inferences, the date-pattern rules, and strict JSON with no
+commentary and no code fences.
+
+WHAT YOU MUST NOT DO
+
+• Do NOT re-emit the transcriptions, and do NOT correct, rewrite, re-punctuate,
+  modernize, translate, or otherwise "improve" them. They were written with the
+  pages in front of the reader; you have only the text. A transcription revised
+  without the page is no longer a transcription of anything, and the fidelity
+  rules exist precisely to stop that. Your output contains no transcription of
+  any kind and no "caption" field.
+• Do NOT invent parts, pages, or files. Work only with the part labels the
+  input gives you.
+• Do NOT renumber or rename anything yourself. Your page verdict is recorded as
+  a finding; the calling program renames no files and reorders nothing.
+
+WEIGH THE EVIDENCE, DO NOT VOTE
+
+The blocks did not see equal evidence. The block holding the first pages saw
+the letterhead, the salutation, the dateline and the addressee; a block from
+the middle of the object may have seen nothing but continuous prose. Their
+provisional guesses are therefore not equal, and no field is settled by
+counting how many blocks happened to say the same thing.
+
+• Prefer the block whose pages actually carry the evidence for the field being
+  decided: a dateline or a postmark for date_guess, a letterhead or an address
+  for location_guess, a title page or a heading for title.
+• A specific claim supported by text you can point to beats a general
+  impression repeated by several blocks.
+• Where blocks genuinely conflict and nothing decides it, choose the more
+  cautious answer and lower the confidence rather than splitting the
+  difference.
+• keywords: start from the union of what the blocks proposed, then drop what
+  the whole object does not support. The result describes the object, not one
+  run of its pages.
+• category: one label for the whole object, from the category list above.
+• ai_caption: write it fresh for the whole object, obeying the ai_caption rules
+  above — the "[AI Analysis]:" opening and the closing inferred-date sentence
+  with its evidence.
+
+PAGE ORDER
+
+Judge the order of the pages the way a careful archivist does: by reading them.
+
+• Narrative flow is the strongest signal there is. Text that breaks off
+  mid-sentence and a page that completes that sentence are adjacent, in that
+  direction, whatever anything else says. A salutation and a dateline open an
+  object; a closing and a signature end it.
+• A page number written or printed on the page is EVIDENCE, never authority.
+  Archives are full of documents that were renumbered, misnumbered, or
+  paginated for something else entirely — a chapter, a letter inside a bundle,
+  the sheets of an enclosure. Where a written number and the narrative flow
+  disagree, follow the flow and say so in page_order_notes.
+• The page number in the filename is only a scanning artifact: it records the
+  order someone fed the sheets through a scanner.
+• Give a number for EVERY part the input gives a page number for, including the
+  ones you agree with. Silence is not agreement.
+• Where the evidence does not decide it, keep the filename's number and add no
+  flag. An uncertain reordering is worse than none.
+
+Use a flag only where the evidence supports it:
+• "out_of_order" — this page's content does not belong where its filename puts
+  it.
+• "missing_page_before" / "missing_page_after" — the text breaks off, or
+  resumes, in a way that shows a page is plainly absent.
+• "duplicate_page" — this page repeats another part's content.
+
+OUTPUT FORMAT — STRICT JSON ONLY
+
+{
+  "result": {
+    "<main_image_path>": {
+      "keywords": [ ... at least 4 strings ... ],
+      "ai_caption": "[AI Analysis]: ...",
+      "title": "<string or null>",
+      "category": "<one of the allowed labels (exact match)>",
+      "location_guess": {
+        "country": "<string|null>",
+        "state": "<string|null>",
+        "city": "<string|null>",
+        "sublocation": "<string|null>",
+        "confidence": <0.0-1.0>
+      },
+      "date_guess": {
+        "iso": "<YYYY or YYYY-MM or YYYY-MM-DD or decade/range>",
+        "confidence": <0.0-1.0>,
+        "import_date": "<YYYY-MM-DD>",
+        "pattern": "<string>"
+      }
+    }
+  },
+  "page_order": {
+    "<part label>": { "page": <integer>, "flags": [ ... optional ... ] }
+  },
+  "page_order_notes": [ "<one short sentence per finding>" ]
+}
+
+• "<main_image_path>" is the "main_image_path" value in the consolidation input
+  below. Copy it exactly, character for character.
+• "page_order" is keyed by PART LABEL exactly as the input spells it — "Page 1",
+  "Front", "Back", "Negative" — never by filename and never by number.
+• "page" is a plain integer, not a string.
+• "page_order_notes" is optional. Each entry is one short sentence naming the
+  parts it is about, e.g. "Page 3 completes the sentence Page 6 breaks off in."
+  Omit the key when you have nothing to report.
+• Include no "caption" field, no "transcriptions" field, no
+  "proposed_new_keywords" field, and no text of any kind outside the JSON
+  object. Proposing a keyword for the vocabulary is a claim about a page you
+  did not see; the calls that did see the pages already made theirs, and this
+  pass must neither add to nor retract from them.

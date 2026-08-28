@@ -81,6 +81,25 @@ GROUP_BY_NONE = "none"
 #: Coarsest first, which is also the order ``--help`` lists them in.
 GROUP_BY_VALUES: tuple[str, ...] = (GROUP_BY_OBJECT, GROUP_BY_PAIR, GROUP_BY_NONE)
 
+# The ``--sidecar-md`` mode axis. Named by format rather than by feature
+# (docs/document-mode-contract.md section 7): ``--sidecar-xmp`` and
+# ``--sidecar-json`` are reserved spellings for the same three-value grammar,
+# so a future format's flag reads this module's constants the same way this
+# one does rather than growing its own vocabulary.
+SIDECAR_MD_OFF = "off"
+SIDECAR_MD_AUTO = "auto"
+SIDECAR_MD_ALL = "all"
+#: ``off`` first, which is also the default and the order ``--help`` lists them in.
+SIDECAR_MD_VALUES: tuple[str, ...] = (SIDECAR_MD_OFF, SIDECAR_MD_AUTO, SIDECAR_MD_ALL)
+
+#: The categories ``--sidecar-md auto`` (and, later, any other format's ``auto``)
+#: writes a sidecar for -- the two text-first categories in
+#: ``prompts_photo_ai/categories.txt``. Format-neutral on purpose (D12): a future
+#: ``--sidecar-xmp auto`` reads this same frozenset rather than growing its own,
+#: so widening the auto-trigger set later is a one-line change shared by every
+#: sidecar format.
+SIDECAR_AUTO_CATEGORIES: frozenset[str] = frozenset({"Document", "Postcard"})
+
 @dataclass
 class Config:
     """Runtime configuration for an analysis run, with environment-variable defaults.
@@ -108,6 +127,13 @@ class Config:
     fail_on_forbidden: bool = False
     max_edge: int | None = 1024
     group_by: str = GROUP_BY_OBJECT
+    # Document mode (docs/document-mode-contract.md sections 7-8). "off" keeps
+    # every existing run byte-for-byte; "all"/"auto" are wired in core.py's
+    # per-file emit loop, gated on SIDECAR_AUTO_CATEGORIES in "auto".
+    sidecar_md: str = SIDECAR_MD_OFF
+    # Payload-size trigger for Phase 3 chunking, not document-specific: any
+    # oversized group of parts chunks the same way. 0 disables chunking.
+    max_images_per_call: int = 8
     # The two date gates are deliberately ordered: filling a date the file does
     # not have is cheap, because nothing is lost if the guess is poor and the
     # field was empty either way, while overwriting a date the file already

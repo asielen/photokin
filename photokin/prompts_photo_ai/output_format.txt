@@ -5,7 +5,7 @@ You must output valid JSON with no commentary, no markdown, and no additional te
 IMPORTANT JSON STRING RULES
 • All string fields MUST be valid JSON strings.
 • Do NOT include literal line breaks inside JSON strings.
-• If you need line breaks in "caption" or "ai_caption", encode them as the two-character escape sequence \n inside the JSON string.
+• If you need line breaks in "caption", "transcriptions" values, or "ai_caption", encode them as the two-character escape sequence \n inside the JSON string.
 • Do NOT use triple quotes (""") anywhere in the JSON output.
 • Captions for multi-page documents may include page-labeled sections like "[Page 1]" / "[Page 2]" inside a single JSON string (with \n for line breaks).
 
@@ -16,6 +16,7 @@ Root structure:
     "<main_image_path>": {
       "keywords": [ ... at least 4 strings ... ],
       "caption": "<verbatim transcription only — see below>",
+      "transcriptions": { "<part label>": "<that part's markdown transcription>", ... },
       "ai_caption": "<scene description + analysis — see below>",
       "title": "<string or null>",
       "category": "<one of the allowed labels (exact match)>",
@@ -44,6 +45,7 @@ if you created a keyword not found in the preferred vocabulary.
 REQUIREMENTS
 • Field names must match exactly as specified.
 • "proposed_new_keywords" is OPTIONAL; include ONLY if you created any keyword not found in the preferred vocabulary. Use an empty array [] if none.
+• "transcriptions" is OPTIONAL; when present, "caption" may be omitted (see below).
 • Do not wrap the JSON in code fences.
 • Do not include comments or explanations outside the JSON.
 
@@ -54,6 +56,21 @@ text-heavy items, separate distinct text blocks with bracket labels like
 [Back], [Front], [Letter], [Address], [Postmark], [Stamp], [Printed text]
 (or [Bottom text]), [Publisher]. Use \n escapes for line breaks. Use ""
 if no text is visible.
+
+transcriptions (OPTIONAL): a per-part transcription map. Each key MUST be
+EXACTLY one of the part labels this prompt assigned ("Front", "Back",
+"Page 1", "Page 2", ..., "Negative") — copy each label character for
+character, including the capital letter and the single space in "Page 1".
+A key spelled any other way is not matched to its file: its text still
+reaches the caption, but under that wrong heading, and the file it
+belongs to is left holding the whole group's transcript instead of its
+own page. "page 1", "Page1" and "Page 01" are all wrong. Each
+value is that part's complete markdown transcription as a single JSON
+string (\n escapes for line breaks), following the same fidelity rules as
+"caption". When "transcriptions" is present, "caption" may be omitted:
+the calling program builds the caption from the parts. If you do not
+include "transcriptions", fill "caption" exactly as described above —
+that response is valid and complete.
 
 ai_caption: "[AI Analysis]: <3–6 sentences of neutral description +
 analysis, ending with an inferred date sentence that includes evidence>".

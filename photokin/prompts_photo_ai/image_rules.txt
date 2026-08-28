@@ -35,41 +35,23 @@ KEYWORD RECALL (USE KNOWN VOCAB)
 • New keywords are the conservative case; known vocabulary keywords are
   the primary source and must be used aggressively when supported.
 
-STYLE OF CAPTION TRANSCRIPTION (TEXT-HEAVY ITEMS)
+CAPTION TRANSCRIPTION (TEXT-HEAVY ITEMS)
 
-The "caption" field is a verbatim transcription of visible text on the photo/document.
+The "caption" field is a verbatim transcription of the text visible on the
+item, and nothing else — no scene description, no commentary.
 
-For historical or typed captions, fidelity outranks readability. Do not
-replace unusual original wording with a cleaner modern equivalent.
-Preserve strange but legible phrases exactly as written.
+The conventions are stated once, in TRANSCRIPTION RULES (GENERAL) in
+instructions_front_back.txt: fidelity, which line breaks to keep and which to
+let flow, the marks for struck / underlined / inserted text, margin notes and
+footnotes, the three uncertainty markers, blank parts, and the bracket section
+labels. Follow them exactly. Nothing in this file overrides them.
 
-ILLEGIBLE TEXT HANDLING
-• Use [?] sparingly — only for a single illegible word in an otherwise
-  readable sentence (e.g., "brought home a big bunch of [?]").
-• For larger illegible sections (3+ consecutive unreadable words), use a
-  single [illegible] marker, NOT individual [?] for every word.
-• Bleed-through text from the reverse side of paper is NOT visible text.
-  Do NOT transcribe bleed-through — simply ignore it entirely.
-• If the entire remainder of a page is illegible, write [remainder illegible]
-  once and stop. NEVER output long runs of repeated [?] markers.
-• Maximum: a caption should contain no more than ~20 [?] markers total.
-  If you find yourself exceeding that, summarize with [illegible] instead.
-
-When there are multiple distinct text regions (common on postcards, letters, forms, scrapbook pages):
-• Split the transcription into clear blocks using bracket labels on their own line, e.g.:
-  [Back]
-  [Letter]
-  <handwritten message>
-  [Address]
-  <recipient line(s)>
-  [Printed text] (or [Bottom text])
-  <printed caption / publisher text>
-  [Publisher]
-  <copyright / series / card number / studio mark>
-• Use labels only when they prevent confusion; keep them short and human-readable.
-• Do not interpret inside the transcription; just transcribe.
-
-(See instructions_front_back.txt for full transcription and labeling rules.)
+What matters here is that the transcription feeds the keywording. Read the
+text before choosing keywords: proper nouns in it — hotel names, street
+names, place names, personal names, publisher and studio marks, short codes —
+are the highest-value retrieval signal on a text-heavy item, and the rules
+below (DOCUMENT SUBTYPES, SHORT CODES & WRITING ON IMAGE, TITLE,
+LOCATION GUESS, DATE GUESS) all draw on what you transcribed.
 
 DOCUMENT SUBTYPES
 • If the primary subject is a document/page (handwritten or typed), include "Document".
