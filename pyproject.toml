@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "photokin"
-version = "0.3.2"
+version = "0.4.0"
 description = "Photo metadata from vision LLMs: verbatim transcription of what's written on scans, plus captions, keywords, and cautious date/location guesses."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,7 +31,13 @@ openai = ["openai>=2.6.1"]
 anthropic = ["anthropic>=0.39.0"]
 gemini = ["google-genai>=0.7.0"]
 all = ["photokin[openai,anthropic,gemini]"]
-dev = ["photokin[all]", "pytest>=8", "ruff", "mypy", "build", "twine"]
+# PyYAML is a TEST-ONLY dependency and must never be imported by the package:
+# photokin/doc_sidecar.py hand-writes the small YAML subset a sidecar's
+# frontmatter needs (quoted scalars, flow lists, one flat flow map). It is here
+# so the round-trip cases that prove that emitter valid actually run -- without
+# it they importorskip, and a serializer whose only proof is skipped in CI is a
+# serializer with no proof at all.
+dev = ["photokin[all]", "pytest>=8", "ruff", "mypy", "build", "twine", "pyyaml"]
 
 [project.scripts]
 photokin = "photokin.cli:main"

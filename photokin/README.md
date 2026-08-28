@@ -19,6 +19,8 @@ That journey maps onto the files like this:
 - `errors.py` — `ProviderApiError`, the normalized provider error.
 - `merge.py` — merges model output with original metadata.
 - `canonical.py` / `changeset.py` — canonical tag mapping and changeset NDJSON records (consumed by the ExifTool wrapper).
+- `doc_sidecar.py` — writes `<stem>.md`, the per-file markdown transcript sidecar (`--sidecar-md`); its own module rather than more of `core.py`, and its own tiny always-quote YAML emitter rather than a PyYAML dependency.
+- `chunking.py` — `partition_parts`, the pure function that splits an oversized group's parts into contiguous, bounded chunks for `--max-images-per-call`. No imports from `core`, by design — it knows nothing about the model, the provider, or the record shape.
 - `cli.py` — command-line interface; composes core + ExifTool wrapper. One input token — positional, or through the `--folder`/`--manifest` aliases — is classified into a `ResolvedInput` and every kind then runs the same path, so `--output-file`, `--changeset` and the ExifTool write flags mean the same thing whatever was passed. It states its plan on stderr before the first model call, and `--dry-run` stops there.
 - `cli_messages.py` — the wording of every user-facing CLI message, and the `RunPlan` summary. Pure and dependency-free, so the text is testable without importing the pipeline; `cli.py` decides when each one fires.
 - `public.py` — stable wrappers for embedding in other tools.
@@ -99,6 +101,8 @@ Two consequences for an embedder. A caption your hydrator supplies for one item 
 
 `caption_original` sits beside it and holds the prior caption unlabelled and unmerged, for a consumer that wants an input rather than the block. Read it as evidence, not as provenance: it is `merge_original_sources(this file, the group)`, so a file that carried no caption of its own reports whichever one the group scan settled on — the front print's, usually — rather than nothing.
 
+A record may also carry `transcriptions: dict[str, str]`, a per-part map (`"Front"`, `"Back"`, `"Page 1"`, ...) the model returns alongside or instead of `caption`; when present, `caption` is *synthesized* from it deterministically rather than trusted verbatim, through the same labelled-section logic described above. It's optional on every response — a model that never mentions it degrades to exactly today's behavior — and it's what `doc_sidecar.write_markdown_sidecar` reads to attribute one file's own transcription rather than the whole group's block. `core.resolve_part_label(item, ...)` is the one function that maps a manifest grouping entry to the label it travelled the payload under; a label it returns is not guaranteed to be a key of `transcriptions` (a displaced or unseated file was never in the payload under any label), and callers are expected to handle that miss rather than assume it.
+
 ## Configuration
 
 All the knobs mentioned above live on one dataclass, `utils.Config` (core fields only — ExifTool settings live in `photokin.exiftool.ExiftoolConfig`):
@@ -106,6 +110,7 @@ All the knobs mentioned above live on one dataclass, `utils.Config` (core fields
 - Provider: `provider`, `provider_name`, `model`, `claude_model_name`, `gemini_model_name`, `openrouter_model_name`
 - Prompts/vocab: `prompts_dir`, `vocab_path`, `forbidden_path`, `metadata_forward_path`, `no_update_vocab`, `fail_on_forbidden`
 - Grouping: `group_by` (default `object`; see [Grouping](#grouping) above)
+- Document mode: `sidecar_md` (default `"off"`, one of `utils.SIDECAR_MD_VALUES`; see "Markdown transcript sidecars" in the root [README](../README.md#advanced-usage)), `max_images_per_call` (default `8`; `0` disables chunking; see "Large documents" in the same section)
 - Imaging: `jpeg_quality` (default 80), `max_edge` (default 1024)
 - Thresholds: `date_confidence_threshold` (0.6, to fill a date a file lacks), `location_confidence_threshold` (0.7), plus the `date_override_*` policies used by `merge.py` -- `date_override_confidence_threshold` is 0.7, deliberately at or above the write gate, because replacing a date the file already holds destroys something while filling an empty one cannot
 - Context: `photo_context_text`, `photo_context_file` (authoritative context forwarded to the model, capped at 200 KB)

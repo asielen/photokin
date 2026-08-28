@@ -1444,6 +1444,10 @@ def _suggest_the_normal_run(args: argparse.Namespace, argv: list[str]) -> str | 
         or args.exiftool_write is not None
         or bool(args.output_file)
         or args.output_sidecars
+        # Same reasoning as --output-sidecars just above: naming a non-default
+        # --sidecar-md value is a stated "write this additional output" intent,
+        # not something -rw would be news to.
+        or args.sidecar_md != utils.SIDECAR_MD_OFF
     )
     if declared:
         return None
@@ -1484,6 +1488,26 @@ def _render_read_clause(read_requested: bool) -> str:
     if read_requested:
         return "ExifTool " + ", ".join(DEFAULT_EXIFTOOL_FIELDS)
     return "none (-r not given)"
+
+
+def _render_sidecar_clause(sidecar_md: str) -> str:
+    """Describe what ``--sidecar-md`` will create, for the plan summary.
+
+    Args:
+        sidecar_md: The resolved mode, one of :data:`utils.SIDECAR_MD_VALUES`.
+
+    Returns:
+        A one-line clause naming what gets written and where, or a
+        ``none (...)`` clause saying which flag value said no.
+    """
+    if sidecar_md == utils.SIDECAR_MD_ALL:
+        return "<image stem>.md beside every analyzed image except crops (--sidecar-md all)"
+    if sidecar_md == utils.SIDECAR_MD_AUTO:
+        return (
+            "<image stem>.md beside each image of a group the model calls "
+            "Document or Postcard (--sidecar-md auto)"
+        )
+    return "none (--sidecar-md off)"
 
 
 def _render_write_clause(
@@ -1680,6 +1704,29 @@ def main() -> None:
                  "alone is handwriting with no photo, caption, date and location inference all "
                  "lean on seeing the front, a multipage document is split into unrelated pages, "
                  "and every crop becomes its own object.",
+        )
+        ap.add_argument(
+            "--sidecar-md",
+            choices=list(utils.SIDECAR_MD_VALUES),
+            default=utils.SIDECAR_MD_OFF,
+            help="Write a Markdown transcript sidecar (<stem>.md) beside each analyzed "
+                 "file (default: %(default)s). off: nothing new written. auto: written "
+                 "when the group's category is Document or Postcard. all: written for "
+                 "every emitted file, any category, except crops. Valid for every input "
+                 "type -- single file, folder and manifest all flow through the same "
+                 "emit loop. --sidecar-xmp and --sidecar-json are reserved spellings for "
+                 "the same three values, for other sidecar formats to come.",
+        )
+        ap.add_argument(
+            "--max-images-per-call",
+            type=int,
+            default=defaults.max_images_per_call,
+            help="Split an oversized group's images into multiple model calls of at "
+                 "most this many images each, with a final text-only consolidation "
+                 "pass, instead of one call carrying the whole group (default: "
+                 "%(default)s). A front/back pair and a part's own variant scans are "
+                 "never split across calls. 0 disables chunking: any group size is "
+                 "sent in a single call, as before this flag existed.",
         )
         # Retired in 0.2.0, still accepted: the Lightroom plug-in launches
         # ``python -m photokin.cli`` and may pass either, and argparse exits 2 on
@@ -1953,6 +2000,8 @@ def main() -> None:
             no_update_vocab=args.no_update_vocab,
             max_edge=(None if (args.max_edge in (None, 0)) else args.max_edge),
             group_by=args.group_by,
+            sidecar_md=args.sidecar_md,
+            max_images_per_call=args.max_images_per_call,
             date_confidence_threshold=args.date_confidence_threshold,
             location_confidence_threshold=args.location_confidence_threshold,
         )
@@ -2071,6 +2120,7 @@ def main() -> None:
             provider=cfg.provider_name,
             model=utils.resolve_model_for_provider(cfg),
             dry_run=args.dry_run,
+            sidecars=_render_sidecar_clause(cfg.sidecar_md),
             suggested_command=suggested_command,
         )
         logger.info("%s", plan.render())

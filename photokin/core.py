@@ -28,6 +28,8 @@ Code map (public-facing entry points marked PUBLIC):
 - _normalize_caption_text       reduce a caption to what two copies must share
 - _captions_are_near_identical  is this caption a restatement of that one?
 - _split_caption_sections       read one file's caption back as labelled sections
+- _normalize_transcriptions     keep only the per-part entries a reply's map may carry
+- _synthesize_caption           build the caption string from per-part transcriptions
 - _build_provider_client        construct the SDK client for the active provider
 - _ensure_provenance_keyword    guarantee one provider/model provenance keyword
 - _should_run_archival_upload   gate Files-API upload by provider
@@ -47,6 +49,7 @@ Code map (public-facing entry points marked PUBLIC):
 - _pair_bucket_key              the escaped group-key/variant join '--group-by pair' uses
 - build_manifest_buckets        PUBLIC: group items the way the stream will
 - _manifest_part_key            the slot an entry competes for in its variant
+- resolve_part_label            PUBLIC: the payload label a grouping entry travelled under
 - _slot_rank_key                the one ordering every grouping tie-break uses
 - analyze_manifest              PUBLIC: aggregate wrapper over the stream
 - process_manifest_stream       PUBLIC: streaming NDJSON batch (the plugin path)
@@ -63,7 +66,7 @@ from datetime import date
 from typing import Callable, Dict, Any, List
 from copy import deepcopy
 
-from . import utils
+from . import chunking, doc_sidecar, utils
 from .api import call_model, extract_output_text, get_response_model
 from .errors import ProviderApiError, SELF_EXPLANATORY_ERROR_TYPES
 from .merge import merge_record_with_original as merge_metadata
@@ -489,6 +492,144 @@ def _split_caption_sections(caption: str, label: str) -> list[tuple[str, list[st
     return [(key, body) for key, body in sections if any(l.strip() for l in body)]
 
 
+def _normalize_transcriptions(raw: object) -> dict[str, str] | None:
+    """Reduce a reply's ``transcriptions`` value to the entries the contract keeps.
+
+    The field is optional and model-written, so it arrives in whatever shape the
+    model chose: possibly not a dict at all, possibly holding non-string keys or
+    values, possibly padded with whitespace. Only string-to-string entries whose
+    value still holds text after stripping survive.
+
+    Args:
+        raw: The reply's ``transcriptions`` value, verbatim.
+
+    Returns:
+        The surviving label-to-text entries, values stripped, or ``None`` when
+        nothing survives -- never an empty dict, so a record either carries a
+        usable map or carries no key at all.
+    """
+    if not isinstance(raw, dict):
+        return None
+    cleaned = {
+        key: text
+        for key, value in raw.items()
+        if isinstance(key, str) and isinstance(value, str) and (text := value.strip())
+    }
+    return cleaned or None
+
+
+#: Heads a block of transcription that could not be attributed to one part --
+#: the text of a chunk that answered with ``caption`` while its siblings
+#: answered with ``transcriptions``. Deliberately not a part label, so nothing
+#: files it to a file, and recognized by :func:`_reorder_caption_sections` so it
+#: cannot be swallowed by the section it follows.
+_UNATTRIBUTED_LABEL = "[Unattributed]"
+
+
+def _reorder_caption_sections(caption: str, part_order: list[str]) -> str:
+    """Sort a caption's bracket-labelled sections back into payload part order.
+
+    Only ever used on a chunked group, and only for the sections whose labels
+    this program assigned itself. Each chunk writes a caption covering the parts
+    that chunk saw, and the partitioner does not hand out the parts in payload
+    order: it puts ``Front``/``Back``/``Negative`` at the end of chunk 1 so a
+    front and its back are never split (its rules 4 and 5). Concatenating the
+    chunk captions therefore reads ``Page 1``..``Page 6``, ``Front``, ``Back``,
+    ``Page 7``.., which is not the object's own order and is not what an
+    unchunked call would have written.
+
+    Sorting the CHUNKS does not fix that and cannot: chunk 1's caption is a
+    single string that already holds pages 1-6 and both sides, so the
+    out-of-order sections are inside it. The sections themselves are what has to
+    move.
+
+    This is a reordering and nothing else -- no line is edited, dropped or
+    re-attributed. It is safe here, where the whole-caption-parsing the design
+    otherwise avoids (D6) is not being attempted: labels are only recognized
+    when they match a part this payload named, so a ``[Letter]`` or
+    ``[Address]`` sub-label the model chose stays exactly where the model put
+    it, inside its own part's section.
+
+    Args:
+        caption: The concatenated chunk captions.
+        part_order: The part labels the payload sent, in payload order.
+
+    Returns:
+        The caption with its recognized sections in part order, or *caption*
+        unchanged when it carries no recognized label.
+    """
+    rank = {label.casefold(): index for index, label in enumerate(part_order)}
+    # Always last, and recognized even though it is not a part: it is the
+    # boundary this module writes itself to fence off text that belongs to no
+    # single file. Without it, unattributed text appended after the sections
+    # would read as the continuation of whichever section happened to end up
+    # last -- inventing exactly the attribution the warning beside it denies.
+    rank[_UNATTRIBUTED_LABEL.strip("[]").casefold()] = len(part_order)
+    preamble: list[str] = []
+    sections: list[tuple[int, int, list[str]]] = []
+    current: list[str] | None = None
+    for line in caption.splitlines():
+        stripped = line.strip()
+        label = (
+            stripped[1:-1].strip().casefold()
+            if stripped.startswith("[") and stripped.endswith("]")
+            else None
+        )
+        if label is not None and label in rank:
+            current = [line]
+            # Arrival index breaks ties, so two chunks that both wrote a
+            # "[Front]" section stay in the order they were called rather than
+            # being swapped by an unstable sort.
+            sections.append((rank[label], len(sections), current))
+            continue
+        (preamble if current is None else current).append(line)
+    if not sections:
+        return caption
+    ordered = [line for _, _, body in sorted(sections) for line in body]
+    return "\n".join(preamble + ordered).strip("\n")
+
+
+def _synthesize_caption(transcriptions: dict[str, str], part_order: list[str]) -> str:
+    """Build the record's caption string from a per-part transcription map.
+
+    Reproduces the shape the model used to write when it merged the parts
+    itself, so the synthesized string enters ``_absorb_caption`` exactly where
+    the model's own ``caption`` does and the caption block keeps its grammar:
+    a lone-part payload is the bare text with no label (the
+    lone-scan-carries-no-label rule), and a payload of two or more parts becomes
+    ``[Label]\\n<text>`` sections joined by newlines in payload part order. A
+    label the payload never named is appended after the ordered parts, in the
+    map's own order, rather than dropped -- the model answered about something,
+    and silently losing that answer is worse than an unexpected section.
+
+    The bare form is decided by how many parts the payload SENT, not by how many
+    came back with text. Those differ in the commonest inscribed-photo shape
+    there is: a front/back pair whose writing is all on the back. Deciding on
+    the survivor count dropped the ``[Back]`` label there, which the model's own
+    ``caption`` path never does ("If there is text only on the back, only
+    include a [Back] section"), and the loss did not stay cosmetic -- an
+    unlabelled block is prose nobody attributed, so the next ``-rw`` run
+    attributed it to the file it was read off and the back's writing became
+    ``[Photo] ...`` on the front, permanently.
+
+    Args:
+        transcriptions: Part label to transcription text, normally as returned
+            by :func:`_normalize_transcriptions`.
+        part_order: The part labels the payload sent, in payload order.
+
+    Returns:
+        The synthesized caption, or ``""`` when no part contributes a section.
+    """
+    ordered = [label for label in part_order if label in transcriptions]
+    ordered += [label for label in transcriptions if label not in part_order]
+    sections = [(label, text) for label in ordered if (text := transcriptions[label].strip())]
+    if not sections:
+        return ""
+    if len(sections) == 1 and len(part_order) <= 1:
+        return sections[0][1]
+    return "\n".join(f"[{label}]\n{text}" for label, text in sections)
+
+
 def _missing_api_key_message(provider_label: str, env_var: str) -> str:
     return (
         f"{provider_label} provider selected but {env_var} is not set. "
@@ -837,6 +978,19 @@ def analyze_photo(
     record = result_obj[main_key]
     _ensure_provenance_keyword(record, provider_name, resolved_model_name)
 
+    # Per-part transcriptions, when the model chose to send them. Optional,
+    # always: a reply without the map -- or with one nothing survives from --
+    # takes today's path verbatim, and no retry is spent demanding the field.
+    # When the map survives, the caption is synthesized from it rather than
+    # trusted from the reply: per-part attribution exists only at generation
+    # time, and the model is told it may omit ``caption`` beside the map.
+    transcriptions = _normalize_transcriptions(record.pop("transcriptions", None))
+    if transcriptions is not None:
+        record["transcriptions"] = transcriptions
+        record["caption"] = _synthesize_caption(
+            transcriptions, ["Front", "Back"] if back else ["Front"]
+        )
+
     # Attach transport info for auditing
     sent = {
         "front": {
@@ -952,6 +1106,418 @@ def analyze_photo(
 
     return data
 
+
+# === Chunked group calls and the consolidation pass ===
+#
+# A group's payload has no upper bound: a sixty-page memoir is sixty images in
+# one request. ``chunking.partition_parts`` splits that into bounded, contiguous
+# blocks; the loop in :func:`analyze_group_parts` sends one call per block and
+# then one final text-only call that reconciles what the blocks each concluded
+# on their own. The helpers below are the parts of that path pure enough to live
+# outside the analyzer and be tested without a provider.
+
+#: A ``Page N`` part label, with its number captured. The part-label vocabulary
+#: is frozen by ``docs/document-mode-contract.md`` section 1, so this is
+#: deliberately narrow rather than guessing at other spellings.
+_GROUP_PAGE_LABEL_RE = re.compile(r"^Page\s+(\d+)$", re.IGNORECASE)
+
+#: The record fields the consolidation pass may replace on a chunked group.
+#: ``caption`` and ``transcriptions`` are pointedly absent: that call never saw
+#: the pages, so letting it rewrite a transcription would launder away exactly
+#: the fidelity the transcription conventions exist to protect.
+#:
+#: ``proposed_new_keywords`` is absent for the same reason, and its absence is
+#: load-bearing rather than tidy. A proposal is a claim about a keyword's
+#: justification -- the section it belongs in and a note saying what it captures
+#: -- made by a call that looked at the page the keyword came off. The
+#: consolidation call looked at no page. Letting it replace the list meant the
+#: empty array it is asked for overwrote the proposals ``_fold_chunk_records``
+#: had just folded from the chunks, and the vocabulary block downstream then
+#: rejected every new keyword for want of a proposal: a chunked group could
+#: never teach the vocabulary anything, which it could before chunking existed.
+_CONSOLIDATED_FIELDS = (
+    "keywords",
+    "title",
+    "category",
+    "ai_caption",
+    "location_guess",
+    "date_guess",
+)
+
+#: The page-order flags a consolidation reply may set, per
+#: ``docs/document-mode-contract.md`` section 6. Anything else is dropped: these
+#: reach the record and the sidecar's frontmatter, where only a value from this
+#: set means anything to a reader or a downstream tool.
+_PAGE_ORDER_FLAGS = frozenset(
+    {"out_of_order", "missing_page_before", "missing_page_after", "duplicate_page"}
+)
+
+#: The shape each consolidated field must arrive in before it may replace what
+#: the chunks concluded. The consolidation reply is model-written JSON, so it
+#: can be perfectly valid JSON and still give a field the wrong type -- and the
+#: chunk answer it would displace was built from calls that actually saw the
+#: pages. A mistyped field is dropped in favour of that, rather than accepted
+#: and left to break something further downstream.
+_CONSOLIDATED_FIELD_TYPES: dict[str, type] = {
+    "keywords": list,
+    "title": str,
+    "category": str,
+    "ai_caption": str,
+    "location_guess": dict,
+    "date_guess": dict,
+}
+
+
+def _page_number_from_label(label: str) -> int | None:
+    """Return the page number a ``Page N`` part label carries.
+
+    Args:
+        label: A payload part label, e.g. ``"Page 3"`` or ``"Front"``.
+
+    Returns:
+        The number for a page label, or ``None`` for any other part.
+    """
+    match = _GROUP_PAGE_LABEL_RE.match(label.strip())
+    return int(match.group(1)) if match else None
+
+
+def _part_counts(parts: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
+    """Return one ``{"label", "count"}`` entry per part, in payload order.
+
+    Args:
+        parts: Ordered ``(label, [paths])`` parts.
+
+    Returns:
+        The per-part image counts, in the shape both the prompt note and the
+        ``_transport`` record describe them in.
+    """
+    return [{"label": label, "count": len(paths)} for label, paths in parts]
+
+
+def _build_group_variants_note(parts: list[tuple[str, list[str]]], image_count: int) -> str:
+    """Build the GROUP VARIANTS NOTE one group call prefixes to its prompt.
+
+    A group reaches this analyzer for its part labels as much as for its size:
+    a lone negative or a lone album page is one image that still has to be
+    named as the part it is. Telling the model it is seeing several would be
+    contradicted by the payload it can count for itself -- so the claim is made
+    from the payload actually being sent, which for a chunked group is that
+    chunk's parts rather than the whole object's.
+
+    Args:
+        parts: The parts this call carries, in payload order.
+        image_count: How many images this call carries.
+
+    Returns:
+        The note text.
+    """
+    extra_lines: list[str] = [
+        "GROUP VARIANTS NOTE:",
+        "You are seeing multiple scans or variants of the same physical photograph or document."
+        if image_count > 1
+        else "You are seeing a single scan of one part of a physical photograph or document.",
+    ]
+
+    for idx, entry in enumerate(_part_counts(parts)):
+        prefix = "The first" if idx == 0 else "The next"
+        extra_lines.append(f"{prefix} {entry['count']} image(s) are {entry['label']} variants of the item.")
+
+    extra_lines.extend(
+        [
+            "Analyze all provided images together as one unified item, preserving the part order given.",
+            # This note is the LAST thing the model reads before the images, so
+            # an unqualified "preserving line breaks" here outranked the LINE
+            # BREAKS rules stated tens of thousands of characters earlier and
+            # undid the whole flowed-prose convention. It points at them now
+            # instead of contradicting them.
+            (
+                "When filling the caption field, transcribe all visible text from each part "
+                "across all variants, merging duplicates and applying the LINE BREAKS rules "
+                "above: paragraph and deliberate breaks are kept, and the wrapped lines of "
+                "running prose are joined."
+            ),
+            "Do NOT describe the scene in the caption field; only transcribed text (with [ ] for guesses and semi-illegible text).",
+            "Describe the visual scene and give 3–6 sentences of cautious but comprehensive historical analysis ONLY in the ai_caption field, starting with '[AI Analysis]:'.",
+        ]
+    )
+    return "\n".join(extra_lines)
+
+
+def _build_chunk_note(
+    chunk_parts: list[tuple[str, list[str]]],
+    chunk_index: int,
+    chunk_count: int,
+    total_pages: int,
+) -> str:
+    """Build the note telling one chunk call that it is seeing part of an object.
+
+    A chunked call is otherwise indistinguishable from a complete one: handed
+    eight pages of a sixty-page memoir and told nothing, a model describes an
+    eight-page document, dates it from the only dateline it can see, and tries
+    to finish the sentence that runs off the last page. The note supplies the
+    three things it cannot work out for itself -- which parts of how many these
+    are, that the object continues past them, and that everything it concludes
+    about the object as a whole is provisional -- and forecloses the one thing
+    it might wrongly conclude from those: that the transcription conventions
+    relax because the payload is partial.
+
+    Args:
+        chunk_parts: The parts this call carries, in payload order.
+        chunk_index: Zero-based index of this chunk among the group's chunks.
+        chunk_count: How many chunk calls the group takes in total.
+        total_pages: How many page parts the whole group holds; ``0`` when it
+            holds none, in which case the total is left unstated rather than
+            claimed as zero.
+
+    Returns:
+        The note text, ready to append to the call's prompt items.
+    """
+    labels = ", ".join(label for label, _ in chunk_parts)
+    of_pages = f", of {total_pages} pages in the whole object" if total_pages else ""
+    return "\n".join(
+        [
+            "CHUNK NOTE:",
+            f"This request carries block {chunk_index + 1} of {chunk_count} of ONE physical object.",
+            f"It holds these parts: {labels}{of_pages}.",
+            # The last block is told the truth about being last. Telling it the
+            # object continues, and that some other block finishes its trailing
+            # sentence, is false there -- and actively harmful: a document whose
+            # final page genuinely stops mid-sentence, or is followed by a
+            # missing sheet, is exactly the evidence the page-order pass needs,
+            # and no later call exists to recover it if this one is talked out
+            # of reporting what it sees.
+            (
+                "The object continues beyond these images. The other blocks are being read in "
+                "separate requests and the calling program joins the results afterwards."
+                if chunk_index < chunk_count - 1
+                else "This is the LAST block of the object. The blocks before it are being read "
+                "in separate requests and the calling program joins the results afterwards; "
+                "nothing follows this one."
+            ),
+            (
+                "Transcribe only what is in front of you. Do not summarize or invent the pages "
+                "you were not sent, and do not complete a sentence that runs off the last page "
+                "here -- the page that finishes it is in another block."
+                if chunk_index < chunk_count - 1
+                else "Transcribe only what is in front of you. Do not summarize or invent the "
+                "pages you were not sent. If the text simply stops part-way through a sentence "
+                "on the last page here, transcribe it exactly as it stops -- that is evidence "
+                "about the object, not a mistake to tidy up."
+            ),
+            "The transcription conventions are unchanged. Apply them exactly as you would to a "
+            + "complete object; a partial payload changes nothing about how text is recorded.",
+            "Your metadata for this request -- keywords, title, category, date_guess and "
+            + "location_guess -- is PROVISIONAL. A consolidation step reconciles it with the "
+            + "other blocks afterwards, so answer from the evidence in these images alone rather "
+            + "than guessing at what the pages you cannot see contain.",
+        ]
+    )
+
+
+def _build_consolidation_payload(
+    parts: list[tuple[str, list[str]]],
+    transcriptions: dict[str, str],
+    chunks: list[list[tuple[str, list[str]]]],
+    chunk_records: list[dict[str, Any]],
+    main_key: str,
+) -> str:
+    """Serialize the text-only evidence the consolidation call reasons over.
+
+    JSON rather than prose because every field of it is already structured and
+    every transcription in it is free to hold blank lines, blockquotes and
+    ``---`` rules of its own -- a prose framing would have to invent a
+    delimiter that the transcriptions are entitled to contain.
+
+    Args:
+        parts: The whole group's ordered parts.
+        transcriptions: The union of the chunks' transcription maps.
+        chunks: The parts each chunk call carried, in call order.
+        chunk_records: Each chunk's parsed record, aligned with ``chunks``.
+        main_key: The path the consolidated ``result`` must be keyed by.
+
+    Returns:
+        The payload as pretty-printed JSON.
+    """
+    payload = {
+        "main_image_path": main_key,
+        "parts": [
+            {
+                "label": label,
+                "files": [os.path.basename(path) for path in paths],
+                "page_from_filename": _page_number_from_label(label),
+                "transcription": transcriptions.get(label),
+            }
+            for label, paths in parts
+        ],
+        "provisional_metadata_by_block": [
+            {
+                "block": idx + 1,
+                "parts_seen": [label for label, _ in chunk],
+                "keywords": record.get("keywords"),
+                "title": record.get("title"),
+                "category": record.get("category"),
+                "ai_caption": record.get("ai_caption"),
+                "date_guess": record.get("date_guess"),
+                "location_guess": record.get("location_guess"),
+                # A block that answered with ``caption`` rather than
+                # ``transcriptions`` contributes nothing to ``parts`` above --
+                # every part it saw shows a null transcription there. Without
+                # its caption here, this call would judge the title, the date
+                # and above all the page order of a document whose middle it
+                # was never shown, while its verdict outranks the answers from
+                # the calls that did see those pages. Present only when it is
+                # the block's sole record of the text.
+                **(
+                    {"unattributed_transcription": record.get("caption")}
+                    if not _normalize_transcriptions(record.get("transcriptions"))
+                    and isinstance(record.get("caption"), str)
+                    and record.get("caption", "").strip()
+                    else {}
+                ),
+            }
+            for idx, (chunk, record) in enumerate(zip(chunks, chunk_records))
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _normalize_page_order(raw: object, part_labels: set[str]) -> dict[str, dict[str, Any]] | None:
+    """Reduce a consolidation reply's ``page_order`` to what the record may carry.
+
+    As tolerant as the main parser, and for the same reason: a page-order
+    verdict is a finding about the scan order, never something the group's
+    metadata depends on, so a reply that garbles it must cost the group
+    nothing. Entries naming a part the payload never sent are dropped -- the
+    map is looked up by part label downstream, so a label no file resolves to
+    could only ever be dead weight in a sidecar.
+
+    Args:
+        raw: The reply's ``page_order`` value, verbatim.
+        part_labels: The part labels this group actually sent.
+
+    Returns:
+        Label to ``{"page": int}`` plus an optional ``"flags"`` list, or
+        ``None`` when nothing usable survives -- never an empty dict.
+    """
+    if not isinstance(raw, dict):
+        return None
+    cleaned: dict[str, dict[str, Any]] = {}
+    for label, entry in raw.items():
+        if not isinstance(label, str) or label not in part_labels or not isinstance(entry, dict):
+            continue
+        page = entry.get("page")
+        if isinstance(page, str) and page.strip().isdigit():
+            page = int(page.strip())
+        if isinstance(page, bool) or not isinstance(page, int):
+            continue
+        raw_flags = entry.get("flags")
+        # Filtered against the frozen vocabulary, not merely against emptiness:
+        # a flag becomes record data and sidecar frontmatter, and a consumer can
+        # only act on the four values the contract names. A hallucinated fifth
+        # would be persisted as though it meant something.
+        flags = (
+            [
+                flag.strip()
+                for flag in raw_flags
+                if isinstance(flag, str) and flag.strip() in _PAGE_ORDER_FLAGS
+            ]
+            if isinstance(raw_flags, list)
+            else []
+        )
+        cleaned[label] = {"page": page, "flags": flags} if flags else {"page": page}
+    return cleaned or None
+
+
+def _fold_chunk_records(chunk_records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combine per-chunk records into one group record without the model's help.
+
+    The consolidation pass is the intended author of a chunked group's final
+    metadata; this is what stands in when its reply is missing or unusable. It
+    keeps the first chunk's answer as the base -- chunk 1 holds the opening
+    pages, which is where a letterhead, a salutation and a dateline almost
+    always are -- then widens it exactly the way the group merge in
+    ``process_manifest_stream`` widens a multi-analysis group: union the
+    keywords, take the highest-confidence date and location guess.
+
+    Args:
+        chunk_records: Each chunk's parsed record, in call order. Never empty;
+            not mutated.
+
+    Returns:
+        A new record dict. ``proposed_new_keywords`` is set only when at least
+        one chunk sent a list for it, so a group whose model never sent the
+        field still reaches the vocabulary block as the missing field it is
+        rather than as an empty approval list.
+    """
+    folded = deepcopy(chunk_records[0])
+    folded["keywords"] = utils.union_keywords(
+        *[record.get("keywords") or [] for record in chunk_records]
+    )
+
+    for field in ("location_guess", "date_guess"):
+        best = None
+        best_conf = -1.0
+        for record in chunk_records:
+            guess = record.get(field)
+            if not isinstance(guess, dict):
+                continue
+            conf = guess.get("confidence")
+            if isinstance(conf, (int, float)) and float(conf) > best_conf:
+                best_conf = float(conf)
+                best = guess
+        if best is not None:
+            folded[field] = deepcopy(best)
+
+    if any(isinstance(record.get("proposed_new_keywords"), list) for record in chunk_records):
+        proposed: list[Any] = []
+        seen: set[str] = set()
+        for record in chunk_records:
+            for entry in record.get("proposed_new_keywords") or []:
+                keyword = entry.get("keyword") if isinstance(entry, dict) else None
+                if isinstance(keyword, str) and keyword not in seen:
+                    seen.add(keyword)
+                    proposed.append(entry)
+        folded["proposed_new_keywords"] = proposed
+
+    return folded
+
+
+def _sum_usages(usages: list[dict | None]) -> dict[str, Any]:
+    """Sum the token usage of every call one chunked group made.
+
+    Matches the summation shape ``process_manifest_stream`` already uses for a
+    group holding more than one analysis, including its habit of reporting a
+    zero as ``None`` so an absent count is never read as a free call.
+
+    Args:
+        usages: One entry per call -- every chunk call plus the consolidation
+            call. A ``None`` entry (a provider that reported no usage) counts
+            as zero.
+
+    Returns:
+        The combined usage dict, carrying the first model string any call
+        reported.
+    """
+
+    def _tok(usage: dict | None, key: str) -> int:
+        value = usage.get(key) if usage else None
+        return int(value) if isinstance(value, int) else 0
+
+    prompt_tokens = sum(_tok(usage, "prompt_tokens") for usage in usages)
+    completion_tokens = sum(_tok(usage, "completion_tokens") for usage in usages)
+    model_name = next(
+        (usage.get("model") for usage in usages if usage and usage.get("model")), None
+    )
+    return {
+        "prompt_tokens": prompt_tokens or None,
+        "completion_tokens": completion_tokens or None,
+        "input_tokens": prompt_tokens or None,
+        "output_tokens": completion_tokens or None,
+        "total_tokens": (prompt_tokens + completion_tokens) or None,
+        "model": model_name,
+    }
+
+
 def analyze_group_parts(
     parts: list[tuple[str, list[str]]],
     config: utils.Config = utils.Config(),
@@ -966,6 +1532,15 @@ def analyze_group_parts(
     part ("Front", "Back", "Page 1", "Page 2", ...). Paths inside a label are
     variant scans of that part. All images are analyzed together in the order
     provided by ``parts``.
+
+    A payload larger than ``config.max_images_per_call`` is split into
+    contiguous chunks (``chunking.partition_parts``), sent as one sequential
+    call each, and reconciled by a final text-only consolidation call whose
+    verdict on the page order lands on the record as ``page_order`` /
+    ``page_order_notes``. Chunking happens here rather than at the call site so
+    that this function's signature, and every caller of it, are unchanged --
+    and a group that fits in one payload takes exactly the path it did before
+    chunking existed: one call, the same prompt items in the same order.
     """
     norm_parts: list[tuple[str, list[str]]] = []
     for label, paths in parts:
@@ -1056,7 +1631,7 @@ def analyze_group_parts(
         if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
             logger.warning("Failed to load forwarded metadata: %s", exc)
 
-    prompt_items = utils.build_prompt_bundle(
+    prompt_bundle = utils.build_prompt_bundle(
             model_name,
             today,
             provider_name = provider_name,
@@ -1065,92 +1640,458 @@ def analyze_group_parts(
             cfg = config,
     )
 
-    # A group reaches this analyzer for its part labels as much as for its size:
-    # a lone negative or a lone album page is one image that still has to be
-    # named as the part it is. Telling the model it is seeing several would be
-    # contradicted by the payload it can count for itself.
-    extra_lines: list[str] = [
-        "GROUP VARIANTS NOTE:",
-        "You are seeing multiple scans or variants of the same physical photograph or document."
-        if len(flat_paths) > 1
-        else "You are seeing a single scan of one part of a physical photograph or document.",
-    ]
-
-    part_counts = [{"label": lbl, "count": len(plist)} for lbl, plist in norm_parts]
-    for idx, entry in enumerate(part_counts):
-        prefix = "The first" if idx == 0 else "The next"
-        extra_lines.append(f"{prefix} {entry['count']} image(s) are {entry['label']} variants of the item.")
-
-    extra_lines.extend(
-        [
-            "Analyze all provided images together as one unified item, preserving the part order given.",
-            "When filling the caption field, transcribe all visible text from each part across all variants, merging duplicates and preserving line breaks.",
-            "Do NOT describe the scene in the caption field; only transcribed text (with [ ] for guesses and semi-illegible text).",
-            "Describe the visual scene and give 3–6 sentences of cautious but comprehensive historical analysis ONLY in the ai_caption field, starting with '[AI Analysis]:'.",
-        ]
-    )
-
-    prompt_items = list(prompt_items) + [
-        {"type": "input_text", "text": "\n".join(extra_lines)}
-    ]
-
+    group_label = os.path.basename(main_key)
+    url_by_path = dict(zip(flat_paths, image_data_urls))
     dump_request_writer = _build_llm_dump_writer(config, main_key, "group")
 
-    def _retry_once_resend_images(extra_instruction: str) -> str:
-        prompts2 = list(prompt_items) + [{"type": "input_text", "text": extra_instruction}]
-        r2 = call_model(client, model_name, prompts2, image_data_urls, provider=provider, dump_request=dump_request_writer)
-        return extract_output_text(r2, provider=provider)
+    def _analyze_parts_once(
+        chunk_parts: list[tuple[str, list[str]]],
+        chunk_note: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict | None, str]:
+        """Make one model call over ``chunk_parts`` and parse what came back.
 
-    resp = call_model(client, model_name, list(prompt_items), image_data_urls, provider=provider, dump_request=dump_request_writer)
-    usage = utils.extract_usage(resp)
-    resolved_model_name = get_response_model(resp, model_name)
-    raw = extract_output_text(resp, provider=provider)
+        The whole of one group call lives here so that a group small enough to
+        fit in a single payload takes a path byte-identical to the unchunked
+        one: same prompt items in the same order, one call, and -- with
+        ``chunk_note`` ``None`` -- nothing appended that says otherwise.
 
-    if not raw or not raw.strip():
-        raw = _retry_once_resend_images(
-            "You MUST return strictly valid JSON only — no markdown, no code fences, "
-            "no commentary. Use literal \\n characters inside JSON strings for line breaks."
-        )
+        Args:
+            chunk_parts: The parts this call carries, in payload order.
+            chunk_note: The note appended after the group note for a chunked
+                call, or ``None`` for a call carrying the whole group.
 
-    def _retry_once() -> str:
-        return _retry_once_resend_images(
-            "Final attempt: Return ONLY valid JSON. No commentary, no markdown. "
-            "If you cannot comply, return an empty JSON object with the correct keys and nulls."
-        )
+        Returns:
+            ``(data, record, usage, resolved_model_name)``: the parsed reply,
+            the record under this call's main key, its token usage (``None``
+            when the provider reported none) and the model string the provider
+            answered with.
 
-    data, _raw_used = utils.parse_with_retry(
-        raw, _retry_once, config=config, source_path=main_key,
-    )
+        Raises:
+            ValueError: The reply held no usable ``result`` for the main key.
+        """
+        chunk_flat: list[str] = []
+        for _label, plist in chunk_parts:
+            for path in plist:
+                if path not in chunk_flat:
+                    chunk_flat.append(path)
+        chunk_urls = [url_by_path[path] for path in chunk_flat]
+        chunk_key = chunk_flat[0]
 
-    result_obj = data.get("result", {}) or {}
-    if main_key not in result_obj:
-        if isinstance(result_obj, dict) and len(result_obj) == 1:
-            only_key = next(iter(result_obj.keys()))
-            data["result"] = {main_key: result_obj[only_key]}
-            result_obj = data["result"]
-        else:
-            raise ValueError(
-                f"Model output did not contain expected main key {main_key!r} "
-                f"and could not be normalized."
+        call_items = list(prompt_bundle) + [
+            {
+                "type": "input_text",
+                "text": _build_group_variants_note(chunk_parts, len(chunk_flat)),
+            }
+        ]
+        if chunk_note:
+            call_items.append({"type": "input_text", "text": chunk_note})
+
+        def _retry_once_resend_images(extra_instruction: str) -> str:
+            prompts2 = list(call_items) + [{"type": "input_text", "text": extra_instruction}]
+            r2 = call_model(client, model_name, prompts2, chunk_urls, provider=provider, dump_request=dump_request_writer)
+            return extract_output_text(r2, provider=provider)
+
+        resp = call_model(client, model_name, list(call_items), chunk_urls, provider=provider, dump_request=dump_request_writer)
+        call_usage = utils.extract_usage(resp)
+        call_model_name = get_response_model(resp, model_name)
+        raw = extract_output_text(resp, provider=provider)
+
+        if not raw or not raw.strip():
+            raw = _retry_once_resend_images(
+                "You MUST return strictly valid JSON only — no markdown, no code fences, "
+                "no commentary. Use literal \\n characters inside JSON strings for line breaks."
             )
 
-    if isinstance(result_obj, dict):
-        for rec in result_obj.values():
-            if isinstance(rec, dict) and "ai_caption" in rec:
-                rec["ai_caption"] = inject_analysis_date(rec.get("ai_caption"), date.fromisoformat(today))
+        def _retry_once() -> str:
+            return _retry_once_resend_images(
+                "Final attempt: Return ONLY valid JSON. No commentary, no markdown. "
+                "If you cannot comply, return an empty JSON object with the correct keys and nulls."
+            )
 
-    record = result_obj.get(main_key) or {}
-    if not isinstance(record, dict):
-        raise ValueError("Model output for main result was not an object/dict.")
+        call_data, _raw_used = utils.parse_with_retry(
+            raw, _retry_once, config=config, source_path=chunk_key,
+        )
 
-    _ensure_provenance_keyword(record, provider_name, resolved_model_name)
+        result_obj = call_data.get("result", {}) or {}
+        if chunk_key not in result_obj:
+            if isinstance(result_obj, dict) and len(result_obj) == 1:
+                only_key = next(iter(result_obj.keys()))
+                call_data["result"] = {chunk_key: result_obj[only_key]}
+                result_obj = call_data["result"]
+            else:
+                raise ValueError(
+                    f"Model output did not contain expected main key {chunk_key!r} "
+                    f"and could not be normalized."
+                )
 
+        if isinstance(result_obj, dict):
+            for rec in result_obj.values():
+                if isinstance(rec, dict) and "ai_caption" in rec:
+                    rec["ai_caption"] = inject_analysis_date(rec.get("ai_caption"), date.fromisoformat(today))
+
+        call_record = result_obj.get(chunk_key) or {}
+        if not isinstance(call_record, dict):
+            raise ValueError("Model output for main result was not an object/dict.")
+
+        _ensure_provenance_keyword(call_record, provider_name, call_model_name)
+
+        # Per-part transcriptions, when the model chose to send them. Optional,
+        # always: a reply without the map -- or with one nothing survives from --
+        # takes today's path verbatim, and no retry is spent demanding the field.
+        # When the map survives, the caption is synthesized from it in payload part
+        # order rather than trusted from the reply: per-part attribution exists
+        # only at generation time, and the model is told it may omit ``caption``
+        # beside the map.
+        call_transcriptions = _normalize_transcriptions(call_record.pop("transcriptions", None))
+        if call_transcriptions is not None:
+            call_record["transcriptions"] = call_transcriptions
+            call_record["caption"] = _synthesize_caption(
+                call_transcriptions, [label for label, _ in chunk_parts]
+            )
+
+        return call_data, call_record, call_usage, call_model_name
+
+    def _run_consolidation(payload_text: str) -> tuple[dict[str, Any] | None, dict | None]:
+        """Make the group's one text-only consolidation call, parsed tolerantly.
+
+        No images are re-sent: the per-chunk transcriptions are the evidence,
+        and paying for the pixels a second time would buy a pass that is only
+        allowed to reason over the text anyway. Nothing here may fail the
+        group, so every way the reply can be unusable ends in ``None`` and an
+        INFO line rather than an exception -- the chunk results are already a
+        complete answer, just an unreconciled one.
+
+        Args:
+            payload_text: The consolidation input, as JSON.
+
+        Returns:
+            ``(parsed_reply, usage)``. The reply is ``None`` when it was
+            empty or not usable JSON; the usage is whatever the call reported
+            either way, since the call was made and billed regardless.
+        """
+        consolidation_items = list(prompt_bundle) + [
+            {
+                "type": "input_text",
+                "text": utils._read_text(utils._resolve_prompt_file("consolidation.txt", config)),
+            },
+            {"type": "input_text", "text": "CONSOLIDATION INPUT (JSON)\n" + payload_text},
+        ]
+        try:
+            resp = call_model(
+                client,
+                model_name,
+                consolidation_items,
+                [],
+                provider=provider,
+                dump_request=_build_llm_dump_writer(config, main_key, "consolidation"),
+            )
+        except ProviderApiError as exc:
+            # The one failure that must not be allowed to cost anything. By the
+            # time this call is made the group has already spent every chunk
+            # call it was going to spend and holds a complete set of
+            # transcriptions; letting a rate limit, a context-window rejection
+            # or a blip on this last cheap text-only request escape would send
+            # the whole group to the batch loop's failure handler and throw all
+            # of that away. The chunk answers are a complete result, merely an
+            # unreconciled one, so fall back to them exactly as for a reply that
+            # came back unusable.
+            #
+            # A credential or model error that is fatal to the RUN still stops
+            # it: the next group's very first chunk call raises the same thing
+            # before anything has been paid for.
+            logger.warning(
+                "Group %s: the consolidation pass could not be made (%s: %s); the chunk "
+                "answers stand and no work is lost.",
+                group_label,
+                exc.error_type,
+                exc,
+            )
+            return None, None
+        consolidation_usage = utils.extract_usage(resp)
+        raw = extract_output_text(resp, provider=provider)
+        if not raw or not raw.strip():
+            logger.info(
+                "Group %s: the consolidation pass returned nothing; the chunk answers stand.",
+                group_label,
+            )
+            return None, consolidation_usage
+        try:
+            # No retry function: a chunked group has already made several calls
+            # and holds a complete set of transcriptions, so spending another
+            # one to re-ask for a reconciliation is worse value than falling
+            # back to what the chunks said.
+            parsed, _consolidation_raw = utils.parse_with_retry(
+                raw, lambda: "", config=config, source_path=main_key,
+            )
+        except json.JSONDecodeError as exc:
+            logger.info(
+                "Group %s: the consolidation reply was not usable JSON (%s); "
+                "the chunk answers stand.",
+                group_label,
+                exc,
+            )
+            return None, consolidation_usage
+        if not isinstance(parsed, dict):
+            logger.info(
+                "Group %s: the consolidation reply was not a JSON object; the chunk answers stand.",
+                group_label,
+            )
+            return None, consolidation_usage
+        return parsed, consolidation_usage
+
+    chunks = chunking.partition_parts(norm_parts, config.max_images_per_call)
+    if config.max_images_per_call > 0:
+        for idx, chunk in enumerate(chunks):
+            chunk_images = sum(len(paths) for _, paths in chunk)
+            if chunk_images > config.max_images_per_call:
+                # A bound the partitioner could not honor must not be silent:
+                # a part with more variant scans than the budget is never split,
+                # and every non-page part rides the first call, so either can
+                # push one call over. The call is still made -- an oversized
+                # payload is better than a dropped page -- but the run says so.
+                logger.warning(
+                    "Group %s: call %d of %d carries %d images, over the "
+                    "--max-images-per-call budget of %d.",
+                    group_label,
+                    idx + 1,
+                    len(chunks),
+                    chunk_images,
+                    config.max_images_per_call,
+                )
+
+    part_order = [label for label, _ in norm_parts]
+
+    if len(chunks) == 1:
+        data, record, record_usage, resolved_model_name = _analyze_parts_once(chunks[0], None)
+    else:
+        page_part_count = len(
+            [label for label in part_order if _page_number_from_label(label) is not None]
+        )
+        logger.info(
+            "Group %s: %d images exceed the per-call budget of %d; sending %d chunked calls "
+            "and one text-only consolidation call.",
+            group_label,
+            len(flat_paths),
+            config.max_images_per_call,
+            len(chunks),
+        )
+
+        chunk_records: list[dict[str, Any]] = []
+        usages: list[dict | None] = []
+        resolved_model_name = model_name
+        # Sequential (D10): deterministic, debuggable, and rate-limit-safe
+        # across four providers with four different limit models. A chunk that
+        # fails after its own retries fails the group exactly as a failed
+        # single call does today -- per-group isolation in the batch loop
+        # already handles that -- so nothing is caught here.
+        for idx, chunk in enumerate(chunks):
+            _chunk_data, chunk_record, chunk_usage, chunk_model = _analyze_parts_once(
+                chunk, _build_chunk_note(chunk, idx, len(chunks), page_part_count)
+            )
+            chunk_records.append(chunk_record)
+            usages.append(chunk_usage)
+            if idx == 0:
+                resolved_model_name = chunk_model
+
+        # The union is taken in payload part order rather than call order, so
+        # the map reads as the object does however the partitioner grouped it.
+        merged_transcriptions: dict[str, str] = {}
+        for label in part_order:
+            for chunk_record in chunk_records:
+                text = (chunk_record.get("transcriptions") or {}).get(label)
+                if isinstance(text, str) and text.strip():
+                    merged_transcriptions[label] = text
+                    break
+
+        # The merge above is an exact-key lookup, so a chunk that spelled a
+        # label even slightly differently ("page 9" for "Page 9") contributes
+        # nothing and its page would leave the record without a word. On the
+        # unchunked path a stray label merely lands in the caption under its own
+        # bogus heading, which is visible; here it is invisible, so say it.
+        known = set(part_order)
+        stray_labels = sorted(
+            {
+                label
+                for chunk_record in chunk_records
+                for label in (chunk_record.get("transcriptions") or {})
+                if isinstance(label, str) and label not in known
+            }
+        )
+        for label in stray_labels:
+            # Carried, not dropped: ``_synthesize_caption`` appends a label the
+            # payload never named rather than losing it, and the chunked path
+            # has no business being stricter than the single-call one. The text
+            # reaches the caption; only its attribution to a file is lost.
+            for chunk_record in chunk_records:
+                text = (chunk_record.get("transcriptions") or {}).get(label)
+                if isinstance(text, str) and text.strip():
+                    merged_transcriptions[label] = text
+                    break
+        if stray_labels:
+            logger.warning(
+                "Group %s: the model returned transcriptions under %d label(s) this payload "
+                "never named (%s); the text is kept in the caption but cannot be filed to a "
+                "file, so those parts get the group transcript in their sidecar rather than "
+                "their own. Expected exactly: %s.",
+                group_label,
+                len(stray_labels),
+                ", ".join(repr(label) for label in stray_labels),
+                ", ".join(repr(label) for label in part_order),
+            )
+
+        consolidation, consolidation_usage = _run_consolidation(
+            _build_consolidation_payload(
+                norm_parts, merged_transcriptions, chunks, chunk_records, main_key
+            )
+        )
+        usages.append(consolidation_usage)
+        record_usage = _sum_usages(usages)
+
+        record = _fold_chunk_records(chunk_records)
+
+        consolidated_result: dict[str, Any] | None = None
+        page_order: dict[str, dict[str, Any]] | None = None
+        page_order_notes: list[str] = []
+        if consolidation is not None:
+            result_block = consolidation.get("result")
+            if isinstance(result_block, dict) and result_block:
+                candidate = result_block.get(main_key)
+                if not isinstance(candidate, dict) and len(result_block) == 1:
+                    candidate = next(iter(result_block.values()))
+                if isinstance(candidate, dict):
+                    consolidated_result = candidate
+            page_order = _normalize_page_order(consolidation.get("page_order"), set(part_order))
+            raw_notes = consolidation.get("page_order_notes")
+            if isinstance(raw_notes, list):
+                page_order_notes = [
+                    note.strip() for note in raw_notes if isinstance(note, str) and note.strip()
+                ]
+
+        if consolidated_result is None:
+            logger.info(
+                "Group %s: the consolidation pass produced no usable result block; the group "
+                "metadata is folded from the chunk answers instead.",
+                group_label,
+            )
+        else:
+            # This replaces the per-analysis best-confidence pick for chunked
+            # groups; an unchunked group's _best_guess path is untouched.
+            if "ai_caption" in consolidated_result:
+                consolidated_result["ai_caption"] = inject_analysis_date(
+                    consolidated_result.get("ai_caption"), date.fromisoformat(today)
+                )
+            for field in _CONSOLIDATED_FIELDS:
+                value = consolidated_result.get(field)
+                if value is None:
+                    continue
+                if not isinstance(value, _CONSOLIDATED_FIELD_TYPES[field]):
+                    # The folded chunk answer came from calls that saw the
+                    # pages; a mistyped consolidated field has not earned the
+                    # right to displace it. "keywords": "Document" is the one
+                    # that bites -- a bare string is truthy, so it would replace
+                    # the whole list and leave the record with a keyword field
+                    # nothing downstream can read.
+                    logger.warning(
+                        "Group %s: the consolidation pass returned %s as %s rather than %s; "
+                        "keeping what the chunk answers concluded for that field.",
+                        group_label,
+                        field,
+                        type(value).__name__,
+                        _CONSOLIDATED_FIELD_TYPES[field].__name__,
+                    )
+                    continue
+                record[field] = value
+            _ensure_provenance_keyword(record, provider_name, resolved_model_name)
+
+        # A chunk that answered with ``caption`` instead of ``transcriptions``.
+        # Compliance is per call, not per run, so one group can genuinely hold
+        # both: the field is optional by design and the plan's own fallback
+        # promise is that ignoring it degrades to current behavior. Reading only
+        # the map when ANY chunk filled it dropped every non-complying chunk's
+        # pages out of the record, the caption block and the sidecars without a
+        # word -- a silent loss of the transcription the group was billed for.
+        #
+        unmapped_captions = [
+            text.strip()
+            for chunk_record in chunk_records
+            if not _normalize_transcriptions(chunk_record.get("transcriptions"))
+            and isinstance(text := chunk_record.get("caption"), str)
+            and text.strip()
+        ]
+
+        if merged_transcriptions:
+            record["transcriptions"] = merged_transcriptions
+            synthesized = _synthesize_caption(merged_transcriptions, part_order)
+            if unmapped_captions:
+                logger.warning(
+                    "Group %s: %d of %d chunk call(s) answered with 'caption' instead of "
+                    "'transcriptions'; their text is appended to the caption, but the pages "
+                    "they cover cannot be attributed to a file and take the group transcript "
+                    "in their sidecar.",
+                    group_label,
+                    len(unmapped_captions),
+                    len(chunks),
+                )
+            # Fenced, not merely appended. A caption-only chunk's text carries
+            # no part label of its own, so concatenating it after the last
+            # synthesized section would file it under that section's page --
+            # asserting an attribution the warning above explicitly denies.
+            fenced = [
+                f"{_UNATTRIBUTED_LABEL}\n{text}" for text in unmapped_captions
+            ]
+            record["caption"] = _reorder_caption_sections(
+                "\n".join(text for text in [synthesized, *fenced] if text),
+                part_order,
+            )
+        else:
+            # The fallback path: a model that ignored ``transcriptions`` still
+            # wrote a caption per chunk, and each already carries its own
+            # bracket-labelled sections, so putting those sections back in
+            # payload order rebuilds what a single call would have written.
+            record.pop("transcriptions", None)
+            record["caption"] = _reorder_caption_sections(
+                "\n".join(unmapped_captions), part_order
+            )
+
+        if page_order:
+            # Data, never action (D11). photokin records the corrected number
+            # and warns; it renames, reorders and renumbers nothing, because
+            # renaming is destructive and cross-tool -- a Lightroom catalog
+            # references these paths.
+            record["page_order"] = page_order
+            if page_order_notes:
+                record["page_order_notes"] = page_order_notes
+            disagreements = [
+                f"{label} reads as page {entry['page']}"
+                for label, entry in page_order.items()
+                if (filename_page := _page_number_from_label(label)) is not None
+                and entry["page"] != filename_page
+            ]
+            if disagreements:
+                logger.warning(
+                    "Group %s: the pages do not read in filename order (%s). "
+                    "The corrected numbers are recorded; no file is renamed.",
+                    group_label,
+                    "; ".join(disagreements),
+                )
+        else:
+            logger.info(
+                "Group %s: the consolidation pass returned no usable page order; "
+                "the filename order stands.",
+                group_label,
+            )
+
+        data = {"result": {main_key: record}}
+
+    part_counts = _part_counts(norm_parts)
     sent: Dict[str, Any] = {
         "max_edge": config.max_edge,
         "jpeg_quality": config.jpeg_quality,
         "part_count": len(norm_parts),
         "parts": part_counts,
     }
+    if len(chunks) > 1:
+        sent["chunk_count"] = len(chunks)
     front_count = next((p["count"] for p in part_counts if p["label"].strip().lower() == "front"), 0)
     back_count = next((p["count"] for p in part_counts if p["label"].strip().lower() == "back"), 0)
     if front_count:
@@ -1175,7 +2116,7 @@ def analyze_group_parts(
     sent["variants"] = variant_payloads
 
     record["_transport"] = sent
-    record["_usage"] = usage
+    record["_usage"] = record_usage
 
     kws = record.get("keywords", []) or []
     warn_list = utils.warn_forbiddenish_keywords(kws)
@@ -1798,6 +2739,45 @@ def _manifest_part_key(entry: dict) -> str:
     return "none"
 
 
+def resolve_part_label(
+    entry: dict,
+    *,
+    multipage_present: bool,
+    relabelled_versions: frozenset[str | None],
+) -> str:
+    """Return the payload part label a manifest grouping entry travelled under.
+
+    The one file-to-label function in the system: a consumer that needs to look
+    a file up in a record's ``transcriptions`` map resolves its label here
+    rather than re-deriving it, so the label vocabulary stays exactly the one
+    the payload used. The untagged front of a multipage variant was relabelled
+    to Page 1 before the payload was built, so the same relabel is applied
+    before mapping; ``none`` otherwise resolves to ``Front``, because the front
+    side is what an untagged file travels as.
+
+    A label this returns is not guaranteed to appear in ``transcriptions``: a
+    displaced or unseated file was never in the payload under any label, so
+    callers must handle a miss.
+
+    Args:
+        entry: A manifest grouping entry, as built by
+            :func:`_resolve_manifest_entry`.
+        multipage_present: Whether the entry's group holds explicit page parts.
+        relabelled_versions: The variant letters whose untagged slot became
+            Page 1, as the emit loop computes for the crop map.
+
+    Returns:
+        The part label the entry's file was sent under: ``"Front"``,
+        ``"Back"``, ``"Negative"`` or ``"Page N"``.
+    """
+    part_key = _manifest_part_key(entry)
+    if part_key == "none" and multipage_present and entry["version"] in relabelled_versions:
+        part_key = "page:1"
+    if part_key.startswith("page:"):
+        return f"Page {part_key.split(':', 1)[1]}"
+    return {"front": "Front", "back": "Back", "negative": "Negative", "none": "Front"}[part_key]
+
+
 def _slot_address_rank(version: str | None, part_key: str) -> tuple[int, int, int, str]:
     """Rank a ``(version, part_key)`` slot address the way entries are ranked.
 
@@ -2024,6 +3004,13 @@ def process_manifest_stream(
     # collision below -- warned without doing so, which is how the completion
     # line came to report zero directly under a WARNING saying otherwise.
     unsent_paths: set[str] = set()
+    # Markdown sidecar destinations already written, for the whole run rather
+    # than for one group. Two files whose names differ only by extension do not
+    # have to be in the same bucket to collide on one ``<stem>.md``: under
+    # ``--group-by none`` every file is its own group, and a manifest may put
+    # them in different groups explicitly, so a per-group guard alone would let
+    # the second group overwrite the first group's sidecar without a word.
+    sidecar_written: dict[str, str] = {}
 
     group_keys = ordered_group_keys(buckets)
     for group_index, stem in enumerate(group_keys):
@@ -2745,21 +3732,47 @@ def process_manifest_stream(
             # section pass settles what each label says; this one is the last
             # net, and it is what stops a model that echoed a caption it was
             # shown from landing that line twice.
+            #
+            # ACROSS sections only, never within one. That distinction is what
+            # makes the block converge, and it is load-bearing now in a way it
+            # was not before per-part transcription existed. A multi-page
+            # document is absorbed as ONE section (``_CAPTION_LABEL_RE`` does
+            # not match "[Page N]"), and inside it a repeated line is the
+            # document's own content, not an echo: a letterhead printed on
+            # every sheet, a recurring "Dear Mother,", a second "[blank page]".
+            # De-duplicating those against each other dropped real
+            # transcription -- and worse, it did not settle, because the block
+            # then no longer matched what the next run synthesized fresh, so
+            # the near-identical section gate stopped firing and every ``-rw``
+            # pass appended another structural tail. Scoping the key to its
+            # section keeps the original purpose (an echo arrives in a
+            # *different* section) and restores "running it twice does not grow
+            # your captions".
             caption_block_lines: list[str] = []
-            seen_lines: set[str] = set()
-            for line in [ln for body in caption_sections for ln in body]:
-                key = " ".join(line.split()).lower()
-                if not key:
-                    # A blank line is the author's paragraph break, not a
-                    # caption; it is kept as written and never counted as a
-                    # duplicate, which is what leaves a multi-paragraph note
-                    # byte-identical after a re-read.
+            first_seen_in: dict[str, int] = {}
+            for section_index, body in enumerate(caption_sections):
+                for line in body:
+                    key = " ".join(line.split()).lower()
+                    if not key:
+                        # A blank line is the author's paragraph break, not a
+                        # caption; it is kept as written and never counted as a
+                        # duplicate, which is what leaves a multi-paragraph note
+                        # byte-identical after a re-read.
+                        caption_block_lines.append(line)
+                        continue
+                    if not _CAPTION_WORD_RE.search(key):
+                        # A wordless line is markdown structure, not content:
+                        # the transcription conventions put footnotes after a
+                        # "---" rule, so two files whose captions both carry
+                        # footnotes hold that rule line twice on purpose, and
+                        # treating the second as a repeat would glue one
+                        # file's footnotes onto the other's prose. Like the
+                        # blank line above, it is layout and is kept as written.
+                        caption_block_lines.append(line)
+                        continue
+                    if first_seen_in.setdefault(key, section_index) != section_index:
+                        continue
                     caption_block_lines.append(line)
-                    continue
-                if key in seen_lines:
-                    continue
-                seen_lines.add(key)
-                caption_block_lines.append(line)
             caption_block = "\n".join(caption_block_lines).strip("\n") or None
 
             def _tok(u: dict | None, key: str) -> int:
@@ -2854,6 +3867,37 @@ def process_manifest_stream(
                 marker for marker in map(_item_part_marker, group) if marker
             )
 
+            # Document-mode sidecar placement facts (contract section 8),
+            # computed once per group rather than once per file below: both are
+            # static across every file the loop emits, and skipped outright
+            # when the flag is off so an ordinary run pays nothing for a
+            # feature it never asked for.
+            sidecar_group_files: tuple[str, ...] = ()
+            sidecar_page_count: int | None = None
+            sidecar_relabelled_versions: frozenset[str | None] = frozenset()
+            # Which file owns each sidecar destination, decided by rank rather
+            # than by the order the group happens to be listed in. Two members
+            # whose names differ only by extension -- a TIFF master beside its
+            # JPEG derivative, which the slot-collision rule above calls the
+            # commonest shape there is -- resolve to one ``<stem>.md``, and one
+            # of them has to yield. Rank is the same order that already chose
+            # which of the two the model saw, so the sidecar ends up belonging
+            # to the file that was actually analyzed, and a folder listed in a
+            # different order still produces the same result.
+            sidecar_owner: dict[str, str] = {}
+            if cfg.sidecar_md != utils.SIDECAR_MD_OFF:
+                ranked_group = sorted(group, key=_slot_rank_key)
+                for ranked_entry in ranked_group:
+                    sidecar_owner.setdefault(
+                        doc_sidecar.sidecar_path_for(ranked_entry["path"]),
+                        ranked_entry["path"],
+                    )
+                sidecar_group_files = tuple(
+                    os.path.basename(g["path"]) for g in ranked_group
+                )
+                sidecar_page_count = len(page_nums_all) if multipage_present else None
+                sidecar_relabelled_versions = frozenset(relabelled_versions)
+
             # emit per-file (merged with per-file metadata)
             for it, own_meta in zip(group, own_metadata):
                 # Read before the merge below, which is the last moment the two
@@ -2899,6 +3943,71 @@ def process_manifest_stream(
                     merged, part_marker, applied_markers - own_markers
                 )
                 merged["all_variant_files"] = canonical["all_variant_files"]
+
+                # Document-mode sidecar (contract sections 7-8): the gate is
+                # exactly the contract's, and a crop is excluded either way
+                # (D9) -- it is a supporting view of its parent and its
+                # sidecar would duplicate the parent's byte for byte.
+                # ``isinstance`` before the membership test, and not for tidiness:
+                # ``category`` is model-written, and a reply of ``["Document"]``
+                # is valid JSON that reaches here as an unhashable list, where
+                # ``in`` on a frozenset raises TypeError. This gate runs after
+                # the analysis is paid for and inside the per-group try, so that
+                # would fail the entire group over a sidecar it could simply
+                # have declined to write.
+                merged_category = merged.get("category")
+                if not it["is_crop"] and (
+                    cfg.sidecar_md == utils.SIDECAR_MD_ALL
+                    or (
+                        cfg.sidecar_md == utils.SIDECAR_MD_AUTO
+                        and isinstance(merged_category, str)
+                        and merged_category in utils.SIDECAR_AUTO_CATEGORIES
+                    )
+                ):
+                    # Invariant, borrowed from the payload rules above: a file
+                    # is never overwritten in silence. The owner was settled by
+                    # rank before this loop began; anyone else pointing at the
+                    # same destination says so and writes nothing.
+                    destination = doc_sidecar.sidecar_path_for(it["path"])
+                    # Two guards, because a collision has two shapes. Within a
+                    # group, rank settled the owner before this loop began.
+                    # Across groups there is no rank to appeal to -- under
+                    # ``--group-by none`` each file is its own group -- so the
+                    # first writer of a destination in this run keeps it.
+                    owner = sidecar_owner.get(destination, it["path"])
+                    contender = sidecar_written.get(destination)
+                    if owner != it["path"] or contender is not None:
+                        logger.warning(
+                            "Group '%s': %s and %s share one sidecar destination (%s); "
+                            "writing %s's and skipping %s's.",
+                            stem,
+                            os.path.basename(contender or owner),
+                            os.path.basename(it["path"]),
+                            os.path.basename(destination),
+                            os.path.basename(contender or owner),
+                            os.path.basename(it["path"]),
+                        )
+                    else:
+                        sidecar_written[destination] = it["path"]
+                        sidecar_context = doc_sidecar.SidecarContext(
+                            group_id=stem,
+                            part_label=resolve_part_label(
+                                it,
+                                multipage_present=multipage_present,
+                                relabelled_versions=sidecar_relabelled_versions,
+                            ),
+                            group_files=sidecar_group_files,
+                            page_count=sidecar_page_count,
+                            page_number=it["page_num"] if it["part_kind"] == "page" else None,
+                        )
+                        sidecar_path = doc_sidecar.write_markdown_sidecar(
+                            merged, it, sidecar_context, cfg
+                        )
+                        if sidecar_path:
+                            logger.info(
+                                "Markdown sidecar written for %s.", os.path.basename(it["path"])
+                            )
+
                 merged["_merge"] = report
                 patch, patch_meta = build_canonical_patch(merged, cfg)
 

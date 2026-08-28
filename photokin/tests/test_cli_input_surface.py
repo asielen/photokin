@@ -1398,12 +1398,13 @@ class TestThePlanPrecedesTheFirstModelCall(_CliTestCase):
                 "  output    : stdout",
                 "  changeset : none (--changeset false)",
                 "  write     : none",
+                "  sidecars  : none (--sidecar-md off)",
                 "  provider  : Claude",
                 f"  model     : {utils.resolve_claude_model('haiku')}",
                 # This run asked for nothing, so the block ends by naming the run
                 # that does something. The provider and model the caller typed are
                 # carried into it: a suggestion that dropped them would describe a
-                # different run from the seven rows above it.
+                # different run from the eight rows above it.
                 "  note      : this run only prints results - your photos are not read or",
                 "              changed. For the normal archival run:",
                 "                  "
@@ -1455,6 +1456,66 @@ class TestThePlanPrecedesTheFirstModelCall(_CliTestCase):
         # path opens its destination with a truncating "w".
         with open(out_path, "rb") as handle:
             self.assertEqual(handle.read(), b"PREVIOUS RUN CONTENT\n")
+
+
+class TestThePlanNamesWhatSidecarModeWillWrite(_CliTestCase):
+    """The plan's ``sidecars`` row states what ``--sidecar-md`` will create.
+
+    Before ``RunPlan`` gained a ``sidecars`` field, ``write`` spoke only for
+    what ExifTool puts inside a file it already owns, so a ``--sidecar-md
+    all`` run printed ``write: none`` immediately before creating one new
+    ``.md`` file per photo -- and ``--dry-run``, documented as the check for
+    what is about to be touched, could not preview it at all. The ``off`` row
+    is already pinned by :class:`TestThePlanPrecedesTheFirstModelCall`; these
+    cases cover ``all``, ``auto`` and the ``--dry-run`` preview.
+    """
+
+    def test_sidecar_md_all_is_named_in_the_plan(self) -> None:
+        folder = self.make_folder("box3_025.jpg")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli([folder, "--sidecar-md", "all"])
+
+        self.assertIsNone(code, stderr)
+        self.assertIn(
+            "  sidecars  : <image stem>.md beside every analyzed image except "
+            "crops (--sidecar-md all)",
+            stderr,
+        )
+
+    def test_sidecar_md_auto_is_named_in_the_plan(self) -> None:
+        folder = self.make_folder("box3_025.jpg")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli([folder, "--sidecar-md", "auto"])
+
+        self.assertIsNone(code, stderr)
+        self.assertIn(
+            "  sidecars  : <image stem>.md beside each image of a group the "
+            "model calls",
+            stderr,
+        )
+        self.assertIn("Document or Postcard (--sidecar-md auto)", stderr)
+
+    def test_dry_run_previews_the_sidecar_clause_before_anything_is_written(self) -> None:
+        folder = self.make_folder("box3_025.jpg")
+        stream = _StreamSpy()
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--sidecar-md", "all", "--dry-run"]
+            )
+
+        self.assertIsNone(code, stderr)
+        self.assertFalse(stream.called, "--dry-run reached the model")
+        self.assertIn(
+            "  sidecars  : <image stem>.md beside every analyzed image except "
+            "crops (--sidecar-md all)",
+            stderr,
+        )
+        self.assertIn(
+            "  --dry-run : stopping here; no model call, and nothing written.", stderr
+        )
 
 
 class TestThePlanAdvisesTheNormalRun(_CliTestCase):

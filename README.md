@@ -448,7 +448,7 @@ That third case is the reason any of this is labelled. Merging happens **per sec
 
 **"Near enough" means punctuation, spacing, quoting and capitalisation.** A trailing full stop, a curly apostrophe against a straight one, an em dash for a hyphen, a stray inner comma — those are one caption typed twice, and the second is dropped. **Anything that changes a word is kept**, including changes that look tiny: `bakery, 1948` against `bakery, 1949` is a different caption, and so is `Ruth and Sam` against `Ruth and Edith`. If you reword a caption and want the old one gone, delete it yourself; photokin will not guess that a rewrite was meant to replace rather than accompany, because guessing wrong there loses something you cannot get back.
 
-For the curious, the deciding comparison is on the words: two captions with the same word sequence are one caption however they are punctuated. A `difflib` similarity ratio of 0.998 sits behind that as a second gate, for a difference too small to be a word — a stray character in a long block. It is set that high on purpose. Measured against real caption pairs, no ratio can separate cosmetic from material on its own: a changed *year* inside a 300-character analysis scores 0.9967, while a changed *quote mark* in a short caption scores 0.9091, so any threshold loose enough to catch the second would throw away the first. 0.998 clears every material difference measured, which is what makes it structurally unable to be the thing that loses your correction.
+For the curious, the deciding comparison is on the words, and it runs in two steps. First, and always: the two captions are reduced to their word sequences (punctuation, casing and spacing folded away), and if those sequences differ at all — a changed year, a changed name — the new caption is kept, full stop, however small the change looks against a long block. No ratio is consulted at that point, because a ratio applied there could only ever discard a genuine correction: a one-character change in a long block and a one-word change in a short one can score nearly identically, so nothing built from a ratio alone can tell "1948" from "1949" apart from a re-typed quotation mark. Only when the word sequences already match exactly does a `difflib` similarity ratio act as a second, looser gate — set at 0.85 — for how heavily the *punctuation* was rewritten: curly quotes, semicolons swapped for commas, or added parentheses stay above it and are treated as the same caption, while a genuine punctuation dump (dashes standing in for every space, an appended ASCII divider line) falls below it and is kept as a real difference.
 
 ### No second model call
 
@@ -463,6 +463,24 @@ Under `-rw`, the block photokin writes into a file is exactly what the next run 
 Two things make that true. Labelled lines are recognised as photokin's own output and taken as they are, never labelled a second time. And this run's own transcription is judged by the same "near enough" rule as any other caption (see above): when the model reads the same text the same way again — the ordinary case for genuine transcription — the line it returns matches the one already in the block and is dropped rather than added a second time.
 
 That is a deliberate change from an earlier release, which glued the model's separate interpretation onto the end of this same block under an `[AI Analysis]:` marker and unconditionally regenerated it on every run, discarding whatever had been there before. That marker never belonged in Description in the first place — it was the model's own reading of the *scene*, not of the object's *text*, and it is now written only to `EXIF:UserComment`, where it belongs. Un-discarding it also removed the free idempotency that regeneration gave it: this run's transcription is caption content now, so if the model's own reading of the object genuinely changes between runs, the new line is kept beside the old one rather than silently replacing it — the same "never guess that a rewrite means replace" principle that governs every other caption edit. A caption an older release already wrote is not left contaminated: the stale `[AI Analysis]` tail is recognised and stripped the next time the file is read, rather than being kept as if it were a caption section.
+
+## A readable transcript beside each scan
+
+The caption block above already holds the group's whole transcription, byte for byte, but it's living inside `XMP-dc:Description` — readable with a metadata viewer, not by opening the file. `--sidecar-md` writes that same transcription out as its own file too: one `.md` per analyzed image, next to it, with YAML frontmatter carrying that file's own metadata (its group, its part, its page number, title, category, keywords, date, location, and which model produced it) and a body holding that page's own markdown transcription — the same struck-out, underlined, margin-noted text that lands in the caption, just readable on its own.
+
+One flag, three values:
+
+- `off` (the default) — nothing new is written.
+- `all` — a sidecar for every emitted file, any category, except crops.
+- `auto` — the same writer, but only for a group whose category comes back `Document` or `Postcard`.
+
+For one scan, `all` is the whole command:
+
+```bash
+photokin letter.jpg --sidecar-md all
+```
+
+That writes `letter.md` beside `letter.jpg`. The frontmatter's exact shape, what `auto` does and doesn't trigger on, and what a large, chunked document's sidecars look like are covered under [Markdown transcript sidecars](#markdown-transcript-sidecars) in Advanced usage.
 
 ## API keys
 
@@ -568,6 +586,63 @@ Replaying *with* `-r` is what reproduces the original result exactly, because th
 
 Items may have existing `metadata` (face tags, existing captions and comments) that can be forwarded to the model as context. Additionally, you can supply `photo_context_text` as free-text additional context to a single photo or a folder. Such as "these photos are all part of a wedding album." The model treats it as truth for the whole batch. Both make a real difference on hard photos.
 
+### Markdown transcript sidecars
+
+`--sidecar-md {off,auto,all}` (default `off`) writes `<stem>.md` beside each analyzed image — the same path derivation `--output-sidecars` uses for `<stem>.json`, and the same failure contract: a destination that can't be written logs a warning naming the file and does not take the analysis it describes down with it. The analysis is already paid for by the time the sidecar is written.
+
+`auto` gates on the group's own `category` result, not on a second model question — the run already paid for the answer. Only `Document` and `Postcard` trigger it: the two categories that are mostly text. `Photo Page` — an album page carrying several mounted photos, typed captions and all — deliberately does not trigger it: it stays photo-like even with text on it, the way a Portrait with a handwritten note on the back gets no sidecar under `auto` either. `all` ignores category outright and writes for every emitted file.
+
+Crops never get a sidecar, under either mode. A crop is a supporting view of its parent, never its own object — it isn't analyzed on its own account, and its sidecar would only duplicate the parent's byte for byte.
+
+Frontmatter carries the same values the changeset would write for that file, plus the structural facts that place it in its group: group id, part label, page number, page count, and every filename in the group. A worked example, page 2 of a six-page letter:
+
+```yaml
+---
+source_file: "box3_017-page2.jpg"
+group: "box3_017"
+part: "Page 2"
+page: 2
+page_count: 6
+group_files: ["box3_017-page1.jpg", "box3_017-page2.jpg", "box3_017-page3.jpg", "box3_017-page4.jpg", "box3_017-page5.jpg", "box3_017-page6.jpg"]
+title: "Letter from Ruth, November 1944"
+category: "Document"
+keywords: ["Document", "Ruth", "Le Mans", "1944"]
+date: "1944-11-27"
+date_pattern: "Y!M!D!"
+date_confidence: 0.95
+location: {country: "France", city: "Le Mans", confidence: 0.9}
+analyzed_by: "Claude claude-sonnet-4-6 (2026-08-27)"
+---
+
+# Letter from Ruth, November 1944
+
+[AI Analysis]: A handwritten letter, three pages, in a woman's hand...
+
+## Transcription — Page 2
+
+Dear Mother,
+
+We arrived in Le Mans yesterday, tired but glad to be off the train at last.
+```
+
+Every key is written only when there's something to say — a file with no location guess writes no `location` key, rather than an empty one. When a chunked document's consolidation pass (see below) corrects a page number, `page` carries the corrected value and the filename's own number is kept alongside as `page_from_filename`, so a reader can see both what the filename said and what the model concluded.
+
+**When there is nothing to attribute to this file specifically** — the response carried no `transcriptions` map at all (an older release, or a model that simply didn't return one; `caption` alone is still a valid, complete response), or this file's part was displaced or unseated and never rode the payload under any label — the body falls back to the whole group's caption block under a bare `## Transcription` heading, and the frontmatter adds `transcription_scope: group`: honest that what follows is the group's transcription, not necessarily this page's alone.
+
+A sidecar is derived output, the same as the JSON one `--output-sidecars` writes: a re-run overwrites it outright rather than merging with what's already there, unlike the caption block written into the image itself, which is merged section by section (see [Captions](#captions)).
+
+### Large documents: `--max-images-per-call`
+
+One model call ordinarily carries a whole group — every page, front, back and negative of one physical object — with no upper bound: a 63-page memoir would be one call holding 63 images. `--max-images-per-call N` (default `8`) caps that: a group whose page images exceed it is split into several calls instead of one, on contiguous, part-aware boundaries — never mid-page. Pages are packed into blocks of at most `N` images each; a single page's own variant rescans never straddle a block; and a front, a back and a negative always ride together in the first call, never separated across chunks. Each block is one model call carrying the usual prompt bundle plus a short note on which pages of how many it's seeing and that the object continues beyond the payload.
+
+After the last chunk call, one further call reconciles them: **text-only, no images**, reading every part's transcription plus each chunk's provisional keywords/title/category/date/location guesses, and returning the group's one final answer for each of those fields, plus a verdict on page order. It does not re-transcribe anything — the per-chunk transcriptions are the evidence, and a text-only pass rewriting them would be exactly the kind of "improvement" the transcription rules exist to forbid.
+
+A group at or under the cap is entirely unaffected — its call sequence is byte-identical to today's single-call behavior. `--max-images-per-call 0` disables chunking outright, at any size.
+
+The cost is worth stating plainly, because it's easy to assume chunking is free: the total number of images sent is exactly the same either way. What chunking adds is the repeated prompt bundle on every chunk call, plus the tokens the consolidation call itself spends. What it buys: per-page attention that doesn't thin out as a document gets longer, payloads that stay under every provider's request-size ceiling, and — when something does go wrong — a failure that names which chunk failed (call 7 of 9) instead of one opaque failure over a single 63-image request.
+
+The consolidation pass's page-order verdict is **recorded, never acted on**. When it concludes the pages read out of filename order, photokin writes the corrected page number into the record and into the sidecar's `page` field, and logs a warning naming the group. It does not rename, reorder, or renumber any file — that stays a decision for a person, made with a tool that knows what else depends on the filename, such as a Lightroom catalog.
+
 ## All flags
 
 ### Input modes
@@ -628,10 +703,18 @@ type instead of detecting it; passing a positional *and* an alias is an error.
 | `--output-file PATH`       | `.ndjson` streams one record per finished photo; `.json` writes one aggregate object atomically. Works for every input type; without it, results go to stdout |
 | `--pretty-json {true,false}` | Indent the stdout result document (and an aggregate `.json` `--output-file`) for human reading (default `true`). Pass `false` for compact single-line output, e.g. when a script parses stdout itself rather than reading it with a JSON library |
 | `--output-sidecars`        | Also write a per-photo sidecar JSON next to each image (default off) |
+| `--sidecar-md {off,auto,all}` | Also write a per-part Markdown transcript sidecar next to each image. `off`: nothing (default). `all`: every emitted file except crops. `auto`: only for a group whose category is `Document` or `Postcard` |
+| `--max-images-per-call N`  | Cap on images sent in one model call. A group whose payload exceeds it is split into contiguous chunks (a front/back pair is never split across chunks) plus one text-only consolidation call that merges the chunks' metadata and corrects page order; a group at or under it is unaffected (default 8, `0` disables chunking) |
 | `--generate-manifest PATH` | Write the manifest folder or single-photo input would be grouped into, then exit without calling the model (not valid with manifest input) |
 | `--batch-id ID`            | Identifier added to each record on the `.ndjson` streaming path, and used to name debug-dump files. It does not appear in the aggregate `.json` or on stdout |
 | `--changeset {true,false}` | Emit a changeset NDJSON of proposed file writes, for every input type (default `false`) |
 | `--dry-run`                | Print the plan summary and stop, before the first model call. Nothing is analyzed and no destination is touched. Beside `--generate-manifest`, reports the grouping it would write and leaves the file alone |
+
+`sidecar-xmp` and `sidecar-json` are **reserved** spellings in this same
+family (not yet flags photokin accepts) — XMP for standard metadata sidecars
+when they arrive, JSON for the day `--output-sidecars` is folded in as an
+alias of `sidecar-json all` — the way `-R` is reserved below, and must not be
+spent on anything else.
 
 ### ExifTool read and write-back
 

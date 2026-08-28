@@ -68,6 +68,14 @@ Metadata, PHOTO_CONTEXT, and face tags must NEVER change or "improve" a
 verbatim transcription. The caption field records what is physically
 written on the object — nothing more.
 
+The transcription conventions in instructions_front_back.txt are part of
+that record rather than an interpretation of it. A ~~strikethrough~~, an
+_underline_, a blockquoted margin note, a footnote, a bracketed uncertainty
+marker: each reports something that is physically on the page, as faithfully
+as the words do, so all of them belong in the caption. Joining the wrapped
+lines of a paragraph is likewise a statement about layout, not about wording
+— no word is ever changed, added, or dropped.
+
 For `ai_caption`:
 1. Visible visual content
 2. Visible written text on the item

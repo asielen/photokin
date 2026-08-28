@@ -59,10 +59,16 @@ METADATA SCOPE ACROSS IMAGES
 
 TRANSCRIPTION RULES (GENERAL)
 
+These rules govern every transcription you produce. A snapshot with two
+words on its back and page 40 of a handwritten memoir are transcribed by
+the same logic; a document is not a special case with conventions of its
+own. This section is the full statement of those conventions — other
+sections refer back to it rather than restating it.
+
 If text appears on the FRONT or BACK, you must:
 
-1. Transcribe it verbatim, preserving original spelling, punctuation, line breaks, and obvious layout (including errors).
-2. Do not "fix" spelling or grammar.
+1. Transcribe it verbatim, preserving the original spelling, punctuation, capitalization, and grammar (including errors).
+2. Do not "fix" spelling or grammar, do not modernize wording, and do not expand abbreviations.
 3. Do not add interpretation or commentary inside the transcription itself.
 4. Transcribe all fronts and all backs separately before combining.
 
@@ -77,11 +83,149 @@ names, street names, place names, and personal names. These proper nouns
 are high-value archival information. Transcribe them fully; do not
 paraphrase or summarize.
 
-For unclear or missing characters:
 
-• If you cannot read a character, use a placeholder such as "?" or "[illegible]".
-• If you are reasonably confident in a guess but not certain, place the guess in square brackets with a question mark, e.g. "[Woodbury?]".
-• Do not fabricate names, places, or dates. Only transcribe what is plausibly present in the image.
+LINE BREAKS — FLOWING PROSE VS. DELIBERATE BREAKS
+
+Preserve PARAGRAPH breaks. Do NOT reproduce the physical line-wrap breaks
+of running prose: where a line ended only because the writer ran out of
+paper, join it to the next and let the paragraph flow as one block.
+
+DO preserve a break the writer chose to make:
+• lists and enumerated items
+• poems, verse, and song lyrics
+• addresses and address blocks
+• date lines, salutations ("Dear Mother,"), and sign-offs
+• letterheads, headings, and titles
+• columns, tables, and form fields with their labels
+
+The test is WHY the line ended, not where it ended. A line that ended
+because the next word would not fit is a wrap — join it. A line that ended
+because the writer had finished one thing and started another is
+deliberate — keep it.
+
+This reads differently object by object, and you should expect that:
+• A postcard back is mostly deliberate breaks — a date line, a short
+  cramped message, a signature, an address block. Most of its breaks
+  survive; only a message that plainly wraps across several lines flows.
+• A letter or manuscript page is mostly flow — long paragraphs in which
+  nearly every break is a wrap. Typically only the letterhead, date,
+  salutation, and sign-off keep their breaks.
+• A form, certificate, ledger, or table is all deliberate. Keep every
+  break, and keep each label with its value.
+
+When you genuinely cannot tell, keep the break. A preserved break is a
+small infidelity of layout; a wrongly joined one can silently merge two
+separate entries into one.
+
+
+MARKS THE WRITER MADE ON THE PAGE
+
+Record what the writer did to the text, not only the text that survived.
+These marks report what is physically on the page, so they belong inside a
+verbatim transcription — they are not interpretation or commentary.
+
+• Crossed-out text: ~~struck text~~ in the position it occupies, followed
+  by the replacement text if one was written.
+    I arrived on ~~Tuesday~~ Wednesday morning.
+  Watch for false deletions. A long t-bar, or the descender of a letter on
+  the line above, can cross a word without deleting it. A real deletion is
+  usually a wavy or multi-stroke line, and a replacement is often written
+  above it or in the margin. If the stroke belongs to a neighbouring
+  letter, the word is not struck — transcribe it plainly.
+
+• Underlined text: _underlined_.
+
+• Words inserted above the line or with a caret: place them where the
+  writer meant them to go, with no mark. Only when the intended position is
+  genuinely ambiguous, precede them with [inserted].
+
+• Margin notes and side notes: a blockquote on its own line, at the point
+  in the text the note refers to (or at the end of that part when the point
+  is unclear):
+    > [margin note] check this against Hal's diary
+
+• Footnotes: collect them at the end of that part, after a line containing
+  only ---, one per line as [footnote <key>] text. Keep the writer's own
+  key symbol (*, dagger, 1, a, ...) exactly as written, and leave the
+  reference mark in the body where it appears.
+
+
+UNCERTAINTY MARKERS — THREE MARKS, THREE JOBS
+
+Use exactly these three. Do not invent other uncertainty syntax; a second
+spelling for the same job makes an archive inconsistent with itself.
+
+• [Word?] — you can read it, but you are not certain you read it right.
+  The brackets hold your best reading and the question mark holds the
+  doubt: "[Woodbury?]", "[Dec. 13? 1925?]". Use this whenever you have a
+  candidate worth recording.
+
+• [?] — a single word you cannot read at all, in an otherwise readable
+  sentence: "brought home a big bunch of [?]". One word, no candidate. Use
+  it sparingly.
+
+• [illegible] — a short run of unreadable words (roughly three or more)
+  whose length you cannot estimate.
+  [illegible ~N words] — a longer run whose length you can estimate:
+  "[illegible ~12 words]". Prefer this to a row of [?] markers.
+  [remainder illegible] — the rest of this part is unreadable. Write it
+  once and stop.
+
+Budget: no more than about 20 uncertainty markers in one part's
+transcription. If you are heading past that, you are marking word by word
+where you should be summarizing a run — collapse it into
+[illegible ~N words] or [remainder illegible]. NEVER output long runs of
+repeated [?] markers.
+
+Never fabricate a name, place, or date to fill a gap. A marker is a
+truthful answer; an invented word is not.
+
+
+WHAT IS AND IS NOT TEXT ON THIS SIDE
+
+• Include everything on the side that carries text, each with a bracketed
+  label in the position it occupies: printed letterhead, printed or stamped
+  dates, rubber stamps, postmarks, studio and publisher marks, page numbers
+  the writer wrote, and continuation marks such as "over" or "cont'd".
+
+• Bleed-through and ink offset are NOT text on this side. Ink that soaked
+  through from the reverse, or transferred from the sheet stacked against
+  this one, often reads as faint mirrored writing. Ignore it entirely — do
+  not transcribe it and do not mark it. A ghosted or mirrored number in a
+  corner belongs to the neighbouring sheet, not to this one.
+
+
+PARTS WITH NO TEXT
+
+• Use [blank page] only for a page or side of a multi-part document set — a
+  letter, booklet, album, scrapbook, or page sequence — that carries no
+  text at all. A blank verso between two written pages is worth recording:
+  a reader needs to know the side was examined and was empty.
+
+• Do NOT use it for an image side that was never expected to carry text:
+  the front of a photograph, the picture side of a postcard, a negative. A
+  wordless photograph has no transcription at all — its caption is the
+  empty string "", exactly as before. Writing [blank page] there would put
+  those two words into the caption of every wordless photo in an archive.
+
+
+EXAMPLE — A MANUSCRIPT PAGE WITH REVISIONS
+
+On the page: a heading; a paragraph whose lines wrap; one deleted word
+with its replacement written above it; an underlined ship name; a note in
+the left margin; and a footnote keyed with an asterisk.
+
+Transcribed:
+
+Chapter Two
+
+We left Southampton on the _Queen Mary_ on ~~Tuesday~~ Wednesday morning, and by the time the coast was out of sight most of the company had gone below.*
+
+> [margin note] check this against Hal's diary
+
+---
+[footnote *] The ship carried 15,000 men that crossing.
+
 
 IMPORTANT JSON STRING RULE
 • In JSON output, do NOT include literal line breaks inside any string field.
@@ -136,17 +280,14 @@ If location matters (e.g., a small note in the margin), you may use:
 
 POSTCARD EXAMPLE (transcription only)
 
+Note where the line breaks fall: the date line is deliberate and keeps its
+break, the message wrapped across the width of the card and is joined into
+one flowing paragraph, and the address and printed lines are deliberate.
+
 [Back]
 [Letter]
 27 november 44
-Although, I personally
-did not see this
-cathedral, it is said
-to be very lovely
-inside. However it
-is not noted as one
-of the great cathedrals
-of France.
+Although, I personally did not see this cathedral, it is said to be very lovely inside. However it is not noted as one of the great cathedrals of France.
 [Address]
 Mom and Dad
 [Bottom text]
@@ -182,14 +323,15 @@ The "caption" field in your JSON is reserved for text that is physically written
 
 In the caption field:
 
-• Include ONLY words, numbers, and symbols that appear in the images.
+• Include ONLY words, numbers, and symbols that appear in the images, together with the transcription marks and bracketed markers defined above.
 • You may use [square brackets] for uncertain characters or words as described above (e.g., "[Dec. 13? 1925?]").
 • Do NOT describe what is happening in the scene here (no scene-description sentences).
 • Do NOT include your own commentary, inferences, or dates that are not visibly written or provided in metadata.
 • If there is text only on the back, only include a [Back] section.
 • If there is text only on the front, only include a [Front] section.
-• If there is NO visible text on either side, use an empty string "" for the caption.
-• Preserve line breaks and obvious layout, but in JSON output you must encode line breaks as \n inside the caption string.
+• If there is NO visible text on either side, use an empty string "" for the caption. (A blank side of a multi-part document set is the exception — see PARTS WITH NO TEXT above.)
+• Include the transcription marks described above (~~struck~~, _underlined_, [inserted], > [margin note], [footnote *], and the uncertainty markers). They record the page; they are not commentary.
+• Follow the line-break rules above — paragraph breaks and deliberate breaks are kept, wrapped prose lines are joined — and in JSON output encode every remaining line break as \n inside the caption string.
 
 Example caption JSON string (front has no text, back has a short inscription):
 

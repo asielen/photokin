@@ -951,6 +951,10 @@ class RunPlan:
         output: The rendered destination clause, or ``"stdout"``.
         changeset: The rendered changeset path, or a ``none (...)`` clause.
         write: The rendered write set, or a ``none (...)`` clause.
+        sidecars: The rendered markdown-sidecar clause, or a ``none (...)``
+            clause. Stated on every run because a sidecar is a file created
+            beside the user's images, and ``write`` speaks only for what
+            ExifTool puts inside them.
         provider: The provider's display name.
         model: The concrete model string the adapter will send.
         dry_run: Whether the run stops after printing this.
@@ -972,6 +976,7 @@ class RunPlan:
     provider: str
     model: str
     dry_run: bool
+    sidecars: str = "none (--sidecar-md off)"
     suggested_command: str | None = None
 
     def as_dict(self) -> dict:
@@ -992,7 +997,7 @@ class RunPlan:
         """Return the whole summary block as one multi-line string.
 
         Returns:
-            Seven rows, plus one under ``--dry-run`` and three more lines when a
+            Eight rows, plus one under ``--dry-run`` and three more lines when a
             command is being advised, emitted as a single log record so nothing
             can be interleaved into the middle of it.
         """
@@ -1007,6 +1012,13 @@ class RunPlan:
             ("output", self.output),
             ("changeset", self.changeset),
             ("write", self.write),
+            # Beside ``write`` because it is one: a sidecar is a file this run
+            # creates next to the user's images. ``write`` names only what
+            # ExifTool puts inside them, so without this row a --sidecar-md all
+            # run could print "write: none" immediately before writing a
+            # markdown file for every photo, and --dry-run -- which exists to
+            # answer "what is about to be touched" -- could not preview it.
+            ("sidecars", self.sidecars),
             ("provider", self.provider),
             ("model", self.model),
         ]
