@@ -337,6 +337,43 @@ Writes go to **every** file in the group at all three settings — the granulari
 >
 > Files that are recorded but not sent are exactly three kinds: a crop that yielded its parent's slot, the loser of two files claiming the same slot (the extension pair above), and a file displaced out of a slot something more specific already held. All three are named in a warning, listed in the record — crops under `all_variant_files.crops`, the other two under `all_variant_files.displaced` — and counted in the same closing number, so the summary can never read as clean while a warning says otherwise.
 
+### Rename mode: `--rename`
+
+`--rename PREFIX` cleans up and renumbers a folder's files under a prefix you choose, keeping every variant tag the naming grammar above already understands and closing the gaps in the numbering. It reads the folder's current order, the same `(name.lower(), name)` order every other mode uses:
+
+```
+file102.tif          ->  newname-001.tif
+file105.tif          ->  newname-002.tif
+file105b.tif          ->  newname-002b.tif
+file105b-back.tif     ->  newname-002b-back.tif
+```
+
+That is the whole feature: "clean up and rename the files in this folder using this prefix." A `-` always separates the prefix from the number, so `parse_media_filename` reads a renamed file back exactly the way it read the original.
+
+**Preview, then `-w`, exactly like the normal run.** `photokin ./scans --rename "newname"` alone plans the rename, prints the preview, and touches nothing — the same "check it's wired up" shape as a bare analysis run. Nothing is renamed until you add `-w`:
+
+```
+photokin ./scans --rename "newname"                       preview, touches nothing
+photokin ./scans --rename "newname" -w                     record the plan and apply it
+```
+
+The prefix can be a template, not just a literal string — `{date}`, `{today}`, `{folder}` and `{orig}` tokens, each with an optional `:FORMAT` on the two date ones:
+
+```
+photokin ./scans --rename "{date:yymmdd}-bag" -w          520601-bag-001.tif; numbering restarts per date
+photokin ./scans --rename "{today:yymmdd}-bag" -w         batch date (the run date) instead of each photo's own
+photokin ./scans --rename "newname{date:yyyy-mm-dd}" -w   newname1952-06-01-001.tif
+photokin ./scans --rename "{orig}" -w                      keep the current prefix, just renumber and clean up
+```
+
+A prefix that renders differently per file (any template using `{date}`) starts its numbering over at 1 for each distinct rendered value, so a folder spanning several scanning sessions gets one clean sequence per session rather than one long one. Companions sharing an image's stem (`.md`, `.json`, `.xmp`, `.txt`, plus a `.jpg` twin of a `.tif`) are carried along automatically; `--companions EXT[,EXT]` adds more extensions to that set.
+
+**Undo.** Every apply writes a journal beside the renamed files before it renames anything, so `photokin ./scans --rename-undo` reverses the most recent applied run in that folder — or pass a journal path directly for an older one. An interrupted run resumes forward with `--rename-resume` instead of undoing; both read the journal back rather than re-planning.
+
+**Photokin renames files on disk only with `-w`.** A folder tracked by a catalog application (Lightroom and the like) must be renamed through that application, not through photokin directly — photokin cannot tell such a folder apart from an ordinary one on its own, so every `--rename` preview says so. When a manifest was exported *by* that application (it carries `managed_by`), `-w` becomes a usage error rather than a guess: photokin plans the rename and, with `--plan-out PATH`, writes it out for the application to apply.
+
+See [`docs/rename-mode.md`](docs/rename-mode.md) for the full specification and [`docs/rename-contract.md`](docs/rename-contract.md) for the manifest, plan and changeset shapes a wrapper reads.
+
 ## Reading and writing your files
 
 ExifTool handles both directions: with `-r`, photokin reads `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` straight out of the files before analysis, so a note, a caption, a title, a date or a keyword already living in an image rides along to the model as context (hydration). After analysis, `-w` writes approved changeset fields back into the files or their sidecars (apply).
@@ -739,6 +776,23 @@ spent on anything else.
 | `--exiftool-path PATH`          | ExifTool binary to use (default: auto-detect) |
 
 `-r` is the read half and `-w` the write half; the short letters are deliberately symmetrical, and they combine as `-rw` (or `-wr`) exactly like any other pair of short flags — that combined form is the one to reach for, for the reason given above. `-R` is **reserved** for the recursive-folder flag that is still deferred (it changes grouping semantics across directories and interacts with write safety, so it gets its own change), and must not be spent on anything else.
+
+### Rename mode
+
+See [Rename mode: --rename](#rename-mode---rename) above for what it does. `--rename` is a mode flag: like `--generate-manifest`, it stops the run before any model call, and it takes a folder or manifest input — not a single photo.
+
+| Flag                    | What it does |
+|--------------------------|---|
+| `--rename PREFIX`       | Plan a grammar-aware mass rename of the input folder or manifest's files under `PREFIX`; print the preview and stop. `-w` applies it. `--exiftool-write` and `--output-file` are refused beside it — rename mode writes no tags, and `--plan-out` is its own destination |
+| `--digits N`            | Zero-padded number width (default 3) |
+| `--order {name,natural}` | Fallback ordering when no item carries an explicit manifest `order` (default `name`). `natural` compares digit runs numerically, so `file9` precedes `file10` |
+| `--undated LITERAL`     | Stand in for `{date}` in a group with no date, instead of refusing to plan it; those groups form their own numbering bucket |
+| `--today YYYY-MM-DD`    | Override `{today}` (default: the run's own date), so a batch scanned earlier can carry its own date and a plan stays reproducible |
+| `--companions EXT[,EXT]` | Extra non-image extensions carried along with a renamed image, beyond the default `.md`, `.json`, `.xmp`, `.txt` |
+| `--plan-out PATH`       | Write the plan as JSON to `PATH` (see [`docs/rename-contract.md`](docs/rename-contract.md)), instead of — or beside — the preview table |
+| `--rename-undo [JOURNAL]` | Reverse the latest applied rename in the positional folder, or the named journal file |
+| `--rename-resume [JOURNAL]` | Finish an interrupted rename run in the positional folder, or the named journal file, forward |
+| `--rename-finish PLAN`  | Rename only the companions of a `--rename` plan whose images a catalog application has already renamed |
 
 ### Debug
 

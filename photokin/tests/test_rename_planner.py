@@ -1,0 +1,544 @@
+"""Tests for the rename-mode planner, ``photokin.rename.plan_rename``.
+
+Pure-function tests only: every case here constructs an in-memory listing
+and reads the returned plan dict back -- nothing touches a filesystem. The
+worked examples in ``docs/rename-mode.md`` sections 1, 4.5 and 4.7 are
+reproduced verbatim (as data, not paraphrased), because those are the
+plan's own binding examples; everything else exercises one rule at a time,
+per section 9's enumeration.
+"""
+
+import os
+import unittest
+from datetime import date
+
+from photokin.rename import (
+    DEFAULT_COMPANION_EXTENSIONS,
+    RenameItem,
+    _MissingDate,
+    _PhotoDate,
+    _render_date_format,
+    _render_template,
+    _tokenize_prefix_template,
+    plan_rename,
+)
+
+_FOLDER = "/scans"
+
+
+def _path(name: str) -> str:
+    return os.path.normpath(f"{_FOLDER}/{name}")
+
+
+def _plan(
+    names,
+    prefix,
+    *,
+    digits=3,
+    disk_files=None,
+    dates=None,
+    orders=None,
+    is_backs=None,
+    versions=None,
+    **kwargs,
+):
+    """Build a :func:`plan_rename` call from a bare list of filenames.
+
+    ``dates``/``orders``/``is_backs``/``versions``, when given, are dicts
+    keyed by filename overriding that one item's field; everything else
+    defaults to "nothing known".
+    """
+    dates = dates or {}
+    orders = orders or {}
+    is_backs = is_backs or {}
+    versions = versions or {}
+    items = []
+    for name in names:
+        metadata = None
+        if name in dates:
+            metadata = {"EXIF:DateTimeOriginal": dates[name]}
+        items.append(
+            RenameItem(
+                path=_path(name),
+                metadata=metadata,
+                order=orders.get(name),
+                is_back=is_backs.get(name),
+                version=versions.get(name),
+            )
+        )
+    files = disk_files if disk_files is not None else [_path(name) for name in names]
+    return plan_rename(
+        folder=_FOLDER,
+        disk_files=files,
+        items=items,
+        prefix_template=prefix,
+        digits=digits,
+        run_id="test-run",
+        **kwargs,
+    )
+
+
+def _entry_for(plan, name):
+    (entry,) = [e for e in plan["entries"] if e["path"] == _path(name)]
+    return entry
+
+
+class BriefExampleTests(unittest.TestCase):
+    """Section 1's example, verbatim."""
+
+    def test_brief_example(self) -> None:
+        plan = _plan(
+            ["file102.tif", "file105.tif", "file105b.tif", "file105b-back.tif"],
+            "newname",
+        )
+        self.assertEqual(plan["errors"], [])
+        self.assertEqual(_entry_for(plan, "file102.tif")["target"], "newname-001.tif")
+        self.assertEqual(_entry_for(plan, "file105.tif")["target"], "newname-002.tif")
+        self.assertEqual(_entry_for(plan, "file105b.tif")["target"], "newname-002b.tif")
+        self.assertEqual(
+            _entry_for(plan, "file105b-back.tif")["target"], "newname-002b-back.tif"
+        )
+
+
+class NumberingRestartTests(unittest.TestCase):
+    """Section 4.5's example: interleaved dates restart their buckets independently."""
+
+    def test_interleaved_dates_restart_independently(self) -> None:
+        plan = _plan(
+            ["scan_001.tif", "scan_002.tif", "scan_002-back.tif", "scan_003.tif", "scan_004.tif"],
+            "{date:yymmdd}-bag-woodbury",
+            dates={
+                "scan_001.tif": "1952:06:01 00:00:00",
+                "scan_002.tif": "1952:06:01 00:00:00",
+                "scan_003.tif": "1961:09:14 00:00:00",
+                "scan_004.tif": "1952:06:01 00:00:00",
+            },
+        )
+        self.assertEqual(plan["errors"], [])
+        self.assertEqual(
+            _entry_for(plan, "scan_001.tif")["target"], "520601-bag-woodbury-001.tif"
+        )
+        self.assertEqual(
+            _entry_for(plan, "scan_002.tif")["target"], "520601-bag-woodbury-002.tif"
+        )
+        self.assertEqual(
+            _entry_for(plan, "scan_002-back.tif")["target"],
+            "520601-bag-woodbury-002-back.tif",
+        )
+        self.assertEqual(
+            _entry_for(plan, "scan_003.tif")["target"], "610914-bag-woodbury-001.tif"
+        )
+        self.assertEqual(
+            _entry_for(plan, "scan_004.tif")["target"], "520601-bag-woodbury-003.tif"
+        )
+
+
+class FullerWorkedExampleTests(unittest.TestCase):
+    """Section 4.7's example, verbatim, including the companion."""
+
+    def test_fuller_worked_example(self) -> None:
+        names = [
+            "box3_017-b.tif",
+            "box3_017.jpg",
+            "box3_017.tif",
+            "box3_017_back.tif",
+            "box3_017b-back-crop.tif",
+            "box3_020-page1.tif",
+            "box3_020-page2.tif",
+            "reunion.tif",
+        ]
+        disk_files = [_path(n) for n in names] + [_path("reunion.md")]
+        plan = _plan(names, "bw", disk_files=disk_files)
+
+        self.assertEqual(plan["errors"], [])
+        self.assertEqual(_entry_for(plan, "box3_017-b.tif")["target"], "bw-001b.tif")
+        self.assertEqual(
+            _entry_for(plan, "box3_017-b.tif")["notes"], ["variant form normalized"]
+        )
+        self.assertEqual(_entry_for(plan, "box3_017.jpg")["target"], "bw-001.jpg")
+        self.assertEqual(_entry_for(plan, "box3_017.tif")["target"], "bw-001.tif")
+        # The .tif/.jpg pair shares one target stem.
+        self.assertEqual(
+            _entry_for(plan, "box3_017.jpg")["target_stem"],
+            _entry_for(plan, "box3_017.tif")["target_stem"],
+        )
+        self.assertEqual(_entry_for(plan, "box3_017_back.tif")["target"], "bw-001-back.tif")
+        self.assertEqual(
+            _entry_for(plan, "box3_017_back.tif")["notes"], ["part separator normalized"]
+        )
+        self.assertEqual(
+            _entry_for(plan, "box3_017b-back-crop.tif")["target"], "bw-001b-back-crop.tif"
+        )
+        self.assertEqual(
+            _entry_for(plan, "box3_020-page1.tif")["target"], "bw-002-page1.tif"
+        )
+        self.assertEqual(
+            _entry_for(plan, "box3_020-page2.tif")["target"], "bw-002-page2.tif"
+        )
+        self.assertEqual(_entry_for(plan, "reunion.tif")["target"], "bw-003.tif")
+
+        reunion_entry = _entry_for(plan, "reunion.tif")
+        self.assertEqual(len(reunion_entry["companions"]), 1)
+        self.assertEqual(reunion_entry["companions"][0]["target"], "bw-003.md")
+        self.assertEqual(reunion_entry["companions"][0]["path"], _path("reunion.md"))
+
+
+class OrderTests(unittest.TestCase):
+    def test_unnumbered_file_takes_its_alphabetical_place(self) -> None:
+        plan = _plan(["apple.tif", "banana5.tif"], "x")
+        self.assertEqual(_entry_for(plan, "apple.tif")["target"], "x-001.tif")
+        self.assertEqual(_entry_for(plan, "banana5.tif")["target"], "x-002.tif")
+        self.assertEqual(plan["order"], "name")
+
+    def test_explicit_order_overrides_name_order(self) -> None:
+        # Alphabetically "alpha" precedes "zeta", but an explicit order reverses them.
+        plan = _plan(
+            ["alpha.tif", "zeta.tif"],
+            "x",
+            orders={"alpha.tif": 2, "zeta.tif": 1},
+        )
+        self.assertEqual(plan["order"], "manifest")
+        self.assertEqual(_entry_for(plan, "zeta.tif")["target"], "x-001.tif")
+        self.assertEqual(_entry_for(plan, "alpha.tif")["target"], "x-002.tif")
+
+    def test_natural_order_compares_digit_runs_numerically(self) -> None:
+        plan = _plan(["file9.tif", "file10.tif"], "x", order_mode="natural")
+        self.assertEqual(plan["order"], "natural")
+        self.assertEqual(_entry_for(plan, "file9.tif")["target"], "x-001.tif")
+        self.assertEqual(_entry_for(plan, "file10.tif")["target"], "x-002.tif")
+
+
+class NormalizationTests(unittest.TestCase):
+    """Each normalization alone (section 9)."""
+
+    def test_dashed_variant_normalized(self) -> None:
+        plan = _plan(["box3_017-b.tif"], "x")
+        entry = _entry_for(plan, "box3_017-b.tif")
+        self.assertEqual(entry["target"], "x-001b.tif")
+        self.assertEqual(entry["notes"], ["variant form normalized"])
+
+    def test_underscore_before_back_normalized(self) -> None:
+        plan = _plan(["box3_017_back.tif"], "x")
+        entry = _entry_for(plan, "box3_017_back.tif")
+        self.assertEqual(entry["target"], "x-001-back.tif")
+        self.assertEqual(entry["notes"], ["part separator normalized"])
+
+    def test_dot_before_back_normalized(self) -> None:
+        plan = _plan(["box3_017.back.tif"], "x")
+        entry = _entry_for(plan, "box3_017.back.tif")
+        self.assertEqual(entry["target"], "x-001-back.tif")
+        self.assertEqual(entry["notes"], ["part separator normalized"])
+
+    def test_page_suffix_retained_without_a_note(self) -> None:
+        plan = _plan(["box3_020-page3.tif"], "x")
+        entry = _entry_for(plan, "box3_020-page3.tif")
+        self.assertEqual(entry["target"], "x-001-page3.tif")
+        self.assertEqual(entry["notes"], [])
+
+    def test_negative_underscore_normalized(self) -> None:
+        plan = _plan(["box3_017_negative.tif"], "x")
+        entry = _entry_for(plan, "box3_017_negative.tif")
+        self.assertEqual(entry["target"], "x-001-negative.tif")
+        self.assertEqual(entry["notes"], ["part separator normalized"])
+
+    def test_crop_stacks_with_normalized_part(self) -> None:
+        plan = _plan(["box3_017_back_crop.tif"], "x")
+        entry = _entry_for(plan, "box3_017_back_crop.tif")
+        self.assertEqual(entry["target"], "x-001-back-crop.tif")
+        self.assertEqual(entry["notes"], ["part separator normalized"])
+
+
+class PairAndCompanionTests(unittest.TestCase):
+    def test_tif_jpg_pair_shares_target_stem(self) -> None:
+        plan = _plan(["photo.tif", "photo.jpg"], "x")
+        tif_entry = _entry_for(plan, "photo.tif")
+        jpg_entry = _entry_for(plan, "photo.jpg")
+        self.assertEqual(tif_entry["target_stem"], jpg_entry["target_stem"])
+        self.assertEqual(tif_entry["target"], "x-001.tif")
+        self.assertEqual(jpg_entry["target"], "x-001.jpg")
+
+    def test_companions_listed_and_unlisted_extension_left_behind(self) -> None:
+        disk_files = [_path("photo.tif"), _path("photo.md"), _path("photo.pdf")]
+        plan = _plan(["photo.tif"], "x", disk_files=disk_files)
+        entry = _entry_for(plan, "photo.tif")
+        self.assertEqual(len(entry["companions"]), 1)
+        self.assertEqual(entry["companions"][0]["path"], _path("photo.md"))
+        self.assertEqual(entry["companions"][0]["target"], "x-001.md")
+        self.assertEqual(
+            plan["left_behind"], [{"path": _path("photo.pdf"), "reason": "extension outside companion set"}]
+        )
+        self.assertTrue(
+            any("left behind" in w for w in plan["warnings"]),
+            plan["warnings"],
+        )
+
+    def test_default_companion_extensions(self) -> None:
+        self.assertEqual(DEFAULT_COMPANION_EXTENSIONS, frozenset({".md", ".json", ".xmp", ".txt"}))
+
+
+class OverrideTests(unittest.TestCase):
+    def test_is_back_true_materializes_back_suffix(self) -> None:
+        plan = _plan(["photo1.tif"], "x", is_backs={"photo1.tif": True})
+        entry = _entry_for(plan, "photo1.tif")
+        self.assertEqual(entry["target"], "x-001-back.tif")
+        self.assertEqual(entry["part"], "back")
+
+    def test_is_back_false_promotes_back_to_front(self) -> None:
+        plan = _plan(["photo2-back.tif"], "x", is_backs={"photo2-back.tif": False})
+        entry = _entry_for(plan, "photo2-back.tif")
+        self.assertEqual(entry["target"], "x-001-front.tif")
+        self.assertEqual(entry["part"], "front")
+
+    def test_version_override_materializes_variant_letter(self) -> None:
+        plan = _plan(["photo3.tif"], "x", versions={"photo3.tif": "c"})
+        entry = _entry_for(plan, "photo3.tif")
+        self.assertEqual(entry["target"], "x-001c.tif")
+        self.assertEqual(entry["variant"], "c")
+
+    def test_version_override_does_not_trigger_normalization_note(self) -> None:
+        # box3_017-b.tif's dashed variant would normally earn a note; an
+        # explicit override replaces it outright, so the note (which is
+        # about the ORIGINAL filename's spelling) does not apply.
+        plan = _plan(["box3_017-b.tif"], "x", versions={"box3_017-b.tif": "q"})
+        entry = _entry_for(plan, "box3_017-b.tif")
+        self.assertEqual(entry["variant"], "q")
+        self.assertNotIn("variant form normalized", entry["notes"])
+
+
+class ValidationErrorTests(unittest.TestCase):
+    def test_bystander_collision(self) -> None:
+        disk_files = [_path("photoA.tif"), _path("x-001.tif")]
+        plan = _plan(["photoA.tif"], "x", disk_files=disk_files)
+        self.assertTrue(
+            any("bystander" in e for e in plan["errors"]), plan["errors"]
+        )
+
+    def test_duplicate_targets_differing_only_in_case(self) -> None:
+        plan = _plan(["foo.TIF", "foo.tif"], "x")
+        self.assertTrue(
+            any("duplicate target" in e for e in plan["errors"]), plan["errors"]
+        )
+
+    def test_digit_overflow(self) -> None:
+        names = [f"item{i}.tif" for i in range(10)]
+        plan = _plan(names, "x", digits=1)
+        self.assertTrue(
+            any("digit" in e or "needs more than" in e for e in plan["errors"]),
+            plan["errors"],
+        )
+
+    def test_missing_date_without_undated_is_an_error(self) -> None:
+        plan = _plan(["nodateshot.tif"], "{date}")
+        self.assertTrue(any("date" in e for e in plan["errors"]), plan["errors"])
+        entry = _entry_for(plan, "nodateshot.tif")
+        self.assertIsNone(entry["target"])
+
+    def test_missing_date_with_undated_literal_succeeds(self) -> None:
+        plan = _plan(["nodateshot.tif"], "{date}", undated_literal="undated")
+        self.assertEqual(plan["errors"], [])
+        entry = _entry_for(plan, "nodateshot.tif")
+        self.assertEqual(entry["target"], "undated-001.tif")
+
+    def test_empty_rendered_prefix_is_an_error(self) -> None:
+        plan = _plan(["105.tif"], "{orig}")
+        self.assertTrue(
+            any("empty" in e for e in plan["errors"]), plan["errors"]
+        )
+
+    def test_illegal_template_character_is_an_error(self) -> None:
+        plan = _plan(["photo.tif"], "bad/prefix")
+        self.assertTrue(plan["errors"])
+        self.assertEqual(plan["entries"], [])
+
+
+class IdempotencyTests(unittest.TestCase):
+    def test_replanning_already_clean_names_changes_nothing(self) -> None:
+        first = _plan(
+            ["box3_017-b.tif", "box3_017_back.tif", "reunion.tif"], "bw"
+        )
+        self.assertEqual(first["errors"], [])
+        clean_names = [e["target"] for e in first["entries"]]
+
+        second = _plan(clean_names, "bw")
+        self.assertEqual(second["errors"], [])
+        self.assertEqual(second["warnings"], [])
+        for entry in second["entries"]:
+            self.assertFalse(entry["changed"], entry)
+
+
+class RoundTripThroughPlannerTests(unittest.TestCase):
+    """The parse/render round trip, exercised through the planner itself
+    (not just utils' own functions, which test_rename_grammar.py already
+    covers combinatorially)."""
+
+    def test_planned_targets_parse_back_to_the_same_tail(self) -> None:
+        from photokin.utils import parse_media_filename
+
+        names = [
+            "a.tif",
+            "b-c.tif",
+            "d_back.tif",
+            "e-page4.tif",
+            "f-g-back-crop.tif",
+        ]
+        plan = _plan(names, "prefix")
+        self.assertEqual(plan["errors"], [])
+        for entry in plan["entries"]:
+            round_tripped = parse_media_filename(entry["target"])
+            self.assertEqual(round_tripped.variant_id, entry["variant"])
+            expected_part = entry["part"] or "none"
+            self.assertEqual(round_tripped.part_kind, expected_part)
+            self.assertEqual(round_tripped.page_num, entry["page"])
+            self.assertEqual(round_tripped.is_crop, entry["crop"])
+
+
+class TemplateFormatTokenTests(unittest.TestCase):
+    """Each FORMAT token, section 4.4 and section 9's template test list."""
+
+    def setUp(self) -> None:
+        self.photo_date = _PhotoDate(1952, 6, 1, partial=False)
+
+    def test_yyyy(self) -> None:
+        self.assertEqual(_render_date_format("yyyy", self.photo_date), "1952")
+
+    def test_yy(self) -> None:
+        self.assertEqual(_render_date_format("yy", self.photo_date), "52")
+
+    def test_mmmm(self) -> None:
+        self.assertEqual(_render_date_format("mmmm", self.photo_date), "June")
+
+    def test_mmm(self) -> None:
+        self.assertEqual(_render_date_format("mmm", self.photo_date), "Jun")
+
+    def test_mm(self) -> None:
+        self.assertEqual(_render_date_format("mm", self.photo_date), "06")
+
+    def test_dd(self) -> None:
+        self.assertEqual(_render_date_format("dd", self.photo_date), "01")
+
+    def test_default_format(self) -> None:
+        self.assertEqual(_render_date_format("yyyy-mm-dd", self.photo_date), "1952-06-01")
+
+    def test_upper_and_lower_case_spellings_render_identically(self) -> None:
+        lower = _render_date_format("yymmdd", self.photo_date)
+        upper = _render_date_format("YYMMDD", self.photo_date)
+        mixed = _render_date_format("YyMmDd", self.photo_date)
+        self.assertEqual(lower, "520601")
+        self.assertEqual(lower, upper)
+        self.assertEqual(lower, mixed)
+
+    def test_mm_always_means_month_not_minutes(self) -> None:
+        # The whole reason this grammar exists: "mm" is never minutes.
+        self.assertEqual(_render_date_format("mm", self.photo_date), "06")
+
+    def test_percent_passthrough_to_strftime(self) -> None:
+        self.assertEqual(_render_date_format("%j", self.photo_date), "153")
+
+    def test_partial_date_renders_00_for_missing_parts(self) -> None:
+        partial = _PhotoDate(1952, None, None, partial=True)
+        self.assertEqual(_render_date_format("yyyy-mm-dd", partial), "1952-00-00")
+
+    def test_partial_date_year_and_month_only(self) -> None:
+        partial = _PhotoDate(1952, 6, None, partial=True)
+        self.assertEqual(_render_date_format("yyyy-mm-dd", partial), "1952-06-00")
+
+
+class TemplatePipelineTests(unittest.TestCase):
+    """Whole-template behavior via :func:`plan_rename`."""
+
+    def test_partial_date_flagged_in_the_preview(self) -> None:
+        plan = _plan(["shot.tif"], "{date}", dates={"shot.tif": "1952"})
+        entry = _entry_for(plan, "shot.tif")
+        self.assertEqual(entry["target"], "1952-00-00-001.tif")
+        self.assertIn("partial date", entry["notes"])
+
+    def test_today_token_uses_the_real_date_by_default(self) -> None:
+        plan = _plan(["shot.tif"], "{today:yyyy-mm-dd}")
+        expected = date.today().strftime("%Y-%m-%d")  # noqa: DTZ011 (matches the planner's own local-date default)
+        entry = _entry_for(plan, "shot.tif")
+        self.assertEqual(entry["target"], f"{expected}-001.tif")
+
+    def test_today_token_honors_override(self) -> None:
+        plan = _plan(["shot.tif"], "{today:yyyy-mm-dd}", today=date(2020, 1, 15))
+        entry = _entry_for(plan, "shot.tif")
+        self.assertEqual(entry["target"], "2020-01-15-001.tif")
+
+    def test_separator_always_present_even_with_a_digit_prefix(self) -> None:
+        plan = _plan(
+            ["shot.tif"], "newname{date:yyyy-mm-dd}", dates={"shot.tif": "1952:06:01"}
+        )
+        entry = _entry_for(plan, "shot.tif")
+        self.assertEqual(entry["target"], "newname1952-06-01-001.tif")
+
+    def test_trailing_dash_trimmed_not_doubled(self) -> None:
+        with_dash = _plan(
+            ["shot.tif"], "{date:yymmdd}-bag-", dates={"shot.tif": "1952:06:01"}
+        )
+        without_dash = _plan(
+            ["shot.tif"], "{date:yymmdd}-bag", dates={"shot.tif": "1952:06:01"}
+        )
+        self.assertEqual(
+            _entry_for(with_dash, "shot.tif")["target"],
+            _entry_for(without_dash, "shot.tif")["target"],
+        )
+        self.assertTrue(any("trimmed" in w for w in with_dash["warnings"]), with_dash["warnings"])
+
+    def test_orig_on_already_numbered_name_strips_number(self) -> None:
+        plan = _plan(["newname-001.tif"], "{orig}")
+        entry = _entry_for(plan, "newname-001.tif")
+        self.assertEqual(entry["target"], "newname-001.tif")
+        self.assertFalse(entry["changed"])
+
+    def test_orig_keeps_the_prefix_renumbers_and_cleans_up(self) -> None:
+        plan = _plan(["file105.tif", "file205.tif"], "{orig}")
+        self.assertEqual(_entry_for(plan, "file105.tif")["target"], "file-001.tif")
+        self.assertEqual(_entry_for(plan, "file205.tif")["target"], "file-002.tif")
+
+
+class TokenizerTests(unittest.TestCase):
+    def test_double_brace_is_a_literal_brace(self) -> None:
+        pieces = _tokenize_prefix_template("a{{b")
+        self.assertEqual(pieces, ["a{b"])
+
+    def test_unknown_token_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            _tokenize_prefix_template("{bogus}")
+
+    def test_format_on_folder_token_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            _tokenize_prefix_template("{folder:x}")
+
+    def test_unterminated_brace_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            _tokenize_prefix_template("prefix{date")
+
+
+class RenderTemplateTests(unittest.TestCase):
+    def test_missing_date_without_undated_raises(self) -> None:
+        pieces = _tokenize_prefix_template("{date}")
+        with self.assertRaises(_MissingDate):
+            _render_template(
+                pieces,
+                photo_date=None,
+                today=_PhotoDate(2020, 1, 1, partial=False),
+                folder_name="scans",
+                orig="orig",
+                undated_literal=None,
+            )
+
+    def test_undated_literal_stands_in_for_date(self) -> None:
+        pieces = _tokenize_prefix_template("{date}-bag")
+        rendered, used_partial = _render_template(
+            pieces,
+            photo_date=None,
+            today=_PhotoDate(2020, 1, 1, partial=False),
+            folder_name="scans",
+            orig="orig",
+            undated_literal="undated",
+        )
+        self.assertEqual(rendered, "undated-bag")
+        self.assertFalse(used_partial)
+
+
+if __name__ == "__main__":
+    unittest.main()

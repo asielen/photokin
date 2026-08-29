@@ -25,7 +25,8 @@ Code map (by section):
 - Image helpers       TIFF→JPEG conversion, data-URL encoding, archival upload
 - Prompt assembly     build_prompt_bundle + photo-context resolution
 - JSON parsing        model-output cleanup and the retry-parser (_ParseLogger)
-- Filename parsing    parse_media_filename: base id / part kind / variant / page
+- Filename parsing    parse_media_filename: base id / part kind / variant / page;
+                      canonicalize_stem / render_media_filename: the grammar's inverse
 - Folder listing      list_folder_images: the image files a folder run reads
 - Manifest helpers    load_manifest (shape validation)
 - Metadata merge      small helpers shared by the merge step
@@ -38,7 +39,8 @@ from __future__ import annotations
 # flatten_known_keywords, warn_forbiddenish_keywords, note_looks_placeholder,
 # insert_keyword_into_vocab_file, safe_backup, resolve_default_paths,
 # build_data_url_and_size, archival_upload, build_prompt_bundle, parse_with_retry,
-# parse_media_filename, list_folder_images, load_manifest,
+# parse_media_filename, canonicalize_stem, render_media_filename,
+# list_folder_images, load_manifest,
 # load_item_metadata, combine_group_metadata, part_markers_in, apply_part_keyword,
 # union_keywords,
 # merge_original_sources, dedupe_captions_with_source, extract_usage.
@@ -1460,6 +1462,118 @@ def parse_media_filename(path: str) -> ParsedName:
         page_num=page_num,
         is_crop=is_crop,
     )
+
+
+def canonicalize_stem(stem: str) -> tuple[str, list[str]]:
+    """Normalize part/crop separators in *stem* before parsing.
+
+    A lenient pre-pass for :func:`parse_media_filename`, applied right to
+    left the same way that parser reads a stem: the ``-crop`` suffix first,
+    then the part suffix beneath it. Any of ``[_. ]`` immediately in front of
+    ``crop``, ``back``, ``front``, ``negative`` or ``pageN`` is rewritten to
+    ``-``, the only separator :func:`parse_media_filename` reads there --
+    ``_EXPLICIT_BACK_SUFFIX_RE`` in ``core.py`` is the existing precedent for
+    accepting those three separators. A separator that is already ``-`` is
+    left alone, so an already-canonical stem comes back with no note.
+
+    This function does not touch the trailing variant letter. The grammar
+    reads only a dashed variant (``-b``) or a digit-adjacent one (``5b``,
+    see :func:`parse_media_filename`'s ``m_var``); a bare ``_b`` or ``.b`` is
+    not part of the grammar, and widening it is out of scope, so both regexes
+    below require the full word (``back``, not ``b``) and never match one.
+
+    Args:
+        stem: A filename stem (no extension), as read from disk.
+
+    Returns:
+        A tuple of the canonical stem and a list of human-readable notes for
+        the rename preview -- currently at most one, ``"part separator
+        normalized"``, present whenever any separator above was rewritten.
+    """
+
+    def _rewrite_before(text: str, word_pattern: str) -> tuple[str, bool]:
+        match = re.search(rf"(?P<sep>[_. ]){word_pattern}$", text, flags=re.IGNORECASE)
+        if match is None:
+            return text, False
+        idx = match.start("sep")
+        return f"{text[:idx]}-{text[idx + 1:]}", True
+
+    working, crop_changed = _rewrite_before(stem, "crop")
+
+    if working.lower().endswith("-crop"):
+        head, crop_tail = working[: -len("-crop")], working[-len("-crop") :]
+    else:
+        head, crop_tail = working, ""
+
+    part_changed = False
+    for word in ("negative", "back", "front"):
+        head, part_changed = _rewrite_before(head, word)
+        if part_changed:
+            break
+    else:
+        head, part_changed = _rewrite_before(head, r"page\d+")
+
+    canonical = head + crop_tail
+    notes = ["part separator normalized"] if crop_changed or part_changed else []
+    return canonical, notes
+
+
+def render_media_filename(
+    prefix: str, number: int, digits: int, parsed: ParsedName, ext: str
+) -> str:
+    """Render a filename from a rendered prefix and a parsed tail.
+
+    The inverse of :func:`parse_media_filename`: for any *parsed* value,
+    running the result back through :func:`parse_media_filename` reads out
+    the same ``variant_id``, ``part_kind``, ``page_num`` and ``is_crop``
+    (``base_id`` is expected to differ -- it becomes ``prefix-{number}``,
+    not whatever *parsed* was originally built from). The variant letter is
+    always written directly after the digits, never behind a ``-``: that is
+    the digit-adjacent alternative of the parser's variant regex, so a
+    dashed original (``-b``) always comes back digit-adjacent (``b``) after
+    a rename, which is the "variant form normalized" case the planner
+    reports -- see ``interface_notes`` on how to detect it, since this
+    function does not.
+
+    Args:
+        prefix: The rendered prefix, e.g. ``"520601-bag-woodbury"``. A
+            trailing ``-`` is trimmed here as well as by the caller, so this
+            function never doubles the separator it adds.
+        number: The 1-based position within the prefix's numbering bucket.
+        digits: Zero-padded width for *number*.
+        parsed: The tail to carry over -- everything but ``base_id``.
+        ext: The extension, including the leading ``.``.
+
+    Returns:
+        The rendered filename, e.g. ``"520601-bag-woodbury-002b-back.tif"``.
+
+    Raises:
+        ValueError: If *prefix* is empty once its trailing ``-`` is trimmed,
+            or *parsed* claims ``part_kind == "page"`` without a
+            ``page_num`` to render.
+    """
+    prefix = prefix.rstrip("-")
+    if not prefix:
+        raise ValueError("rendered prefix is empty after trimming trailing '-'")
+
+    variant = parsed.variant_id or ""
+
+    if parsed.part_kind == "front":
+        part = "-front"
+    elif parsed.part_kind == "back":
+        part = "-back"
+    elif parsed.part_kind == "negative":
+        part = "-negative"
+    elif parsed.part_kind == "page":
+        if parsed.page_num is None:
+            raise ValueError("part_kind is 'page' but page_num is None")
+        part = f"-page{parsed.page_num}"
+    else:
+        part = ""
+
+    crop = "-crop" if parsed.is_crop else ""
+
+    return f"{prefix}-{number:0{digits}d}{variant}{part}{crop}{ext}"
 
 # === Folder listing ===
 def _is_image_file(path: str) -> bool:

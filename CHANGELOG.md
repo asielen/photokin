@@ -3,6 +3,42 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0]
+
+### Added
+
+- **Rename mode: `--rename PREFIX`.** A grammar-aware mass rename of a
+  folder or manifest's files: it keeps every variant tag the naming
+  grammar already understands (`-b`/`5b`, `-front`/`-back`/`-negative`,
+  `-pageN`, `-crop`), closes the gaps in the numbering, and follows the
+  folder's current order.
+  ```
+  file102.tif          ->  newname-001.tif
+  file105.tif          ->  newname-002.tif
+  file105b.tif          ->  newname-002b.tif
+  file105b-back.tif     ->  newname-002b-back.tif
+  ```
+  `--rename` alone previews; **photokin renames files on disk only with
+  `-w`.** The prefix can be a template — `{date}`, `{today}`, `{folder}`,
+  `{orig}` — so `--rename "{date:yymmdd}-bag" -w` restarts the numbering
+  per date and `--rename "{orig}" -w` just renumbers and cleans up in
+  place. Every apply is journalled before it touches a file, two-phase
+  through hidden temporary names so a gap-closing renumber never
+  collides, and reversible: `--rename-undo` reverses the latest applied
+  run in a folder, `--rename-resume` finishes one an interruption left
+  half-done. `--rename-finish` is the one on-disk operation a catalog
+  wrapper needs from photokin: it renames only the companions and
+  rewrites sidecars for images the catalog application has already
+  renamed itself. **A folder tracked by a catalog application (Lightroom
+  and the like) must be renamed through that application, not through
+  photokin directly** — photokin cannot tell such a folder apart from an
+  ordinary one on its own, so every `--rename` preview says so, and a
+  manifest a catalog application exported (`managed_by`) makes `-w` a
+  usage error rather than a guess. See "Rename mode: `--rename`" in
+  README.md, `docs/rename-mode.md` for the full specification, and
+  `docs/rename-contract.md` for the plan and changeset shapes a wrapper
+  reads.
+
 ## [0.5.0]
 
 ### Changed
