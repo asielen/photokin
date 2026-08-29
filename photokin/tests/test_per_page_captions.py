@@ -97,10 +97,11 @@ class TestCaptionBlockAssemblyIsNotWastedOnAMultipageGroup(_CaptionBlockTestCase
     Pinned by behavior, per the task: ``core._assemble_caption_block`` is
     wrapped with a counting mock, and the call count is asserted directly
     rather than timed. For a multipage group whose files are individually
-    attributed, the only calls are one per attributed file (building that
-    file's own block) plus exactly one for the group's fallback intake, which
-    is computed once regardless of whether any file ends up using it. A group
-    block built and thrown away would add exactly one more call than that.
+    attributed, the only calls are one per attributed file, building that
+    file's own block. Nothing else is assembled: not the group-wide block a
+    document never reads, and not a fallback block no file in this group
+    needs. Either would fold the whole transcript to produce something no
+    branch reads, on precisely the documents this change exists to scale.
     """
 
     def _count_assemble_calls(self, captions: dict[str, str], **kwargs) -> int:
@@ -127,9 +128,9 @@ class TestCaptionBlockAssemblyIsNotWastedOnAMultipageGroup(_CaptionBlockTestCase
         call_count = self._count_assemble_calls(group, transcriptions=pages)
         self.assertEqual(
             call_count,
-            len(group) + 1,
-            "expected one call per attributed file plus one for the fallback "
-            "intake, and no extra call for a group-wide block nothing consumes",
+            len(group),
+            "expected one call per attributed file and nothing else -- an extra "
+            "call means a group-wide or fallback block was folded and discarded",
         )
 
     def test_a_non_multipage_group_still_builds_exactly_one_group_block(self) -> None:

@@ -2908,6 +2908,25 @@ def resolve_part_label(
     part_key = _manifest_part_key(entry)
     if part_key == "none" and multipage_present and entry["version"] in relabelled_versions:
         part_key = "page:1"
+    return part_label_for_slot(part_key)
+
+
+def part_label_for_slot(part_key: str) -> str:
+    """Return the payload part label a slot key travels under.
+
+    Split out of :func:`resolve_part_label` because attribution sometimes has
+    to start from a slot rather than from an entry: a path a manifest listed
+    twice under contradicting roles keeps only one of its addresses, and the
+    label that matters is the retained one, not the one the losing entry would
+    resolve to on its own.
+
+    Args:
+        part_key: A slot key as produced by :func:`_manifest_part_key`, or
+            ``"page:N"`` after the page-1 relabel.
+
+    Returns:
+        ``"Front"``, ``"Back"``, ``"Negative"`` or ``"Page N"``.
+    """
     if part_key.startswith("page:"):
         return f"Page {part_key.split(':', 1)[1]}"
     return {"front": "Front", "back": "Back", "negative": "Negative", "none": "Front"}[part_key]
@@ -3958,13 +3977,6 @@ def process_manifest_stream(
                 # so it is the question worth asking.
                 attributed: list[str] = []
                 for entry in group:
-                    part_label = resolve_part_label(
-                        entry,
-                        multipage_present=True,
-                        relabelled_versions=relabelled_versions_frozen,
-                    )
-                    part_value = group_transcriptions.get(part_label)
-                    part_text = part_value.strip() if isinstance(part_value, str) else ""
                     # Attribution follows the SLOT this file contends for, not
                     # whether this particular path was the one sent. The two
                     # differ for every file that yields its slot to a better
@@ -3984,6 +3996,23 @@ def process_manifest_stream(
                     slot_key = _manifest_part_key(entry)
                     if slot_key == "none" and entry["version"] in relabelled_versions_frozen:
                         slot_key = "page:1"
+                    # ``carried_as`` first, because a manifest may list one path
+                    # twice under contradicting roles -- once as its filename's
+                    # page, once flagged a back. Only one of those addresses
+                    # survives arbitration, and the losing ENTRY still reaches
+                    # this loop; resolving it through its own discarded slot
+                    # finds no winner, falls back, and then overwrites the
+                    # correctly attributed record for that same path, because
+                    # both entries emit under one key. The path travelled under
+                    # exactly one label, so that is the one to attribute it by.
+                    slot_key = carried_as.get(entry["path"], slot_key)
+                    # The label comes from the RETAINED slot too, not from the
+                    # entry: taking the slot's winner while keeping the losing
+                    # entry's label would look up a transcription belonging to
+                    # the address that was discarded.
+                    part_label = part_label_for_slot(slot_key)
+                    part_value = group_transcriptions.get(part_label)
+                    part_text = part_value.strip() if isinstance(part_value, str) else ""
                     slot_winner = variant_parts.get(entry["version"], {}).get(slot_key)
                     attributed.append(
                         part_text if slot_winner in analyzed_paths else ""
@@ -4017,8 +4046,15 @@ def process_manifest_stream(
                     )
                     if not part_text
                 ]
-                fallback_block = _assemble_caption_block(
-                    fallback_intake, fresh_group_caption
+                # Only when something actually falls back. With every file
+                # attributed -- the ordinary case for a document the model
+                # answered in full -- this would otherwise fold the whole
+                # transcript into a block no branch reads, once per group, on
+                # top of the per-file blocks already built.
+                fallback_block = (
+                    _assemble_caption_block(fallback_intake, fresh_group_caption)
+                    if any(not part_text for part_text in attributed)
+                    else None
                 )
 
                 for entry, entry_meta, part_text in zip(group, own_metadata, attributed):
@@ -4203,6 +4239,15 @@ def process_manifest_stream(
                 # record would be noise.
                 if file_caption:
                     record_for_item["caption"] = file_caption
+                # Cleared before it is conditionally set, because the record
+                # this was deep-copied from is the MODEL's, and nothing filters
+                # a reply down to the keys the schema names. A reply that
+                # happened to carry a "caption_scope" of its own would ride
+                # through to an ordinary photo's record, where the documented
+                # contract says the key does not appear at all -- and an
+                # embedder is told to read exactly this key to tell the two
+                # caption regimes apart. Only a value derived here is true.
+                record_for_item.pop("caption_scope", None)
                 if caption_scope:
                     record_for_item["caption_scope"] = caption_scope
 

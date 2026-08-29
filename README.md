@@ -832,7 +832,7 @@ Two destinations are deliberately exempt. `--dry-run` never opens the envelope �
 
 One safety property carries over unchanged: a **pre-existing** `--output-file` is left completely untouched by a refusal. The envelope opens immediately only for a destination that does not exist yet; for one that does, it opens only once every check has passed and the run is committing to overwrite it anyway — at that point it gets the same `start`/`plan` records a fresh destination got immediately.
 
-Every record — envelope and per-file alike — carries `schema_version` (currently `2`) and, when `--batch-id` was given, `batch_id`. `schema_version` bumps whenever a record's shape changes in a way a consumer could care about; see `--capabilities` below for a caller that wants to check compatibility rather than discover it the hard way, the way `photokin/README.md`'s `## Providers` section describes an older mismatch doing.
+Every record — envelope and per-file alike — carries `schema_version` (currently `3`) and, when `--batch-id` was given, `batch_id`. `schema_version` bumps whenever a record's shape changes in a way a consumer could care about; see `--capabilities` below for a caller that wants to check compatibility rather than discover it the hard way, the way `photokin/README.md`'s `## Providers` section describes an older mismatch doing.
 
 Per-file error payloads also carry two optional fields beyond the `type`/`message` documented under [When calls fail](#when-calls-fail): `provider_message` (the provider's own error text, extracted from the SDK's structured response rather than read off a Python exception's `str()`, which for these SDKs is often the whole body rendered as a dict repr) and `retry_after` (seconds, when the provider's response included one — reliably available for OpenAI and Anthropic, not for Gemini).
 
@@ -869,8 +869,8 @@ Prints this build's contract as JSON and exits, before any input is required —
 ```json
 {
   "version": "0.3.0",
-  "ndjson_schema_version": 2,
-  "changeset_schema_version": 1,
+  "ndjson_schema_version": 3,
+  "changeset_schema_version": 2,
   "canonical_tags": {
     "ai_caption": "EXIF:UserComment",
     "caption": "XMP-dc:Description",
