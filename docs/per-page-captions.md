@@ -6,7 +6,7 @@ length limit that currently makes a long document unwritable.
 
 **Target:** 0.4.0 to 0.5.0 · **Branch:** master · **Scope:** 2 parts, shippable
 separately · **Breaking changes:** 1 (the caption a multipage group writes), with
-a schema bump and a migration that is honest about what it cannot do
+a schema bump; archives already processed keep the caption they already hold
 
 The two in one sentence each. **Part B** (ship first): ExifTool receives tag
 values inline on the command line, so a transcription over roughly 20 pages
@@ -73,7 +73,7 @@ memory of it. Line numbers are that tree's.
 | E9 | **When this file's part is not in the map — no `transcriptions` at all, a displaced or unseated file, or a partial map — the file keeps the group block, and the record says so via `caption_scope: "group"`.** | Inventing an attribution nothing supports is the one thing this codebase consistently refuses to do. Falling back to the group block preserves today's behavior exactly, and the disclosure key mirrors the sidecar's own `transcription_scope` (`doc_sidecar.py:205-218`) so an embedder can tell the two regimes apart rather than guessing from length. Logged once per group at INFO, naming the group. |
 | E10 | **`transcriptions` keeps riding every file whole. Do not trim it.** | `doc_sidecar.py:205` reads this file's entry out of the whole map, and `docs/document-mode-contract.md:40-45` freezes it. Trimming it to one entry per file is the obvious "while we're here" optimization and it would break the sidecar. Stated here so nobody does it. |
 | E11 | **Bump `_NDJSON_SCHEMA_VERSION`, and bump `changeset.SCHEMA_VERSION` while writing the bump criterion it never had.** | `cli.py:101-108` states the rule in its own words: changing what an existing key *means* requires a bump even when its shape is unchanged. `caption` goes from "the group's whole transcription, on every file" to "this file's part". `changeset.py` carries no such criterion anywhere — the plan writes one mirroring `cli.py`'s rather than making a silent judgment call. |
-| E12 | **Already-processed archives are not silently left broken, and not over-promised either.** An automatic lever clears the stored block when it is recognizably this run's own output; everything else keeps the old caption and the README says so plainly, with the ExifTool one-liner to clear it. | See §4 R2. The fat block is a *stable fixed point*, not a slow-converging one — measured over five runs. Pretending a re-run fixes it would be the worst outcome. |
+| E12 | **No migration. An archive already processed under 0.4.0 keeps the group block it already holds, on every file, permanently.** The change applies to what is written from here on. One sentence in the README and the CHANGELOG says so; nothing in the code goes looking for old captions. | Maintainer decision 2026-08-28. The alternative was a lever that could only ever fire when the model re-transcribed a page identically — and 0.4.0's own prose-flow change makes rewording likely on exactly the first re-run after upgrading, so it would have been machinery that mostly did not fire, in the most dangerous function in the codebase. The consequence is accepted and worth stating: a folder re-run after upgrading holds thin captions on newly analyzed documents and fat ones on old, and photokin will not reconcile them. Clearing `XMP-dc:Description` is the user's own act if they want it. |
 
 ## 3. Sequence
 
@@ -148,46 +148,32 @@ document.
 
 ## 4. Risks
 
-**R1 — the migration lever that looks obvious is unsafe, and was measured to be.**
-Teaching `_CAPTION_LABEL_RE` (`core.py:269`) to match `[Page N]` would make a
-stored fat block splittable into per-page sections, which is exactly what a
-migration wants. It also turns a letterhead repeated across two pages into a
-cross-section duplicate, and the section-scoped line dedup then deletes the
-second one. This is not hypothetical: the existing regression test fails with
+**R1 — the label change that looks obvious is unsafe, and was measured to be.**
+E8 chose no label for a per-page caption, and the natural objection is "why not
+just `[Page N]`?" Because that requires teaching `_CAPTION_LABEL_RE`
+(`core.py:269`) to match it, and doing so turns a letterhead repeated across two
+pages into a cross-section duplicate, after which the section-scoped line dedup
+deletes the second one. This is not hypothetical: the existing regression test fails with
 `1 != 2 : the letterhead ... was deduplicated down to one occurrence, losing
 real text`. That test exists because this was a shipped bug three weeks ago.
 **Do not touch the regex.** `docs/document-mode-contract.md:113-116` states it
 as a contract clause; this plan reaffirms it rather than superseding it.
 
-**R2 — an already-processed archive cannot be repaired by re-running, and this
-is the plan's least satisfying part.** Measured over five successive runs: a
-multipage archive processed under 0.4.0 holds the fat group block in every
-file's Description, and under the per-file rule that block is a **stable fixed
-point**. It re-reads as one section (because `[Page N]` is not a label), and
-this file's own fresh page text is then dropped by the section-scoped dedup as a
-repeat of text already in section 0. The output is the fat block, unchanged,
-forever.
+**R2 — an already-processed archive keeps its fat caption, permanently.** Not a
+risk to be mitigated; a consequence accepted under E12, recorded here so the
+behavior is not mistaken for a bug later. Measured over five successive runs: a
+multipage archive processed under 0.4.0 holds the group block in every file's
+Description, and under the per-file rule that block is a **stable fixed point**.
+It re-reads as one section (because `[Page N]` is not a label), and this file's
+own fresh page text is then dropped by the section-scoped dedup as a repeat of
+text already in section 0. Re-running does not converge it and is not meant to.
 
-What ships:
-
-- **The automatic lever.** Drop a stored section when it is
-  `_captions_are_near_identical` to the freshly synthesized *group* caption.
-  Safe by construction — it can only ever drop text this run is about to rewrite
-  verbatim — and it clears the common case of an archive re-run against the same
-  model.
-- **What the lever cannot do, stated rather than hidden.** It fails whenever the
-  transcription is reworded, and 0.4.0's own convention change (flowed prose,
-  new styling marks) makes rewording *likely* on the first re-run after
-  upgrading. It also cannot fire when a human typed anything into the block,
-  and must not: dropping a section that might hold a person's own words is the
-  one failure this codebase is built to avoid.
-- **The escape hatch, documented.** For files where the lever does not fire, the
-  README gives the ExifTool one-liner that clears `XMP-dc:Description` for a
-  folder, after which a re-run writes clean per-page captions. Destructive, so
-  it is the user's own explicit act, not something a flag does quietly.
-
-A `--remigrate-captions` command that does this safely per group is a real
-feature and is deferred to §5 rather than bolted on here.
+What this costs, plainly, because the README has to say it in a sentence: a
+folder re-run after upgrading ends up mixed — documents analyzed from 0.5.0 on
+carry per-page captions, ones analyzed earlier carry the whole book, and nothing
+reconciles them. Clearing `XMP-dc:Description` for those files is the user's own
+act. A `--remigrate-captions` command that could do it safely is §5's, not this
+plan's.
 
 **R3 — mixed regimes inside one folder.** A partial map (pages 1-40 answered,
 41-63 not) leaves some files with a thin per-page caption and others with the
@@ -212,7 +198,7 @@ without reading every one of those tests first is not. The list is in §6.
 
 | Item | Why deferred | Where it plugs in |
 |---|---|---|
-| `--remigrate-captions` | R2's automatic lever plus a documented one-liner covers the common case; a safe per-group rewrite that never touches human text is its own feature with its own failure modes | A pass over a group's stored captions that drops only sections this tool can prove it wrote |
+| `--remigrate-captions` | E12 takes no migration at all, so there is nothing half-built to finish; if the mixed archive R2 describes ever becomes annoying enough, this is where the fix goes | A pass over a group's stored captions that drops only sections this tool can prove it wrote, never a section a human may have touched |
 | Master transcript per document (D4, still) | Per-page captions make it more wanted, not less: the whole-document view now lives only in the sidecars | A pure function over one group's sidecar data; no model call |
 | Trimming `transcriptions` per file | E10 — the sidecar reads the whole map | Nothing; this is a note not to do it |
 | A flag to keep the old group-wide caption for documents | `--group-by none` already gives per-file captions by a blunter route; nobody has asked for the inverse | One value on a future `--caption-scope` flag if ever wanted |
@@ -227,9 +213,9 @@ a write-path regression.
 |---|---|---|---|
 | B1 | DATFILE routing + temp-dir lifecycle + round-trip tests | `photokin/exiftool/apply.py`, `photokin/tests/test_exiftool_wrapper.py` | — |
 | A0 | Hoist `resolve_part_label`'s inputs out of the sidecar gate | `core.py` (emit loop only) | B1 tagged |
-| A1 | Per-file caption build, `caption_scope`, the near-identical migration lever | `core.py` (block build + emit loop) | A0 |
+| A1 | Per-file caption build and `caption_scope` | `core.py` (block build + emit loop) | A0 |
 | A2 | Schema bumps + the missing changeset bump criterion | `cli.py`, `changeset.py` | A1 |
-| A3 | Tests: rewrite the pinned ones, add per-page convergence and migration cases | the test files in the list below | A1 |
+| A3 | Tests: rewrite the pinned ones, add per-page convergence cases, and pin R2's accepted behavior so it reads as a decision rather than a bug | the test files in the list below | A1 |
 | A4 | Docs: README "Captions" carve-out, `photokin/README.md` embedder contract, contract-doc supersession note, CHANGELOG, version | `README.md`, `photokin/README.md`, `docs/document-mode-contract.md`, `CHANGELOG.md`, `pyproject.toml` | A1 |
 
 **Tests that pin the current behavior and must be read before A1 is written.**
