@@ -119,6 +119,37 @@ silently re-sectioning captions written by earlier releases.
 survives into the caption — it is information about a document page, and the
 sidecar wants it.
 
+### Supersession note — 2026-08-28 (`docs/per-page-captions.md`, Part A)
+
+This section describes `transcriptions` synthesizing into **one** `caption`
+string per group, written to every file. That is no longer the whole story
+for a multipage group (`multipage_present`): each file's `XMP-dc:Description`
+now carries only its own part's text, read straight out of `transcriptions`
+and unlabelled — not the joined multi-part string this section describes.
+The synthesized group `caption` this section documents is still built,
+unchanged, exactly as written above; it is just no longer what most files in
+a multipage group receive. It survives as two things: the transcription a
+non-multipage group still absorbs (this section's mechanism was never
+document-specific), and, inside a multipage group, the group block a file
+falls back to when its own part never arrived. See
+`docs/per-page-captions.md` E6-E9 for the file-level rule and E12/R2 for why
+an archive already processed under the old rule is not migrated.
+
+What this section got right and what does not change, stated because it is
+now MORE load-bearing than it was: **`_CAPTION_LABEL_RE` is not extended**
+now guards two absorption sites instead of one — the group's synthesized
+`caption` above, and the per-file absorption of a file's own previously
+stored caption against its own fresh part text. Either site sectioning on
+`[Page N]` reproduces the letterhead-dedup regression `docs/per-page-captions.md`
+names as R1, measured and rejected there exactly as it was here. The original
+decision recorded above is not rewritten — this note only says what still
+holds and what a later reader should know changed.
+
+(Naming note: `_absorb_caption`, named above, is now the private `_absorb`
+closure inside `_assemble_caption_block` — the same function, extracted so a
+per-file caption and a group caption can both call it. The behavior this
+section describes did not change in the move.)
+
 ## 4. The markdown sidecar
 
 **Path.** `<image stem>.md` beside the image — the same derivation as

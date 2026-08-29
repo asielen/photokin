@@ -3,6 +3,34 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0]
+
+### Changed
+
+- **A multipage document's `XMP-dc:Description` now holds each page's own
+  transcription, not the whole book.** A group of views of one object — a
+  print, its back, a rescan — still gets one shared block written
+  byte-identically to every file, exactly as before. A group that is instead
+  an ordered sequence of pages gives each file only its own page's text,
+  unlabelled, so a `.md` sidecar and its image's Description finally agree
+  about the same document rather than disagreeing the way they did in 0.4.0.
+  A file whose own page never arrived in the model's reply keeps the group's
+  whole block as before, and the record now says which of the two it got via
+  a new `caption_scope` key (`"part"` or `"group"`). **The migration cost:**
+  an archive already processed under an earlier release keeps the
+  whole-document caption it already holds — re-running does not clear it —
+  so a folder you re-run after upgrading ends up mixed, with newly analyzed
+  documents holding per-page captions and previously analyzed ones still
+  holding the whole book. See "Documents get their own page, not the whole
+  book" in README.md.
+- **A long document's transcription now writes.** ExifTool used to receive
+  every tag value inline on its own command line, which Windows' roughly
+  32,767-character command-line ceiling made unwritable past about 20
+  handwritten pages of transcription. A value over 4,000 characters now
+  routes through a small temporary file that ExifTool reads directly instead,
+  with no change to the value it writes, the flags you pass, or anything
+  under that threshold.
+
 ## [0.4.0]
 
 ### Added
@@ -83,4 +111,5 @@ All notable changes to this project are documented here, in the style of
 Earlier history lives in the git log; this file starts recording from 0.4.0
 rather than reconstructing releases nobody watched happen.
 
+[0.5.0]: https://github.com/asielen/photokin/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/asielen/photokin/compare/v0.3.2...v0.4.0

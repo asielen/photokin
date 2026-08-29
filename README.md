@@ -364,7 +364,7 @@ Those are the spellings to pass to `--exiftool-fields`, verbatim. The XMP ones a
 
 If none is found, a run that asked for one stops before it costs anything: `-r` and `-w` both resolve the binary before the first model call, so either flag with no ExifTool anywhere exits 2 immediately rather than analyzing the whole batch and only then discovering it cannot read or write any of it. Once that check passes, a mid-run failure on a single file — a lock, a corrupt image, a timeout — is a warning on both sides and the analysis still runs.
 
-**Writing during a run.** Nothing is written into your files unless you ask for it: `--exiftool-write` defaults to `false`, and a changeset on its own only records what *would* be written. `-w` is the one-flag spelling of `--changeset true --exiftool-write true` — record the proposed writes and apply them — and works for folder, manifest and single-photo input alike. Spelled out, that is `--changeset true --exiftool-write true` — those two flags and no others, with `--exiftool-fields` left at its `EXIF:UserComment` default; `--exiftool-write true` is required rather than a confirmation of the default. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults. Every run prints a plan summary before its first model call naming the write set, so "nothing will be written" is visible up front; `--dry-run` prints that summary and stops.
+**Writing during a run.** Nothing is written into your files unless you ask for it: `--exiftool-write` defaults to `false`, and a changeset on its own only records what *would* be written. `-w` is the one-flag spelling of `--changeset true --exiftool-write true` — record the proposed writes and apply them — and works for folder, manifest and single-photo input alike. Spelled out, that is `--changeset true --exiftool-write true` — those two flags and no others, with `--exiftool-fields` left at its `EXIF:UserComment` default; `--exiftool-write true` is required rather than a confirmation of the default. The same settings are available as env vars (`EXIFTOOL_WRITE_ENABLED`, `EXIFTOOL_FIELDS`, `EXIFTOOL_PATH`), with flags winning over env over defaults. Every run prints a plan summary before its first model call naming the write set, so "nothing will be written" is visible up front; `--dry-run` prints that summary and stops. A long transcription writes fine regardless of length — a value too long to fit safely on the command line is routed through a small temporary file instead, invisibly, with no flag to think about.
 
 **When writes fail.** A run that asked to write, saw files, and wrote *none* of them exits 2 and says so — that shape is always a setting that is wrong for every file (an unwritable `--exiftool-fields` tag, a read-only folder, a binary that will not run), so a script moving on to the next box of scans should stop. A *partial* failure exits 0: some files were written, so the settings were right, and one locked or corrupt file among many is ordinary. Either way the per-file reasons are logged as `[ExifTool] Errors:` before the run ends. Manifest mode is the exception and always exits 0, because it is the Lightroom plug-in's contract and the plug-in reads the per-item records rather than the exit status.
 
@@ -381,7 +381,7 @@ photokin <folder> -rw    proposes  nothing                               # 14-ye
 
 ## Captions
 
-The caption is the one field where photokin has to reconcile what you already wrote with what the model just said, and where it writes the same text into several files at once. This section is what it does and why.
+The caption is the one field where photokin has to reconcile what you already wrote with what the model just said, and where — for a group of views of one object — it writes the same text into several files at once. This section is what it does and why. A multipage document is the one exception to "several files at once"; see [Documents get their own page, not the whole book](#documents-get-their-own-page-not-the-whole-book) below.
 
 ### The shape
 
@@ -428,13 +428,25 @@ The letters are the letters on disk. `box3_017b.jpg` is `[Photo B]` because the 
 
 ### How it is built, and the surprise in it
 
-The block is assembled once for the whole group and then written to every file in it. Concretely: photokin reads each file's existing caption while it still knows which file it came off — that is the only moment the attribution is free — labels it accordingly, merges the labelled pieces from across the group into one block together with this run's own transcription of the same object, and hands the same result to every member.
+The block is assembled once for the whole group and then written to every file in it — for a group of views of one object, which is what this whole section describes. Concretely: photokin reads each file's existing caption while it still knows which file it came off — that is the only moment the attribution is free — labels it accordingly, merges the labelled pieces from across the group into one block together with this run's own transcription of the same object, and hands the same result to every member.
 
 "Existing caption" means whatever the run was given: the `XMP:Description` in the file itself under `-r`, or a `caption` you put in a manifest item's `metadata`. Without either, there is nothing pre-existing to merge and the block is just this run's own transcription — which is another reason the normal run is `-rw`.
 
 **This means a caption you typed on one file will appear on its siblings.** If you wrote "Ruth and Sam outside the bakery" on the front scan only, after a run the back scan holds it too, as `[Photo] Ruth and Sam outside the bakery`. That is intended and it is the whole feature, but it will surprise you the first time, so: if you do not want two scans sharing captions, they are not one object as far as photokin is concerned — put them in different groups, or run with `--group-by none`, which analyses and captions every file entirely on its own.
 
 The order of the block is the group's own order — photos before backs, variant A before variant B — and never the order your files happened to be listed in, so the same folder produces the same block on every run and on every machine.
+
+### Documents get their own page, not the whole book
+
+Everything above describes a group of *views of one object* — a print, its back, a rescan of it — where which file you happen to open a year from now is an accident of how you were browsing, and the whole point of the shared block is that any one of them tells the whole story.
+
+A multipage document is the case where that same reasoning inverts, not the rule that follows from it. You did not stumble onto page 37 of a 63-page letter; you opened it on purpose, looking for what that page says. So each page of a document carries only its own transcription in `XMP-dc:Description` — not the whole book, and unlabelled, for the same reason a lone scan's caption carries no label: the file holds exactly one part's text, so there is nothing to tell it apart from. A front/back pair, a rescan, a variant letter — anything that is not an ordered sequence of pages — is unaffected and still gets the shared block described above.
+
+This is also what makes the `.md` sidecar (see ["A readable transcript beside each scan"](#a-readable-transcript-beside-each-scan)) and `XMP-dc:Description` finally agree for a document: both now hold that one page's own text, where before the sidecar showed page 37 and Description showed the whole book.
+
+A page whose own text never arrived — the model's reply carried no `transcriptions` map at all, or this page was displaced or unseated and rode the payload under no label — keeps the group's whole block exactly as it would have before, rather than photokin inventing an attribution nothing in the reply supports. A folder can end up with some files in each state; that is legible rather than a mystery, because the record says which one applies per file (see the `caption_scope` note in [photokin/README.md](photokin/README.md#when-calls-succeed)).
+
+**The migration cost, in one sentence:** an archive already processed keeps the whole-document caption it already holds — re-running does not clear it — so a folder you re-run after upgrading ends up mixed, with newly analyzed documents holding per-page captions and previously analyzed ones still holding the whole book, and photokin does not reconcile the two.
 
 ### What happens to a caption you already have
 
