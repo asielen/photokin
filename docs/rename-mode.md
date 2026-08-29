@@ -43,7 +43,7 @@ photokin ./scans --rename-undo                            reverse the last appli
 | Numbering | Three digits, zero-padded, `--digits` to change. Numbering restarts at 001 for each distinct rendered prefix (each date when the prefix contains `{date}`). |
 | Order | The folder's current alphabetical order, the `(name.lower(), name)` key `list_folder_images` already uses. Files with no trailing number are not special; they take the number their position gives them. A manifest may carry an explicit `order` per item, which wins. |
 | Cleanup | Variant form normalized (`box3_025-b` becomes `...025b`); part separators normalized (`_back`, `.back`, ` back` become `-back`); companion files carried along (`.md`, `.json`, `.xmp`, `.txt` sharing a stem, plus the `.jpg` twin of a `.tif`, which is an image in its own right and gets the same stem). Extensions are left exactly as they are. |
-| Prefix | The template renders the prefix; the renderer always puts `-` between it and the number, so every name ends in `-NNN[letter][-part][-crop]` and `parse_media_filename` reads it back unchanged. A prefix that already ends in `-` is trimmed rather than doubled; an empty prefix is an error. The separator is fixed because it is also the grammar's part separator. |
+| Prefix | The template renders the prefix; the renderer always puts `-` between it and the number, so every name ends in `-NNN[letter][-part][-crop]` and `parse_media_filename` reads it back unchanged. A prefix that already begins or ends in `-` is trimmed rather than doubled; an empty prefix is an error. (Amended 2026-08-29, during the build: this said trailing only. `{folder}` at a drive root renders empty, so `"{folder}-bag"` produced the prefix `-bag` and every target began with a dash -- which is the same objection this table already makes to an empty prefix, that a name starting with `-001` is not a name, and a leading-dash filename is read as a flag by every command-line tool that meets it.) The separator is fixed because it is also the grammar's part separator. |
 | Safety | Two-phase rename through hidden temporary names, journal written and flushed before the first rename, nothing ever overwritten (`os.rename`, never `os.replace`), full verification after, undo and resume from the journal. |
 
 ## 3. Architecture
@@ -174,7 +174,7 @@ The separator between prefix and number is always `-` and is never typed: the
 renderer adds it. `newname{date:yyyy-mm-dd}` gives
 `newname1952-06-01-001.tif`, and a prefix that ends in a digit is no problem,
 because the dash keeps the prefix's digits and the number apart. A rendered
-prefix that ends in one or more `-` has them trimmed first, so
+prefix that begins or ends in one or more `-` has them trimmed first, so
 `{date:yymmdd}-bag-` and `{date:yymmdd}-bag` produce the same names; the
 trim is reported in the preview notes. A rendered prefix that is empty (a
 literal of nothing, or `{orig}` on a file named only by digits) is an error

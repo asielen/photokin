@@ -16,6 +16,7 @@ dying mid-run, which must leave the journal ``in_progress`` for a later
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
 from pathlib import Path
@@ -148,6 +149,35 @@ def _simple_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
         ],
     )
     return folder, plan
+
+
+def _chain_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
+    """An upward chain: the first file's target is the second file's own name."""
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    first = _write(folder / "a.tif", "a bytes")
+    second = _write(folder / "bw-001.tif", "b bytes")
+    plan = _plan(folder, [_entry(first, "bw-001.tif"), _entry(second, "bw-002.tif")])
+    return folder, plan
+
+
+def _two_sidecar_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
+    """Two images, each with a transcript sidecar of its own."""
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    first = _write(folder / "file102.tif", "first image")
+    second = _write(folder / "file105.tif", "second image")
+    first_md = _sidecar(folder / "file102.md", "file102.tif")
+    second_md = _sidecar(folder / "file105.md", "file105.tif")
+    plan = _plan(
+        folder,
+        [
+            _entry(first, "newname-001.tif", {first_md: "newname-001.md"}),
+            _entry(second, "newname-002.tif", {second_md: "newname-002.md"}),
+        ],
+    )
+    return folder, plan
+
 
 
 # --- Apply and verify --------------------------------------------------
@@ -424,6 +454,123 @@ def test_an_unfinished_run_blocks_a_new_apply_in_the_same_folder(
     with pytest.raises(RenamePreflightError) as excinfo:
         apply_plan(_plan(folder, [], run_id="2026-08-29T21:00:00Z_ffffffff"))
     assert "in_progress" in str(excinfo.value)
+
+
+def test_resume_finishes_an_upward_chain_killed_at_the_first_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staged file's destination is the next op's source, not a second copy.
+
+    Phase A killed after one rename is the ordinary shape of a chain: the
+    temporary carries this run's id and belongs to that one op, so the name
+    sitting at its destination is somebody else's file. Reading that as "in
+    two places at once" closes every route out of the folder at once --
+    resume, undo and a fresh apply all refuse it.
+    """
+    folder, plan = _chain_folder(tmp_path)
+    # Rename 1 stages a.tif; rename 2 is where the process dies.
+    _fail_at(monkeypatch, 2, _Crash())
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+    assert "a.tif" not in _names(folder)
+    assert "bw-001.tif" in _names(folder)
+
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    resumed = resume_run(journal)
+
+    assert resumed.status == rename_apply.STATUS_APPLIED
+    assert _names(folder) == {"bw-001.tif", "bw-002.tif"}
+    assert (folder / "bw-001.tif").read_bytes() == b"a bytes"
+    assert (folder / "bw-002.tif").read_bytes() == b"b bytes"
+
+
+def test_resume_refuses_a_destination_held_by_a_stranger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Taking chains as normal must not wave a real collision through."""
+    folder, plan = _chain_folder(tmp_path)
+    _fail_at(monkeypatch, 2, _Crash())
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+    _write(folder / "bw-002.tif", "a file nobody planned for")
+
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    with pytest.raises(RenamePreflightError) as excinfo:
+        resume_run(journal)
+
+    assert "a file is already called that: bw-002.tif" in str(excinfo.value)
+    assert (folder / "bw-002.tif").read_bytes() == b"a file nobody planned for"
+
+
+def test_a_rollback_during_a_resume_reverses_the_whole_segment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``rolled_back`` has to mean the same thing on a resume as on an apply.
+
+    docs/rename-contract.md defines it as "every completed step was put back;
+    the folder is as it was", and it is a closed status: a folder left holding
+    the interrupted run's already-placed ops under that footer is neither
+    resumable nor undoable, and the original names survive only in the journal.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    before = {name: (folder / name).read_bytes() for name in _names(folder)}
+
+    # Renames 1-3 are phase A; rename 4 places the first op, rename 5 dies.
+    _fail_at(monkeypatch, 5, _Crash())
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+    assert (folder / "newname-001.tif").exists()
+
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    _fail_at(monkeypatch, 1, OSError("the disk said no"))
+    report = resume_run(journal)
+    monkeypatch.undo()
+
+    assert report.status == rename_apply.STATUS_ROLLED_BACK
+    assert report.exit_code == 1
+    assert report.stranded == ()
+    assert _names(folder) == set(before)
+    assert {name: (folder / name).read_bytes() for name in _names(folder)} == before
+    assert _records(journal)[-1]["status"] == rename_apply.STATUS_ROLLED_BACK
+
+
+def test_resume_rewrites_the_sidecar_of_an_entry_that_finished_before_the_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar pass covers the whole segment, not the resumed subset.
+
+    An entry whose image and whose .md both cleared phase B is not part of the
+    work a resume has left to do, and verification checks names only -- so a
+    pass driven off the resumed subset leaves that transcript pointing at a
+    file that no longer exists, under an ``applied`` report with no warnings.
+    """
+    folder, plan = _two_sidecar_folder(tmp_path)
+    # Phase A is renames 1-4; renames 5 and 6 place the first entry's pair.
+    _fail_at(monkeypatch, 7, _Crash())
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+    assert {"newname-001.tif", "newname-001.md"} <= _names(folder)
+
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    resumed = resume_run(journal)
+
+    assert resumed.status == rename_apply.STATUS_APPLIED
+    assert resumed.warnings == ()
+    assert 'source_file: "newname-001.tif"' in (folder / "newname-001.md").read_text(
+        encoding="utf-8"
+    )
+    assert 'source_file: "newname-002.tif"' in (folder / "newname-002.md").read_text(
+        encoding="utf-8"
+    )
+
 
 
 # --- Rollback ----------------------------------------------------------
@@ -704,6 +851,51 @@ def test_a_sidecar_keeps_its_line_endings(tmp_path: Path) -> None:
     assert (folder / "newname-001.md").read_bytes() == (
         b'---\r\nsource_file: "newname-001.tif"\r\npart: "Front"\r\n---\r\n\r\nBody\r\n'
     )
+
+
+def test_a_crash_during_the_sidecar_rewrite_never_costs_the_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The only path in this module that can destroy bytes, killed mid-write.
+
+    Opening the transcript ``"wb"`` in place truncates it before a byte is
+    written, so a process killed at that instant leaves zero bytes and no copy
+    anywhere -- and the journal still says ``in_progress``, so a later resume
+    reports ``applied``, exit 0, warnings empty, over the loss. The rewrite is
+    staged in a sibling temporary and swapped in instead, so the kill leaves
+    either the old bytes or the new ones.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    before = (folder / "file105.md").read_bytes()
+    real_open = builtins.open
+
+    def fake_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(file, mode, *args, **kwargs)
+        if "w" in mode and str(file).endswith(".md"):
+            handle.close()
+            raise _Crash()
+        return handle
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+
+    # Phase B finished before the rewrite began, so the transcript is at its
+    # new name -- with every byte it started with.
+    assert (folder / "newname-002.md").read_bytes() == before
+
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    resumed = resume_run(journal)
+
+    assert resumed.status == rename_apply.STATUS_APPLIED
+    assert resumed.warnings == ()
+    assert _names(folder) == {"newname-001.tif", "newname-002.tif", "newname-002.md"}
+    assert 'source_file: "newname-002.tif"' in (folder / "newname-002.md").read_text(
+        encoding="utf-8"
+    )
+
 
 
 # --- The safety net itself ---------------------------------------------

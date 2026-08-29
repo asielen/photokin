@@ -819,7 +819,51 @@ def _sidecar_rewrites(ops: Sequence[RenameOp]) -> list[tuple[str, str]]:
     ]
 
 
-def _rewrite_sidecar(md_path: str, image_name: str) -> str | None:
+def _swap_in(path: str, tmp_path: str, payload: bytes) -> str | None:
+    """Replace *path*'s bytes with *payload*, atomically, via a sibling temporary.
+
+    Opening the file ``"wb"`` in place would truncate it before a single byte
+    was written: a process killed at that instant leaves zero bytes and no
+    copy anywhere, and the journal still says ``in_progress``, so a later
+    ``--rename-resume`` reports ``applied`` over the loss. The new bytes
+    therefore land in a temporary in the same folder, are flushed and fsynced,
+    and are only then swapped in.
+
+    ``os.replace`` is correct here and in no other place in this module. The
+    "``os.rename``, never ``os.replace``" rule (``docs/rename-mode.md``
+    section 2) is about *moving a user's file*, where a destination that
+    already exists is a collision that must fail loudly. This is an atomic
+    content swap onto a file this run is deliberately superseding, and
+    atomicity is the entire point: a kill at any instant must leave either the
+    old bytes or the new ones, never zero. Do not "restore consistency" by
+    changing it back to an in-place write.
+
+    Args:
+        path: The file whose content is being replaced.
+        tmp_path: Sibling temporary to stage the new bytes in; it must sit in
+            the same folder as *path*, or the swap is not atomic.
+        payload: The complete new content.
+
+    Returns:
+        A warning line when the swap did not happen, or ``None`` on success.
+    """
+    try:
+        with open(tmp_path, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        if os.path.lexists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError as cleanup_exc:
+                logger.warning("Could not remove %s: %s", tmp_path, cleanup_exc)
+        return f"sidecar not updated ({exc.strerror or exc}): {os.path.basename(path)}"
+    return None
+
+
+def _rewrite_sidecar(md_path: str, image_name: str, tmp_path: str) -> str | None:
     """Point a markdown sidecar's ``source_file:`` frontmatter at *image_name*.
 
     Only the leading frontmatter block is touched, and only its first
@@ -836,6 +880,8 @@ def _rewrite_sidecar(md_path: str, image_name: str) -> str | None:
     Args:
         md_path: Absolute path of the sidecar, already at its new name.
         image_name: The image's new basename.
+        tmp_path: Sibling temporary the rewritten bytes are staged in before
+            they are swapped onto *md_path* (see :func:`_swap_in`).
 
     Returns:
         A warning line when nothing was rewritten, or ``None`` on success.
@@ -862,20 +908,28 @@ def _rewrite_sidecar(md_path: str, image_name: str) -> str | None:
             continue
         terminator = lines[index][len(lines[index].rstrip("\r\n")) :]
         lines[index] = f"source_file: {_yaml_string(image_name)}{terminator}"
-        try:
-            with open(md_path, "wb") as handle:
-                handle.write("".join(lines).encode("utf-8"))
-        except OSError as exc:
-            return f"sidecar not updated ({exc.strerror or exc}): {os.path.basename(md_path)}"
-        return None
+        return _swap_in(md_path, tmp_path, "".join(lines).encode("utf-8"))
     return f"sidecar not updated (no source_file line): {os.path.basename(md_path)}"
 
 
-def _apply_sidecars(folder: str, ops: Sequence[RenameOp]) -> list[str]:
-    """Rewrite every renamed sidecar's ``source_file``; return the warnings."""
+def _apply_sidecars(folder: str, ops: Sequence[RenameOp], run_token: str) -> list[str]:
+    """Rewrite every renamed sidecar's ``source_file``; return the warnings.
+
+    Args:
+        folder: The folder every name is resolved against.
+        ops: The run's ops, in the direction they were executed.
+        run_token: This run's folded id, which keeps each rewrite's staging
+            temporary from colliding with another run's.
+
+    Returns:
+        One warning line per sidecar that was not rewritten.
+    """
     warnings: list[str] = []
-    for sidecar_name, image_name in _sidecar_rewrites(ops):
-        warning = _rewrite_sidecar(os.path.join(folder, sidecar_name), image_name)
+    for index, (sidecar_name, image_name) in enumerate(_sidecar_rewrites(ops)):
+        tmp = f"{_TMP_PREFIX}{run_token}-sidecar-{index}{_SIDECAR_EXT}"
+        warning = _rewrite_sidecar(
+            os.path.join(folder, sidecar_name), image_name, os.path.join(folder, tmp)
+        )
         if warning is not None:
             logger.warning("%s", warning)
             warnings.append(warning)
@@ -984,7 +1038,11 @@ def _verify(
     touched = {op.src for op in ops} | {op.dst for op in ops} | {op.tmp for op in ops if op.tmp}
     after = _snapshot(folder)
     for name, (size, mtime) in before.items():
-        if name in touched or name == ignore:
+        # A name carrying this module's temporary prefix is never a bystander:
+        # it is this run's own staging, or a stray one an earlier kill left,
+        # which a resume legitimately consumes. Only real files are held to
+        # the untouched check.
+        if name in touched or name == ignore or name.startswith(_TMP_PREFIX):
             continue
         current = after.get(name)
         if current is None:
@@ -999,7 +1057,9 @@ def _execute(
     ops: Sequence[RenameOp],
     *,
     journal: str,
+    run_token: str,
     resume_from: Sequence[RenameOp] | None = None,
+    already_placed: Sequence[RenameOp] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Run both phases, rewrite sidecars, verify, and roll back on any failure.
 
@@ -1013,32 +1073,47 @@ def _execute(
         ops: Every op of the run, external ones included (they are recorded
             and verified, never moved).
         journal: The journal path, exempted from the untouched check.
+        run_token: This run's folded id, which names the sidecar rewrites'
+            staging temporaries.
         resume_from: Ops already sitting at their temporary when this started,
             which skip phase A. ``None`` for a fresh run.
+        already_placed: Ops an interrupted run had already put at their target
+            before this attempt began. They are not moved forward, but they
+            *are* reversed by a rollback, because a rollback's contract is the
+            whole segment, not this attempt's share of it. ``None`` for a
+            fresh run.
 
     Returns:
         ``(status, stranded, warnings)``.
     """
-    already_staged = list(resume_from or [])
-    staged_set = set(already_staged)
-    pending_a = [op for op in ops if not op.external and op not in staged_set]
+    staged_before = list(resume_from or [])
+    placed_before = list(already_placed or [])
+    settled = set(staged_before) | set(placed_before)
+    pending_a = [op for op in ops if not op.external and op not in settled]
 
     before = _snapshot(folder)
-    staged: list[RenameOp] = list(already_staged)
-    placed: list[RenameOp] = []
+    staged: list[RenameOp] = list(staged_before)
+    placed: list[RenameOp] = list(placed_before)
     warnings: list[str] = []
     sidecars_rewritten = False
     try:
         _move_all(folder, pending_a, to_tmp=True, done=staged)
         _move_all(folder, staged, to_tmp=False, done=placed)
-        warnings = _apply_sidecars(folder, ops)
+        warnings = _apply_sidecars(folder, ops, run_token)
         sidecars_rewritten = True
         problems = _verify(folder, ops, before, os.path.basename(journal))
         if problems:
             raise _VerifyFailed(problems)
     except (OSError, _VerifyFailed) as exc:
         logger.error("Rename failed, putting every file back: %s", exc)
-        stranded = _reverse(folder, staged, placed)
+        # An op the interrupted run already placed reverses exactly as one this
+        # attempt placed does, so it belongs to both legs of the walk back:
+        # ``placed`` moves it off its target, the staged sequence moves it on
+        # to its source. Leave it out and ``rolled_back`` would be a lie --
+        # docs/rename-contract.md defines that status as "the folder is exactly
+        # as it started", and it would still be holding half of a run nobody
+        # asked for, with no open journal left to resume or undo it from.
+        stranded = _reverse(folder, [*staged, *placed_before], placed)
         if stranded:
             # A reversal that could not finish is not a state to keep editing
             # files in: every remaining decision belongs to a person.
@@ -1047,7 +1122,7 @@ def _execute(
             # Verification can fail after the sidecars have been rewritten, so
             # they have to follow the files back or the rollback would leave
             # every sidecar pointing at a name that is no longer on disk.
-            warnings.extend(_apply_sidecars(folder, [_reversed_op(op) for op in ops]))
+            warnings.extend(_apply_sidecars(folder, [_reversed_op(op) for op in ops], run_token))
         return STATUS_ROLLED_BACK, stranded, warnings
     return STATUS_APPLIED, [], warnings
 
@@ -1139,6 +1214,7 @@ def apply_plan(plan: Mapping[str, Any], *, dry_run: bool = False) -> ApplyReport
 
     plan_run_id = str(plan.get("run_id") or "")
     run_id, journal = _fresh_journal(folder, plan_run_id)
+    safe = _safe_run_id(run_id)
     ops = _ops_from_plan(plan, run_id)
     counts = _counts(plan, ops)
     if dry_run:
@@ -1149,7 +1225,7 @@ def apply_plan(plan: Mapping[str, Any], *, dry_run: bool = False) -> ApplyReport
     header = _header(run_id, folder, plan, MODE_APPLY, _plan_run_id(run_id, plan_run_id))
     _write_segment(journal, header, ops)
 
-    status, stranded, warnings = _execute(folder, ops, journal=journal)
+    status, stranded, warnings = _execute(folder, ops, journal=journal, run_token=safe)
     _append_footer(journal, _footer(status, counts, stranded))
     return ApplyReport(
         status, journal, *counts, stranded=tuple(stranded), warnings=tuple(warnings)
@@ -1252,7 +1328,7 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
 
     header = _header(run_id, folder, plan, MODE_FINISH, _plan_run_id(run_id, plan_run_id))
     _write_segment(journal, header, ops)
-    status, stranded, warnings = _execute(folder, ops, journal=journal)
+    status, stranded, warnings = _execute(folder, ops, journal=journal, run_token=safe)
     _append_footer(journal, _footer(status, counts, stranded))
     return ApplyReport(
         status,
@@ -1267,10 +1343,11 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
 def resume_run(journal_path: str) -> ApplyReport:
     """Finish a run left ``in_progress`` or ``needs_attention``, forward.
 
-    Each op is classified by where its file actually is -- at its source, at
-    its temporary, or already at its target -- and the run continues from
-    there through the same two phases. A file that is somehow in two places at
-    once stops the resume rather than being guessed at.
+    Each op is classified by where its file actually is -- at its temporary,
+    still at its source, or already at its target -- and the run continues
+    from there through the same two phases. A file that is genuinely in two
+    places at once, or a destination held by something the journal cannot
+    account for, stops the resume rather than being guessed at.
 
     Args:
         journal_path: The journal to finish.
@@ -1295,6 +1372,8 @@ def resume_run(journal_path: str) -> ApplyReport:
     names = _list_names(folder)
     ops = list(segment.ops)
     staged: list[RenameOp] = []
+    placed: list[RenameOp] = []
+    pending: list[RenameOp] = []
     problems: list[str] = []
     for op in ops:
         if op.external:
@@ -1302,14 +1381,32 @@ def resume_run(journal_path: str) -> ApplyReport:
                 problems.append(f"the image was not renamed after all: {op.dst}")
             continue
         at_src, at_tmp, at_dst = op.src in names, op.tmp in names, op.dst in names
-        if at_tmp and (at_src or at_dst):
-            problems.append(f"in two places at once: {op.src}")
-        elif at_tmp:
-            staged.append(op)
-        elif at_src and at_dst and op.src != op.dst:
-            problems.append(f"in two places at once: {op.src}")
-        elif not at_src and not at_dst:
+        # The temporary is decisive. It carries this run's id and belongs to
+        # this one op, so a file sitting at it is unambiguously staged and
+        # ``at_dst`` says nothing about it -- it says some *other* file holds
+        # the destination name, which during phase A is routinely a later op's
+        # source that has not been staged yet. That is the ordinary shape of an
+        # upward chain, not an anomaly. Only the source being back as well is a
+        # contradiction the journal cannot explain.
+        if at_tmp:
+            if at_src:
+                problems.append(f"in two places at once: {op.src}")
+            else:
+                staged.append(op)
+        elif at_src:
+            pending.append(op)
+        elif at_dst:
+            placed.append(op)
+        else:
             problems.append(f"gone: {op.src}")
+
+    # A destination held by another op that is itself still waiting at its
+    # source is a chain phase A will unwind; anything else holding it is a
+    # collision this run must not rename into.
+    waiting = {op.src for op in pending}
+    for op in pending:
+        if op.dst != op.src and op.dst in names and op.dst not in waiting:
+            problems.append(f"a file is already called that: {op.dst}")
     if problems:
         raise RenamePreflightError(
             "This folder is not in a state the rename journal describes.",
@@ -1317,12 +1414,22 @@ def resume_run(journal_path: str) -> ApplyReport:
             problems,
         )
 
-    # An op already at its target is done; one still at its source restarts at
-    # phase A. Both are decided above from the listing, never from the journal.
-    done = {op.dst for op in ops if not op.external and op.dst in names and op.src not in names}
-    pending = [op for op in ops if op.external or op.dst not in done]
+    # The whole segment goes to the executor, not just the ops this attempt has
+    # left to move. Two things follow from that, and both are the point of it:
+    # a rollback reverses the ops the interrupted run had already placed as
+    # well, so ``rolled_back`` keeps meaning "the folder is as it was" and the
+    # run never closes on a state nobody asked for; and the sidecar pass runs
+    # over every entry, so one whose image and .md both finished before the
+    # crash still gets its ``source_file`` line pointed at the new name.
+    # ``_rewrite_sidecar`` is idempotent, so redoing a correct one costs
+    # nothing.
     status, stranded, warnings = _execute(
-        folder, pending, journal=journal.path, resume_from=staged
+        folder,
+        ops,
+        journal=journal.path,
+        run_token=_safe_run_id(segment.run_id) or "resume",
+        resume_from=staged,
+        already_placed=placed,
     )
     if status == STATUS_APPLIED and segment.mode == MODE_UNDO:
         status = STATUS_UNDONE
@@ -1431,6 +1538,7 @@ def undo_run(journal_path: str) -> ApplyReport:
 
     folder = journal.folder
     run_id = make_run_id()
+    safe = _safe_run_id(run_id)
     ops, skipped = _reverse_ops(segment, _list_names(folder), run_id)
     counts = (
         sum(1 for op in ops if op.kind == _IMAGE_KIND and not op.external),
@@ -1449,7 +1557,7 @@ def undo_run(journal_path: str) -> ApplyReport:
         {"undoes": segment.run_id},
     )
     _write_segment(journal.path, header, ops, append=True)
-    status, stranded, warnings = _execute(folder, ops, journal=journal.path)
+    status, stranded, warnings = _execute(folder, ops, journal=journal.path, run_token=safe)
     if status == STATUS_APPLIED:
         status = STATUS_UNDONE
     _append_footer(journal.path, _footer(status, counts, stranded))

@@ -419,6 +419,13 @@ _VARIANT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The exact page regex parse_media_filename matches against, re-run here so
+# _variant_was_dashed can strip a page suffix by its REAL text length rather
+# than reconstructing one from the parsed page number: parse_media_filename
+# reads that number with int(), which drops leading zeros ("007" -> 7), so a
+# length computed from the integer is wrong for any zero-padded page number.
+_PAGE_SUFFIX_RE = re.compile(r"^(.*?)-page(\d+)$", re.IGNORECASE)
+
 
 def _variant_was_dashed(canonical_stem: str, parsed: utils.ParsedName) -> bool:
     """Return whether *canonical_stem*'s variant letter, if any, was dashed.
@@ -450,7 +457,12 @@ def _variant_was_dashed(canonical_stem: str, parsed: utils.ParsedName) -> bool:
     elif parsed.part_kind == "negative":
         tail = tail[: -len("-negative")]
     elif parsed.part_kind == "page" and parsed.page_num is not None:
-        tail = tail[: -len(f"-page{parsed.page_num}")]
+        # Re-run the same page regex parse_media_filename used and take its
+        # own group(1), rather than slicing by a length rebuilt from the
+        # parsed (leading-zero-stripped) integer -- see _PAGE_SUFFIX_RE.
+        page_match = _PAGE_SUFFIX_RE.match(tail)
+        if page_match:
+            tail = page_match.group(1)
     match = _VARIANT_RE.match(tail)
     return bool(match and match.group("variant") is not None)
 
@@ -713,6 +725,16 @@ def plan_rename(
         group_members = sorted(groups[group_key], key=lambda m: m.position)
         display = group_members[0].parsed.base_id
 
+        if not display:
+            # A filename that is only a part suffix ("_back.tif" -> base_id
+            # "") groups under the same empty key as any other such file.
+            # Their targets do not collide (the part suffix differs), so
+            # nothing is lost, but two unrelated photos silently becoming
+            # one numbered object is worth flagging -- grouping itself is
+            # unchanged, this only names what happened.
+            member_names = ", ".join(sorted(os.path.basename(m.item.path) for m in group_members))
+            warnings.append(f"group with an empty base id: {member_names}")
+
         bad_dirs = sorted({m.dirname for m in group_members if m.dirname != normalized_folder})
         if bad_dirs:
             errors.append(
@@ -763,7 +785,15 @@ def plan_rename(
             group_plans.append(_GroupPlan(group_key, display, group_members, None, False))
             continue
 
-        prefix = prefix_before_trim.rstrip("-")
+        # A leading '-' is trimmed the same way a trailing one already is:
+        # {folder} at a drive root (os.path.basename of "C:\\" is "") renders
+        # an empty {folder} value, so a template like "{folder}-bag" would
+        # otherwise render the hostile prefix "-bag" -- a name starting with
+        # "-" is section 4.4's "not a name" the same way an empty one is, and
+        # is actively hostile to command-line tools that read a leading '-'
+        # as a flag. A prefix that was nothing but dashes now strips to
+        # empty and is caught by the empty check below, same as before.
+        prefix = prefix_before_trim.strip("-")
         if prefix != prefix_before_trim:
             warnings.append(f"prefix '{prefix_before_trim}' trimmed to '{prefix}'")
         if not prefix:
@@ -849,7 +879,7 @@ def plan_rename(
         entries=entries,
         disk_files=sorted(disk_files, key=_name_key),
         normalized_folder=normalized_folder,
-        known_image_paths={os.path.normpath(m.item.path) for m in members},
+        known_image_paths={os.path.normcase(os.path.normpath(m.item.path)) for m in members},
         companion_extensions=effective_companions,
         left_behind=left_behind,
         warnings=warnings,
@@ -863,6 +893,14 @@ def plan_rename(
     for entry in entries:
         if entry["target"] and len(entry["target"].encode("utf-8")) > 255:
             errors.append(f"{entry['target']}: name exceeds 255 bytes")
+        # A companion's own target (target_stem + its own extension) is not
+        # the same string as the image's target -- a longer companion
+        # extension (".json" vs ".tif") can push it past the limit on its
+        # own even when the image's target is within it, so each companion
+        # target needs its own check rather than inheriting the image's.
+        for companion in entry["companions"]:
+            if len(companion["target"].encode("utf-8")) > 255:
+                errors.append(f"{companion['target']}: name exceeds 255 bytes")
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -900,7 +938,13 @@ def _attach_companions_and_bystanders(
     own source paths is a bystander: its current name (lowercased) is added
     to *bystander_names*, so :func:`_validate_targets` can reject any
     rendered target that collides with it (4.6's "a target matching a
-    bystander's current name").
+    bystander's current name"). *known_image_paths* is compared with
+    ``os.path.normcase`` (the caller pre-normcases it), the same check
+    ``rename_apply.preflight`` uses for this same reason: a manifest's own
+    spelling of a path and the spelling ``os.scandir`` returns for the
+    identical file can differ only in case on Windows, and without a
+    case-insensitive comparison that difference reads as two different
+    files, making a file its own bystander and breaking idempotency.
 
     Mutates *entries* (each matched one's ``companions`` list),
     *left_behind*, *warnings* and *bystander_names* in place.
@@ -917,7 +961,7 @@ def _attach_companions_and_bystanders(
         name = os.path.basename(norm_disk_path)
         stem, ext = os.path.splitext(name)
         if ext.lower() in utils.VALID_EXTS:
-            if norm_disk_path not in known_image_paths:
+            if os.path.normcase(norm_disk_path) not in known_image_paths:
                 bystander_names.add(name.lower())
             continue
         matches = entry_indices_by_stem.get(stem.lower(), [])

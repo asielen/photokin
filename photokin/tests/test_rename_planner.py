@@ -351,6 +351,110 @@ class ValidationErrorTests(unittest.TestCase):
         self.assertEqual(plan["entries"], [])
 
 
+class ManifestCaseMismatchTests(unittest.TestCase):
+    """A manifest item whose path case differs from what ``os.scandir``
+    reports for the identical file must not become its own bystander (the
+    executor's ``preflight`` already compares with ``os.path.normcase`` for
+    this exact reason)."""
+
+    def test_case_mismatched_manifest_path_is_not_its_own_bystander(self) -> None:
+        disk_path = _path("same-001.tif")
+        manifest_path = _path("SAME-001.TIF")  # same file, spelled differently
+        plan = plan_rename(
+            folder=_FOLDER,
+            disk_files=[disk_path],
+            items=[RenameItem(path=manifest_path)],
+            prefix_template="same",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertEqual(plan["errors"], [])
+
+
+class CompanionLengthTests(unittest.TestCase):
+    """The 255-byte rule (4.6) must measure a companion's own target, not
+    just the image's -- a longer companion extension can push the companion
+    past the limit even when the image's target is within it."""
+
+    def test_long_companion_extension_pushes_past_255_bytes_alone(self) -> None:
+        # 247-byte prefix: the .tif image target lands at exactly 255 bytes
+        # (passes); the .json companion's longer extension pushes its own
+        # target to 256.
+        prefix = "p" * 247
+        disk_files = [_path("photo.tif"), _path("photo.json")]
+        plan = _plan(["photo.tif"], prefix, disk_files=disk_files)
+        entry = _entry_for(plan, "photo.tif")
+        self.assertEqual(len(entry["target"].encode("utf-8")), 255)
+        companion_target = entry["companions"][0]["target"]
+        self.assertEqual(len(companion_target.encode("utf-8")), 256)
+        self.assertTrue(
+            any(companion_target in e and "255 bytes" in e for e in plan["errors"]),
+            plan["errors"],
+        )
+
+
+class VariantPageSuffixLengthTests(unittest.TestCase):
+    """The "variant form normalized" note must not be derived from a suffix
+    length rebuilt out of the parsed page number, since ``int()`` drops
+    leading zeros -- a zero-padded page number makes that length wrong."""
+
+    def test_digit_adjacent_variant_before_zero_padded_page_gets_no_false_note(
+        self,
+    ) -> None:
+        # The variant "b" is already digit-adjacent (canonical); nothing
+        # here should be reported as normalized.
+        plan = _plan(["y5b-page007.tif"], "x")
+        entry = _entry_for(plan, "y5b-page007.tif")
+        self.assertNotIn("variant form normalized", entry["notes"])
+
+    def test_dashed_variant_before_zero_padded_page_gets_the_note(self) -> None:
+        # The variant "b" really is written after a "-" here, and really is
+        # rewritten digit-adjacent in the target -- the note must fire.
+        plan = _plan(["y-b-page07.tif"], "x")
+        entry = _entry_for(plan, "y-b-page07.tif")
+        self.assertIn("variant form normalized", entry["notes"])
+
+
+class LeadingDashPrefixTests(unittest.TestCase):
+    """``{folder}`` at a drive root renders empty, so a template like
+    ``"{folder}-bag"`` must not be allowed to render a hostile leading-dash
+    prefix (``"-bag"``) -- a leading ``-`` is trimmed the same way a
+    trailing one already is."""
+
+    def test_folder_token_at_drive_root_does_not_leave_a_leading_dash(self) -> None:
+        folder = "C:\\"
+        item_path = os.path.normpath(os.path.join(folder, "photo.tif"))
+        plan = plan_rename(
+            folder=folder,
+            disk_files=[item_path],
+            items=[RenameItem(path=item_path)],
+            prefix_template="{folder}-bag",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertEqual(plan["errors"], [])
+        (entry,) = plan["entries"]
+        self.assertEqual(entry["target"], "bag-001.tif")
+        self.assertFalse(entry["target"].startswith("-"))
+        self.assertTrue(any("trimmed" in w for w in plan["warnings"]), plan["warnings"])
+
+
+class EmptyBaseIdWarningTests(unittest.TestCase):
+    """A filename that is only a part suffix parses to an empty base_id, so
+    unrelated files sharing that empty key silently merge into one group.
+    Grouping itself is unchanged; a warning naming the files is required."""
+
+    def test_two_part_only_files_merging_under_empty_base_id_warns(self) -> None:
+        plan = _plan(["_back.tif", "_front.tif"], "x")
+        self.assertTrue(
+            any("empty base id" in w for w in plan["warnings"]), plan["warnings"]
+        )
+        back_entry = _entry_for(plan, "_back.tif")
+        front_entry = _entry_for(plan, "_front.tif")
+        self.assertEqual(back_entry["target"], "x-001-back.tif")
+        self.assertEqual(front_entry["target"], "x-001-front.tif")
+
+
 class IdempotencyTests(unittest.TestCase):
     def test_replanning_already_clean_names_changes_nothing(self) -> None:
         first = _plan(

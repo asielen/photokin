@@ -1223,7 +1223,7 @@ def rename_no_journal_found(folder: str, verb: str) -> UsageMessage:
     Returns:
         The problem line and the remedy line, in that order.
     """
-    wanted = "an applied" if verb == "undo" else "an in-progress or needs-attention"
+    wanted = "applied" if verb == "undo" else "in-progress or needs-attention"
     return (
         f"no {wanted} rename journal was found in:\n  {folder}",
         f"check the folder by hand, or pass the journal path directly to --rename-{verb}",

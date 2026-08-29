@@ -15,7 +15,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from photokin import rename_apply
+from photokin import cli_messages, rename_apply
 from photokin.tests.test_cli_input_surface import (
     _CliTestCase,
     _write_bytes,
@@ -344,6 +344,29 @@ class TestRenameFinish(_CliTestCase):
             _non_journal_names(folder), sorted(["bw-001.jpg", "bw-001.md", "plan.json"])
         )
         self.assertIn("Rename finish:", stderr)
+
+
+class TestNoJournalFoundWording(unittest.TestCase):
+    """``rename_no_journal_found`` must parse as English for both verbs.
+
+    Regression coverage for a broken article: the message used to read "no an
+    applied rename journal was found in:" and "no an in-progress or
+    needs-attention rename journal was found in:", both of which stop a
+    reader cold on the second word. Pinned directly on the message function
+    rather than through the CLI, since this is wording, not wiring.
+    """
+
+    def test_undo_branch_reads_as_english(self) -> None:
+        problem, _remedy = cli_messages.rename_no_journal_found("/scans", "undo")
+        self.assertIn("no applied rename journal was found in:", problem)
+        self.assertNotIn("no an applied", problem)
+
+    def test_resume_branch_reads_as_english(self) -> None:
+        problem, _remedy = cli_messages.rename_no_journal_found("/scans", "resume")
+        self.assertIn(
+            "no in-progress or needs-attention rename journal was found in:", problem
+        )
+        self.assertNotIn("no an in-progress", problem)
 
 
 if __name__ == "__main__":

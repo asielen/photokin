@@ -156,7 +156,7 @@ the last three rows below.
 | `target` | string \| `null` | The rendered filename (with extension), e.g. `"520601-bag-woodbury-002b-back.tif"`. `null` only for a member of a group that could not be rendered -- see `errors`. |
 | `target_stem` | string \| `null` | `target` without its extension. `null` under the same condition as `target`. This is what a companion's own target is built from (`target_stem + companion_ext`). |
 | `group` | string | The group's display name -- its representative member's `base_id` as `parse_media_filename` read it, before rendering. Not unique across the whole plan by itself; `(folder, group)` is. |
-| `prefix` | string \| `null` | The group's fully rendered prefix (template resolved, trailing `-` trimmed), e.g. `"520601-bag-woodbury"`. Every member of a group shares this. `null` under the same condition as `target`. |
+| `prefix` | string \| `null` | The group's fully rendered prefix (template resolved, leading and trailing `-` trimmed), e.g. `"520601-bag-woodbury"`. Every member of a group shares this. `null` under the same condition as `target`. |
 | `number` | int \| `null` | The 1-based position within `prefix`'s numbering bucket (section 4.5) -- **not** zero-padded; `digits` plus this value is what `target` was rendered from. `null` under the same condition as `target`. |
 | `variant` | string \| `null` | The single-letter variant (`"b"`, ...), or `null` when the name carries none. |
 | `part` | `"front"` \| `"back"` \| `"negative"` \| `"page"` \| `null` | Which part of the object this file is, after any `is_back`/`version` override is applied. `null` means "no part suffix" (an ordinary front), not "unknown". |
