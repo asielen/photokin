@@ -28,6 +28,20 @@ def _names(folder: str) -> list[str]:
     return sorted(os.listdir(folder))
 
 
+def _snapshot(folder: str) -> dict[str, tuple[int, float]]:
+    """Return ``{name: (size, mtime)}`` for every entry directly inside *folder*.
+
+    Stronger than :func:`_names`: a rename that swaps two files back and
+    forth, or one that overwrites a file's bytes without changing its name,
+    would both pass a names-only comparison but fail this one.
+    """
+    result = {}
+    for name in os.listdir(folder):
+        st = os.stat(os.path.join(folder, name))
+        result[name] = (st.st_size, st.st_mtime)
+    return result
+
+
 def _non_journal_names(folder: str) -> list[str]:
     """Basenames inside *folder*, excluding the rename journal and changeset.
 
@@ -344,6 +358,69 @@ class TestRenameFinish(_CliTestCase):
             _non_journal_names(folder), sorted(["bw-001.jpg", "bw-001.md", "plan.json"])
         )
         self.assertIn("Rename finish:", stderr)
+
+
+class TestExecutorCommandsRefuseDryRun(_CliTestCase):
+    """``--dry-run`` is refused on the three executor commands (P1, round 2).
+
+    ``--rename ... -w --dry-run`` already rehearses through
+    ``rename_apply.apply_plan``'s own ``dry_run``. ``--rename-undo``,
+    ``--rename-resume`` and ``--rename-finish`` have no such path -- each one
+    starts writing (a fresh journal segment, then the actual moves) as soon
+    as it runs -- so the global promise that ``--dry-run`` touches no
+    destination is kept by refusing the combination outright, before either
+    executor call is reached. Each case snapshots size and mtime, not just
+    names, so a same-name overwrite would also be caught.
+    """
+
+    def test_rename_undo_dry_run_is_refused_and_touches_nothing(self) -> None:
+        folder = self.make_folder("box3_017.jpg", "box3_017-b.tif")
+        apply_code, _out, _err = self.run_cli([folder, "--rename", "bw", "-w"])
+        self.assertIsNone(apply_code)
+        before = _snapshot(folder)
+
+        code, stdout, stderr = self.run_cli([folder, "--rename-undo", "--dry-run"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("cannot preview `--rename-undo`", stderr)
+        self.assertIn("starts writing to disk", stderr)
+        self.assertEqual(_snapshot(folder), before)
+
+    def test_rename_resume_dry_run_is_refused_and_touches_nothing(self) -> None:
+        folder = self.make_folder("box3_017.jpg")
+        before = _snapshot(folder)
+
+        code, stdout, stderr = self.run_cli([folder, "--rename-resume", "--dry-run"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("cannot preview `--rename-resume`", stderr)
+        self.assertIn("starts writing to disk", stderr)
+        self.assertEqual(_snapshot(folder), before)
+
+    def test_rename_finish_dry_run_is_refused_and_touches_nothing(self) -> None:
+        folder = self.scratch()
+        image = _write_bytes(os.path.join(folder, "box3_017.jpg"))
+        with open(os.path.join(folder, "box3_017.md"), "w", encoding="utf-8") as handle:
+            handle.write("---\nsource_file: box3_017.jpg\n---\ntranscript\n")
+        plan_path = os.path.join(folder, "plan.json")
+        plan_code, _out, _err = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", plan_path]
+        )
+        self.assertIsNone(plan_code)
+        os.rename(image, os.path.join(folder, "bw-001.jpg"))
+        before = _snapshot(folder)
+
+        code, stdout, stderr = self.run_cli(
+            ["--rename-finish", plan_path, "--dry-run"]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("cannot preview `--rename-finish`", stderr)
+        self.assertIn("starts writing to disk", stderr)
+        self.assertEqual(_snapshot(folder), before)
 
 
 class TestNoJournalFoundWording(unittest.TestCase):

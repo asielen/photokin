@@ -19,6 +19,7 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -159,6 +160,23 @@ def _chain_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
     second = _write(folder / "bw-001.tif", "b bytes")
     plan = _plan(folder, [_entry(first, "bw-001.tif"), _entry(second, "bw-002.tif")])
     return folder, plan
+
+
+def _renumber_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
+    """A gap-closing renumber: every target is the current name of another file.
+
+    The shape rename mode exists to produce, and the one that makes "is this
+    name free" answerable only against the plan as a whole: ``file004.tif``
+    sits in the folder before the run because it is the second op's source,
+    and after it because it is the second op's target.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    entries = [
+        _entry(_write(folder / source, f"bytes of {source}"), target)
+        for source, target in (("file004.tif", "file003.tif"), ("file005.tif", "file004.tif"))
+    ]
+    return folder, _plan(folder, entries)
 
 
 def _two_sidecar_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
@@ -331,6 +349,41 @@ def test_undo_restores_every_name_and_byte(tmp_path: Path) -> None:
     assert {name: (folder / name).read_bytes() for name in _names(folder)} == before
 
 
+def test_undo_reverses_a_gap_closing_renumber(tmp_path: Path) -> None:
+    """The undo of the thing this feature is for must not read as a collision.
+
+    Every old name in a renumber is some other op's target, so an occupancy
+    check made one entry at a time sees a stranger holding ``file004.tif`` --
+    and one such skip makes the undo builder refuse the whole run, which
+    leaves --rename-undo unable to reverse a renumber at all.
+    """
+    folder, plan = _renumber_folder(tmp_path)
+    before = {name: (folder / name).read_bytes() for name in _names(folder)}
+    applied = apply_plan(plan)
+    assert applied.status == rename_apply.STATUS_APPLIED
+    assert applied.journal_path is not None
+
+    report = undo_run(applied.journal_path)
+
+    assert report.status == rename_apply.STATUS_UNDONE
+    assert report.skipped == ()
+    assert {name: (folder / name).read_bytes() for name in _names(folder)} == before
+
+
+def test_undo_still_refuses_an_old_name_held_by_a_stranger(tmp_path: Path) -> None:
+    """Reading a renumber as normal may not wave a real collision through."""
+    folder, plan = _renumber_folder(tmp_path)
+    applied = apply_plan(plan)
+    assert applied.journal_path is not None
+    _write(folder / "file005.tif", "a file nobody planned for")
+
+    with pytest.raises(RenamePreflightError) as excinfo:
+        undo_run(applied.journal_path)
+
+    assert "something is already called that: file005.tif" in str(excinfo.value)
+    assert (folder / "file005.tif").read_bytes() == b"a file nobody planned for"
+
+
 def test_undo_appends_to_the_journal_rather_than_rewriting_it(tmp_path: Path) -> None:
     """The journal stays an ordered account of everything that happened."""
     _folder, plan = _simple_folder(tmp_path)
@@ -486,6 +539,41 @@ def test_resume_finishes_an_upward_chain_killed_at_the_first_rename(
     assert (folder / "bw-002.tif").read_bytes() == b"b bytes"
 
 
+def test_resume_finishes_a_renumber_killed_between_the_last_rename_and_the_footer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every file is at its target and no temporary is left: that is resumable.
+
+    What distinguishes this from a chain killed inside phase A is that there
+    is no temporary anywhere to be decisive about. Each op then looks both
+    moved and unmoved at once -- its target is on disk, and so is its source,
+    because that name is the *next* op's target -- and an op-by-op reading
+    calls the first one pending and then refuses to rename into its own
+    finished target. The folder would have no way out: not resumable, not
+    undoable (the journal is open), and closed to a fresh apply.
+    """
+    folder, plan = _renumber_folder(tmp_path)
+
+    def crash(path: str, footer: Any) -> None:
+        raise _Crash()
+
+    monkeypatch.setattr(rename_apply, "_append_footer", crash)
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+    assert _names(folder) == {"file003.tif", "file004.tif"}
+
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    assert read_journal(journal).status == rename_apply.STATUS_IN_PROGRESS
+    resumed = resume_run(journal)
+
+    assert resumed.status == rename_apply.STATUS_APPLIED
+    assert _names(folder) == {"file003.tif", "file004.tif"}
+    assert (folder / "file003.tif").read_bytes() == b"bytes of file004.tif"
+    assert (folder / "file004.tif").read_bytes() == b"bytes of file005.tif"
+
+
 def test_resume_refuses_a_destination_held_by_a_stranger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -576,6 +664,47 @@ def test_resume_rewrites_the_sidecar_of_an_entry_that_finished_before_the_crash(
 # --- Rollback ----------------------------------------------------------
 
 
+def test_the_renamed_folder_is_synced_before_the_journal_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A closed ``applied`` footer may not outlive the renames it describes.
+
+    A filesystem is free to make a file's own fsync durable without the
+    directory updates around it, so a power cut between the last rename and
+    the footer can keep the footer and lose phase B -- after which resume
+    refuses the folder (its journal is closed) and undo assumes targets that
+    are not there. The journal's own creation is synced too, which is why this
+    pins the *order* rather than counting the calls.
+    """
+    _folder, plan = _simple_folder(tmp_path)
+    order: list[str] = []
+    real_fsync = rename_apply._fsync_directory
+    real_footer = rename_apply._append_footer
+    real_rename = os.rename
+
+    def record_fsync(directory: str) -> None:
+        order.append("fsync")
+        real_fsync(directory)
+
+    def record_footer(path: str, footer: Any) -> None:
+        order.append(f"footer {footer['status']}")
+        real_footer(path, footer)
+
+    def record_rename(src: Any, dst: Any, **kwargs: Any) -> None:
+        order.append("rename")
+        real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(rename_apply, "_fsync_directory", record_fsync)
+    monkeypatch.setattr(rename_apply, "_append_footer", record_footer)
+    monkeypatch.setattr(os, "rename", record_rename)
+    report = apply_plan(plan)
+    monkeypatch.undo()
+
+    assert report.status == rename_apply.STATUS_APPLIED
+    assert "rename" in order
+    assert order[-2:] == ["fsync", "footer applied"]
+
+
 def test_a_failure_in_phase_b_puts_every_file_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -639,6 +768,26 @@ def test_an_existing_non_source_target_fails_preflight(tmp_path: Path) -> None:
     with pytest.raises(RenamePreflightError):
         apply_plan(plan)
     assert (folder / "newname-001.tif").read_bytes() == b"a file nobody planned for"
+
+
+def test_a_directory_holding_a_target_name_fails_preflight(tmp_path: Path) -> None:
+    """Occupancy is a question about names, and a directory holds one too.
+
+    A check made against the file snapshot cannot see a directory or a
+    symlink, so the run gets its journal written and every source staged
+    before phase B notices and reverses the lot.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    (folder / "newname-001.tif").mkdir()
+
+    problems = preflight(plan)
+
+    assert problems == ["a file is already called that: newname-001.tif"]
+    with pytest.raises(RenamePreflightError):
+        apply_plan(plan)
+    assert (folder / "newname-001.tif").is_dir()
+    assert not list(folder.glob("*.ndjson"))
+    assert _names(folder) == {"file102.tif", "file105.tif", "file105.md", "newname-001.tif"}
 
 
 def test_two_entries_wanting_one_name_fails_preflight(tmp_path: Path) -> None:
@@ -790,6 +939,41 @@ def test_finish_renames_only_the_companions_whose_image_is_in_place(tmp_path: Pa
     )
 
 
+def test_finish_carries_the_companions_of_a_gap_closing_renumber(tmp_path: Path) -> None:
+    """The catalog renumbered; every old name it freed is a new name it used.
+
+    Requiring an entry's old name to be absent reports the first entry of the
+    chain as "not renamed" and leaves its transcript behind under a name the
+    next entry's transcript also wants, so the second entry is refused too and
+    the run ends having done nothing at all.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    first = _write(folder / "file004.tif", "first image")
+    second = _write(folder / "file005.tif", "second image")
+    first_md = _sidecar(folder / "file004.md", "file004.tif")
+    second_md = _sidecar(folder / "file005.md", "file005.tif")
+    plan = _plan(
+        folder,
+        [
+            _entry(first, "file003.tif", {first_md: "file003.md"}),
+            _entry(second, "file004.tif", {second_md: "file004.md"}),
+        ],
+    )
+    # The catalog renamed both images, lowest first, as any renumber must.
+    first.rename(folder / "file003.tif")
+    second.rename(folder / "file004.tif")
+
+    report = finish_plan(plan)
+
+    assert report.status == rename_apply.STATUS_APPLIED
+    assert report.skipped == ()
+    assert report.companions == 2
+    assert _names(folder) == {"file003.tif", "file003.md", "file004.tif", "file004.md"}
+    assert 'source_file: "file003.tif"' in (folder / "file003.md").read_text(encoding="utf-8")
+    assert 'source_file: "file004.tif"' in (folder / "file004.md").read_text(encoding="utf-8")
+
+
 def test_finish_is_safe_to_run_again(tmp_path: Path) -> None:
     """A second run finds nothing left to do and writes no second journal."""
     folder, plan = _finish_folder(tmp_path)
@@ -913,6 +1097,35 @@ def test_a_damaged_journal_is_refused_rather_than_guessed_at(tmp_path: Path) -> 
     assert _names(folder) == {"newname-001.tif", "newname-002.tif", "newname-002.md"}
 
 
+def test_an_unterminated_last_record_is_ignored_rather_than_fatal(tmp_path: Path) -> None:
+    """The one damage a crash can do to this file is the line it was writing.
+
+    Every record before it was fsynced and still describes a folder resume and
+    undo can act on, so refusing the journal for a torn tail takes both away
+    at exactly the failure the journal exists to survive. The tail is dropped
+    on the next append too, or the record written behind it would splice the
+    two into one complete line no reader may accept.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    applied = apply_plan(plan)
+    assert applied.journal_path is not None
+    with open(applied.journal_path, "a", encoding="utf-8") as handle:
+        handle.write('{"record": "footer", "status": "und')
+
+    assert read_journal(applied.journal_path).status == rename_apply.STATUS_APPLIED
+    undone = undo_run(applied.journal_path)
+
+    assert undone.status == rename_apply.STATUS_UNDONE
+    assert _names(folder) == {"file102.tif", "file105.tif", "file105.md"}
+    assert read_journal(applied.journal_path).status == rename_apply.STATUS_UNDONE
+    assert [record["status"] for record in _records(applied.journal_path) if "status" in record] == [
+        rename_apply.STATUS_IN_PROGRESS,
+        rename_apply.STATUS_APPLIED,
+        rename_apply.STATUS_IN_PROGRESS,
+        rename_apply.STATUS_UNDONE,
+    ]
+
+
 def test_the_journal_lands_inside_the_renamed_folder(tmp_path: Path) -> None:
     """Named for the folder and the run, beside the files it describes."""
     folder, plan = _simple_folder(tmp_path)
@@ -943,6 +1156,73 @@ def test_a_sidecar_without_frontmatter_is_left_alone_and_reported(tmp_path: Path
     assert report.status == rename_apply.STATUS_APPLIED
     assert (folder / "newname-001.md").read_bytes() == b"just some notes\n"
     assert report.warnings == ("sidecar not updated (no frontmatter): newname-001.md",)
+
+
+def test_a_sidecar_pointing_at_another_file_is_renamed_but_never_rewritten(
+    tmp_path: Path,
+) -> None:
+    """Its ``source_file`` value is the only record of what it pointed at.
+
+    Rewriting a link that names some other image destroys that value outright,
+    and the undo then writes the op's own old image name rather than putting
+    back what was there, so the original is gone for good.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    image = _write(folder / "file102.tif", "image")
+    sidecar = _sidecar(folder / "file102.md", "somebody-else.tif")
+    plan = _plan(folder, [_entry(image, "newname-001.tif", {sidecar: "newname-001.md"})])
+
+    report = apply_plan(plan)
+
+    assert report.status == rename_apply.STATUS_APPLIED
+    assert report.warnings == ("sidecar not updated (it names another file): newname-001.md",)
+    assert 'source_file: "somebody-else.tif"' in (folder / "newname-001.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert report.journal_path is not None
+    undo_run(report.journal_path)
+    assert 'source_file: "somebody-else.tif"' in (folder / "file102.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_the_staged_sidecar_carries_the_originals_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap must not hand a private transcript back with umask permissions.
+
+    The staged replacement is a new inode, so its mode is whatever the umask
+    gives it and every extended attribute of the original is dropped at the
+    swap -- a transcript deliberately stored 0600 comes back readable by
+    everyone. The mode is read off the staged file at the moment of the swap
+    because that is the only reading every platform can make: Windows keeps
+    one permission bit, not nine, and refuses to replace a read-only file at
+    all.
+    """
+    original = tmp_path / "note.md"
+    _write(original, "old bytes")
+    os.chmod(original, 0o444)
+    expected = stat.S_IMODE(original.stat().st_mode)
+    staged = tmp_path / "staged.md"
+    seen: dict[str, int] = {}
+    real_replace = os.replace
+
+    def spy_replace(src: Any, dst: Any, **kwargs: Any) -> None:
+        seen["mode"] = stat.S_IMODE(os.stat(src).st_mode)
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    try:
+        rename_apply._swap_in(str(original), str(staged), b"new bytes")
+    finally:
+        monkeypatch.undo()
+        for path in (original, staged):
+            if path.exists():
+                os.chmod(path, 0o666)
+
+    assert seen["mode"] == expected
 
 
 def test_a_sidecar_keeps_its_line_endings(tmp_path: Path) -> None:

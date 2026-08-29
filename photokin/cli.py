@@ -1681,6 +1681,39 @@ def _refuse_rename_mode_conflicts(args: argparse.Namespace) -> None:
         )
 
 
+def _refuse_executor_dry_run(args: argparse.Namespace) -> None:
+    """Refuse ``--dry-run`` on the three executor commands; each of them writes.
+
+    ``--rename -w --dry-run`` already rehearses faithfully, through
+    ``rename_apply.apply_plan``'s own ``dry_run`` parameter (preflight and
+    count, nothing written). ``finish_plan``, ``undo_run`` and ``resume_run``
+    -- the executors behind ``--rename-finish``/``--rename-undo``/
+    ``--rename-resume`` -- have no such parameter: each one opens a fresh
+    journal segment and starts moving files the moment it runs, so there is
+    no non-destructive path through them for this module to drive. Refusing
+    keeps the global promise (``--dry-run`` touches no destination) instead
+    of a rehearsal that would have to guess at, or reimplement, their
+    two-phase mechanics from the outside.
+
+    Args:
+        args: The parsed namespace, checked before any of the three branches
+            runs.
+
+    Raises:
+        SystemExit: With code 2 when ``--dry-run`` was given alongside one of
+            them.
+    """
+    if not args.dry_run:
+        return
+    for flag, given in (
+        ("--rename-finish", args.rename_finish is not None),
+        ("--rename-undo", args.rename_undo is not None),
+        ("--rename-resume", args.rename_resume is not None),
+    ):
+        if given:
+            _exit_with_usage_error(*cli_messages.rename_executor_dry_run_refused(flag))
+
+
 def _exit_with_rename_preflight_error(exc: rename_apply.RenamePreflightError) -> NoReturn:
     """Report a :class:`rename_apply.RenamePreflightError` and exit 2.
 
@@ -2652,6 +2685,7 @@ def main() -> None:
         # named two of these gets one clear refusal instead of whichever
         # branch happened to run first.
         _refuse_rename_mode_conflicts(args)
+        _refuse_executor_dry_run(args)
         if args.rename_finish is not None:
             _run_rename_finish(args.rename_finish)
             return

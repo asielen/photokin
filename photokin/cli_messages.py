@@ -1188,6 +1188,30 @@ def rename_today_invalid(value: str) -> UsageMessage:
     )
 
 
+def rename_executor_dry_run_refused(flag: str) -> UsageMessage:
+    """``--dry-run`` was given beside an executor command; it always writes.
+
+    ``--rename -w --dry-run`` rehearses through ``rename_apply.apply_plan``'s
+    own ``dry_run`` (preflight and count, nothing written). The three
+    executor commands have no equivalent: ``finish_plan``, ``undo_run`` and
+    ``resume_run`` open a fresh journal segment and start moving files the
+    moment they run, with no ``dry_run`` parameter to intercept that -- so
+    refusing is the faithful answer here, not a rehearsal that would have to
+    lie about what actually happens.
+
+    Args:
+        flag: The executor flag, ``--rename-undo``, ``--rename-resume`` or
+            ``--rename-finish``.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`--dry-run` cannot preview `{flag}`: it starts writing to disk as soon as it runs.",
+        f"drop --dry-run and run {flag} for real; only `--rename -w --dry-run` rehearses",
+    )
+
+
 def rename_command_needs_folder(flag: str, display: str) -> UsageMessage:
     """A rename executor command was given input that names no folder.
 

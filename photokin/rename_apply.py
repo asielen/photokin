@@ -30,6 +30,7 @@ Code map:
 - ApplyReport           what a run did, its counts, and its exit code
 - JournalSegment        one run's header, file records and final status
 - Journal               a parsed journal file: its segments and current status
+- _locate_moves         where every file of a run is now, read as one mapping
 - preflight             PUBLIC: re-check a plan against the folder
 - apply_plan            PUBLIC: journal, two phases, sidecars, verify
 - finish_plan           PUBLIC: companions only, images renamed by someone else
@@ -48,9 +49,12 @@ import logging
 import ntpath
 import os
 import re
-from collections.abc import Iterable, Mapping, Sequence
+import stat
+from collections import deque
+from collections.abc import Container, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import islice
 from typing import Any
 
 from .changeset import make_run_id
@@ -101,6 +105,10 @@ _COMPANION_KIND = "companion"
 #: a float and read back off a fresh ``stat``, so an exact compare is one
 #: rounding away from calling an untouched file modified.
 _MTIME_TOLERANCE_S = 1e-6
+
+#: One backslash escape inside a double-quoted YAML scalar, the shape
+#: ``doc_sidecar._yaml_string`` writes.
+_YAML_ESCAPE_RE = re.compile(r"\\(.)")
 
 #: Characters that are illegal in a Windows filename but legal in a run id
 #: (which is an ISO timestamp, so it always contains ``:``).
@@ -395,16 +403,39 @@ def _list_names(folder: str) -> set[str]:
     return set(os.listdir(folder))
 
 
-def _snapshot(folder: str) -> dict[str, tuple[int, float]]:
-    """Return ``name -> (size, mtime)`` for every file directly inside *folder*."""
-    snapshot: dict[str, tuple[int, float]] = {}
+def _scan(folder: str) -> tuple[set[str], dict[str, tuple[int, float]]]:
+    """Return every name directly inside *folder*, and the stats of its files.
+
+    Two answers from one directory walk, because preflight needs both and they
+    answer different questions: whether a planned source is the file the plan
+    measured is a question about files, while whether a planned target's name
+    is free is a question about *names* -- a directory or a symlink called
+    like a target holds that name just as firmly as a file does.
+
+    Args:
+        folder: The directory to walk.
+
+    Returns:
+        ``(every name, name -> (size, mtime) for the plain files)``.
+
+    Raises:
+        OSError: If the folder cannot be walked.
+    """
+    names: set[str] = set()
+    files: dict[str, tuple[int, float]] = {}
     with os.scandir(folder) as entries:
         for entry in entries:
+            names.add(entry.name)
             if not entry.is_file(follow_symlinks=False):
                 continue
-            stat = entry.stat(follow_symlinks=False)
-            snapshot[entry.name] = (stat.st_size, stat.st_mtime)
-    return snapshot
+            info = entry.stat(follow_symlinks=False)
+            files[entry.name] = (info.st_size, info.st_mtime)
+    return names, files
+
+
+def _snapshot(folder: str) -> dict[str, tuple[int, float]]:
+    """Return ``name -> (size, mtime)`` for every file directly inside *folder*."""
+    return _scan(folder)[1]
 
 
 def _fsync_directory(folder: str) -> None:
@@ -480,6 +511,8 @@ def _write_segment(
         OSError: If the journal cannot be written; the caller must not proceed.
         FileExistsError: If a new run's journal is already there.
     """
+    if append:
+        _drop_torn_tail(path)
     mode = "a" if append else "x"
     lines = [json.dumps(dict(header), ensure_ascii=False)]
     lines.extend(json.dumps(_op_record(op), ensure_ascii=False) for op in ops)
@@ -490,8 +523,38 @@ def _write_segment(
     _fsync_directory(os.path.dirname(path) or ".")
 
 
+def _drop_torn_tail(path: str) -> None:
+    """Cut a never-finished last record off *path* before appending to it.
+
+    :func:`read_journal` ignores a last line with no newline on the end of it,
+    because a machine that died mid-append is the only thing that writes one.
+    A record appended behind those bytes would splice itself onto them and
+    make one complete, unparseable line out of two -- damage a reader has to
+    refuse, which would cost the folder the resume or undo this same tolerance
+    just bought it. What is dropped here is exactly the bytes no reader ever
+    accepted.
+
+    Args:
+        path: The journal about to be appended to.
+
+    Raises:
+        OSError: If the file cannot be read or trimmed; the caller must not
+            append to a journal it could not seal.
+    """
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    if not raw or raw.endswith((b"\n", b"\r")):
+        return
+    logger.warning("Dropping the unterminated last record of %s; it was never finished.", path)
+    with open(path, "r+b") as handle:
+        handle.truncate(max(raw.rfind(b"\n"), raw.rfind(b"\r")) + 1)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _append_footer(path: str, footer: Mapping[str, Any]) -> None:
     """Append a run's closing record and flush it to disk."""
+    _drop_torn_tail(path)
     with open(path, "a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(dict(footer), ensure_ascii=False) + "\n")
         handle.flush()
@@ -506,6 +569,15 @@ def read_journal(path: str) -> Journal:
     records rather than rewriting, so the current state of the folder is the
     status of the last status-bearing record.
 
+    A last line with no newline on the end of it is dropped rather than
+    refused. That is the one damage a crash can do to this file: the machine
+    died while a record was being appended, so the bytes that made it down are
+    a record nobody finished writing, while every record before it was fsynced
+    and still describes a recoverable folder. Refusing the file for it would
+    take resume and undo away at exactly the moment the journal exists for. A
+    *terminated* record that does not parse is different -- that is damage
+    from somewhere else, and it stays an error.
+
     Args:
         path: The journal file to read.
 
@@ -513,18 +585,26 @@ def read_journal(path: str) -> Journal:
         The parsed :class:`Journal`.
 
     Raises:
-        RenamePreflightError: If the file cannot be read or does not parse.
+        RenamePreflightError: If the file cannot be read, or a complete record
+            in it does not parse.
     """
     path = os.path.abspath(path)
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            raw_lines = handle.read().splitlines()
+            text = handle.read()
     except OSError as exc:
         raise RenamePreflightError(
             "This rename journal cannot be read.",
             f"Check the file's permissions ({exc.strerror or exc}).",
             [path],
         ) from exc
+
+    raw_lines = text.splitlines()
+    if raw_lines and not text.endswith(("\n", "\r")):
+        logger.warning(
+            "Ignoring the unterminated last record of %s; it was never finished.", path
+        )
+        raw_lines.pop()
 
     segments: list[JournalSegment] = []
     header: dict[str, Any] | None = None
@@ -683,6 +763,94 @@ def _ops_from_plan(
                 )
             )
     return ops
+
+
+# --- Where every file of a run is now ----------------------------------
+
+#: One file's move, as the three names it can be found under: where it
+#: started, where it ends up, and the hidden temporary in between (empty for a
+#: move this executor does not make itself).
+_Move = tuple[str, str, str]
+
+_AT_TMP = "tmp"
+_AT_SOURCE = "source"
+_AT_TARGET = "target"
+_GONE = "gone"
+_UNDECIDED = ""
+
+
+def _moves_of(ops: Iterable[RenameOp]) -> list[_Move]:
+    """Return the ``(source, target, temporary)`` triples of *ops*."""
+    return [(op.src, op.dst, op.tmp) for op in ops]
+
+
+def _locate_moves(moves: Sequence[_Move], names: Container[str]) -> tuple[list[str], set[str]]:
+    """Say where each file of a run is now, reading the run as a whole.
+
+    Asked about one move on its own the question has no honest answer for the
+    very thing rename mode exists to do. In a gap-closing renumber --
+    ``file004 -> file003`` beside ``file005 -> file004`` -- both of a move's
+    names are routinely occupied at once, because the other move puts a file
+    there, and a check that reads a name in isolation calls that a collision.
+    It is the plan working. So the folder is read against the run's complete
+    source/target mapping instead: a name is only unaccounted for when no
+    other move explains the file sitting under it.
+
+    The temporary decides on its own -- it carries the run's id and belongs to
+    one move, so a file under it is that move's whatever else is on disk.
+    Everything after that is elimination: a move with only one of its two
+    names free is where that name says it is, and each such decision releases
+    the other moves that could have claimed the name it just took, which walks
+    a chain in from whichever end is unambiguous. A move still undecided when
+    that runs out is a cycle (``a -> b`` beside ``b -> a`` looks identical
+    before and after), and is reported as still at its source -- the
+    conservative reading at all three call sites, because it makes a caller
+    redo a move rather than skip one.
+
+    Args:
+        moves: The run's moves, in the order they were journalled.
+        names: The folder's current names, as the filesystem spells them.
+
+    Returns:
+        One location per move, in the same order (``_AT_TMP``, ``_AT_SOURCE``,
+        ``_AT_TARGET`` or ``_GONE``), and the names on disk those locations
+        account for.
+    """
+    locations = [_UNDECIDED] * len(moves)
+    claimed: set[str] = set()
+    holders: dict[str, list[int]] = {}
+    queue: deque[int] = deque()
+    for index, (source, target, tmp) in enumerate(moves):
+        holders.setdefault(source, []).append(index)
+        holders.setdefault(target, []).append(index)
+        if tmp and tmp in names:
+            locations[index] = _AT_TMP
+            claimed.add(tmp)
+        else:
+            queue.append(index)
+
+    while queue:
+        index = queue.popleft()
+        if locations[index] != _UNDECIDED:
+            continue
+        source, target, _tmp = moves[index]
+        at_source = source in names and source not in claimed
+        at_target = target in names and target not in claimed
+        if at_source and at_target:
+            continue
+        if not at_source and not at_target:
+            locations[index] = _GONE
+            continue
+        held = source if at_source else target
+        locations[index] = _AT_SOURCE if at_source else _AT_TARGET
+        claimed.add(held)
+        queue.extend(other for other in holders[held] if locations[other] == _UNDECIDED)
+
+    for index, location in enumerate(locations):
+        if location == _UNDECIDED:
+            locations[index] = _AT_SOURCE
+            claimed.add(moves[index][0])
+    return locations, claimed
 
 
 # --- Preflight ---------------------------------------------------------
@@ -900,7 +1068,7 @@ def preflight(plan: Mapping[str, Any]) -> list[str]:
     if problems and not os.path.isdir(folder):
         return problems
 
-    present = _snapshot(folder)
+    listing, present = _scan(folder)
     located = _locate_sources(folder, present, plan)
     sources_ci: set[str] = set()
     targets_ci: dict[str, str] = {}
@@ -927,11 +1095,15 @@ def preflight(plan: Mapping[str, Any]) -> list[str]:
                 problems.append(f"two files want the same name: {target}")
             targets_ci[key] = target
 
-    existing_ci = {casefold_filename(name) for name in present}
+    # Occupancy is asked of the whole listing, not of the file snapshot: a
+    # directory or a symlink named like a target is not a file, so a check
+    # made against the snapshot cannot see it, and the run would get as far as
+    # phase B before ``_rename`` noticed and rolled everything back.
+    existing_ci = {casefold_filename(name) for name in listing}
     for key, target in sorted(targets_ci.items()):
         if key in existing_ci and key not in sources_ci:
             problems.append(f"a file is already called that: {target}")
-    for name in sorted(present):
+    for name in sorted(listing):
         if name.startswith(_TMP_PREFIX):
             problems.append(f"a temporary from an earlier run is still here: {name}")
     return problems
@@ -949,8 +1121,8 @@ def _raise_preflight(problems: Sequence[str]) -> None:
 # --- Sidecars ----------------------------------------------------------
 
 
-def _sidecar_rewrites(ops: Sequence[RenameOp]) -> list[tuple[str, str]]:
-    """Return ``(sidecar name, image name)`` pairs to rewrite after phase B.
+def _sidecar_rewrites(ops: Sequence[RenameOp]) -> list[tuple[str, str, str]]:
+    """Return ``(sidecar name, image name before, image name after)`` triples.
 
     ``write_markdown_sidecar`` sets a sidecar's ``source_file`` to its image's
     basename, so a renamed image leaves every sidecar pointing at a name that
@@ -958,20 +1130,74 @@ def _sidecar_rewrites(ops: Sequence[RenameOp]) -> list[tuple[str, str]]:
     ``photo_id`` both carry, which means this is derivable from the journal
     alone -- resume and undo need no extra records to redo or reverse it.
 
+    Both of the image's names are carried, because the rewrite is only allowed
+    to touch a link that names the image being renamed
+    (:func:`_rewrite_sidecar`).
+
     Args:
         ops: The run's ops, in the direction they are being executed.
 
     Returns:
-        Pairs of names as they will be *after* the run.
+        Triples whose sidecar name is the name it carries *after* the run.
     """
-    images = {op.photo_id: op.dst for op in ops if op.kind == _IMAGE_KIND and op.photo_id}
+    images = {
+        op.photo_id: (op.src, op.dst) for op in ops if op.kind == _IMAGE_KIND and op.photo_id
+    }
     return [
-        (op.dst, images[op.photo_id])
+        (op.dst, *images[op.photo_id])
         for op in ops
         if op.kind == _COMPANION_KIND
         and op.dst.lower().endswith(_SIDECAR_EXT)
         and op.photo_id in images
     ]
+
+
+def _carry_protection(original: str, staged: str) -> None:
+    """Give *staged* the protection *original* carries, before it replaces it.
+
+    The staged file is a new inode created under the process umask, so a
+    transcript deliberately stored ``0600`` comes back ``0644`` and every
+    extended attribute the original carried -- a POSIX ACL among them -- is
+    dropped at the swap. Content somebody restricted on purpose would quietly
+    become readable by everyone, which is a worse outcome than not rewriting
+    the ``source_file`` line at all. The mode is the part every platform has
+    and is not optional here: a file whose protection could not be set is not
+    swapped in, and the caller reports it. Ownership and extended attributes
+    exist only where the OS offers them and are carried as far as this process
+    is permitted to, since failing at those loses metadata rather than
+    exposing anything.
+
+    Args:
+        original: The file being replaced.
+        staged: The temporary that will replace it.
+
+    Raises:
+        OSError: If *original* cannot be stat'd or *staged*'s mode cannot be
+            set; the caller must not swap in a file it could not protect.
+    """
+    info = os.stat(original)
+    os.chmod(staged, stat.S_IMODE(info.st_mode))
+    chown = getattr(os, "chown", None)
+    if chown is not None:
+        try:
+            chown(staged, info.st_uid, info.st_gid)
+        except OSError as exc:
+            logger.debug("Could not carry the ownership of %s: %s", original, exc)
+    listxattr = getattr(os, "listxattr", None)
+    getxattr = getattr(os, "getxattr", None)
+    setxattr = getattr(os, "setxattr", None)
+    if listxattr is None or getxattr is None or setxattr is None:
+        return
+    try:
+        attributes = listxattr(original)
+    except OSError as exc:
+        logger.debug("Could not read the extended attributes of %s: %s", original, exc)
+        return
+    for name in attributes:
+        try:
+            setxattr(staged, name, getxattr(original, name))
+        except OSError as exc:
+            logger.debug("Could not carry %s of %s: %s", name, original, exc)
 
 
 def _swap_in(path: str, tmp_path: str, payload: bytes) -> str | None:
@@ -1007,6 +1233,7 @@ def _swap_in(path: str, tmp_path: str, payload: bytes) -> str | None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        _carry_protection(path, tmp_path)
         os.replace(tmp_path, path)
     except OSError as exc:
         if os.path.lexists(tmp_path):
@@ -1018,8 +1245,30 @@ def _swap_in(path: str, tmp_path: str, payload: bytes) -> str | None:
     return None
 
 
-def _rewrite_sidecar(md_path: str, image_name: str, tmp_path: str) -> str | None:
-    """Point a markdown sidecar's ``source_file:`` frontmatter at *image_name*.
+def _sidecar_link(line: str) -> str:
+    """Return the file name a ``source_file:`` frontmatter line points at.
+
+    ``_yaml_string`` always double-quotes and backslash-escapes what it emits,
+    so that spelling is unwrapped exactly; a hand-written single-quoted or
+    bare value is read the way YAML reads it. Anything this cannot make sense
+    of comes back as the raw text, which simply will not match the image being
+    renamed -- and not matching is the safe answer (:func:`_rewrite_sidecar`).
+
+    Args:
+        line: The frontmatter line, stripped of surrounding whitespace.
+
+    Returns:
+        The file name the line carries.
+    """
+    value = line.partition(":")[2].strip()
+    if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
+        inner = value[1:-1]
+        return _YAML_ESCAPE_RE.sub(r"\1", inner) if value[0] == '"' else inner.replace("''", "'")
+    return value
+
+
+def _rewrite_sidecar(md_path: str, was: str, now: str, tmp_path: str) -> str | None:
+    """Point a markdown sidecar's ``source_file:`` frontmatter at *now*.
 
     Only the leading frontmatter block is touched, and only its first
     ``source_file`` line; every other byte of the file is written back exactly
@@ -1028,13 +1277,24 @@ def _rewrite_sidecar(md_path: str, image_name: str, tmp_path: str) -> str | None
     writer's own string emitter rather than a second one here, so the line is
     identical to what a re-analysis would produce.
 
-    A sidecar that is not this shape is left alone: the rename has already
-    happened by the time this runs, and refusing to finish it over a file
-    photokin does not own would be the worse outcome.
+    The line is rewritten only when it names the image this op renamed. A
+    same-stem ``.md`` whose ``source_file`` points somewhere else is either
+    stale or deliberate, and either way that value is the only record of what
+    it pointed at: overwriting it destroys that, and an undo would then write
+    the op's old image name rather than what was there. Journalling the old
+    value instead was the alternative, and it is the weaker one -- it helps
+    only a reader holding the journal, while leaving the value alone keeps the
+    file itself true. A link already naming the new image is left alone too,
+    which is what lets a resume redo the whole segment's sidecars.
+
+    A sidecar that is not this shape is left alone for the same reason: the
+    rename has already happened by the time this runs, and refusing to finish
+    it over a file photokin does not own would be the worse outcome.
 
     Args:
         md_path: Absolute path of the sidecar, already at its new name.
-        image_name: The image's new basename.
+        was: The image's basename before this run renamed it.
+        now: The image's basename after it.
         tmp_path: Sibling temporary the rewritten bytes are staged in before
             they are swapped onto *md_path* (see :func:`_swap_in`).
 
@@ -1061,8 +1321,13 @@ def _rewrite_sidecar(md_path: str, image_name: str, tmp_path: str) -> str | None
             break
         if not stripped.startswith("source_file:"):
             continue
+        current = casefold_filename(_sidecar_link(stripped))
+        if current == casefold_filename(now):
+            return None
+        if current != casefold_filename(was):
+            return f"sidecar not updated (it names another file): {os.path.basename(md_path)}"
         terminator = lines[index][len(lines[index].rstrip("\r\n")) :]
-        lines[index] = f"source_file: {_yaml_string(image_name)}{terminator}"
+        lines[index] = f"source_file: {_yaml_string(now)}{terminator}"
         return _swap_in(md_path, tmp_path, "".join(lines).encode("utf-8"))
     return f"sidecar not updated (no source_file line): {os.path.basename(md_path)}"
 
@@ -1080,10 +1345,10 @@ def _apply_sidecars(folder: str, ops: Sequence[RenameOp], run_token: str) -> lis
         One warning line per sidecar that was not rewritten.
     """
     warnings: list[str] = []
-    for index, (sidecar_name, image_name) in enumerate(_sidecar_rewrites(ops)):
+    for index, (sidecar_name, was, now) in enumerate(_sidecar_rewrites(ops)):
         tmp = f"{_TMP_PREFIX}{run_token}-sidecar-{index}{_SIDECAR_EXT}"
         warning = _rewrite_sidecar(
-            os.path.join(folder, sidecar_name), image_name, os.path.join(folder, tmp)
+            os.path.join(folder, sidecar_name), was, now, os.path.join(folder, tmp)
         )
         if warning is not None:
             logger.warning("%s", warning)
@@ -1251,6 +1516,7 @@ def _execute(
     placed: list[RenameOp] = list(placed_before)
     warnings: list[str] = []
     sidecars_rewritten = False
+    outcome: tuple[str, list[str], list[str]]
     try:
         _move_all(folder, pending_a, to_tmp=True, done=staged)
         _move_all(folder, staged, to_tmp=False, done=placed)
@@ -1272,14 +1538,29 @@ def _execute(
         if stranded:
             # A reversal that could not finish is not a state to keep editing
             # files in: every remaining decision belongs to a person.
-            return STATUS_NEEDS_ATTENTION, stranded, warnings
-        if sidecars_rewritten:
-            # Verification can fail after the sidecars have been rewritten, so
-            # they have to follow the files back or the rollback would leave
-            # every sidecar pointing at a name that is no longer on disk.
-            warnings.extend(_apply_sidecars(folder, [_reversed_op(op) for op in ops], run_token))
-        return STATUS_ROLLED_BACK, stranded, warnings
-    return STATUS_APPLIED, [], warnings
+            outcome = (STATUS_NEEDS_ATTENTION, stranded, warnings)
+        else:
+            if sidecars_rewritten:
+                # Verification can fail after the sidecars have been rewritten,
+                # so they have to follow the files back or the rollback would
+                # leave every sidecar pointing at a name that is not on disk.
+                warnings.extend(
+                    _apply_sidecars(folder, [_reversed_op(op) for op in ops], run_token)
+                )
+            outcome = (STATUS_ROLLED_BACK, stranded, warnings)
+    else:
+        outcome = (STATUS_APPLIED, [], warnings)
+
+    # The renamed directory entries go to the platter here, before the caller
+    # appends any closed-status footer to the journal. A filesystem is free to
+    # make a file's own fsync durable without the unrelated directory updates
+    # around it, so without this a power cut can leave a journal closed
+    # ``applied`` over a folder that lost some or all of phase B -- a state
+    # resume refuses (the journal is closed) and undo misreads (it assumes the
+    # targets are there). The rollback paths are synced for the same reason:
+    # ``rolled_back`` is a closed status too.
+    _fsync_directory(folder)
+    return outcome
 
 
 # --- Public entry points -----------------------------------------------
@@ -1391,10 +1672,11 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
     """Bring companions along for images someone else has already renamed.
 
     The executor with the images taken as done: each entry is required to have
-    its target in place and its old name gone, and only then are its
-    companions renamed and its sidecar rewritten. Entries whose image is not
-    renamed yet are reported and skipped, so the command is safe to run again;
-    so is an entry whose companions are already in place from an earlier run.
+    its target in place and nothing unaccounted-for sitting under its old
+    name, and only then are its companions renamed and its sidecar rewritten.
+    Entries whose image is not renamed yet are reported and skipped, so the
+    command is safe to run again; so is an entry whose companions are already
+    in place from an earlier run.
 
     Args:
         plan: The plan whose images a catalog application has applied.
@@ -1420,36 +1702,54 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
     skipped: list[str] = []
     renamed_images = 0
 
-    for entry in plan.get("entries") or []:
-        if not isinstance(entry, Mapping):
-            continue
+    entries = [entry for entry in plan.get("entries") or [] if isinstance(entry, Mapping)]
+    files_by_entry = [_entry_files(entry) for entry in entries]
+    # Every question below -- has the catalog renamed this image yet, is this
+    # companion already across, is that name held by a stranger -- is asked of
+    # the plan's complete source/target mapping (:func:`_locate_moves`), never
+    # of one file on its own. In a gap-closing renumber a file's old name is
+    # routinely still on disk because it is the name the *next* entry was
+    # renamed to; asked file by file, the first entry of every chain is
+    # reported as not renamed and its companions are left behind.
+    locations, accounted = _locate_moves(
+        [
+            (os.path.basename(source), target, "")
+            for files in files_by_entry
+            for source, target, _kind in files
+        ],
+        names,
+    )
+    placements = iter(locations)
+
+    for entry, image_files in zip(entries, files_by_entry, strict=True):
+        placed_at = list(islice(placements, len(image_files)))
         photo_id = str(entry.get("photo_id") or "")
-        image_files = _entry_files(entry)
         source, target, _kind = image_files[0]
         name = os.path.basename(source)
         if not name or not target:
             skipped.append("an entry has no path or no target")
             continue
-        if name != target and not (target in names and name not in names):
+        if name != target and placed_at[0] != _AT_TARGET:
             skipped.append(f"image not renamed yet: {name}")
             continue
 
         entry_ops: list[RenameOp] = []
-        for companion_source, companion_target, _companion_kind in image_files[1:]:
+        for (companion_source, companion_target, _companion_kind), location in zip(
+            image_files[1:], placed_at[1:], strict=True
+        ):
             companion_name = os.path.basename(companion_source)
             if not companion_name or not companion_target:
                 continue
-            if companion_name == companion_target:
+            if companion_name == companion_target or location == _AT_TARGET:
+                # Already where it belongs, from this plan's own earlier run.
                 continue
-            if companion_target in names:
-                # Already carried across by an earlier run -- unless the old
-                # name is still there too, in which case two files claim one
-                # target and this is not a state to rename into.
-                if companion_name in names:
-                    skipped.append(f"a file is already called that: {companion_target}")
-                continue
-            if companion_name not in names:
+            if location == _GONE:
                 skipped.append(f"companion gone: {companion_name}")
+                continue
+            if companion_target in names and companion_target not in accounted:
+                # Two files claim one name and only one of them is in this
+                # plan: not a state to rename into.
+                skipped.append(f"a file is already called that: {companion_target}")
                 continue
             entry_ops.append(
                 RenameOp(
@@ -1526,31 +1826,35 @@ def resume_run(journal_path: str) -> ApplyReport:
     folder = journal.folder
     names = _list_names(folder)
     ops = list(segment.ops)
+    # Where each file is is decided from the segment as a whole
+    # (:func:`_locate_moves`), never op by op. Op by op, a run killed between
+    # its last rename and its footer reads as unresumable: every op of a
+    # gap-closing chain is sitting at its target, and every one of those
+    # targets is also the *source* name of the op before it, so each op looks
+    # both moved and unmoved at once and the collision check refuses the only
+    # way out of the folder.
+    locations, accounted = _locate_moves(_moves_of(ops), names)
     staged: list[RenameOp] = []
     placed: list[RenameOp] = []
     pending: list[RenameOp] = []
     problems: list[str] = []
-    for op in ops:
+    for op, location in zip(ops, locations, strict=True):
         if op.external:
             if op.dst not in names:
                 problems.append(f"the image was not renamed after all: {op.dst}")
             continue
-        at_src, at_tmp, at_dst = op.src in names, op.tmp in names, op.dst in names
-        # The temporary is decisive. It carries this run's id and belongs to
-        # this one op, so a file sitting at it is unambiguously staged and
-        # ``at_dst`` says nothing about it -- it says some *other* file holds
-        # the destination name, which during phase A is routinely a later op's
-        # source that has not been staged yet. That is the ordinary shape of an
-        # upward chain, not an anomaly. Only the source being back as well is a
-        # contradiction the journal cannot explain.
-        if at_tmp:
-            if at_src:
+        if location == _AT_TMP:
+            # The temporary is decisive: it carries this run's id and belongs
+            # to this one op. A file still under the op's source name is then
+            # a second copy only if nothing else in the segment accounts for
+            # it -- in a chain that name is a neighbour's target or its
+            # not-yet-staged source.
+            if op.src in names and op.src not in accounted:
                 problems.append(f"in two places at once: {op.src}")
-            else:
-                staged.append(op)
-        elif at_src:
+            staged.append(op)
+        elif location == _AT_SOURCE:
             pending.append(op)
-        elif at_dst:
+        elif location == _AT_TARGET:
             placed.append(op)
         else:
             problems.append(f"gone: {op.src}")
@@ -1611,6 +1915,14 @@ def _reverse_ops(
     at its old name, and the companions of one that is not are reported and
     left alone.
 
+    "Still at its target" is decided from the segment as a whole
+    (:func:`_locate_moves`). Read op by op it is wrong for every gap-closing
+    renumber, which is what this feature is for: after ``file004 ->
+    file003`` and ``file005 -> file004``, a file called ``file004`` is on disk
+    because it is the *second* op's target, and taking that as an unrelated
+    file already holding the first op's old name turns one bogus skip into a
+    refusal of the whole undo.
+
     Args:
         segment: The completed segment to reverse.
         names: The folder's current names.
@@ -1632,8 +1944,9 @@ def _reverse_ops(
         blocked.add(op.photo_id)
         skipped.append(f"image not put back yet: {op.dst}")
 
+    locations, _accounted = _locate_moves(_moves_of(segment.ops), names)
     ops: list[RenameOp] = []
-    for op in reversed(segment.ops):
+    for op, location in reversed(list(zip(segment.ops, locations, strict=True))):
         if op.photo_id in blocked:
             if not op.external:
                 skipped.append(f"left alone: {op.dst}")
@@ -1644,7 +1957,7 @@ def _reverse_ops(
         if op.dst not in names:
             skipped.append(f"not where the journal left it: {op.dst}")
             continue
-        if op.src in names:
+        if location != _AT_TARGET:
             skipped.append(f"something is already called that: {op.src}")
             continue
         ops.append(_reversed_op(op, _tmp_name(safe, len(ops), op.dst)))

@@ -13,12 +13,14 @@ import unittest
 from datetime import date
 from unittest import mock
 
+from photokin import utils
 from photokin.rename import (
     DEFAULT_COMPANION_EXTENSIONS,
     RenameItem,
     _MissingDate,
     _natural_sort_key,
     _parse_photo_date,
+    _PartialDatePercentFormat,
     _PhotoDate,
     _render_date_format,
     _render_template,
@@ -741,6 +743,99 @@ class PartialDateValidationTests(unittest.TestCase):
         self.assertEqual(plan["errors"], [])
         entry = _entry_for(plan, "shot.tif")
         self.assertEqual(entry["target"], "undated-001.tif")
+
+
+class PercentFormatPartialDateTests(unittest.TestCase):
+    """P2 (second review round): a percent-style FORMAT must not invent
+    precision on a partial date -- substituting January 1 for a missing
+    month/day before calling ``strftime``, as this used to do, rendered
+    ``1952-01-01`` for a photo whose day nobody actually recorded, while the
+    non-percent grammar renders ``00`` for the same case (4.4). Rather than
+    fabricate a matching ``00`` through ``strftime`` (impossible for a
+    general percent code like ``%j``, which has no well-defined value for
+    an unknown month), a percent format on a partial date is refused
+    outright -- consistent with the missing-date case, which is also a
+    named plan error rather than a guess."""
+
+    def test_percent_format_raises_on_a_partial_date(self) -> None:
+        partial = _PhotoDate(1952, None, None, partial=True)
+        with self.assertRaises(_PartialDatePercentFormat):
+            _render_date_format("%Y-%m-%d", partial)
+
+    def test_percent_format_still_renders_a_complete_date(self) -> None:
+        # The fix must not disturb the ordinary (non-partial) case.
+        complete = _PhotoDate(1952, 6, 1, partial=False)
+        self.assertEqual(_render_date_format("%Y-%m-%d", complete), "1952-06-01")
+
+    def test_percent_template_on_a_partial_date_is_a_plan_error_not_a_fabricated_day(
+        self,
+    ) -> None:
+        plan = _plan(["shot.tif"], "{date:%Y-%m-%d}", dates={"shot.tif": "1952"})
+        self.assertTrue(
+            any("shot" in e or "strftime" in e for e in plan["errors"]), plan["errors"]
+        )
+        entry = _entry_for(plan, "shot.tif")
+        self.assertIsNone(entry["target"])
+        # Before the fix this passed with entry["target"] == "1952-01-01-001.tif".
+
+
+class VersionOverrideGrammarCharacterClassTests(unittest.TestCase):
+    """P2 (second review round): the version override validation must
+    reject against the same character class ``parse_media_filename``'s own
+    variant regex matches (``[a-zA-Z]``), not ``str.isalpha()``, which also
+    accepts non-ASCII letters the grammar cannot read back -- accepting one
+    would render a target that ``parse_media_filename`` reads back as an
+    unversioned base id on the very next run."""
+
+    def test_non_ascii_letter_version_override_is_rejected(self) -> None:
+        # Cyrillic "a" (U+0430) satisfies str.isalpha() but is outside
+        # [a-zA-Z]; accepting it round-trips to an unversioned base id.
+        plan = _plan(["photo3.tif"], "x", versions={"photo3.tif": "а"})
+        self.assertTrue(
+            any("photo3.tif" in e for e in plan["errors"]), plan["errors"]
+        )
+        entry = _entry_for(plan, "photo3.tif")
+        self.assertIsNotNone(entry["target"])
+        self.assertNotIn("а", entry["target"])
+
+    def test_ascii_letter_version_override_still_accepted(self) -> None:
+        # The fix must not disturb the ordinary ASCII case.
+        plan = _plan(["photo3.tif"], "x", versions={"photo3.tif": "c"})
+        self.assertEqual(plan["errors"], [])
+        entry = _entry_for(plan, "photo3.tif")
+        self.assertEqual(entry["variant"], "c")
+
+
+class CaseMismatchFallbackPerformanceTests(unittest.TestCase):
+    """P2 (second review round): a systematically case-mismatched manifest
+    (every path differs in case from the disk listing -- a case-insensitive
+    filesystem, a catalog export) must not fall back to a pairwise
+    ``paths_are_same_file`` scan of every known path for every disk file.
+    That is O(n) syscalls per image, O(n**2) for the folder, against a
+    planner the plan and AGENTS.md both describe as O(n log n)."""
+
+    def test_fallback_calls_paths_are_same_file_linearly_not_quadratically(self) -> None:
+        n = 50
+        names = [f"file{i:03d}.tif" for i in range(n)]
+        disk_files = [_path(name) for name in names]
+        items = [RenameItem(path=_path(name.upper())) for name in names]
+        with mock.patch(
+            "photokin.utils.paths_are_same_file", wraps=utils.paths_are_same_file
+        ) as spy:
+            plan = plan_rename(
+                folder=_FOLDER,
+                disk_files=disk_files,
+                items=items,
+                prefix_template="x",
+                digits=3,
+                run_id="test-run",
+            )
+        self.assertEqual(plan["errors"], [])
+        # O(n): at most one paths_are_same_file call per disk file, since
+        # each one has exactly one case-folded candidate. The quadratic
+        # fallback this regresses against calls it once per KNOWN path for
+        # every disk file (n**2 -- 2500 calls at n=50), far more than n.
+        self.assertLessEqual(spy.call_count, n, spy.call_count)
 
 
 class FolderNormalizationTests(unittest.TestCase):

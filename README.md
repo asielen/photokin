@@ -344,8 +344,8 @@ Writes go to **every** file in the group at all three settings — the granulari
 ```
 file102.tif          ->  newname-001.tif
 file105.tif          ->  newname-002.tif
-file105b.tif          ->  newname-002b.tif
-file105b-back.tif     ->  newname-002b-back.tif
+file105b.tif         ->  newname-002b.tif
+file105b-back.tif    ->  newname-002b-back.tif
 ```
 
 That is the whole feature: "clean up and rename the files in this folder using this prefix." A `-` always separates the prefix from the number, so `parse_media_filename` reads a renamed file back exactly the way it read the original.
@@ -354,7 +354,7 @@ That is the whole feature: "clean up and rename the files in this folder using t
 
 ```
 photokin ./scans --rename "newname"                       preview, touches nothing
-photokin ./scans --rename "newname" -w                     record the plan and apply it
+photokin ./scans --rename "newname" -w                    record the plan and apply it
 ```
 
 The prefix can be a template, not just a literal string — `{date}`, `{today}`, `{folder}` and `{orig}` tokens, each with an optional `:FORMAT` on the two date ones:
@@ -363,7 +363,7 @@ The prefix can be a template, not just a literal string — `{date}`, `{today}`,
 photokin ./scans --rename "{date:yymmdd}-bag" -w          520601-bag-001.tif; numbering restarts per date
 photokin ./scans --rename "{today:yymmdd}-bag" -w         batch date (the run date) instead of each photo's own
 photokin ./scans --rename "newname{date:yyyy-mm-dd}" -w   newname1952-06-01-001.tif
-photokin ./scans --rename "{orig}" -w                      keep the current prefix, just renumber and clean up
+photokin ./scans --rename "{orig}" -w                     keep the current prefix, just renumber and clean up
 ```
 
 A prefix that renders differently per file (any template using `{date}`) starts its numbering over at 1 for each distinct rendered value, so a folder spanning several scanning sessions gets one clean sequence per session rather than one long one. Companions sharing an image's stem (`.md`, `.json`, `.xmp`, `.txt`, plus a `.jpg` twin of a `.tif`) are carried along automatically; `--companions EXT[,EXT]` adds more extensions to that set.

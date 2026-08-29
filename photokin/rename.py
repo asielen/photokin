@@ -192,6 +192,19 @@ def _parse_photo_date(raw: str) -> _PhotoDate | None:
     return _PhotoDate(parsed.year, parsed.month, parsed.day, partial=False)
 
 
+class _PartialDatePercentFormat(ValueError):
+    """A percent-style FORMAT was asked to render a date missing its month
+    or day.
+
+    ``strftime`` requires a complete, valid calendar date -- there is no
+    month-0 or day-0 to hand it the way the yyyy/mm/dd token grammar renders
+    an unknown part as ``"00"`` (4.4). Filling the gap with January 1 before
+    calling ``strftime``, as this used to do, invents a day nobody actually
+    recorded; raising instead of guessing keeps a percent format's precision
+    honest with what the token grammar already promises.
+    """
+
+
 _FORMAT_TOKENS = ("yyyy", "mmmm", "mmm", "mm", "yy", "dd")
 
 
@@ -231,8 +244,16 @@ def _render_date_format(fmt: str, photo_date: _PhotoDate) -> str:
 
     Returns:
         The rendered string.
+
+    Raises:
+        _PartialDatePercentFormat: *fmt* contains ``%`` and *photo_date* is
+            missing its month or day -- see that exception's docstring.
     """
     if "%" in fmt:
+        if photo_date.partial:
+            raise _PartialDatePercentFormat(fmt)
+        # partial=False guarantees month/day are set; the "or 1" fallback is
+        # unreachable and only satisfies mypy's Optional[int] narrowing.
         month = photo_date.month or 1
         day = photo_date.day or 1
         return datetime(photo_date.year, month, day).strftime(fmt)  # noqa: DTZ001 (date only, no zone)
@@ -398,6 +419,9 @@ def _render_template(
     Raises:
         _MissingDate: The template uses ``{date}``, *photo_date* is
             ``None``, and *undated_literal* is also ``None``.
+        _PartialDatePercentFormat: The ``{date}`` token's FORMAT contains
+            ``%`` and *photo_date* is missing its month or day -- propagated
+            straight out of :func:`_render_date_format`.
     """
     out: list[str] = []
     used_partial_date = False
@@ -530,6 +554,17 @@ def _natural_sort_key(name: str) -> tuple[int | str, ...]:
     return natural + (name.lower(), name)
 
 
+# The exact character class parse_media_filename's own variant regex
+# matches (`[a-z]` under re.IGNORECASE, i.e. ASCII a-z/A-Z only -- see
+# _VARIANT_RE above). str.isalpha() accepts any Unicode letter (Cyrillic,
+# Greek, ...), which the grammar does not, so validating an override with it
+# let a non-ASCII "letter" through: render_media_filename would write it
+# into the filename, and parse_media_filename reads that back as an
+# unversioned base id, exactly the round-trip failure this validation
+# exists to prevent.
+_VERSION_LETTER_RE = re.compile(r"^[a-zA-Z]$")
+
+
 def _validate_version_override(raw: str) -> tuple[str | None, str | None]:
     """Validate a manifest ``version`` override (4.1, C1).
 
@@ -558,7 +593,7 @@ def _validate_version_override(raw: str) -> tuple[str | None, str | None]:
     stripped = raw.strip()
     if not stripped:
         return None, None
-    if len(stripped) == 1 and stripped.isalpha():
+    if _VERSION_LETTER_RE.match(stripped):
         return stripped.lower(), None
     return None, f"version override {raw!r} is not a single letter"
 
@@ -864,6 +899,16 @@ def plan_rename(
             )
             group_plans.append(_GroupPlan(group_key, display, group_members, None, False))
             continue
+        except _PartialDatePercentFormat as exc:
+            errors.append(
+                f"group '{display}': FORMAT {str(exc)!r} needs strftime, but "
+                f"'{os.path.basename(representative.item.path)}' only has a partial date; "
+                "strftime cannot render an unknown month or day the way the yyyy/mm/dd "
+                "token grammar renders '00' for it, so this format is refused rather "
+                "than inventing one"
+            )
+            group_plans.append(_GroupPlan(group_key, display, group_members, None, False))
+            continue
 
         # A leading '-' is trimmed the same way a trailing one already is:
         # {folder} at a drive root (os.path.basename of "C:\\" is "") renders
@@ -1037,8 +1082,13 @@ def _attach_companions_and_bystanders(
     making a file its own bystander and breaking idempotency. The exact
     (already-normalized) spelling is tried first, in a set, so this stays
     O(n) for the overwhelming common case where every path already agrees
-    on spelling; the fallback only runs the pairwise check for whichever
-    handful of paths do not match exactly.
+    on spelling. When it does not -- every manifest path differing in case
+    from the directory listing, a case-insensitive filesystem's own catalog
+    export -- the fallback still has to stay O(n) overall: it looks the
+    disk path up by a case-folded key in a dict built once from
+    *known_image_paths*, so it verifies with :func:`utils.paths_are_same_file`
+    only against the (typically single) candidate that already agrees on
+    spelling modulo case, never against every known path.
 
     Mutates *entries* (each matched one's ``companions`` list),
     *left_behind*, *warnings* and *bystander_names* in place.
@@ -1049,6 +1099,9 @@ def _attach_companions_and_bystanders(
         entry_indices_by_stem.setdefault(stem, []).append(idx)
 
     known_exact = set(known_image_paths)
+    known_by_casefold: dict[str, list[str]] = {}
+    for known in known_image_paths:
+        known_by_casefold.setdefault(utils.casefold_filename(known), []).append(known)
 
     for disk_path in disk_files:
         # norm_disk_path is what gets stored on companion/left_behind
@@ -1065,8 +1118,9 @@ def _attach_companions_and_bystanders(
         name = os.path.basename(norm_disk_path)
         stem, ext = os.path.splitext(name)
         if ext.lower() in utils.VALID_EXTS:
+            candidates = known_by_casefold.get(utils.casefold_filename(abs_disk_path), ())
             is_known = abs_disk_path in known_exact or any(
-                utils.paths_are_same_file(abs_disk_path, known) for known in known_image_paths
+                utils.paths_are_same_file(abs_disk_path, candidate) for candidate in candidates
             )
             if not is_known:
                 bystander_names.add(utils.casefold_filename(name))
