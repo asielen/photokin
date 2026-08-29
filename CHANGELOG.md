@@ -114,5 +114,10 @@ All notable changes to this project are documented here, in the style of
 Earlier history lives in the git log; this file starts recording from 0.4.0
 rather than reconstructing releases nobody watched happen.
 
-[0.5.0]: https://github.com/asielen/photokin/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/asielen/photokin/compare/v0.3.2...v0.4.0
+0.4.0 was merged but never tagged or published, so 0.5.0 is the first release
+on PyPI that carries document mode. Its compare link below therefore spans from
+0.3.2, and 0.4.0's points at the pull request it landed in rather than at a tag
+that does not exist.
+
+[0.5.0]: https://github.com/asielen/photokin/compare/v0.3.2...v0.5.0
+[0.4.0]: https://github.com/asielen/photokin/pull/9
