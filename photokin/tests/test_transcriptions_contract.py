@@ -310,15 +310,21 @@ class TestResolvePartLabel(unittest.TestCase):
 
 
 class TestStylingMarksRoundTrip(_ScratchFilesTestCase):
-    """Styling marks survive synthesis and the caption block byte-identically.
+    """Styling marks reach each page's own caption byte-identically.
 
     The transcription conventions put crossed-out text in ``~~..~~``,
     underlines in ``_.._``, margin notes in ``> [margin note]`` blockquotes and
     footnotes after a ``---`` rule -- lines that read like noise to machinery
     written for prose captions. Both pages here end in a ``---`` rule on
-    purpose: a repeated wordless rule line is layout, and the line-level dedup
-    must keep the second one rather than gluing page two's footnote onto its
-    prose.
+    purpose: a wordless rule line is layout, not content, and must survive into
+    the page that wrote it rather than being mistaken for a repeat of the
+    other page's.
+
+    This case used to assert the two pages' transcriptions arrived CONCATENATED
+    on both files, which is what a multipage group wrote before per-page
+    captions. What it pins now is the same round trip against the rule that
+    replaced it: page 2's file holds page 2, and nothing about the marks
+    changes on the way there.
     """
 
     PAGE_ONE = (
@@ -334,14 +340,14 @@ class TestStylingMarksRoundTrip(_ScratchFilesTestCase):
         "* written sideways in pencil"
     )
 
-    def test_the_synthesized_caption_reaches_every_file_unchanged(self) -> None:
+    def test_each_page_reaches_its_own_file_unchanged(self) -> None:
         page1, page2 = self.make_files("doc-page1.jpg", "doc-page2.jpg")
-        expected = f"[Page 1]\n{self.PAGE_ONE}\n[Page 2]\n{self.PAGE_TWO}"
+        transcriptions = {"Page 1": self.PAGE_ONE, "Page 2": self.PAGE_TWO}
         reply = {
             "result": {
                 "k": {
                     "caption": "the model's own merged caption",
-                    "transcriptions": {"Page 1": self.PAGE_ONE, "Page 2": self.PAGE_TWO},
+                    "transcriptions": transcriptions,
                     "keywords": ["Document"],
                 }
             }
@@ -354,18 +360,48 @@ class TestStylingMarksRoundTrip(_ScratchFilesTestCase):
             )
 
         self.assertEqual(sorted(out["results"]), sorted([page1, page2]))
-        for path, merged in out["results"].items():
+        for path, expected in ((page1, self.PAGE_ONE), (page2, self.PAGE_TWO)):
+            merged = out["results"][path]
             with self.subTest(path=os.path.basename(path)):
-                # Byte-identical: through _absorb_caption, the near-identical
+                # Byte-identical: through the section fold, the near-identical
                 # dedup and the line-level dedup, nothing was resectioned,
-                # dropped or reflowed.
+                # dropped or reflowed -- and no label was invented, because a
+                # file holding exactly one part's text has nothing to be told
+                # apart from.
                 self.assertEqual(merged["caption"], expected)
-                # The map rides the fan-out whole: every file of the group
-                # holds every part's transcription.
-                self.assertEqual(
-                    merged["transcriptions"],
-                    {"Page 1": self.PAGE_ONE, "Page 2": self.PAGE_TWO},
-                )
+                self.assertEqual(merged["caption_scope"], "part")
+                # The map still rides the fan-out whole. Trimming it to this
+                # file's one entry is the obvious optimization here and it
+                # would break the .md sidecar, which reads this file's entry
+                # out of the whole map.
+                self.assertEqual(merged["transcriptions"], transcriptions)
+
+    def test_neither_page_carries_the_other_ones_text(self) -> None:
+        """The 63x redundancy this replaced, asserted from the other side.
+
+        A caption equal to page 1 satisfies the case above whether the rest of
+        the book followed it or not, since page 1's text leads the group block
+        too. What actually has to be true is that page 2's words are nowhere
+        near page 1's file.
+        """
+        page1, page2 = self.make_files("doc-page1.jpg", "doc-page2.jpg")
+        reply = {
+            "result": {
+                "k": {
+                    "transcriptions": {"Page 1": self.PAGE_ONE, "Page 2": self.PAGE_TWO},
+                    "keywords": ["Document"],
+                }
+            }
+        }
+
+        with _provider_stubbed(reply):
+            out = core.process_manifest_stream(
+                manifest={"items": [{"path": page1}, {"path": page2}]},
+                cfg=utils.Config(dry_run=True, max_edge=None, no_update_vocab=True),
+            )
+
+        self.assertNotIn("The crossing was calm", out["results"][page1]["caption"])
+        self.assertNotIn("Dear Mother", out["results"][page2]["caption"])
 
 
 class TestBackOnlyTranscriptionStaysAttributedAcrossRepeatedRuns(_ScratchFilesTestCase):

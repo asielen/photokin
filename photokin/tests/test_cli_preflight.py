@@ -405,9 +405,12 @@ class TestOutputFileForEveryInputType(_CliTestCase):
         # Per-file records only: the file also carries the run envelope
         # (run: start/plan/complete), which has no "path" of its own.
         per_file = [record for record in lines if "path" in record]
-        self.assertEqual(
-            per_file, [{"path": "box3_025.jpg", "status": "ok", "schema_version": 2}]
-        )
+        expected = {
+            "path": "box3_025.jpg",
+            "status": "ok",
+            "schema_version": cli._NDJSON_SCHEMA_VERSION,
+        }
+        self.assertEqual(per_file, [expected])
 
     def test_single_photo_input_writes_an_aggregate_json_output_file(self) -> None:
         folder = self.make_folder()

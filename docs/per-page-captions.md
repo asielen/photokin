@@ -143,8 +143,12 @@ every file a different caption; a front/back/variant group is byte-identical to
 consecutive `-rw` runs over a multipage group are byte-identical from run 1
 (E8's convergence, measured); a group whose reply carries no `transcriptions`
 keeps the whole block and carries `caption_scope: "group"`; a displaced file
-does the same; the `.md` sidecar and `XMP-dc:Description` finally agree for a
-document.
+does the same; the `.md` sidecar and `XMP-dc:Description` cover the same page
+for a document, where before the sidecar showed page 37 and Description showed
+the whole book. Agreement is on scope, not forever on content: Description is
+merged and a sidecar is overwritten, so a re-run that rewords a page leaves
+both readings in Description and only the newest in the sidecar — the ordinary
+caption-merge rule, not an exception to it.
 
 ## 4. Risks
 

@@ -106,7 +106,16 @@ _LOG_FILE_HANDLER_NAME = "photokin-cli-logfile"
 # ``changeset.SCHEMA_VERSION`` -- the one other place this package
 # schema-versions an NDJSON stream -- but is independent of it: the two
 # streams (results, changeset) evolve on their own schedules.
-_NDJSON_SCHEMA_VERSION = 2
+#
+# History (why each bump happened, not a full changelog):
+#   3 -- a multipage group's per-file ``caption`` changed meaning: it used to
+#        be the group's whole transcription, written byte-identically to
+#        every file; it is now that file's own part. The key's shape (a
+#        string) is unchanged, but a consumer that averaged, compared, or
+#        deduped ``caption`` across a group's files would have gotten a
+#        different answer with no shape change to detect it by. See
+#        docs/per-page-captions.md, decision E11.
+_NDJSON_SCHEMA_VERSION = 3
 
 # Guards every physical append to a results NDJSON file. One process runs one
 # main() at a time, but a background writer (a heartbeat, were one added) and

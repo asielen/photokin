@@ -397,6 +397,12 @@ class TestTheDefaultIsANoOp(_GroupByTestCase):
     of its own, the same as any other lone scan's caption. The caption is
     therefore the one field of this golden that is *expected* to differ from
     f4153ae; every other byte still has to survive.
+
+    Per-page captions did not move it again, and that is the point of leaving
+    this golden alone: the fixture is a lone scan and a front/back pair, so
+    nothing in it is a document, the group block is still what every file gets,
+    and no ``caption_scope`` key appears. A run of this file that suddenly
+    disagrees is the alarm for a per-page rule that leaked out of documents.
     """
 
     _FIXTURE: ClassVar[tuple[str, ...]] = (
