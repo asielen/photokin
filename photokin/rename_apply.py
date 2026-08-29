@@ -45,6 +45,7 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import ntpath
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -54,6 +55,7 @@ from typing import Any
 
 from .changeset import make_run_id
 from .doc_sidecar import _yaml_string
+from .utils import casefold_filename, paths_are_same_file
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,10 @@ _MTIME_TOLERANCE_S = 1e-6
 #: Characters that are illegal in a Windows filename but legal in a run id
 #: (which is an ISO timestamp, so it always contains ``:``).
 _RUN_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+#: One planned source found on disk: the folder's own spelling of its name,
+#: and the size and mtime that file has right now.
+_Located = tuple[str, int, float]
 
 
 class RenamePreflightError(RuntimeError):
@@ -274,6 +280,26 @@ def _safe_run_id(run_id: str) -> str:
     return _RUN_ID_UNSAFE_RE.sub("-", run_id)
 
 
+def _journal_prefix(folder: str) -> str:
+    """Return the name every journal in *folder* begins with.
+
+    One derivation, used both where a journal is created and where one is
+    looked for. A folder with no basename of its own -- a filesystem root, or
+    a Windows drive root -- stands in ``folder``, and a discovery prefix that
+    did not stand in the same thing would never find the journal the run had
+    just written: no automatic ``--rename-resume``, no ``--rename-undo``, and
+    no open-journal guard to stop a second run trampling a half-finished one.
+
+    Args:
+        folder: The folder being renamed.
+
+    Returns:
+        ``<foldername>_rename-``.
+    """
+    name = os.path.basename(os.path.normpath(os.path.abspath(folder))) or "folder"
+    return f"{name}{_JOURNAL_MARKER}"
+
+
 def journal_path_for(folder: str, run_id: str) -> str:
     """Return the journal path for a run: ``<foldername>_rename-<run_id>.ndjson``.
 
@@ -285,8 +311,9 @@ def journal_path_for(folder: str, run_id: str) -> str:
         An absolute path inside *folder*.
     """
     folder = os.path.abspath(folder)
-    name = os.path.basename(os.path.normpath(folder)) or "folder"
-    return os.path.join(folder, f"{name}{_JOURNAL_MARKER}{_safe_run_id(run_id)}{_JOURNAL_SUFFIX}")
+    return os.path.join(
+        folder, f"{_journal_prefix(folder)}{_safe_run_id(run_id)}{_JOURNAL_SUFFIX}"
+    )
 
 
 def _fresh_journal(folder: str, plan_run_id: str) -> tuple[str, str]:
@@ -552,7 +579,7 @@ def _journal_candidates(folder: str) -> list[str]:
         names = _list_names(folder)
     except OSError:
         return []
-    prefix = f"{os.path.basename(os.path.normpath(folder))}{_JOURNAL_MARKER}"
+    prefix = _journal_prefix(folder)
     matched = sorted(
         (name for name in names if name.startswith(prefix) and name.endswith(_JOURNAL_SUFFIX)),
         reverse=True,
@@ -615,17 +642,22 @@ def _entry_files(entry: Mapping[str, Any]) -> list[tuple[str, str, str]]:
     return files
 
 
-def _ops_from_plan(plan: Mapping[str, Any], run_id: str) -> list[RenameOp]:
+def _ops_from_plan(
+    plan: Mapping[str, Any], run_id: str, located: Mapping[str, _Located]
+) -> list[RenameOp]:
     """Build the ops for an apply run: every planned file whose name changes.
 
     Whether a file moves is decided by comparing its current name to its
     target, not by the entry's ``changed`` flag. The flag is the planner's
     summary for the preview; the names are what the filesystem will be asked
-    to do, and this is the last gate before it is asked.
+    to do, and this is the last gate before it is asked. "Its current name" is
+    the folder's spelling of it (:func:`_locate_sources`), not the plan's,
+    since that is the name the rename has to be given.
 
     Args:
         plan: The plan (``docs/rename-mode.md`` 6.2).
         run_id: The run id, which names the temporaries.
+        located: ``planned name -> (disk name, size, mtime)`` for the folder.
 
     Returns:
         The ops, in plan order, images before their own companions.
@@ -637,7 +669,8 @@ def _ops_from_plan(plan: Mapping[str, Any], run_id: str) -> list[RenameOp]:
             continue
         photo_id = str(entry.get("photo_id") or "")
         for source, target, kind in _entry_files(entry):
-            name = os.path.basename(source)
+            found = located.get(os.path.basename(source))
+            name = found[0] if found else os.path.basename(source)
             if not name or not target or name == target:
                 continue
             ops.append(
@@ -653,6 +686,54 @@ def _ops_from_plan(plan: Mapping[str, Any], run_id: str) -> list[RenameOp]:
 
 
 # --- Preflight ---------------------------------------------------------
+
+
+def _is_bare_filename(name: str) -> bool:
+    """Return whether *name* names a file and nothing about where it sits.
+
+    ``os.path.basename`` answers this differently depending on where photokin
+    is running: on POSIX it reads ``..\\outside.md``, ``C:\\outside.md`` and
+    ``C:outside.md`` as ordinary filenames, because none of those separators
+    mean anything there. A target is a name this executor will rename onto
+    inside one folder, and a rename never crosses a folder boundary
+    (``docs/rename-mode.md`` section 11), so the answer may not depend on the
+    running OS. ``ntpath`` knows every separator POSIX knows and the ones it
+    does not, and ``.``/``..`` are spelled out because ``basename`` returns
+    them unchanged.
+
+    Args:
+        name: The candidate filename.
+
+    Returns:
+        ``True`` when *name* is a bare filename.
+    """
+    return bool(name) and name not in (".", "..") and ntpath.basename(name) == name
+
+
+def _target_refusals(plan: Mapping[str, Any]) -> list[str]:
+    """Refuse every target that is not a bare filename.
+
+    This runs before the journal is opened and before anything moves, for
+    every entry point that takes a plan, because a companion moved out of the
+    folder and then interrupted is a file a resume cannot even see: resume
+    lists the folder, and the file is no longer in it. A hand-edited or
+    damaged plan is the case; the answer is to refuse the plan, not to repair
+    it.
+
+    Args:
+        plan: The plan to check.
+
+    Returns:
+        One line per target that names a path rather than a file.
+    """
+    problems: list[str] = []
+    for entry in plan.get("entries") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        for _source, target, _kind in _entry_files(entry):
+            if target and not _is_bare_filename(target):
+                problems.append(f"a target names a path, not a file: {target}")
+    return problems
 
 
 def _open_journal_problems(folder: str) -> list[str]:
@@ -676,8 +757,79 @@ def _common_refusals(folder: str, plan: Mapping[str, Any]) -> list[str]:
         return problems
     for message in plan.get("errors") or []:
         problems.append(f"the plan reports an error: {message}")
+    problems.extend(_target_refusals(plan))
     problems.extend(_open_journal_problems(folder))
     return problems
+
+
+def _disk_spelling(
+    folder: str,
+    name: str,
+    present: Mapping[str, tuple[int, float]],
+    folded: Mapping[str, str],
+) -> str | None:
+    """Return the folder's own spelling of *name*, or ``None`` if it is not there.
+
+    Args:
+        folder: The folder both spellings are resolved against.
+        name: The plan's spelling of the file.
+        present: The folder's current listing.
+        folded: Collision key -> the folder's spelling, built from *present*.
+
+    Returns:
+        The name as the filesystem spells it.
+    """
+    if name in present:
+        return name
+    candidate = folded.get(casefold_filename(name))
+    if candidate is None or not os.path.exists(os.path.join(folder, name)):
+        # Nothing on disk answers to the plan's spelling, which on a
+        # case-sensitive filesystem is the whole answer: two names differing
+        # only in case are two files there, and the planned one is gone. The
+        # fold only nominates a candidate; identity below is what decides.
+        return None
+    same = paths_are_same_file(os.path.join(folder, name), os.path.join(folder, candidate))
+    return candidate if same else None
+
+
+def _locate_sources(
+    folder: str, present: Mapping[str, tuple[int, float]], plan: Mapping[str, Any]
+) -> dict[str, _Located]:
+    """Find every planned source in the folder, under the folder's own spelling.
+
+    A plan -- or the manifest a wrapper built it from -- may spell an existing
+    file in a case the disk does not, and on a case-insensitive volume that
+    spelling names exactly that file; the planner's own identity check has
+    already accepted it. An exact lookup in the listing would call it gone and
+    refuse a run whose files are all right there. So a name the listing does
+    not carry verbatim is looked up by filesystem identity, and what comes
+    back is the disk's spelling: the name photokin renames is the name on
+    disk, never the plan's idea of it.
+
+    Args:
+        folder: The plan's folder.
+        present: ``name -> (size, mtime)`` for the folder as it is now.
+        plan: The plan whose sources are being located.
+
+    Returns:
+        ``planned name -> (disk name, size, mtime)``, carrying only the
+        sources that are actually there.
+    """
+    folded: dict[str, str] = {}
+    for name in present:
+        folded.setdefault(casefold_filename(name), name)
+    located: dict[str, _Located] = {}
+    for entry in plan.get("entries") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        for source, _target, _kind in _entry_files(entry):
+            name = os.path.basename(source)
+            if not name or name in located:
+                continue
+            disk_name = _disk_spelling(folder, name, present, folded)
+            if disk_name is not None:
+                located[name] = (disk_name, *present[disk_name])
+    return located
 
 
 def _source_problems(
@@ -685,7 +837,7 @@ def _source_problems(
     source: str,
     target: str,
     record: Mapping[str, Any],
-    present: Mapping[str, tuple[int, float]],
+    located: Mapping[str, _Located],
 ) -> list[str]:
     """Check one planned file against the folder as it is now."""
     problems: list[str] = []
@@ -698,14 +850,12 @@ def _source_problems(
         problems.append(f"outside the plan's folder: {source}")
     if not target:
         problems.append(f"no target planned for: {name}")
-    elif os.path.basename(target) != target:
-        problems.append(f"a target names a path, not a file: {target}")
 
-    found = present.get(name)
+    found = located.get(name)
     if found is None:
         problems.append(f"gone since the plan was made: {name}")
         return problems
-    size, mtime = found
+    _disk_name, size, mtime = found
     planned_size = record.get("size")
     planned_mtime = record.get("mtime")
     resized = isinstance(planned_size, int) and planned_size != size
@@ -727,9 +877,13 @@ def preflight(plan: Mapping[str, Any]) -> list[str]:
     if a journal in the folder is still open. A stale plan is replanned, never
     patched.
 
-    Targets are compared with ``os.path.normcase``, which is exactly the
-    question being asked: on Windows a target differing from a bystander only
-    in case *is* that bystander, and on POSIX it is not.
+    Targets are compared with :func:`~photokin.utils.casefold_filename` on
+    every platform, never with ``os.path.normcase``: whether two planned names
+    collide is a property of the plan -- of where the files might later live --
+    and not of the OS that happens to be running photokin, and ``normcase`` is
+    a no-op on POSIX, so a check built on it catches nothing on Linux. Whether
+    a planned source is a file already on disk is the other question entirely,
+    and :func:`_locate_sources` answers it by filesystem identity.
 
     Args:
         plan: The plan to check.
@@ -747,6 +901,7 @@ def preflight(plan: Mapping[str, Any]) -> list[str]:
         return problems
 
     present = _snapshot(folder)
+    located = _locate_sources(folder, present, plan)
     sources_ci: set[str] = set()
     targets_ci: dict[str, str] = {}
     for entry in plan.get("entries") or []:
@@ -763,16 +918,16 @@ def preflight(plan: Mapping[str, Any]) -> list[str]:
             record: Mapping[str, Any] = (
                 entry if source == image_source else (companions.get(source) or {})
             )
-            problems.extend(_source_problems(folder, source, target, record, present))
-            sources_ci.add(os.path.normcase(os.path.basename(source)))
+            problems.extend(_source_problems(folder, source, target, record, located))
+            sources_ci.add(casefold_filename(os.path.basename(source)))
             if not target:
                 continue
-            key = os.path.normcase(target)
+            key = casefold_filename(target)
             if key in targets_ci:
                 problems.append(f"two files want the same name: {target}")
             targets_ci[key] = target
 
-    existing_ci = {os.path.normcase(name) for name in present}
+    existing_ci = {casefold_filename(name) for name in present}
     for key, target in sorted(targets_ci.items()):
         if key in existing_ci and key not in sources_ci:
             problems.append(f"a file is already called that: {target}")
@@ -1215,7 +1370,7 @@ def apply_plan(plan: Mapping[str, Any], *, dry_run: bool = False) -> ApplyReport
     plan_run_id = str(plan.get("run_id") or "")
     run_id, journal = _fresh_journal(folder, plan_run_id)
     safe = _safe_run_id(run_id)
-    ops = _ops_from_plan(plan, run_id)
+    ops = _ops_from_plan(plan, run_id, _locate_sources(folder, _snapshot(folder), plan))
     counts = _counts(plan, ops)
     if dry_run:
         return ApplyReport(STATUS_WOULD_APPLY, None, *counts)

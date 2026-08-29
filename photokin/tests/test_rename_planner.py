@@ -11,11 +11,14 @@ per section 9's enumeration.
 import os
 import unittest
 from datetime import date
+from unittest import mock
 
 from photokin.rename import (
     DEFAULT_COMPANION_EXTENSIONS,
     RenameItem,
     _MissingDate,
+    _natural_sort_key,
+    _parse_photo_date,
     _PhotoDate,
     _render_date_format,
     _render_template,
@@ -353,9 +356,14 @@ class ValidationErrorTests(unittest.TestCase):
 
 class ManifestCaseMismatchTests(unittest.TestCase):
     """A manifest item whose path case differs from what ``os.scandir``
-    reports for the identical file must not become its own bystander (the
-    executor's ``preflight`` already compares with ``os.path.normcase`` for
-    this exact reason)."""
+    reports for the identical file must not become its own bystander.
+
+    Answered with real filesystem identity, not by folding case: on a
+    case-sensitive volume ``SAME.TIF`` and ``same.tif`` genuinely are two
+    files, and folding would wrongly merge them. ``os.path.normcase`` cannot
+    answer it either -- it is a no-op on POSIX, which is what made this fail
+    on Linux while passing on Windows.
+    """
 
     def test_case_mismatched_manifest_path_is_not_its_own_bystander(self) -> None:
         disk_path = _path("same-001.tif")
@@ -416,13 +424,20 @@ class VariantPageSuffixLengthTests(unittest.TestCase):
 
 
 class LeadingDashPrefixTests(unittest.TestCase):
-    """``{folder}`` at a drive root renders empty, so a template like
+    """``{folder}`` at a filesystem root renders empty, so a template like
     ``"{folder}-bag"`` must not be allowed to render a hostile leading-dash
     prefix (``"-bag"``) -- a leading ``-`` is trimmed the same way a
-    trailing one already is."""
+    trailing one already is.
 
-    def test_folder_token_at_drive_root_does_not_leave_a_leading_dash(self) -> None:
-        folder = "C:\\"
+    ``os.sep`` alone -- not a hardcoded ``"C:\\\\"`` -- is what drives a
+    genuinely empty ``{folder}`` render portably: ``os.path.basename`` of
+    the root is ``""`` on POSIX (``/``) exactly as it is at a Windows drive
+    root (``os.path.abspath(os.sep)``, e.g. ``"D:\\\\"``), so this exercises
+    the same rule on either platform instead of failing on Linux the way a
+    literal drive letter does (CI-3)."""
+
+    def test_folder_token_at_filesystem_root_does_not_leave_a_leading_dash(self) -> None:
+        folder = os.path.abspath(os.sep)
         item_path = os.path.normpath(os.path.join(folder, "photo.tif"))
         plan = plan_rename(
             folder=folder,
@@ -642,6 +657,175 @@ class RenderTemplateTests(unittest.TestCase):
         )
         self.assertEqual(rendered, "undated-bag")
         self.assertFalse(used_partial)
+
+
+class SharedCompanionSingleOwnerTests(unittest.TestCase):
+    """C6: a companion shared by a same-stem pair (4.3's ".tif/.jpg is one
+    slot") must get exactly one owner, or ``_validate_targets`` sees the
+    same rendered companion target twice and refuses the whole plan --
+    photokin's own ``.md`` sidecars make this the feature's main use case."""
+
+    def test_md_sidecar_shared_by_a_tif_jpg_pair_does_not_duplicate(self) -> None:
+        names = ["photo.tif", "photo.jpg"]
+        disk_files = [_path(n) for n in names] + [_path("photo.md")]
+        plan = _plan(names, "x", disk_files=disk_files)
+
+        self.assertEqual(plan["errors"], [])
+        tif_entry = _entry_for(plan, "photo.tif")
+        jpg_entry = _entry_for(plan, "photo.jpg")
+        total_companions = len(tif_entry["companions"]) + len(jpg_entry["companions"])
+        self.assertEqual(total_companions, 1, (tif_entry, jpg_entry))
+
+    def test_owner_is_the_entry_whose_extension_sorts_first(self) -> None:
+        # ".jpg" sorts before ".tif"; the companion belongs to that entry.
+        names = ["photo.tif", "photo.jpg"]
+        disk_files = [_path(n) for n in names] + [_path("photo.md")]
+        plan = _plan(names, "x", disk_files=disk_files)
+        jpg_entry = _entry_for(plan, "photo.jpg")
+        tif_entry = _entry_for(plan, "photo.tif")
+        self.assertEqual(len(jpg_entry["companions"]), 1)
+        self.assertEqual(jpg_entry["companions"][0]["target"], "x-001.md")
+        self.assertEqual(len(tif_entry["companions"]), 0)
+
+
+class VersionOverrideValidationTests(unittest.TestCase):
+    """C1: a non-letter ``version`` override must not be concatenated into
+    the rendered filename -- the grammar supports exactly one letter."""
+
+    def test_multi_letter_version_override_is_a_plan_error_not_a_filename(self) -> None:
+        plan = _plan(["photo3.tif"], "x", versions={"photo3.tif": "blue"})
+        self.assertTrue(
+            any("photo3.tif" in e and "blue" in e for e in plan["errors"]), plan["errors"]
+        )
+        entry = _entry_for(plan, "photo3.tif")
+        self.assertIsNotNone(entry["target"])
+        self.assertNotIn("blue", entry["target"])
+
+    def test_digit_version_override_is_a_plan_error(self) -> None:
+        plan = _plan(["photo3.tif"], "x", versions={"photo3.tif": "5"})
+        self.assertTrue(any("photo3.tif" in e for e in plan["errors"]), plan["errors"])
+
+    def test_empty_version_override_still_clears_the_letter(self) -> None:
+        # An empty override is documented behavior (clears an existing
+        # variant), not the invalid case this fix targets.
+        plan = _plan(["box3_017-b.tif"], "x", versions={"box3_017-b.tif": ""})
+        self.assertEqual(plan["errors"], [])
+        entry = _entry_for(plan, "box3_017-b.tif")
+        self.assertIsNone(entry["variant"])
+
+
+class PartialDateValidationTests(unittest.TestCase):
+    """C5: an impossible month in a partial date must not crash the
+    renderer -- it has to be rejected during parsing so the group falls to
+    the ordinary missing-date handling."""
+
+    def test_out_of_range_month_is_rejected_not_accepted(self) -> None:
+        self.assertIsNone(_parse_photo_date("1952:13"))
+
+    def test_implausible_year_is_rejected(self) -> None:
+        self.assertIsNone(_parse_photo_date("0001"))
+
+    def test_out_of_range_month_falls_back_to_missing_date_error(self) -> None:
+        plan = _plan(["shot.tif"], "{date:mmmm}", dates={"shot.tif": "1952:13"})
+        self.assertTrue(any("date" in e for e in plan["errors"]), plan["errors"])
+        entry = _entry_for(plan, "shot.tif")
+        self.assertIsNone(entry["target"])
+
+    def test_out_of_range_month_with_undated_literal_does_not_crash(self) -> None:
+        # Before the fix this raised IndexError inside _render_date_token
+        # (_MONTH_NAMES[13 - 1]) the moment a group with month=13 got past
+        # the missing-date check -- exercised here through {date:mmmm}.
+        plan = _plan(
+            ["shot.tif"], "{date:mmmm}", dates={"shot.tif": "1952:13"}, undated_literal="undated"
+        )
+        self.assertEqual(plan["errors"], [])
+        entry = _entry_for(plan, "shot.tif")
+        self.assertEqual(entry["target"], "undated-001.tif")
+
+
+class FolderNormalizationTests(unittest.TestCase):
+    """C9: the plan must not store a relative folder -- a later
+    ``--rename-finish`` run from a different working directory would
+    resolve it somewhere else."""
+
+    def test_relative_folder_is_normalized_to_absolute_in_the_plan(self) -> None:
+        item_path = os.path.join(".", "photo.tif")
+        plan = plan_rename(
+            folder=".",
+            disk_files=[item_path],
+            items=[RenameItem(path=item_path)],
+            prefix_template="x",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertEqual(plan["errors"], [])
+        self.assertTrue(os.path.isabs(plan["folder"]), plan["folder"])
+        self.assertEqual(plan["folder"], os.path.normpath(os.path.abspath(".")))
+
+    def test_folder_token_on_a_relative_folder_renders_the_real_name_not_a_dot(self) -> None:
+        item_path = os.path.join(".", "photo.tif")
+        plan = plan_rename(
+            folder=".",
+            disk_files=[item_path],
+            items=[RenameItem(path=item_path)],
+            prefix_template="{folder}-x",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertEqual(plan["errors"], [])
+        (entry,) = plan["entries"]
+        expected_name = os.path.basename(os.path.normpath(os.path.abspath(".")))
+        self.assertEqual(entry["target"], f"{expected_name}-x-001.tif")
+
+
+class NaturalOrderTieBreakTests(unittest.TestCase):
+    """C10: ``--order natural`` discards case and a numeric run's own
+    spelling, so two differently-spelled names can share a natural key --
+    the ordinary ``(name.lower(), name)`` tie-break must decide those, so
+    permuting the manifest does not change the assigned numbers."""
+
+    def test_natural_key_breaks_ties_that_collapse_to_the_same_digit_value(self) -> None:
+        # "file1.tif" and "file01.tif" both reduce to ('file', 1, '');
+        # without a tie-break these keys are equal, not merely close.
+        self.assertNotEqual(_natural_sort_key("file1.tif"), _natural_sort_key("file01.tif"))
+        self.assertLess(_natural_sort_key("file01.tif"), _natural_sort_key("file1.tif"))
+
+    def test_number_assignment_is_stable_across_manifest_permutations(self) -> None:
+        forward = _plan(["file1.tif", "file01.tif"], "x", order_mode="natural")
+        backward = _plan(["file01.tif", "file1.tif"], "x", order_mode="natural")
+        self.assertEqual(
+            _entry_for(forward, "file1.tif")["number"],
+            _entry_for(backward, "file1.tif")["number"],
+        )
+        self.assertEqual(
+            _entry_for(forward, "file01.tif")["number"],
+            _entry_for(backward, "file01.tif")["number"],
+        )
+
+
+class PlatformIndependentCaseFoldingTests(unittest.TestCase):
+    """CI-2 / the case-folding policy: the manifest-vs-disk identity check
+    must not depend on ``os.path.normcase`` actually folding case -- it is
+    a no-op on POSIX, which is exactly why the equivalent Windows-only test
+    above is insufficient on its own. Patching ``normcase`` to the POSIX
+    (identity) behavior here, even while running on Windows, reproduces
+    what Ubuntu CI saw."""
+
+    def test_case_mismatched_manifest_path_is_not_a_bystander_even_when_normcase_is_a_noop(
+        self,
+    ) -> None:
+        disk_path = _path("same-001.tif")
+        manifest_path = _path("SAME-001.TIF")
+        with mock.patch("os.path.normcase", side_effect=lambda p: p):
+            plan = plan_rename(
+                folder=_FOLDER,
+                disk_files=[disk_path],
+                items=[RenameItem(path=manifest_path)],
+                prefix_template="same",
+                digits=3,
+                run_id="test-run",
+            )
+        self.assertEqual(plan["errors"], [])
 
 
 if __name__ == "__main__":

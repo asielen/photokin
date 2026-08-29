@@ -14,12 +14,17 @@ author did not think to write down.
 """
 
 import itertools
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from photokin.utils import (
     ParsedName,
     canonicalize_stem,
+    casefold_filename,
     parse_media_filename,
+    paths_are_same_file,
     render_media_filename,
 )
 
@@ -265,6 +270,55 @@ class CanonicalizeStemThenParseTests(unittest.TestCase):
                 loose_parsed = parse_media_filename(canonicalized + ".tif")
                 canonical_parsed = parse_media_filename(canonical + ".tif")
                 self.assertEqual(loose_parsed, canonical_parsed)
+
+
+class CaseHelperTests(unittest.TestCase):
+    """The two case questions, which are not the same question.
+
+    Conflating them is what put Ubuntu CI red while Windows stayed green: the
+    code answered both with ``os.path.normcase``, which folds case on Windows
+    and nothing at all on POSIX.
+    """
+
+    def test_target_collision_folds_case_on_every_platform(self) -> None:
+        # Whether two planned names collide is a property of the PLAN -- of
+        # where the files may later live -- not of the machine planning it. A
+        # plan that emits both of these is unsafe on macOS and Windows however
+        # it was produced, so folding must not depend on the running OS.
+        self.assertEqual(casefold_filename("NEW-001.TIF"), casefold_filename("new-001.tif"))
+        self.assertNotEqual(casefold_filename("new-001.tif"), casefold_filename("new-002.tif"))
+
+    def test_folding_survives_a_normcase_that_does_nothing(self) -> None:
+        # The POSIX no-op, made explicit: patching normcase away must not
+        # change the answer, because the answer never consulted it.
+        with mock.patch("os.path.normcase", side_effect=lambda value: value):
+            self.assertEqual(
+                casefold_filename("NEW-001.TIF"), casefold_filename("new-001.tif")
+            )
+
+    def test_identity_is_the_filesystem_s_answer_not_a_folded_string(self) -> None:
+        # Whether two paths name one file is the filesystem's to answer. On a
+        # case-sensitive volume these are two files and folding would wrongly
+        # merge them; on a case-insensitive one they are the same file and a
+        # case-sensitive compare would wrongly split it. Only the filesystem
+        # knows which volume this is.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "photo.tif")
+            with open(path, "w", encoding="utf-8"):
+                pass
+            self.assertTrue(paths_are_same_file(path, path))
+            other = os.path.join(folder, "other.tif")
+            with open(other, "w", encoding="utf-8"):
+                pass
+            self.assertFalse(paths_are_same_file(path, other))
+
+    def test_identity_falls_back_when_a_path_cannot_be_stat_d(self) -> None:
+        # A target does not exist yet, so there is nothing to stat and the
+        # question has to be answered on the strings alone.
+        with tempfile.TemporaryDirectory() as folder:
+            missing = os.path.join(folder, "gone.tif")
+            self.assertTrue(paths_are_same_file(missing, missing))
+            self.assertFalse(paths_are_same_file(missing, os.path.join(folder, "other.tif")))
 
 
 if __name__ == "__main__":

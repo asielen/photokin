@@ -652,14 +652,88 @@ def test_two_entries_wanting_one_name_fails_preflight(tmp_path: Path) -> None:
     assert preflight(plan) == ["two files want the same name: NEW-001.tif"]
 
 
-def test_a_target_naming_a_path_fails_preflight(tmp_path: Path) -> None:
-    """The executor never renames across a folder boundary."""
+def test_duplicate_targets_are_folded_by_the_plan_not_by_the_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``os.path.normcase`` folds nothing on POSIX, so the check may not use it.
+
+    Patching it to the identity it already is on Linux and macOS puts a
+    Windows run in the position CI runs in: a plan whose two targets differ
+    only in case is unsafe wherever it was planned, and preflight has to say
+    so on every platform.
+    """
+    monkeypatch.setattr(os.path, "normcase", lambda name: name)
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    first = _write(folder / "a.tif", "a")
+    second = _write(folder / "b.tif", "b")
+    plan = _plan(folder, [_entry(first, "new-001.tif"), _entry(second, "NEW-001.tif")])
+
+    assert preflight(plan) == ["two files want the same name: NEW-001.tif"]
+
+
+def test_a_bystander_differing_only_in_case_still_holds_the_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Target against bystander is the same question, and gets the same answer."""
+    monkeypatch.setattr(os.path, "normcase", lambda name: name)
     folder = tmp_path / "scans"
     folder.mkdir()
     image = _write(folder / "a.tif", "a")
-    plan = _plan(folder, [_entry(image, os.path.join("..", "new-001.tif"))])
+    _write(folder / "NEWNAME-001.TIF", "a file nobody planned for")
+    plan = _plan(folder, [_entry(image, "newname-001.tif")])
 
-    assert "a target names a path, not a file" in preflight(plan)[0]
+    assert preflight(plan) == ["a file is already called that: newname-001.tif"]
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["../new-001.tif", "..\\new-001.tif", "sub/new-001.tif", "sub\\new-001.tif", ".."],
+)
+def test_a_target_naming_a_path_fails_preflight(tmp_path: Path, target: str) -> None:
+    """The executor never renames across a folder boundary.
+
+    Every spelling is read the same way on both platforms: ``os.path.basename``
+    alone waves a backslash through on Linux and ``..`` through everywhere.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    image = _write(folder / "a.tif", "a")
+    plan = _plan(folder, [_entry(image, target)])
+
+    assert preflight(plan) == [f"a target names a path, not a file: {target}"]
+
+
+def test_a_source_spelled_in_another_case_is_renamed_under_its_disk_name(
+    tmp_path: Path,
+) -> None:
+    """A manifest may spell an existing file in its own case, and often does.
+
+    On a case-insensitive volume that spelling names the file that is there,
+    which the planner's identity check has already accepted, so preflight may
+    not call it missing -- and every rename still uses the name on disk. On a
+    case-sensitive one the two spellings are two files and the planned one is
+    genuinely gone.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    image = _write(folder / "file102.tif", "first image")
+    entry = _entry(image, "newname-001.tif")
+    entry["path"] = str(folder / "FILE102.TIF")
+    plan = _plan(folder, [entry])
+
+    if not _case_insensitive(folder):
+        assert preflight(plan) == ["gone since the plan was made: FILE102.TIF"]
+        return
+
+    assert preflight(plan) == []
+    report = apply_plan(plan)
+
+    assert report.status == rename_apply.STATUS_APPLIED
+    assert _names(folder) == {"newname-001.tif"}
+    assert report.journal_path is not None
+    moved = [r for r in _records(report.journal_path) if r.get("record") == "file"]
+    assert [record["from"] for record in moved] == ["file102.tif"]
 
 
 def test_a_plan_carrying_errors_is_refused(tmp_path: Path) -> None:
@@ -745,6 +819,26 @@ def test_finish_marks_the_image_as_renamed_by_someone_else(tmp_path: Path) -> No
     assert image["tmp"] is None
 
 
+def test_finish_refuses_a_companion_target_that_leaves_the_folder(tmp_path: Path) -> None:
+    """A damaged plan may not walk a companion out of the folder it names.
+
+    The refusal comes before the journal, because a companion moved out and
+    then interrupted is a file ``--rename-resume`` cannot even see: resume
+    lists the folder, and the file is no longer in it.
+    """
+    folder, plan = _finish_folder(tmp_path)
+    plan["entries"][0]["companions"][0]["target"] = "../outside.md"
+    before = _names(folder)
+
+    with pytest.raises(RenamePreflightError) as excinfo:
+        finish_plan(plan)
+
+    assert "a target names a path, not a file: ../outside.md" in str(excinfo.value)
+    assert _names(folder) == before
+    assert not (tmp_path / "outside.md").exists()
+    assert not list(folder.glob("*.ndjson"))
+
+
 def test_undo_of_a_finish_journal_reverses_companions_only(tmp_path: Path) -> None:
     """The catalog puts its own images back first; photokin follows with the rest."""
     folder, plan = _finish_folder(tmp_path)
@@ -777,6 +871,22 @@ def test_undo_of_a_finish_journal_waits_for_the_image_to_come_back(tmp_path: Pat
 
 
 # --- Journals ----------------------------------------------------------
+
+
+def test_a_root_folders_journal_is_still_discovered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A folder with no basename writes and looks for the same journal name.
+
+    A filesystem or drive root is the case: the journal is created as
+    ``folder_rename-...`` and discovery has to look for exactly that, or
+    ``--rename-resume``, ``--rename-undo`` and the open-journal guard all miss
+    it. The listing is stubbed because the folder in question is the root
+    itself, which no test may write to.
+    """
+    root = os.path.abspath(os.sep)
+    journal_name = os.path.basename(rename_apply.journal_path_for(root, RUN_ID))
+    monkeypatch.setattr(rename_apply, "_list_names", lambda folder: {journal_name})
+
+    assert rename_apply._journal_candidates(root) == [os.path.join(root, journal_name)]
 
 
 def test_latest_journal_filters_by_status(tmp_path: Path) -> None:

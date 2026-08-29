@@ -132,6 +132,12 @@ _MONTH_NAMES = (
     "July", "August", "September", "October", "November", "December",
 )
 
+#: A partial date's year has to land somewhere plausible for a photograph,
+#: the same range ``merge._extract_year`` already treats as sane for a
+#: freeform date string -- reused here rather than re-litigated, since both
+#: are "is this actually a year" checks on the same kind of input.
+_PLAUSIBLE_YEAR_RANGE = (1800, 2100)
+
 
 def _parse_photo_date(raw: str) -> _PhotoDate | None:
     """Parse one ``EXIF:DateTimeOriginal``-shaped string into a :class:`_PhotoDate`.
@@ -163,8 +169,21 @@ def _parse_photo_date(raw: str) -> _PhotoDate | None:
     partial_match = _PARTIAL_DATE_RE.match(text)
     if partial_match:
         year = int(partial_match.group("year"))
+        if not (_PLAUSIBLE_YEAR_RANGE[0] <= year <= _PLAUSIBLE_YEAR_RANGE[1]):
+            return None
         month_text = partial_match.group("month")
-        month = int(month_text) if month_text else None
+        if month_text is not None:
+            month = int(month_text)
+            # The regex only constrains this to two digits -- "1952:13" and
+            # "1952:00" both match it. Rejecting an out-of-range month here,
+            # rather than downstream in the renderer, is what sends the
+            # group to the documented missing-date error (or --undated)
+            # instead of into _render_date_token's IndexError on
+            # _MONTH_NAMES[13 - 1].
+            if not (1 <= month <= 12):
+                return None
+        else:
+            month = None
         return _PhotoDate(year, month, None, partial=True)
     try:
         parsed = datetime.fromisoformat(text)
@@ -482,6 +501,7 @@ class _Member:
     final_parsed: utils.ParsedName
     notes: list[str]
     photo_date: _PhotoDate | None
+    version_error: str | None = None
 
 
 def _name_key(path: str) -> tuple[str, str]:
@@ -494,14 +514,58 @@ _DIGIT_RUN_RE = re.compile(r"(\d+)")
 
 
 def _natural_sort_key(name: str) -> tuple[int | str, ...]:
-    """``--order natural``'s key: digit runs compared numerically (4.3)."""
+    """``--order natural``'s key: digit runs compared numerically (4.3).
+
+    The natural components alone are not a total order: they discard case
+    and a numeric run's own spelling, so ``file1.tif`` and ``file01.tif``
+    (or ``File1.tif``) produce the same key and compare equal. Python's
+    sort is stable, so two equal keys are then left in whatever order they
+    arrived in -- meaning merely permuting the manifest, with nothing about
+    the files themselves changing, changes the assigned numbers (C10). The
+    ordinary ``(name.lower(), name)`` key breaks that tie deterministically,
+    the same way it already does for the plain ``"name"`` order.
+    """
     parts = _DIGIT_RUN_RE.split(name.lower())
-    return tuple(int(part) if part.isdigit() else part for part in parts)
+    natural = tuple(int(part) if part.isdigit() else part for part in parts)
+    return natural + (name.lower(), name)
+
+
+def _validate_version_override(raw: str) -> tuple[str | None, str | None]:
+    """Validate a manifest ``version`` override (4.1, C1).
+
+    The grammar supports exactly one variant letter (``parse_media_filename``'s
+    ``m_var``, a single ``[a-zA-Z]``); an override that is not that -- a word
+    like ``"blue"``, a digit, punctuation -- is not a smaller version of the
+    same idea, it is a different kind of value that ``render_media_filename``
+    would otherwise concatenate straight into the filename
+    (``x-001blue.tif``), which ``parse_media_filename`` then reads back as an
+    unversioned base id, silently splitting the renamed file from its
+    siblings on the very next run. Rejecting it here, before it ever reaches
+    the renderer, is what turns that into a named plan error instead of a
+    filename that lies about its own grammar.
+
+    Args:
+        raw: The manifest's ``version`` string, exactly as given. An empty
+            (or all-whitespace) string is a valid override -- it explicitly
+            clears an existing variant letter (see the manifest contract).
+
+    Returns:
+        A ``(variant, error)`` pair: ``(letter_or_None, None)`` when *raw*
+        is empty (clears the variant) or is exactly one letter, otherwise
+        ``(None, message)`` with a message naming what was wrong -- the
+        caller must not apply the override in that case.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return None, None
+    if len(stripped) == 1 and stripped.isalpha():
+        return stripped.lower(), None
+    return None, f"version override {raw!r} is not a single letter"
 
 
 def _build_member(item: RenameItem, position: int) -> _Member:
     """Parse one item and apply its ``is_back``/``version`` overrides (4.1, 4.2)."""
-    norm_path = os.path.normpath(item.path)
+    norm_path = os.path.normpath(os.path.abspath(item.path))
     dirname = os.path.dirname(norm_path)
     base, ext = os.path.splitext(os.path.basename(norm_path))
     canonical_stem, notes = utils.canonicalize_stem(base)
@@ -522,8 +586,14 @@ def _build_member(item: RenameItem, position: int) -> _Member:
         final_part_kind, final_page_num = "back", None
     elif item.is_back is False and final_part_kind == "back":
         final_part_kind = "front"
+    version_error = None
     if item.version is not None:
-        final_variant = item.version.strip().lower() or None
+        validated_variant, version_error = _validate_version_override(item.version)
+        if version_error is None:
+            final_variant = validated_variant
+        # else: leave final_variant as the filename's own reading -- the
+        # invalid override is reported (below, via version_error) rather
+        # than coerced into the name or dropped without a trace.
 
     final_parsed = utils.ParsedName(
         base_id=parsed.base_id,
@@ -548,6 +618,7 @@ def _build_member(item: RenameItem, position: int) -> _Member:
         final_parsed=final_parsed,
         notes=notes,
         photo_date=photo_date,
+        version_error=version_error,
     )
 
 
@@ -666,7 +737,12 @@ def plan_rename(
     warnings: list[str] = []
     left_behind: list[dict[str, Any]] = []
 
-    normalized_folder = os.path.normpath(folder)
+    # Absolute before anything derives from it (C9): a relative folder
+    # (".", "scans") must not leak into plan["folder"] -- a later
+    # --rename-finish run from a different working directory would resolve
+    # it somewhere else entirely -- nor into {folder}, which needs the
+    # folder's real name, not "." or "..".
+    normalized_folder = os.path.normpath(os.path.abspath(folder))
     resolved_today = today if today is not None else date.today()  # noqa: DTZ011 (local run date)
     resolved_run_id = run_id if run_id is not None else make_run_id()
     effective_companions = (
@@ -711,6 +787,10 @@ def plan_rename(
         return _skeleton([literal_error])
 
     members = [_build_member(item, position) for position, item in enumerate(ordered_items)]
+
+    for member in members:
+        if member.version_error is not None:
+            errors.append(f"{os.path.basename(member.item.path)}: {member.version_error}")
 
     groups: dict[str, list[_Member]] = {}
     for member in members:
@@ -879,7 +959,7 @@ def plan_rename(
         entries=entries,
         disk_files=sorted(disk_files, key=_name_key),
         normalized_folder=normalized_folder,
-        known_image_paths={os.path.normcase(os.path.normpath(m.item.path)) for m in members},
+        known_image_paths=[os.path.normpath(os.path.abspath(m.item.path)) for m in members],
         companion_extensions=effective_companions,
         left_behind=left_behind,
         warnings=warnings,
@@ -923,7 +1003,7 @@ def _attach_companions_and_bystanders(
     entries: list[dict[str, Any]],
     disk_files: Sequence[str],
     normalized_folder: str,
-    known_image_paths: set[str],
+    known_image_paths: list[str],
     companion_extensions: frozenset[str],
     left_behind: list[dict[str, Any]],
     warnings: list[str],
@@ -934,37 +1014,64 @@ def _attach_companions_and_bystanders(
     A non-image file whose stem exactly matches a renamed image's stem
     becomes that entry's companion when its extension is in
     *companion_extensions*, or a ``left_behind`` record naming the reason
-    otherwise. An image file in *disk_files* that is not one of *entries*'
-    own source paths is a bystander: its current name (lowercased) is added
-    to *bystander_names*, so :func:`_validate_targets` can reject any
-    rendered target that collides with it (4.6's "a target matching a
-    bystander's current name"). *known_image_paths* is compared with
-    ``os.path.normcase`` (the caller pre-normcases it), the same check
-    ``rename_apply.preflight`` uses for this same reason: a manifest's own
+    otherwise. When a companion's stem matches more than one entry -- the
+    ordinary case being a same-stem image pair sharing one slot (4.3), e.g.
+    ``photo.tif``/``photo.jpg``/``photo.md`` -- it needs exactly ONE owner:
+    attaching it to every matching entry makes the same rendered companion
+    target appear twice, which :func:`_validate_targets` then reports as a
+    duplicate and refuses the whole plan (C6's regression is this exact
+    folder). The owner is the matching entry whose extension sorts first
+    (``.jpg`` before ``.tif``), tie-broken by path -- deterministic and
+    independent of *entries*' or the filesystem's own ordering.
+
+    An image file in *disk_files* that is not one of *entries*' own source
+    paths is a bystander: its current name, case-folded, is added to
+    *bystander_names*, so :func:`_validate_targets` can reject any rendered
+    target that collides with it (4.6's "a target matching a bystander's
+    current name"). Whether a disk path is one of *known_image_paths* is
+    answered with :func:`utils.paths_are_same_file` (question 2: is this
+    the same file, not merely the same spelling) -- a manifest's own
     spelling of a path and the spelling ``os.scandir`` returns for the
-    identical file can differ only in case on Windows, and without a
-    case-insensitive comparison that difference reads as two different
-    files, making a file its own bystander and breaking idempotency.
+    identical file can differ only in case on Windows, and without that
+    real-identity check the difference reads as two different files,
+    making a file its own bystander and breaking idempotency. The exact
+    (already-normalized) spelling is tried first, in a set, so this stays
+    O(n) for the overwhelming common case where every path already agrees
+    on spelling; the fallback only runs the pairwise check for whichever
+    handful of paths do not match exactly.
 
     Mutates *entries* (each matched one's ``companions`` list),
     *left_behind*, *warnings* and *bystander_names* in place.
     """
     entry_indices_by_stem: dict[str, list[int]] = {}
     for idx, entry in enumerate(entries):
-        stem = os.path.splitext(os.path.basename(entry["path"]))[0].lower()
+        stem = utils.casefold_filename(os.path.splitext(os.path.basename(entry["path"]))[0])
         entry_indices_by_stem.setdefault(stem, []).append(idx)
 
+    known_exact = set(known_image_paths)
+
     for disk_path in disk_files:
+        # norm_disk_path is what gets stored on companion/left_behind
+        # records -- unchanged from before C9, so those still carry
+        # whatever spelling the caller's listing used. abs_disk_path is
+        # solely for comparing against normalized_folder and
+        # known_image_paths, which are themselves absolute now (C9); a
+        # third path spelling here would just make the comparison itself
+        # wrong again.
         norm_disk_path = os.path.normpath(disk_path)
-        if os.path.dirname(norm_disk_path) != normalized_folder:
+        abs_disk_path = os.path.normpath(os.path.abspath(disk_path))
+        if os.path.dirname(abs_disk_path) != normalized_folder:
             continue
         name = os.path.basename(norm_disk_path)
         stem, ext = os.path.splitext(name)
         if ext.lower() in utils.VALID_EXTS:
-            if os.path.normcase(norm_disk_path) not in known_image_paths:
-                bystander_names.add(name.lower())
+            is_known = abs_disk_path in known_exact or any(
+                utils.paths_are_same_file(abs_disk_path, known) for known in known_image_paths
+            )
+            if not is_known:
+                bystander_names.add(utils.casefold_filename(name))
             continue
-        matches = entry_indices_by_stem.get(stem.lower(), [])
+        matches = entry_indices_by_stem.get(utils.casefold_filename(stem), [])
         if not matches:
             continue
         matched_groups = {entries[i]["group"] for i in matches}
@@ -974,11 +1081,14 @@ def _attach_companions_and_bystanders(
                 f"({', '.join(sorted(matched_groups))})"
             )
         if ext.lower() in companion_extensions:
-            for i in matches:
-                target_stem = entries[i]["target_stem"]
-                if target_stem is None:
-                    continue
-                entries[i]["companions"].append(
+            plannable = [i for i in matches if entries[i]["target_stem"] is not None]
+            if plannable:
+                owner = min(
+                    plannable,
+                    key=lambda i: (os.path.splitext(entries[i]["path"])[1].lower(), entries[i]["path"]),
+                )
+                target_stem = entries[owner]["target_stem"]
+                entries[owner]["companions"].append(
                     {"path": norm_disk_path, "target": target_stem + ext}
                 )
         else:
@@ -992,19 +1102,28 @@ def _validate_targets(
     bystander_names: set[str],
     errors: list[str],
 ) -> None:
-    """Duplicate-target and bystander-collision checks (4.6), case-insensitive."""
+    """Duplicate-target and bystander-collision checks (4.6).
+
+    Question (1), "do two target names collide" -- always
+    ``utils.casefold_filename``, per the case-folding policy, so the plan is
+    safe wherever it is later applied regardless of which OS planned it.
+    """
     target_sources: dict[str, list[str]] = {}
     for entry in entries:
         if entry["target"] is not None:
-            target_sources.setdefault(entry["target"].lower(), []).append(entry["path"])
+            target_sources.setdefault(utils.casefold_filename(entry["target"]), []).append(
+                entry["path"]
+            )
         for companion in entry["companions"]:
-            target_sources.setdefault(companion["target"].lower(), []).append(companion["path"])
+            target_sources.setdefault(
+                utils.casefold_filename(companion["target"]), []
+            ).append(companion["path"])
 
-    for target_lower, sources in sorted(target_sources.items()):
+    for target_key, sources in sorted(target_sources.items()):
         if len(sources) > 1:
-            errors.append(f"duplicate target '{target_lower}', from: {', '.join(sorted(sources))}")
-        if target_lower in bystander_names:
+            errors.append(f"duplicate target '{target_key}', from: {', '.join(sorted(sources))}")
+        if target_key in bystander_names:
             errors.append(
-                f"target '{target_lower}' matches a bystander's current name, from: "
+                f"target '{target_key}' matches a bystander's current name, from: "
                 f"{', '.join(sorted(sources))}"
             )

@@ -26,7 +26,9 @@ Code map (by section):
 - Prompt assembly     build_prompt_bundle + photo-context resolution
 - JSON parsing        model-output cleanup and the retry-parser (_ParseLogger)
 - Filename parsing    parse_media_filename: base id / part kind / variant / page;
-                      canonicalize_stem / render_media_filename: the grammar's inverse
+                      canonicalize_stem / render_media_filename: the grammar's inverse;
+                      casefold_filename / paths_are_same_file: the two case-folding
+                      questions ("do these names collide" vs "is this the same file")
 - Folder listing      list_folder_images: the image files a folder run reads
 - Manifest helpers    load_manifest (shape validation)
 - Metadata merge      small helpers shared by the merge step
@@ -40,6 +42,7 @@ from __future__ import annotations
 # insert_keyword_into_vocab_file, safe_backup, resolve_default_paths,
 # build_data_url_and_size, archival_upload, build_prompt_bundle, parse_with_retry,
 # parse_media_filename, canonicalize_stem, render_media_filename,
+# casefold_filename, paths_are_same_file,
 # list_folder_images, load_manifest,
 # load_item_metadata, combine_group_metadata, part_markers_in, apply_part_keyword,
 # union_keywords,
@@ -1574,6 +1577,85 @@ def render_media_filename(
     crop = "-crop" if parsed.is_crop else ""
 
     return f"{prefix}-{number:0{digits}d}{variant}{part}{crop}{ext}"
+
+
+def casefold_filename(name: str) -> str:
+    """Fold *name* for question (1): would two target names collide?
+
+    Always ``str.casefold()``, on every platform, never
+    ``os.path.normcase`` -- ``normcase`` is a no-op on POSIX, so a check
+    built from it stops catching a collision the moment photokin runs on
+    Linux or macOS, even though the plan it produced is exactly as unsafe
+    there as it would be on Windows. A rename plan's duplicate-target
+    check, its target-vs-bystander check, and the executor's own preflight
+    duplicate check are all this question -- "do these two rendered names
+    collide" -- and the answer has to be a property of the PLAN (where the
+    files might later live), not of whichever OS happens to be running
+    photokin right now.
+
+    Use the return value as a comparison key, e.g.
+    ``casefold_filename(a) == casefold_filename(b)`` or as a ``dict``/``set``
+    key when grouping many names at once.
+
+    Do not reach for this to answer question (2), "are these two paths the
+    same file on disk" -- see :func:`paths_are_same_file` for that. A name
+    collision says nothing about file identity: two *existing* files named
+    ``SAME.TIF`` and ``same.tif`` on a case-sensitive filesystem really are
+    two different files, and folding their names to compare would wrongly
+    merge them.
+
+    Args:
+        name: A filename (or any single path component) to fold.
+
+    Returns:
+        The case-folded name, suitable for equality comparison or hashing.
+    """
+    return name.casefold()
+
+
+def paths_are_same_file(path_a: str, path_b: str) -> bool:
+    """Answer question (2): do *path_a* and *path_b* name the same file?
+
+    Uses real filesystem identity, ``os.path.samefile``, whenever both
+    paths can be stat'd -- correct on a case-insensitive volume (macOS,
+    Windows) and on a case-sensitive one alike, and it never wrongly merges
+    two genuinely distinct files that merely happen to share a casefolded
+    spelling on a case-sensitive filesystem. This is what a manifest's own
+    spelling of a path should be checked against what ``os.scandir``
+    returned for that same file, and what a planned source should be
+    checked against in an executor's preflight snapshot.
+
+    Falls back to a case-folded string comparison only when at least one of
+    the two paths does not exist (so it cannot be stat'd) -- a manifest
+    entry for a file that has since vanished, or, in a pure-function
+    planner test, a path that was never written to disk at all. That
+    fallback is an approximation, accepted only because the alternative is
+    no answer at all; it is not a substitute for the real check above when
+    a real check is possible.
+
+    Do not use :func:`casefold_filename` alone for this question: it
+    answers question (1), whether two rendered names *would* collide if
+    the archive later sat on a case-insensitive volume -- a property of a
+    plan, not a fact about files that exist right now. Here, on a
+    case-sensitive filesystem, ``SAME.TIF`` and ``same.tif`` really are two
+    different files, and casefold-only matching would say otherwise.
+
+    Args:
+        path_a: One path.
+        path_b: The other.
+
+    Returns:
+        Whether the two paths refer to the same file.
+    """
+    norm_a = os.path.normpath(path_a)
+    norm_b = os.path.normpath(path_b)
+    if os.path.exists(norm_a) and os.path.exists(norm_b):
+        try:
+            return os.path.samefile(norm_a, norm_b)
+        except OSError:
+            return False
+    return norm_a.casefold() == norm_b.casefold()
+
 
 # === Folder listing ===
 def _is_image_file(path: str) -> bool:
