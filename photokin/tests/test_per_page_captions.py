@@ -268,6 +268,47 @@ class TestABackInADocumentGetsItsOwnText(_CaptionBlockTestCase):
                 self.assertEqual(record["caption_scope"], "part")
 
 
+class TestACropInheritsItsParentPagesTranscription(_CaptionBlockTestCase):
+    """D1 (Codex review 3): attribution follows the SLOT a file contends for,
+    not whether that file's own path happened to ride the payload.
+
+    A crop yields its page-1 slot to the uncropped original on rank -- the
+    same rule folder mode uses -- so the crop's own path is never in
+    ``analyzed_paths``. It is still a view of the very page the winner is,
+    so page 1's transcription is its text too. Before this was fixed, the
+    check asked whether ``entry["path"]`` itself was analyzed; the crop's
+    never is, so it fell all the way back to the group block instead of
+    reading the page it is a view of.
+    """
+
+    GROUP: ClassVar[dict[str, str]] = {
+        "doc12_004-page1.jpg": "",
+        "doc12_004-page1-crop.jpg": "",
+        "doc12_004-page2.jpg": "",
+    }
+    PAGES: ClassVar[dict[str, str]] = {
+        "Page 1": "Dearest Nan,",
+        "Page 2": "The crossing took eleven days.",
+    }
+
+    def test_the_crops_caption_is_its_page_not_the_group_block(self) -> None:
+        records = self.records(self.GROUP, transcriptions=self.PAGES)
+
+        self.assertEqual(records["doc12_004-page1-crop.jpg"]["caption"], "Dearest Nan,")
+        self.assertEqual(records["doc12_004-page1-crop.jpg"]["caption_scope"], "part")
+
+        # The file the crop yielded its slot to gets the identical text,
+        # which is what proves the crop is reading its PARENT page rather
+        # than some coincidence of matching strings.
+        self.assertEqual(records["doc12_004-page1.jpg"]["caption"], "Dearest Nan,")
+        self.assertEqual(records["doc12_004-page1.jpg"]["caption_scope"], "part")
+
+        self.assertEqual(
+            records["doc12_004-page2.jpg"]["caption"], "The crossing took eleven days."
+        )
+        self.assertEqual(records["doc12_004-page2.jpg"]["caption_scope"], "part")
+
+
 class TestConvergenceAcrossRepeatedReadWritePasses(_CaptionBlockTestCase):
     """E8's convergence claim, run four passes deep.
 

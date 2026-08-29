@@ -538,6 +538,51 @@ class TestDatfileRoutingCountsNonBMPCharactersAsWindowsDoes(_ChangesetFileMixin,
         )
 
 
+class TestBuildCommandDeclaresUtf8FilenameCharsetOnlyWhenRouting(
+    _ChangesetFileMixin, unittest.TestCase
+):
+    """D3 (Codex review 3): a routed command must tell ExifTool its DATFILE
+    path is UTF-8, and an ordinary inline-only command must stay exactly the
+    command this wrapper has always built.
+
+    ``_datfile_name`` keeps the DATFILE's own BASENAME ASCII, but the
+    directory it sits in is the system temporary root, which is not this
+    wrapper's to choose -- a non-ASCII Windows profile name, or a customized
+    ``%TEMP%``, puts non-ASCII in the path regardless. Without
+    ``-charset filename=utf8``, ExifTool decodes that path in the system
+    codepage, does not find the file, and rejects every routed value on such
+    a machine. The switch must appear only on a command that actually routes
+    something -- an inline-only write has no DATFILE path for it to protect,
+    and the read wrapper's own byte-identical command is the thing an
+    unconditional switch would have changed for no reason.
+    """
+
+    def test_a_routed_command_declares_the_charset_switch(self) -> None:
+        cmd = _build_exiftool_command(
+            "/fake/exiftool",
+            ExiftoolConfig(),
+            {"XMP-dc:Description": "irrelevant once routed"},
+            "/photos/a.jpg",
+            {"XMP-dc:Description": "/tmp/000001_XMP-dc_Description_deadbeef.txt"},
+        )
+        self.assertIn("-charset", cmd)
+        self.assertEqual(cmd[cmd.index("-charset") + 1], "filename=utf8")
+
+    def test_an_inline_only_command_is_byte_identical_to_before_the_fix(self) -> None:
+        cmd = _build_exiftool_command(
+            "/fake/exiftool",
+            ExiftoolConfig(),
+            {"EXIF:UserComment": "Hello"},
+            "/photos/a.jpg",
+            None,
+        )
+        self.assertNotIn("-charset", cmd)
+        self.assertEqual(
+            cmd,
+            ["/fake/exiftool", "-overwrite_original", "-EXIF:UserComment=Hello", "/photos/a.jpg"],
+        )
+
+
 class TestDatfileTempDirectoryIsCreatedLazily(_ChangesetFileMixin, unittest.TestCase):
     """C3: the batch's ``TemporaryDirectory`` must not be created until a
     value actually routes.
@@ -679,6 +724,56 @@ class TestADatfileWriteFailureIsPerFileNotBatchFatal(_ChangesetFileMixin, unitte
         self.assertEqual(len(summary["errors"]), 1)
         self.assertEqual(summary["errors"][0]["path"], "/photos/a.jpg")
         self.assertEqual(summary["files_written"], 1, "the second file must still be written")
+
+
+class TestAShortLoneSurrogateDoesNotAbortTheWholeBatch(_ChangesetFileMixin, unittest.TestCase):
+    """D2 (Codex review 3): the UTF-16 command-length measurement itself must
+    tolerate a lone surrogate, not just the DATFILE write ``C4`` guards.
+
+    A lone surrogate reaches this wrapper from a perfectly valid JSON
+    ``\\ud800`` escape. ``TestADatfileWriteFailureIsPerFileNotBatchFatal``
+    (C4) pins the DATFILE-write encode for a value long enough to force
+    routing on its own; this pins a SEPARATE encode the UTF-16 length fix
+    itself introduced, reachable even for a value well under
+    ``_INLINE_VALUE_MAX`` that never routes at all.
+    ``_select_datfile_routing`` measures the whole assembled command on
+    every call -- including the common case where nothing is long enough to
+    route -- so a strict UTF-16 encode there raised ``UnicodeEncodeError``
+    before either per-file guard (the DATFILE write, the ``subprocess.run``
+    call) had a chance to catch it, escaping ``apply_changeset`` entirely and
+    aborting every record after the first.
+    """
+
+    def test_a_short_lone_surrogate_value_still_lets_the_next_record_write(self) -> None:
+        surrogate_value = "\ud800" * 10  # far under _INLINE_VALUE_MAX: must not route
+        self.assertLess(len(surrogate_value), _INLINE_VALUE_MAX)
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": surrogate_value}},
+                },
+                {
+                    "path": "/photos/b.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": "An ordinary caption"}},
+                },
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        ok_result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run", return_value=ok_result):
+            # Must not raise: a UnicodeEncodeError measuring the first
+            # record's (short, inline) command used to escape
+            # apply_changeset and abort the whole batch before the second
+            # record was ever reached.
+            summary = apply_changeset(changeset, cfg)
+
+        self.assertEqual(summary["files_seen"], 2)
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(summary["files_written"], 2, "the second record must still be written")
 
 
 class TestDatfileNamesDoNotCollideAcrossTagSpellings(_ChangesetFileMixin, unittest.TestCase):

@@ -249,7 +249,17 @@ def _select_datfile_routing(
         # a musical symbol, an emoji in a modern annotation -- takes two units
         # per character where ``len`` sees one, and the estimate would be under
         # by up to half on such text.
-        return len(subprocess.list2cmdline(cmd).encode("utf-16-le")) // 2 + 1
+        #
+        # ``surrogatepass`` because this is a measurement, not a write. A value
+        # can legitimately carry a lone surrogate -- a valid JSON ``\ud800``
+        # escape puts one there -- and a strict encode would raise from inside
+        # this function, which is called before either of the guards that make
+        # a bad value one file's error rather than the whole batch's. A lone
+        # surrogate is one UTF-16 unit, which is exactly what Windows would
+        # count, so passing it through measures the truth as well as avoiding
+        # the raise. Writing that value still fails, per-file, further down.
+        rendered = subprocess.list2cmdline(cmd)
+        return len(rendered.encode("utf-16-le", errors="surrogatepass")) // 2 + 1
 
     remaining_by_length = sorted(
         (tag for tag in tags if tag not in routed), key=lambda t: len(tags[t]), reverse=True
@@ -289,6 +299,19 @@ def _build_exiftool_command(
     """
     datfile_paths = datfile_paths or {}
     cmd = [exiftool]
+    if datfile_paths:
+        # Only a routed command declares this, so an ordinary short-value write
+        # is byte-identical to the one this wrapper has always built.
+        #
+        # ``_datfile_name`` keeps the BASENAME ASCII, but the directory it sits
+        # in comes from the system temporary root, which is not ours to choose:
+        # a Windows profile with a non-ASCII name, or a customized %TEMP%, puts
+        # non-ASCII in the path regardless. Without this, ExifTool decodes that
+        # path in the system codepage, looks for a file that is not there, and
+        # rejects every routed value in that environment. The read wrapper
+        # already passes the same switch (exiftool/manifest.py) for the same
+        # reason.
+        cmd.extend(["-charset", "filename=utf8"])
     if cfg.write_sidecar_only:
         cmd.extend(["-o", "%d%f.xmp"])
     elif cfg.overwrite_original:

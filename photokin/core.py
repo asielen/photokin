@@ -945,7 +945,15 @@ def _write_sidecar_document(data: Dict[str, Any], image_path: str, config: utils
     try:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2 if config.pretty_json else None, ensure_ascii=False)
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
+        # ``UnicodeError`` beside ``OSError`` for the same reason its markdown
+        # twin catches it (``doc_sidecar.write_markdown_sidecar``): what is
+        # being written is model-authored text, and a lone surrogate in it
+        # raises UnicodeEncodeError -- a ValueError -- which an OSError-only
+        # guard lets past, into the batch loop's per-group handler, discarding
+        # the paid-for analysis this function exists to protect. ``ensure_ascii``
+        # is False here, so the surrogate reaches the encoder rather than being
+        # escaped on the way out.
         logger.warning(
             "Sidecar not written for %s (%s): the analysis is kept in the results.",
             os.path.basename(image_path),
@@ -3957,8 +3965,28 @@ def process_manifest_stream(
                     )
                     part_value = group_transcriptions.get(part_label)
                     part_text = part_value.strip() if isinstance(part_value, str) else ""
+                    # Attribution follows the SLOT this file contends for, not
+                    # whether this particular path was the one sent. The two
+                    # differ for every file that yields its slot to a better
+                    # claimant and is still recorded:
+                    #
+                    # - a crop yields to the uncropped original and a displaced
+                    #   TIFF yields to its JPEG, but each is a view of the same
+                    #   physical page as the file that won, so that page's
+                    #   transcription is theirs too. Asking whether the path
+                    #   itself travelled would hand a crop of page 1 the whole
+                    #   document instead of page 1.
+                    # - an untagged scan unseated by a real ``-front`` is NOT a
+                    #   view of the front; it merely resolves to the same label.
+                    #   Its slot is popped from ``variant_parts`` when it is
+                    #   unseated, so the lookup below finds no winner and it
+                    #   falls back, which is the whole point of the check.
+                    slot_key = _manifest_part_key(entry)
+                    if slot_key == "none" and entry["version"] in relabelled_versions_frozen:
+                        slot_key = "page:1"
+                    slot_winner = variant_parts.get(entry["version"], {}).get(slot_key)
                     attributed.append(
-                        part_text if entry["path"] in analyzed_paths else ""
+                        part_text if slot_winner in analyzed_paths else ""
                     )
 
                 # The block a file with no transcription of its own falls back
