@@ -35,7 +35,21 @@ from typing import Any
 from .canonical import CANONICAL_KEYWORDS_TAG
 from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywords
 
-SCHEMA_VERSION = 1
+# Bumped whenever a record's shape changes in a way a consumer could care
+# about -- a new top-level key, a renamed one, a changed meaning for an
+# existing one -- mirroring ``cli._NDJSON_SCHEMA_VERSION``'s rule (the one
+# other place this package schema-versions an NDJSON stream), independently:
+# the two streams (changeset, results) evolve on their own schedules.
+#
+# History (why each bump happened, not a full changelog):
+#   2 -- a multipage group's per-file ``XMP-dc:Description`` value in
+#        ``proposed_changes.set`` changed meaning: it used to be the group's
+#        whole transcription, identical across every file; it is now that
+#        file's own part. The diff's shape is unchanged, but a consumer that
+#        compared or deduped that value across a group's files would have
+#        gotten a different answer with no shape change to detect it by. See
+#        docs/per-page-captions.md, decision E11.
+SCHEMA_VERSION = 2
 
 
 def make_run_id() -> str:

@@ -28,6 +28,7 @@ Code map (public-facing entry points marked PUBLIC):
 - _normalize_caption_text       reduce a caption to what two copies must share
 - _captions_are_near_identical  is this caption a restatement of that one?
 - _split_caption_sections       read one file's caption back as labelled sections
+- _assemble_caption_block       fold captions and a transcription into one block
 - _normalize_transcriptions     keep only the per-part entries a reply's map may carry
 - _synthesize_caption           build the caption string from per-part transcriptions
 - _build_provider_client        construct the SDK client for the active provider
@@ -490,6 +491,132 @@ def _split_caption_sections(caption: str, label: str) -> list[tuple[str, list[st
         elif sections:
             sections[-1][1].append(line)
     return [(key, body) for key, body in sections if any(l.strip() for l in body)]
+
+
+def _assemble_caption_block(intake: list[tuple[str, str]], fresh_caption: str) -> str | None:
+    """Fold a set of existing captions and one fresh transcription into a block.
+
+    The one place a caption block is built, and it is now called in two
+    regimes. For a group of views of one object it is called ONCE, with every
+    member's stored caption filed under the label of the file it came off --
+    the print, its back and its rescan share one block, which is what lets
+    whichever file someone opens tell the whole story of the object. For a
+    multipage document it is called once PER FILE, with that file's own stored
+    caption alone and that file's own page as the fresh text.
+
+    Which captions go in is the whole of the difference between the two: the
+    folding, the section de-duplication and the line de-duplication below are
+    identical either way, deliberately, so that "running it twice does not grow
+    your captions" is one proof rather than two.
+
+    Being keyed by section is what makes the result safe to re-read, which is
+    not optional: under ``-rw`` the block written here is exactly what the next
+    run reads back as a file's existing caption. Intake recognizes its own
+    output and takes it verbatim; attributing it a second time is how you get
+    "[Photo A] [Photo A] Caption A" and a caption that grows on every pass.
+
+    Args:
+        intake: ``(existing caption, label)`` pairs in the order they are to be
+            absorbed. *label* is what unattributed prose in that caption earns
+            -- ``"[Photo A]"``, ``"[Back]"``, or ``""`` where the text needs no
+            attribution because the block covers exactly one thing. An empty
+            caption contributes nothing.
+        fresh_caption: This run's transcription of whatever the block covers,
+            absorbed last and always unlabelled.
+
+    Returns:
+        The block, or ``None`` when nothing survived to write.
+    """
+    caption_sections: list[list[str]] = []
+    accepted_texts: list[str] = []
+
+    def _absorb(text: str, label: str) -> None:
+        """Fold *text* in section by section, never whole-string.
+
+        Filling in a missing "[Photo B]" therefore cannot disturb the
+        "[Photo A]" already accepted, and a source holding the same caption --
+        or a trivially reworded copy of it -- adds nothing rather than adding a
+        near-twin line.
+
+        Args:
+            text: One source caption, verbatim.
+            label: The label its unattributed prose earns, or ``""``.
+        """
+        for _key, body in _split_caption_sections(text, label):
+            section_text = _caption_section_text(body)
+            if any(
+                _captions_are_near_identical(seen, section_text) for seen in accepted_texts
+            ):
+                continue
+            accepted_texts.append(section_text)
+            caption_sections.append(body)
+
+    for existing_caption, label in intake:
+        if existing_caption:
+            _absorb(existing_caption, label)
+    if fresh_caption:
+        _absorb(fresh_caption, "")
+
+    # De-duplicated line by line as well as section by section. The section
+    # pass settles what each label says; this one is the last net, and it is
+    # what stops a model that echoed a caption it was shown from landing that
+    # line twice.
+    #
+    # ACROSS sections only, never within one. That distinction is what makes
+    # the block converge, and it is load-bearing now in a way it was not before
+    # per-part transcription existed. A multi-page transcription absorbed as a
+    # group block is ONE section (``_CAPTION_LABEL_RE`` does not match
+    # "[Page N]"), and inside it a repeated line is the document's own content,
+    # not an echo: a letterhead printed on every sheet, a recurring "Dear
+    # Mother,", a second "[blank page]". De-duplicating those against each
+    # other dropped real transcription -- and worse, it did not settle, because
+    # the block then no longer matched what the next run synthesized fresh, so
+    # the near-identical section gate stopped firing and every ``-rw`` pass
+    # appended another structural tail. Scoping the key to its section keeps the
+    # original purpose (an echo arrives in a *different* section) and restores
+    # "running it twice does not grow your captions".
+    caption_block_lines: list[str] = []
+    first_seen_in: dict[str, int] = {}
+    for section_index, body in enumerate(caption_sections):
+        # Buffered per section rather than appended as we go, because a section
+        # every one of whose content lines was already said elsewhere is an echo
+        # whole, and its blank lines and rule lines are then framing nothing.
+        # Emitting them anyway is not cosmetic: a page's own text, read back
+        # beside a group block an earlier release wrote, repeats every word of
+        # it but none of its layout, so the layout survived the dedup, was
+        # stored, and came back again on the pass after -- one "---" of
+        # unbounded growth per run, on exactly the archives E12 declines to
+        # migrate. A section that never had a content line to lose is layout
+        # somebody wrote on purpose and is kept as it always was.
+        section_lines: list[str] = []
+        section_had_content = False
+        section_kept_content = False
+        for line in body:
+            key = " ".join(line.split()).lower()
+            if not key:
+                # A blank line is the author's paragraph break, not a caption;
+                # it is kept as written and never counted as a duplicate, which
+                # is what leaves a multi-paragraph note byte-identical after a
+                # re-read.
+                section_lines.append(line)
+                continue
+            if not _CAPTION_WORD_RE.search(key):
+                # A wordless line is markdown structure, not content: the
+                # transcription conventions put footnotes after a "---" rule, so
+                # two files whose captions both carry footnotes hold that rule
+                # line twice on purpose, and treating the second as a repeat
+                # would glue one file's footnotes onto the other's prose. Like
+                # the blank line above, it is layout and is kept as written.
+                section_lines.append(line)
+                continue
+            section_had_content = True
+            if first_seen_in.setdefault(key, section_index) != section_index:
+                continue
+            section_kept_content = True
+            section_lines.append(line)
+        if section_kept_content or not section_had_content:
+            caption_block_lines.extend(section_lines)
+    return "\n".join(caption_block_lines).strip("\n") or None
 
 
 def _normalize_transcriptions(raw: object) -> dict[str, str] | None:
@@ -3572,7 +3699,26 @@ def process_manifest_stream(
             if best_date:
                 canonical["date_guess"] = best_date
 
-            # === Rule 2: one caption block, built once, written to every file ===
+            # relabelled_versions-as-frozenset, hoisted out of the sidecar gate
+            # further down: resolve_part_label needs it to map a file to its
+            # part label, and the per-file caption build below calls
+            # resolve_part_label too -- on the default path, where sidecars are
+            # off. Left inside that gate it would silently stay the empty
+            # frozenset whenever sidecars are off, and the untagged file that
+            # became Page 1 would resolve to the wrong label, which is now a
+            # wrong caption on the commonest run there is. The mutable
+            # ``relabelled_versions`` it freezes is already computed
+            # unconditionally above (the crop map needs it); only the freeze was
+            # gated, so hoisting it costs an ordinary run one frozenset() call,
+            # not the sidecar-only work. Do not move this back inside the gate.
+            relabelled_versions_frozen: frozenset[str | None] = frozenset(relabelled_versions)
+
+            # === Rule 2: one caption block per object, written to every file ===
+            #
+            # Still built for every group, including a document, where it is
+            # what a file the model did not transcribe falls back to -- but for
+            # a document it is no longer what most files receive. The per-file
+            # rule is below this block, and reads it.
             #
             # A print, its back and a rescan of it are one object, so whichever
             # of them someone opens in Lightroom should tell the whole story of
@@ -3675,34 +3821,15 @@ def process_manifest_stream(
             # contributes all of its sections at once, in the order that block
             # had, which is what keeps a settled group's answer stable.
             own_metadata = [utils.load_item_metadata(it) or {} for it in group]
-            caption_sections: list[list[str]] = []
-            accepted_texts: list[str] = []
-
-            def _absorb_caption(text: str, label: str) -> None:
-                """Split *text* into labelled sections and fold them into
-                ``caption_sections``, section by section, never whole-string.
-                Filling in a missing "[Photo B]" therefore cannot disturb the
-                "[Photo A]" already accepted, and a source holding the same
-                caption -- or a trivially reworded copy of it -- adds nothing
-                rather than adding a near-twin line."""
-                for _key, body in _split_caption_sections(text, label):
-                    section_text = _caption_section_text(body)
-                    if any(
-                        _captions_are_near_identical(seen, section_text)
-                        for seen in accepted_texts
-                    ):
-                        continue
-                    accepted_texts.append(section_text)
-                    caption_sections.append(body)
-
-            for entry, entry_meta in sorted(
-                zip(group, own_metadata), key=lambda pair: _slot_rank_key(pair[0])
-            ):
-                existing_caption = (entry_meta.get("caption") or "").strip()
-                if not existing_caption:
-                    continue
-                label = _label_for(entry["is_back"], entry["version"], entry.get("page_num"))
-                _absorb_caption(existing_caption, label)
+            group_intake = [
+                (
+                    (entry_meta.get("caption") or "").strip(),
+                    _label_for(entry["is_back"], entry["version"], entry.get("page_num")),
+                )
+                for entry, entry_meta in sorted(
+                    zip(group, own_metadata), key=lambda pair: _slot_rank_key(pair[0])
+                )
+            ]
 
             # --- This run's own transcription, merged in last --------------------
             #
@@ -3718,62 +3845,116 @@ def process_manifest_stream(
             # built in ``analyze_group_parts``), so it is split and filed under
             # those exactly as a pre-existing per-file caption would be; a lone
             # scan's plain, unbracketed transcription is filed unlabelled.
+            fresh_group_caption = ""
             if analyses:
-                record0 = analyses[0][0]
-                fresh_caption = _strip_empty_caption_sections(
-                    (record0.get("caption") or "").strip()
+                fresh_group_caption = _strip_empty_caption_sections(
+                    (analyses[0][0].get("caption") or "").strip()
                 )
-                if fresh_caption:
-                    _absorb_caption(fresh_caption, "")
 
-            # --- The block ------------------------------------------------------
+            caption_block = _assemble_caption_block(group_intake, fresh_group_caption)
+
+            # === Each page of a document carries its own caption ===============
             #
-            # De-duplicated line by line as well as section by section. The
-            # section pass settles what each label says; this one is the last
-            # net, and it is what stops a model that echoed a caption it was
-            # shown from landing that line twice.
+            # The block above is still built for a multipage group -- it is what
+            # a file the model did not transcribe falls back to -- but it is no
+            # longer what most of that group's files receive. A 63-page letter
+            # wrote the whole book into all 63 files' Description: 63x
+            # redundant, and wrong for the reader, who opens page 37 and is
+            # shown page 1. Each file gets its OWN part's transcription instead,
+            # which is also what the .md sidecar has been writing all along --
+            # until now the sidecar and Description disagreed about the same
+            # document.
             #
-            # ACROSS sections only, never within one. That distinction is what
-            # makes the block converge, and it is load-bearing now in a way it
-            # was not before per-part transcription existed. A multi-page
-            # document is absorbed as ONE section (``_CAPTION_LABEL_RE`` does
-            # not match "[Page N]"), and inside it a repeated line is the
-            # document's own content, not an echo: a letterhead printed on
-            # every sheet, a recurring "Dear Mother,", a second "[blank page]".
-            # De-duplicating those against each other dropped real
-            # transcription -- and worse, it did not settle, because the block
-            # then no longer matched what the next run synthesized fresh, so
-            # the near-identical section gate stopped firing and every ``-rw``
-            # pass appended another structural tail. Scoping the key to its
-            # section keeps the original purpose (an echo arrives in a
-            # *different* section) and restores "running it twice does not grow
-            # your captions".
-            caption_block_lines: list[str] = []
-            first_seen_in: dict[str, int] = {}
-            for section_index, body in enumerate(caption_sections):
-                for line in body:
-                    key = " ".join(line.split()).lower()
-                    if not key:
-                        # A blank line is the author's paragraph break, not a
-                        # caption; it is kept as written and never counted as a
-                        # duplicate, which is what leaves a multi-paragraph note
-                        # byte-identical after a re-read.
-                        caption_block_lines.append(line)
+            # The trigger is document-ness, not size. ``multipage_present``
+            # already means "an ordered sequence of pages rather than views of
+            # one object", which is the distinction the reasoning depends on; a
+            # byte threshold would make it unpredictable ("why does page 20 have
+            # the whole book and page 21 not?"). A print, its back and a rescan
+            # keep the shared block, because they ARE one object.
+            #
+            # Uniform within the group: a ``Back`` in a multipage group gets its
+            # own ``Back`` transcription, not the book. Attribution follows
+            # part-ness or it does not, and the back of page 3 is no more the
+            # whole book than page 3 is. Variants of one page need no rule of
+            # their own -- page2.jpg and page2b.jpg both resolve to ``Page 2``
+            # and both find that one transcription.
+            #
+            # Two things here are load-bearing and neither is obvious:
+            #
+            # - the intake is THIS file's own stored caption and nothing else.
+            #   Sweeping the group, as the block above does, would hand every
+            #   page every other page's stored text on the first ``-rw``; from
+            #   the pass after that, that text is the file's own stored caption
+            #   and the change has undone itself while still passing any test
+            #   that only looks at a single run.
+            # - the fresh text carries NO label. The file holds exactly one
+            #   part's text, so there is nothing to tell it apart from -- the
+            #   same rule a lone scan already follows. A label would also have
+            #   to be one ``_CAPTION_LABEL_RE`` recognizes or it would be
+            #   re-attributed on the next read, and teaching that regex
+            #   "[Page N]" re-introduces a bug this repo shipped once already:
+            #   a letterhead repeated across two pages becomes a cross-section
+            #   duplicate and the section-scoped line dedup deletes it. Measured
+            #   against both labelled candidates, unlabelled is also the only
+            #   one that is a fixed point from run 1 rather than run 2.
+            #
+            # Nothing here looks at what an earlier release stored. An archive
+            # processed under the group-wide rule keeps the block it holds, on
+            # every file, permanently; that block is a stable fixed point under
+            # this rule and reconciling it is the user's own act.
+            # ``isinstance`` twice over, and not for tidiness: this map is
+            # model-written, and while the parse normalizes it, ``canonical``
+            # is whatever reached the emit loop. A reply of
+            # ``"transcriptions": ["Page 1"]``, or a page whose value came back
+            # as a list of lines, is valid JSON that would raise here -- inside
+            # the per-group try, after the analysis is already paid for, taking
+            # down a whole group over a caption it could simply have declined
+            # to attribute.
+            group_transcriptions = canonical.get("transcriptions")
+            if not isinstance(group_transcriptions, dict):
+                group_transcriptions = {}
+            # One (caption, scope) per entry of ``group``, positionally, so the
+            # emit loop can zip it beside ``own_metadata`` rather than key it by
+            # a path a manifest may list twice.
+            captions_for_files: list[tuple[str | None, str | None]] = [
+                (caption_block, None)
+            ] * len(group)
+            if multipage_present:
+                captions_for_files = []
+                kept_group_block: list[str] = []
+                for entry, entry_meta in zip(group, own_metadata):
+                    part_label = resolve_part_label(
+                        entry,
+                        multipage_present=True,
+                        relabelled_versions=relabelled_versions_frozen,
+                    )
+                    part_value = group_transcriptions.get(part_label)
+                    part_text = part_value.strip() if isinstance(part_value, str) else ""
+                    if not part_text:
+                        # No map at all, a partial one, or a displaced or
+                        # unseated file that was never in the payload under any
+                        # label. Inventing an attribution nothing supports is the
+                        # one thing this codebase consistently refuses to do, so
+                        # the file keeps exactly today's group block -- and says
+                        # which of the two regimes it is in, so an embedder
+                        # reading a folder that ended up mixed can tell rather
+                        # than guessing from length.
+                        kept_group_block.append(os.path.basename(entry["path"]))
+                        captions_for_files.append((caption_block, "group"))
                         continue
-                    if not _CAPTION_WORD_RE.search(key):
-                        # A wordless line is markdown structure, not content:
-                        # the transcription conventions put footnotes after a
-                        # "---" rule, so two files whose captions both carry
-                        # footnotes hold that rule line twice on purpose, and
-                        # treating the second as a repeat would glue one
-                        # file's footnotes onto the other's prose. Like the
-                        # blank line above, it is layout and is kept as written.
-                        caption_block_lines.append(line)
-                        continue
-                    if first_seen_in.setdefault(key, section_index) != section_index:
-                        continue
-                    caption_block_lines.append(line)
-            caption_block = "\n".join(caption_block_lines).strip("\n") or None
+                    own_caption = (entry_meta.get("caption") or "").strip()
+                    captions_for_files.append(
+                        (_assemble_caption_block([(own_caption, "")], part_text), "part")
+                    )
+                if kept_group_block:
+                    logger.info(
+                        "Group '%s': %d of %d file(s) have no transcription of their own "
+                        "and keep the group's caption block: %s",
+                        stem,
+                        len(kept_group_block),
+                        len(group),
+                        ", ".join(kept_group_block),
+                    )
 
             def _tok(u: dict | None, key: str) -> int:
                 return int(u.get(key)) if (u and isinstance(u.get(key), int)) else 0
@@ -3874,7 +4055,6 @@ def process_manifest_stream(
             # feature it never asked for.
             sidecar_group_files: tuple[str, ...] = ()
             sidecar_page_count: int | None = None
-            sidecar_relabelled_versions: frozenset[str | None] = frozenset()
             # Which file owns each sidecar destination, decided by rank rather
             # than by the order the group happens to be listed in. Two members
             # whose names differ only by extension -- a TIFF master beside its
@@ -3896,10 +4076,11 @@ def process_manifest_stream(
                     os.path.basename(g["path"]) for g in ranked_group
                 )
                 sidecar_page_count = len(page_nums_all) if multipage_present else None
-                sidecar_relabelled_versions = frozenset(relabelled_versions)
 
             # emit per-file (merged with per-file metadata)
-            for it, own_meta in zip(group, own_metadata):
+            for it, own_meta, (file_caption, caption_scope) in zip(
+                group, own_metadata, captions_for_files
+            ):
                 # Read before the merge below, which is the last moment the two
                 # are distinguishable: a marker this file already carried is the
                 # caller's own keyword however many siblings share the part it
@@ -3918,13 +4099,21 @@ def process_manifest_stream(
                     keywords_for_item = utils.union_keywords(keywords_for_item, [part_marker])
                 record_for_item["keywords"] = keywords_for_item
 
-                # Rule 2: the group's one block, byte-identical on every file.
-                # This file's own caption is already in it, under this file's
-                # label, put there by the intake sweep above -- joining it again
-                # here is what would give each file a personal preamble and make
-                # the blocks diverge.
-                if caption_block:
-                    record_for_item["caption"] = caption_block
+                # Rule 2, for a group of views of one object: the group's one
+                # block, byte-identical on every file. This file's own caption
+                # is already in it, under this file's label, put there by the
+                # intake sweep above -- joining it again here is what would give
+                # each file a personal preamble and make the blocks diverge. For
+                # a multipage document it is instead this file's own part, built
+                # above, and ``caption_scope`` records which of the two this
+                # file got. The key is written only inside a multipage group,
+                # where the two regimes can differ file to file; everywhere else
+                # the caption is group-scoped by design and saying so on every
+                # record would be noise.
+                if file_caption:
+                    record_for_item["caption"] = file_caption
+                if caption_scope:
+                    record_for_item["caption_scope"] = caption_scope
 
                 merged, report = merge_metadata(
                     record_for_item,
@@ -3994,7 +4183,7 @@ def process_manifest_stream(
                             part_label=resolve_part_label(
                                 it,
                                 multipage_present=multipage_present,
-                                relabelled_versions=sidecar_relabelled_versions,
+                                relabelled_versions=relabelled_versions_frozen,
                             ),
                             group_files=sidecar_group_files,
                             page_count=sidecar_page_count,

@@ -287,14 +287,15 @@ class _CaptionBlockTestCase(unittest.TestCase):
     #: interpretation were pulled apart into Description and UserComment.
     ANALYSIS = "Two people outside a bakery."
 
-    def blocks(
+    def records(
         self,
         captions: dict[str, str],
         *,
         group_by: str = utils.GROUP_BY_OBJECT,
         analysis: str | None = None,
-    ) -> dict[str, str]:
-        """Run one set of files and return each one's caption, keyed by basename.
+        transcriptions: dict[str, str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Run one set of files and return each one's record, keyed by basename.
 
         The captions are supplied through the ExifTool stand-in rather than as
         manifest metadata, so every case travels the ``-r`` path the growth bug
@@ -305,9 +306,12 @@ class _CaptionBlockTestCase(unittest.TestCase):
                 holding none.
             group_by: Grouping granularity, as ``--group-by`` sets it.
             analysis: What the model returns for this run.
+            transcriptions: The per-part map the model returns, or ``None`` for
+                a reply carrying none. A multipage group with a map is the one
+                shape whose caption is built per file rather than per group.
 
         Returns:
-            ``{basename: caption}`` for every file.
+            ``{basename: merged record}`` for every file.
         """
         work = tempfile.mkdtemp(prefix="pk-block-")
         paths = {name: _touch(work, name) for name in captions}
@@ -317,24 +321,62 @@ class _CaptionBlockTestCase(unittest.TestCase):
             )
             for name, path in paths.items()
         }
+        reply: dict[str, Any] = {
+            "caption": self.ANALYSIS if analysis is None else analysis,
+            "keywords": [],
+        }
+        if transcriptions is not None:
+            reply["transcriptions"] = transcriptions
         out = _run(
             [{"path": paths[name]} for name in captions],
-            {"caption": self.ANALYSIS if analysis is None else analysis, "keywords": []},
+            reply,
             hydrator=_tag_hydrator(store),
             cfg=utils.Config(group_by=group_by),
             from_files=True,
         )
+        return {os.path.basename(path): out["results"][path] for path in paths.values()}
+
+    def blocks(self, captions: dict[str, str], **kwargs: Any) -> dict[str, str]:
+        """Return each file's caption, keyed by basename.
+
+        Args:
+            captions: ``{filename: existing caption}``, as :meth:`records` takes.
+            **kwargs: Passed straight to :meth:`records`.
+
+        Returns:
+            ``{basename: caption}`` for every file.
+        """
         return {
-            os.path.basename(path): out["results"][path].get("caption") or ""
-            for path in paths.values()
+            name: record.get("caption") or ""
+            for name, record in self.records(captions, **kwargs).items()
+        }
+
+    def scopes(self, captions: dict[str, str], **kwargs: Any) -> dict[str, str | None]:
+        """Return each file's disclosed ``caption_scope``, keyed by basename.
+
+        Args:
+            captions: ``{filename: existing caption}``, as :meth:`records` takes.
+            **kwargs: Passed straight to :meth:`records`.
+
+        Returns:
+            ``{basename: caption_scope}``, the value being ``None`` on a record
+            that carries no such key.
+        """
+        return {
+            name: record.get("caption_scope")
+            for name, record in self.records(captions, **kwargs).items()
         }
 
     def one_block(self, captions: dict[str, str], **kwargs: Any) -> str:
         """Return the single block a group produced, asserting every file has it.
 
-        Identical-on-every-file is the feature, so it is checked here rather
-        than in one test of its own: no case below can accidentally assert about
-        a block that only one file of the group received.
+        Identical-on-every-file is the feature for every group except a
+        multipage document: a print, its back and a rescan are one object, and
+        which of them someone opens a year later is an accident of how they were
+        browsing. It is asserted here rather than in one test of its own so no
+        case below can accidentally assert about a block only one file of the
+        group received. The document case has :meth:`page_blocks` instead, which
+        makes the opposite claim just as hard to sidestep.
         """
         produced = self.blocks(captions, **kwargs)
         self.assertEqual(
@@ -348,6 +390,27 @@ class _CaptionBlockTestCase(unittest.TestCase):
             f"for the group and written to every member of it: {produced!r}",
         )
         return distinct.pop()
+
+    def page_blocks(self, captions: dict[str, str], **kwargs: Any) -> dict[str, str]:
+        """Return a document's per-file captions, asserting no two files match.
+
+        The multipage counterpart of :meth:`one_block`, and it exists for the
+        same reason. The failure this feature is most likely to regress into is
+        every page quietly holding the whole book again, and a case asserting
+        only that page 1 reads "Dear Ruth," would still pass under it: page 1's
+        own text is the first thing in the group block too.
+        """
+        produced = self.blocks(captions, **kwargs)
+        self.assertEqual(
+            sorted(produced), sorted(captions), "a file came back with no record"
+        )
+        self.assertEqual(
+            len(set(produced.values())),
+            len(produced),
+            "two files of a document hold the same caption, so at least one of "
+            f"them is not carrying its own page: {produced!r}",
+        )
+        return produced
 
 
 class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
@@ -522,19 +585,287 @@ class TestTheBlockIsTheWholeGroupsStory(_CaptionBlockTestCase):
         "[Photo]", merging three distinct captions under one indistinguishable
         heading. The page number is what the filenames already call them, so
         that is what disambiguates them.
+
+        A document's files normally carry a caption each now rather than this
+        one block. This reply carries no ``transcriptions``, which is the
+        fallback: there is no per-part text to attribute, so the group block is
+        what every file gets and the label rule above is what builds it. That
+        makes this both the original case and the pin on the fallback -- the
+        model returning nothing per part must leave a document exactly where it
+        was before per-page captions existed.
         """
+        pages = {
+            "box5_010-page1.jpg": "Dear Ruth,",
+            "box5_010-page2.jpg": "I hope this finds you well.",
+            "box5_010-page3.jpg": "Love, Sam",
+        }
         self.assertEqual(
-            self.one_block(
-                {
-                    "box5_010-page1.jpg": "Dear Ruth,",
-                    "box5_010-page2.jpg": "I hope this finds you well.",
-                    "box5_010-page3.jpg": "Love, Sam",
-                }
-            ),
+            self.one_block(pages),
             "[Photo 1] Dear Ruth,\n"
             "[Photo 2] I hope this finds you well.\n"
             "[Photo 3] Love, Sam\n"
             f"{self.ANALYSIS}",
+        )
+        self.assertEqual(
+            set(self.scopes(pages).values()),
+            {"group"},
+            "a document that fell back to the group block did not say so",
+        )
+
+
+class TestADocumentGivesEachPageItsOwnCaption(_CaptionBlockTestCase):
+    """Each page of a document carries its own page, not the whole book.
+
+    The group block is right for a print, its back and a rescan: they are one
+    object, and which of them someone opens a year later is an accident of how
+    they were browsing. A 63-page letter is not one object. Writing the whole
+    transcription into all 63 files made every page's Description 63x redundant
+    and told the reader who opened page 37 about page 1 -- and the ``.md``
+    sidecar, which has always preferred this file's own part, disagreed with
+    the Description of the same file.
+
+    The trigger is document-ness, not size: ``multipage_present`` already means
+    "an ordered sequence of pages rather than views of one object". Within such
+    a group the rule is uniform -- a back gets the back's own text, and two
+    scans of one page both get that page's.
+    """
+
+    #: A three page letter, no file holding a caption of its own yet.
+    LETTER: typing.ClassVar[dict[str, str]] = {
+        "box5_020-page1.jpg": "",
+        "box5_020-page2.jpg": "",
+        "box5_020-page3.jpg": "",
+    }
+    PAGES: typing.ClassVar[dict[str, str]] = {
+        "Page 1": "Dear Ruth,",
+        "Page 2": "I hope this finds you well.",
+        "Page 3": "Love, Sam",
+    }
+
+    def test_each_page_holds_its_own_part_and_nothing_else(self):
+        self.assertEqual(
+            self.page_blocks(self.LETTER, transcriptions=self.PAGES),
+            {
+                "box5_020-page1.jpg": "Dear Ruth,",
+                "box5_020-page2.jpg": "I hope this finds you well.",
+                "box5_020-page3.jpg": "Love, Sam",
+            },
+        )
+
+    def test_a_page_carries_no_label(self):
+        """The file holds exactly one part's text, so there is nothing to tell
+        it apart from -- the rule a lone scan already follows. A label would
+        also have to be one the intake recognizes on the next read or it would
+        be attributed a second time, and the only spelling that would fit is
+        the "[Page N]" the section dedup must never be taught.
+        """
+        for name, caption in self.page_blocks(
+            self.LETTER, transcriptions=self.PAGES
+        ).items():
+            with self.subTest(file=name):
+                self.assertNotIn("[", caption)
+
+    def test_the_pages_say_which_regime_they_are_in(self):
+        self.assertEqual(
+            set(self.scopes(self.LETTER, transcriptions=self.PAGES).values()), {"part"}
+        )
+
+    def test_a_back_in_a_document_gets_the_backs_own_text(self):
+        """Attribution follows part-ness or it does not.
+
+        A rule reading "pages get their own text but the back gets everything"
+        would be two rules, and the back of a page is no more the whole book
+        than the page is.
+        """
+        self.assertEqual(
+            self.page_blocks(
+                {
+                    "box5_021-page1.jpg": "",
+                    "box5_021-page2.jpg": "",
+                    "box5_021-back.jpg": "",
+                },
+                transcriptions={
+                    "Page 1": "Dear Ruth,",
+                    "Page 2": "Love, Sam",
+                    "Back": "Written on the reverse in pencil.",
+                },
+            ),
+            {
+                "box5_021-page1.jpg": "Dear Ruth,",
+                "box5_021-page2.jpg": "Love, Sam",
+                "box5_021-back.jpg": "Written on the reverse in pencil.",
+            },
+        )
+
+    def test_two_scans_of_one_page_share_that_pages_text(self):
+        """The half of this change that needed no code at all.
+
+        The payload is built per PART with a list of paths, so a page and its
+        rescan travel under one label and resolve back to it. They are scans of
+        the same physical sheet, so they hold the same text -- which is the
+        variants-still-combine rule, arrived at by the same route rather than
+        by an exception.
+        """
+        produced = self.blocks(
+            {
+                "box5_022-page1.jpg": "",
+                "box5_022-page2.jpg": "",
+                "box5_022b-page2.jpg": "",
+            },
+            transcriptions={"Page 1": "Dear Ruth,", "Page 2": "Love, Sam"},
+        )
+        self.assertEqual(produced["box5_022-page2.jpg"], "Love, Sam")
+        self.assertEqual(produced["box5_022b-page2.jpg"], "Love, Sam")
+        self.assertEqual(produced["box5_022-page1.jpg"], "Dear Ruth,")
+
+    def test_a_page_the_model_did_not_answer_keeps_the_group_block(self):
+        """The mixed folder, made legible rather than mysterious.
+
+        ``transcriptions`` is optional by design, and a partial map is what a
+        long document actually produces when something goes wrong part way
+        through. Inventing an attribution nothing supports is the one thing
+        this codebase refuses to do, so the unanswered file keeps exactly the
+        caption it would have had before -- and says which regime it is in, so
+        a reader is not left inferring it from length.
+        """
+        group = {
+            "box5_023-page1.jpg": "",
+            "box5_023-page2.jpg": "",
+            "box5_023-page3.jpg": "",
+        }
+        answered = {"Page 1": "Dear Ruth,", "Page 2": "I hope this finds you well."}
+
+        produced = self.blocks(group, transcriptions=answered)
+        self.assertEqual(produced["box5_023-page1.jpg"], "Dear Ruth,")
+        self.assertEqual(produced["box5_023-page3.jpg"], self.ANALYSIS)
+        self.assertEqual(
+            self.scopes(group, transcriptions=answered),
+            {
+                "box5_023-page1.jpg": "part",
+                "box5_023-page2.jpg": "part",
+                "box5_023-page3.jpg": "group",
+            },
+        )
+
+    def test_a_group_of_views_of_one_object_is_left_exactly_as_it_was(self):
+        """The common case, untouched, including the absence of the new key.
+
+        ``caption_scope`` is written only inside a document, where the two
+        regimes can differ file to file. Everywhere else the caption is
+        group-scoped by design and stamping that on every record in an archive
+        of ordinary photographs would be noise in a value users read.
+        """
+        pair = {"box3_050.jpg": "Ruth and Sam", "box3_050-back.jpg": "pencil note"}
+        transcriptions = {"Front": "Ruth and Sam", "Back": "pencil note"}
+
+        self.assertEqual(
+            self.one_block(pair, transcriptions=transcriptions),
+            f"[Photo] Ruth and Sam\n[Back] pencil note\n{self.ANALYSIS}",
+        )
+        self.assertEqual(set(self.scopes(pair, transcriptions=transcriptions).values()),
+                         {None})
+
+    def test_no_page_ever_receives_a_siblings_stored_caption(self):
+        """The trap in this change, and the one a single run cannot see.
+
+        The group's intake sweep absorbs every file's existing caption into one
+        block. Left group-wide for a document, it would hand every page every
+        other page's stored text on the first ``-rw`` -- and from the pass
+        after that, that text is the file's own stored caption, so the change
+        has quietly undone itself while a test that only checks "page 2 says
+        page 2" still passes.
+        """
+        produced = self.blocks(
+            {
+                "box5_024-page1.jpg": "an archivist's note about the first sheet",
+                "box5_024-page2.jpg": "a different note about the second sheet",
+            },
+            transcriptions={"Page 1": "Dear Ruth,", "Page 2": "Love, Sam"},
+        )
+
+        self.assertEqual(
+            produced["box5_024-page1.jpg"],
+            "an archivist's note about the first sheet\nDear Ruth,",
+        )
+        self.assertNotIn("second sheet", produced["box5_024-page1.jpg"])
+        self.assertNotIn("first sheet", produced["box5_024-page2.jpg"])
+
+    def test_the_pages_do_not_depend_on_the_order_they_arrived_in(self):
+        """Permutation invariance, kept where it still applies.
+
+        A group block is one value and has to be the same whatever order the
+        folder was listed in. Per-page captions are several values, so the
+        claim becomes "the same MAP" -- which is the same property and the same
+        class of bug, since the per-file build reads a group-wide part map and
+        a group-wide relabel set.
+        """
+        answers = {
+            tuple(sorted(self.blocks(dict(order), transcriptions=self.PAGES).items()))
+            for order in itertools.permutations(self.LETTER.items())
+        }
+        self.assertEqual(len(answers), 1, f"arrival order leaked into a caption: {answers!r}")
+
+    def test_a_map_whose_value_is_not_text_falls_back_instead_of_failing(self):
+        """``transcriptions`` is model-written, so its values are whatever the
+        model sent. A page that came back as a list of lines is valid JSON; the
+        group has already been paid for by the time it gets here, so an
+        unusable value declines to attribute that file rather than taking the
+        whole group down with it.
+        """
+        group = {"box5_025-page1.jpg": "", "box5_025-page2.jpg": ""}
+        produced = self.blocks(
+            group,
+            transcriptions={"Page 1": ["Dear", "Ruth"], "Page 2": "Love, Sam"},
+        )
+
+        self.assertEqual(produced["box5_025-page1.jpg"], self.ANALYSIS)
+        self.assertEqual(produced["box5_025-page2.jpg"], "Love, Sam")
+
+    def test_the_scope_key_is_a_record_field_and_never_a_written_tag(self):
+        """``caption_scope`` is disclosure for whoever reads the record -- the
+        plug-in, the NDJSON stream, a sidecar. It is not a tag, and it must not
+        become one: the canonical patch is what reaches the user's files.
+        """
+        for name, record in self.records(
+            self.LETTER, transcriptions=self.PAGES
+        ).items():
+            patch, _patch_meta = build_canonical_patch(record, utils.Config())
+            with self.subTest(file=name):
+                self.assertEqual(record["caption_scope"], "part")
+                self.assertNotIn("caption_scope", patch)
+                self.assertNotIn(
+                    "part",
+                    [str(entry.get("value")) for entry in patch.values()],
+                )
+
+    def test_four_consecutive_runs_are_byte_identical_from_the_first(self):
+        """The README's promise, on the path this change created.
+
+        Under ``-rw`` the caption written here is exactly what the next run
+        reads back out of the file, so anything that is not a fixed point grows
+        without bound into the user's photographs. Carrying no label is what
+        makes this settle on run 1 rather than run 2: an unlabelled caption is
+        read back as one unlabelled section, and this run's own fresh text for
+        the same page is then recognized as a restatement of it.
+        """
+        held = dict(self.LETTER)
+        passes: list[dict[str, str]] = []
+        for _run in range(4):
+            held = self.blocks(held, transcriptions=self.PAGES)
+            passes.append(dict(held))
+
+        self.assertEqual(
+            passes[1:],
+            [passes[0], passes[0], passes[0]],
+            "a per-page caption is not a fixed point of its own intake",
+        )
+        self.assertEqual(
+            passes[0],
+            {
+                "box5_020-page1.jpg": "Dear Ruth,",
+                "box5_020-page2.jpg": "I hope this finds you well.",
+                "box5_020-page3.jpg": "Love, Sam",
+            },
         )
 
 
@@ -817,6 +1148,11 @@ class TestTheCaptionBlockIsPermutationInvariant(_CaptionBlockTestCase):
     leak into a value written into the user's photographs. Phase B1 exists for
     this class of bug; the intake sweep is ordered by ``_slot_rank_key`` for the
     same reason every other choice in the bucket loop is.
+
+    The group here is four scans of one object, which is exactly the shape that
+    still gets one block. A document's pages get one caption each, and the same
+    invariant restated for them -- the same MAP whatever the order -- is in
+    ``TestADocumentGivesEachPageItsOwnCaption``.
     """
 
     #: Four files, all carrying captions, spanning both roles and both variants,
@@ -867,6 +1203,12 @@ class TestCaptionJoinIsIdempotent(_CaptionBlockTestCase):
     The steady state is not "one file holds the block": it is EVERY file holding
     it, because that is what the previous run wrote. That is the case most likely
     to double, and it is the one the runs below re-feed.
+
+    Every shape below is a group of views of one object or a lone file, so all
+    of them still hold one block. The same promise for a document, whose files
+    now each hold their own page, is
+    ``TestADocumentGivesEachPageItsOwnCaption`` -- carrying no label is what
+    makes that one settle on the first run rather than the second.
     """
 
     ORIGINAL = "Grandma on the porch, Ohio, summer 1948"
