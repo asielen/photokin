@@ -1,6 +1,9 @@
 import argparse
+import base64
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,8 +12,20 @@ from unittest.mock import patch
 from photokin import cli
 from photokin.exiftool import ExiftoolConfig, apply_changeset
 from photokin.exiftool import locate
-from photokin.exiftool.apply import _normalize_exif_datetime
+from photokin.exiftool.apply import _COMMAND_LENGTH_BUDGET, _INLINE_VALUE_MAX, _normalize_exif_datetime
 from photokin.exiftool.config import parse_fields
+
+#: A 283-byte 4x4 baseline JPEG -- the same minimal fixture
+#: test_canonical_tags_are_writable.py uses, duplicated here rather than
+#: imported so this file stays self-contained and a missing Pillow can't
+#: become a second, quieter reason for the round-trip test not to run.
+_MINIMAL_JPEG_B64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABsSFBcUERsXFhceHBsgKEIrKCUlKFE6PTBCYFVlZF9V"
+    "XVtqeJmBanGQc1tdhbWGkJ6jq62rZ4C8ybqmx5moq6T/2wBDARweHigjKE4rK06kbl1upKSkpKSk"
+    "pKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKT/wAARCAAEAAQDASIA"
+    "AhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAAAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEA"
+    "AAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AAA//2Q=="
+)
 
 
 class TestExiftoolConfig(unittest.TestCase):
@@ -70,7 +85,9 @@ class TestExiftoolConfig(unittest.TestCase):
         self.assertEqual(parse_fields("A, B,,C "), ("A", "B", "C"))
 
 
-class TestApplyChangeset(unittest.TestCase):
+class _ChangesetFileMixin:
+    """Shared helper: write an NDJSON changeset file, cleaned up after the test."""
+
     def _write_changeset(self, records) -> str:
         handle = tempfile.NamedTemporaryFile(
             "w", suffix=".ndjson", delete=False, encoding="utf-8"
@@ -78,9 +95,15 @@ class TestApplyChangeset(unittest.TestCase):
         with handle:
             for record in records:
                 handle.write(json.dumps(record) + "\n")
-        self.addCleanup(os.unlink, handle.name)
+        # This mixin has no TestCase base of its own -- that's what lets two
+        # datfile-routing test classes share it alongside TestApplyChangeset
+        # without a diamond -- so mypy can't see that addCleanup resolves; it
+        # only does once a concrete subclass mixes in unittest.TestCase too.
+        self.addCleanup(os.unlink, handle.name)  # type: ignore[attr-defined]
         return handle.name
 
+
+class TestApplyChangeset(_ChangesetFileMixin, unittest.TestCase):
     def test_disabled_config_returns_warning_summary(self):
         path = self._write_changeset([])
         cfg = ExiftoolConfig(enabled=False)
@@ -198,6 +221,208 @@ class TestApplyChangeset(unittest.TestCase):
         self.assertEqual(summary["files_written"], 2)
         self.assertEqual(len(summary["errors"]), 1)
         self.assertEqual(summary["errors"][0]["path"], "/photos/b.jpg")
+
+
+class TestDatfileRoutingForLongValues(_ChangesetFileMixin, unittest.TestCase):
+    """Part B: values too long for the command line move into a DATFILE.
+
+    The round-trip case exercises the real ExifTool binary (skipped cleanly
+    when none is on PATH, matching test_canonical_tags_are_writable.py's
+    convention) because the hazard it guards against -- a value silently
+    truncated or dropped -- is a property of what ExifTool actually does with
+    the file it is handed, not something a mock can demonstrate. The routing,
+    budget and cleanup behavior below it only need to observe what argv
+    ``apply_changeset`` assembles, so those are exercised at the mocked
+    ``subprocess.run`` boundary, matching this file's existing style.
+    """
+
+    def test_a_long_description_round_trips_byte_identical_via_the_real_binary(self):
+        """The E2 exit criterion: a ~40,000-char value survives write+read whole.
+
+        Covers newlines, non-ASCII, and the marks the 0.4.0 conventions
+        produce (``~~struck~~``, ``_underlined_``, a ``> [margin note]`` line,
+        a bare ``---`` rule) -- and asserts content equality, not just that
+        the run reported success, per E5.
+        """
+        exiftool = shutil.which("exiftool")
+        if not exiftool:
+            self.skipTest("no exiftool binary on PATH")
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        image = Path(tmp.name) / "probe.jpg"
+        image.write_bytes(base64.b64decode(_MINIMAL_JPEG_B64))
+
+        marks = (
+            "Café résumé — naïve façade\n"
+            "~~struck~~ and _underlined_\n"
+            "> a margin note\n"
+            "---\n"
+        )
+        body = ("Some handwritten transcription text. " * 50 + "\n") * 20
+        description = marks + body
+        # Pad/trim to exactly 40,000 characters -- the size the plan measured
+        # a plain inline value failing at (WinError 206 past ~32,767).
+        description = (
+            description[:40_000]
+            if len(description) > 40_000
+            else description + "x" * (40_000 - len(description))
+        )
+        self.assertEqual(len(description), 40_000)
+
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": str(image),
+                    "proposed_changes": {"set": {"XMP-dc:Description": description}},
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, path=exiftool, fields=("XMP-dc:Description",))
+        summary = apply_changeset(changeset, cfg)
+
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(summary["files_written"], 1)
+
+        readback = subprocess.run(
+            [exiftool, "-b", "-XMP-dc:Description", str(image)],
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(readback.stdout.decode("utf-8"), description)
+
+    def test_a_short_value_still_takes_the_inline_path(self):
+        """Threshold-gating (E3) must leave the ordinary case alone."""
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": "A short caption."}},
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        ok_result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch(
+            "photokin.exiftool.apply.subprocess.run", return_value=ok_result
+        ) as run_mock:
+            summary = apply_changeset(changeset, cfg)
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(summary["files_written"], 1)
+        cmd = run_mock.call_args[0][0]
+        self.assertTrue(any(arg.startswith("-EXIF:UserComment=") for arg in cmd))
+        self.assertFalse(any("<=" in arg for arg in cmd))
+
+    def test_medium_values_that_together_exceed_the_budget_get_routed(self):
+        """Several values individually under the per-value threshold can still
+        sum past the whole-command budget (E3) -- the OS limit is on the
+        whole command line, not on any one value. Enough of them must be
+        routed for the assembled command to fit the budget.
+        """
+        tags = tuple(f"XMP-dc:Field{i}" for i in range(10))
+        value = "m" * 3_500
+        self.assertLess(len(value), _INLINE_VALUE_MAX)  # under threshold alone
+        changeset = self._write_changeset(
+            [{"path": "/photos/a.jpg", "proposed_changes": {"set": dict.fromkeys(tags, value)}}]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=tags)
+        ok_result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch(
+            "photokin.exiftool.apply.subprocess.run", return_value=ok_result
+        ) as run_mock:
+            summary = apply_changeset(changeset, cfg)
+        self.assertEqual(summary["errors"], [])
+        cmd = run_mock.call_args[0][0]
+        self.assertLessEqual(len(" ".join(cmd)), _COMMAND_LENGTH_BUDGET)
+        routed = [arg for arg in cmd if "<=" in arg]
+        self.assertGreater(len(routed), 0, "expected at least one value routed to a DATFILE")
+        self.assertLess(len(routed), len(tags), "expected some values to stay inline")
+
+    def test_a_datfile_read_failure_is_reported_even_when_exiftool_exits_zero(self):
+        """E5: do not trust the exit code alone.
+
+        Measured against the real binary: when one tag's DATFILE cannot be
+        opened but other tags on the same command succeed, ExifTool still
+        reports "N image files updated" and exits 0 -- only stderr names the
+        miss. Trusting the exit code alone would let that silently-dropped
+        write pass as success.
+        """
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": "z" * 5_000}},
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        partial_result = type(
+            "Result",
+            (),
+            {
+                "returncode": 0,
+                "stdout": "    1 image files updated\n",
+                "stderr": "Error opening file 000001_EXIF-UserComment.txt\n",
+            },
+        )()
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run", return_value=partial_result):
+            summary = apply_changeset(changeset, cfg)
+        self.assertEqual(summary["files_written"], 0)
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertIn("DATFILE", summary["errors"][0]["error"])
+
+    def test_no_temp_files_survive_the_batch_including_a_failed_file(self):
+        """E4: one TemporaryDirectory for the whole batch, cleaned up on exit
+        even when a file in the middle of the batch fails.
+        """
+        long_value = "y" * 5_000  # over _INLINE_VALUE_MAX so a DATFILE is actually written
+        changeset = self._write_changeset(
+            [
+                {"path": "/photos/a.jpg", "proposed_changes": {"set": {"EXIF:UserComment": long_value}}},
+                {"path": "/photos/b.jpg", "proposed_changes": {"set": {"EXIF:UserComment": long_value}}},
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        ok_result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        def _run(cmd, **_kw):
+            if "/photos/b.jpg" in cmd:
+                raise PermissionError("not executable")
+            return ok_result
+
+        real_temporary_directory = tempfile.TemporaryDirectory
+        created: list[str] = []
+
+        def _spy_temporary_directory(*args, **kwargs):
+            instance = real_temporary_directory(*args, **kwargs)
+            created.append(instance.name)
+            return instance
+
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch(
+            "photokin.exiftool.apply.subprocess.run", side_effect=_run
+        ), patch(
+            "photokin.exiftool.apply.tempfile.TemporaryDirectory",
+            side_effect=_spy_temporary_directory,
+        ):
+            summary = apply_changeset(changeset, cfg)
+
+        self.assertEqual(summary["files_written"], 1)
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertEqual(len(created), 1)
+        self.assertFalse(os.path.exists(created[0]))
 
 
 class TestExifDatetimeNormalization(unittest.TestCase):

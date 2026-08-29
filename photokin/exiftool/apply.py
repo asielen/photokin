@@ -19,6 +19,8 @@ Code map:
 - _normalize_exif_string      strip/clean a scalar string value
 - _parse_fallback_datetime    last-ditch parse of loose date text
 - _normalize_tag_value        dispatch a tag+value to the right normalizer
+- _datfile_name               deterministic ASCII filename for one (file, tag) DATFILE
+- _select_datfile_routing     decide which tag values must move off the command line
 - _build_exiftool_command     assemble the ExifTool argv for one file's writes
 - apply_changeset             PUBLIC: read a changeset NDJSON and write via ExifTool
 - main                        PUBLIC: CLI entry (python -m photokin.exiftool)
@@ -32,6 +34,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from datetime import date, datetime
 from json import JSONDecodeError
 from typing import Any, Iterable
@@ -44,6 +47,41 @@ logger = logging.getLogger(__name__)
 EXIF_DATE_TAGS = {"EXIF:DateTimeOriginal", "EXIF:CreateDate"}
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
 _EXIF_DT_RE = re.compile(r"^\d{4}:\d{2}:\d{2}( \d{2}:\d{2}:\d{2})?$")
+
+# Windows' CreateProcess caps a full command line at 32,767 characters. Measured
+# against the real binary in this checkout: a 32,000-character inline tag value
+# writes fine, a 40,000-character one raises FileNotFoundError [WinError 206],
+# which the per-file handler below catches as an OSError -- so the write simply
+# never happens, for every tag on that file, and looks like a missing-binary
+# failure rather than what it is. At roughly 1,500 characters per handwritten
+# page that ceiling arrives around 20 pages of transcription.
+#
+# _INLINE_VALUE_MAX gates individual values: anything longer always moves off
+# the command line into a DATFILE ExifTool reads directly (`-TAG<=path`), per
+# the ``-@ ARGFILE`` vs. ``-TAG<=DATFILE`` decision recorded in
+# docs/per-page-captions.md (E2) -- an argfile holds one argument per line and
+# silently truncates a multi-line value, which a DATFILE does not.
+#
+# _COMMAND_LENGTH_BUDGET gates the *whole* command: ``tags_to_write`` can hold
+# several fields, so several values individually under the per-value threshold
+# can still sum past the OS ceiling. The budget sits well below 32,767 so the
+# approximate length check in `_select_datfile_routing` (argv joined by single
+# spaces, which slightly under-counts real CreateProcess quoting overhead) still
+# leaves margin, and so the exe path and target file path have room too.
+_INLINE_VALUE_MAX = 4_000
+_COMMAND_LENGTH_BUDGET = 30_000
+
+# ExifTool's own docs warn that ``-TAG<=DATFILE`` looks like shell redirection.
+# It is not: the command below is built as an argv list and executed by
+# subprocess.run with no shell involved, so the literal ``<`` character never
+# reaches a shell to misinterpret. Do not add quoting around it -- a literal
+# quote character would become part of the path ExifTool tries to open.
+#
+# ExifTool's default value charset is already UTF-8, so `-charset` is not
+# needed here. `-charset filename=utf8` would matter only if a DATFILE *path*
+# itself were non-ASCII; `_datfile_name` keeps every path ASCII, so that never
+# arises.
+_DATFILE_READ_FAILURE_MARKER = "Error opening file"
 
 
 def _normalize_exif_datetime(value: Any) -> tuple[str | None, str | None]:
@@ -114,14 +152,111 @@ def _normalize_tag_value(tag: str, value: Any, warnings: list[dict[str, Any]]) -
     return None
 
 
-def _build_exiftool_command(exiftool: str, cfg: ExiftoolConfig, tags: dict[str, str], path: str) -> list[str]:
+_TAG_FILENAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _datfile_name(file_index: int, tag: str) -> str:
+    """Build a deterministic, ASCII-safe DATFILE basename for one write.
+
+    Args:
+        file_index: The changeset line number this write belongs to (1-based).
+        tag: The ExifTool tag being routed off the command line, e.g.
+            ``"XMP-dc:Description"``.
+
+    Returns:
+        A filename unique within one ``apply_changeset`` run and reproducible
+        across runs of the same changeset, e.g.
+        ``"000007_XMP-dc_Description.txt"``. Tag punctuation such as ``:`` is
+        replaced because it is not a legal filename character on Windows.
+    """
+    safe_tag = _TAG_FILENAME_UNSAFE_RE.sub("_", tag)
+    return f"{file_index:06d}_{safe_tag}.txt"
+
+
+def _select_datfile_routing(
+    exiftool: str,
+    cfg: ExiftoolConfig,
+    tags: dict[str, str],
+    path: str,
+    candidate_paths: dict[str, str],
+) -> dict[str, str]:
+    """Decide which of one file's tag values must route through a DATFILE.
+
+    Two passes, per decision E3 in docs/per-page-captions.md: first, any value
+    longer than ``_INLINE_VALUE_MAX`` always routes. Then the whole command is
+    assembled and measured, and -- because the OS limit is on the whole
+    command line, not on any single value -- the next-longest still-inline
+    value is routed and the command re-measured, repeating until it fits
+    ``_COMMAND_LENGTH_BUDGET`` or nothing inline is left to route.
+
+    Args:
+        exiftool: Path to the ExifTool executable (needed to measure the
+            actual assembled command, not just the tag arguments).
+        cfg: Wrapper config, for the same reason.
+        tags: Ordered tag -> value mapping for one file's write.
+        path: The file path the command targets.
+        candidate_paths: Tag -> DATFILE path, precomputed for every tag in
+            ``tags`` regardless of whether it ends up routed.
+
+    Returns:
+        A ``{tag: path}`` mapping -- a subset of ``candidate_paths`` -- for
+        the tags that must be written to a DATFILE and rendered as
+        ``-TAG<=path`` rather than inlined.
+    """
+    routed = {tag for tag, value in tags.items() if len(value) > _INLINE_VALUE_MAX}
+
+    def _command_length() -> int:
+        routed_paths = {tag: candidate_paths[tag] for tag in routed}
+        cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed_paths)
+        return len(" ".join(cmd))
+
+    remaining_by_length = sorted(
+        (tag for tag in tags if tag not in routed), key=lambda t: len(tags[t]), reverse=True
+    )
+    for tag in remaining_by_length:
+        if _command_length() <= _COMMAND_LENGTH_BUDGET:
+            break
+        routed.add(tag)
+
+    return {tag: candidate_paths[tag] for tag in routed}
+
+
+def _build_exiftool_command(
+    exiftool: str,
+    cfg: ExiftoolConfig,
+    tags: dict[str, str],
+    path: str,
+    datfile_paths: dict[str, str] | None = None,
+) -> list[str]:
+    """Assemble the ExifTool argv for one file's tag writes.
+
+    Args:
+        exiftool: Path to the ExifTool executable.
+        cfg: Wrapper config; controls ``-overwrite_original`` vs. the sidecar
+            ``-o`` form.
+        tags: Ordered tag -> value mapping to write.
+        path: Path to the file the command targets.
+        datfile_paths: Tag -> DATFILE path for tags rendered as
+            ``-TAG<=path`` instead of inlined as ``-TAG=value`` (E3). A tag
+            absent from this mapping is inlined; ``tags[tag]`` is unused for a
+            routed tag here -- the caller must already have written that
+            value to the given path before running this command.
+
+    Returns:
+        The argv list to hand to ``subprocess.run`` (no shell involved, so
+        the ``<`` in a routed tag's ``-TAG<=path`` needs no quoting).
+    """
+    datfile_paths = datfile_paths or {}
     cmd = [exiftool]
     if cfg.write_sidecar_only:
         cmd.extend(["-o", "%d%f.xmp"])
     elif cfg.overwrite_original:
         cmd.append("-overwrite_original")
     for tag, value in tags.items():
-        cmd.append(f"-{tag}={value}")
+        if tag in datfile_paths:
+            cmd.append(f"-{tag}<={datfile_paths[tag]}")
+        else:
+            cmd.append(f"-{tag}={value}")
     cmd.append(path)
     return cmd
 
@@ -201,7 +336,17 @@ def apply_changeset(
     if unwritable_fields:
         allowed_fields = tuple(f for f in allowed_fields if f not in unwritable_fields)
 
-    with open(changeset_path, "r", encoding="utf-8") as handle:
+    # One temp directory for the whole batch (E4), not a file per write: a
+    # per-write file would need its own cleanup that a crash could skip, and
+    # could collide across concurrent runs. This one directory, opened as a
+    # context manager around the loop below, is removed on the way out
+    # (including on an unhandled exception) and every DATFILE this run writes
+    # lives inside it, named deterministically by (line number, tag) via
+    # `_datfile_name` so a 500-file batch is reproducible.
+    with (
+        tempfile.TemporaryDirectory(prefix="photokin-exiftool-") as tmp_dir,
+        open(changeset_path, "r", encoding="utf-8") as handle,
+    ):
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
@@ -250,7 +395,29 @@ def apply_changeset(
                 summary["tags_written"] += len(tags_to_write)
                 continue
 
-            cmd = _build_exiftool_command(exiftool, cfg, tags_to_write, path)
+            candidate_paths = {
+                tag: os.path.join(tmp_dir, _datfile_name(line_number, tag)) for tag in tags_to_write
+            }
+            datfile_paths = _select_datfile_routing(
+                exiftool, cfg, tags_to_write, path, candidate_paths
+            )
+
+            try:
+                for tag, datfile_path in datfile_paths.items():
+                    # newline="" is load-bearing: Python's text-mode write
+                    # translates a bare "\n" to "\r\n" on Windows, which
+                    # would corrupt every transcription's line breaks
+                    # before ExifTool ever reads the file. No BOM either --
+                    # ExifTool's default value charset is already UTF-8.
+                    with open(datfile_path, "w", encoding="utf-8", newline="") as datfile:
+                        datfile.write(tags_to_write[tag])
+            except OSError as exc:
+                summary["errors"].append(
+                    {"path": path, "error": f"Failed to write DATFILE for ExifTool: {exc}"}
+                )
+                continue
+
+            cmd = _build_exiftool_command(exiftool, cfg, tags_to_write, path, datfile_paths)
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             except (OSError, ValueError) as exc:
@@ -269,6 +436,26 @@ def apply_changeset(
                     {
                         "path": path,
                         "error": f"ExifTool failed with code {result.returncode}.",
+                        "stderr": result.stderr.strip(),
+                    }
+                )
+                continue
+
+            if datfile_paths and _DATFILE_READ_FAILURE_MARKER in result.stderr:
+                # E5: a corrupted or dropped write must never pass as
+                # success just because the process exited 0. Measured
+                # against the real binary -- when one DATFILE among
+                # several tag writes cannot be opened (e.g. it vanished
+                # mid-batch), ExifTool still reports "N image files
+                # updated" and exits 0, because the *other* tags on that
+                # same command did get written; only stderr names the
+                # miss. Trusting the exit code alone would let that file's
+                # skipped tag pass silently as written.
+                summary["errors"].append(
+                    {
+                        "path": path,
+                        "error": "ExifTool could not read a DATFILE for this write; nothing on this "
+                        "file was confirmed written.",
                         "stderr": result.stderr.strip(),
                     }
                 )
