@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from photokin import cli
@@ -464,20 +465,220 @@ class TestDatfileRoutingMeasuresTheRealWindowsCommandLine(_ChangesetFileMixin, u
         exiftool = "exiftool"
         cfg = ExiftoolConfig()
         path = "/photos/adversarial.jpg"
-        candidate_paths = {
-            tag: f"/tmp/{_datfile_name(1, tag)}" for tag in tags
-        }
+        # A callable, not a mapping: the routing asks for a path only for a tag
+        # it actually routes, which is what lets the real caller hold off
+        # creating a temporary directory until one is needed.
+        asked_for: list[str] = []
 
-        routed = _select_datfile_routing(exiftool, cfg, tags, path, candidate_paths)
+        def _path_for(tag: str) -> str:
+            asked_for.append(tag)
+            return f"/tmp/{_datfile_name(1, tag)}"
+
+        routed = _select_datfile_routing(exiftool, cfg, tags, path, _path_for)
         self.assertGreater(len(routed), 0, "expected quoting overhead to force some routing")
+        self.assertEqual(
+            set(asked_for), set(routed),
+            "a path was requested for a tag that was never routed",
+        )
 
         cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed)
-        real_length = len(subprocess.list2cmdline(cmd))
+        real_length = len(subprocess.list2cmdline(cmd).encode("utf-16-le")) // 2 + 1
         self.assertLessEqual(
             real_length,
             _COMMAND_LENGTH_BUDGET,
             "the command Windows actually sends still exceeds the budget",
         )
+
+
+class TestDatfileRoutingCountsNonBMPCharactersAsWindowsDoes(_ChangesetFileMixin, unittest.TestCase):
+    """C1: the routing budget must measure UTF-16 code units, not code points.
+
+    Windows' ``CreateProcess`` counts a command line in UTF-16 code units;
+    Python's ``len`` counts Unicode code points. The two agree for ordinary
+    text and diverge by exactly 2x for any character outside the Basic
+    Multilingual Plane -- a historic script, a musical symbol, an emoji a
+    modern annotation might carry -- because each one is a single code point
+    but a UTF-16 *surrogate pair*. Seven values built from such a character,
+    each individually under ``_INLINE_VALUE_MAX`` so none force-routes alone,
+    measure comfortably under ``_COMMAND_LENGTH_BUDGET`` by code point and
+    past it by nearly 2x as Windows actually sees them -- code-point counting
+    lets a command like this sail through unrouted and fail at
+    ``CreateProcess`` with WinError 206.
+    """
+
+    def test_non_bmp_values_are_measured_in_utf16_units_and_routed(self) -> None:
+        # MUSICAL SYMBOL G CLEF (U+1D11E): one Python code point, a UTF-16
+        # surrogate pair -- two code units where ``len`` sees one.
+        clef = "\U0001D11E"
+        value = clef * 3_998
+        tags = {f"XMP-dc:Field{i}": value for i in range(7)}
+        for v in tags.values():
+            self.assertLess(len(v), _INLINE_VALUE_MAX, "value must not force-route alone")
+
+        exiftool = "exiftool"
+        cfg = ExiftoolConfig()
+        path = "/photos/non-bmp.jpg"
+
+        def _path_for(tag: str) -> str:
+            return f"/tmp/{_datfile_name(1, tag)}"
+
+        routed = _select_datfile_routing(exiftool, cfg, tags, path, _path_for)
+        self.assertGreater(
+            len(routed),
+            0,
+            "expected non-BMP text to be measured at its real UTF-16 cost and routed",
+        )
+
+        cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed)
+        real_length = len(subprocess.list2cmdline(cmd).encode("utf-16-le")) // 2 + 1
+        self.assertLessEqual(
+            real_length,
+            _COMMAND_LENGTH_BUDGET,
+            "the command Windows actually sends still exceeds the budget",
+        )
+
+
+class TestDatfileTempDirectoryIsCreatedLazily(_ChangesetFileMixin, unittest.TestCase):
+    """C3: the batch's ``TemporaryDirectory`` must not be created until a
+    value actually routes.
+
+    Creating it unconditionally on entry meant even a dry run -- whose whole
+    promise is that it touches nothing -- raised in a locked-down environment
+    with no writable temporary root. Spied the same way
+    ``test_no_temp_files_survive_the_batch_including_a_failed_file`` already
+    does, so a regression back to eager creation shows up as a directory
+    having been created in a run that should never have made one.
+    """
+
+    def _spy_temporary_directory(self) -> tuple[list[str], Any]:
+        real_temporary_directory = tempfile.TemporaryDirectory
+        created: list[str] = []
+
+        def _spy(*args, **kwargs):
+            instance = real_temporary_directory(*args, **kwargs)
+            created.append(instance.name)
+            return instance
+
+        return created, _spy
+
+    def test_a_dry_run_with_a_long_value_creates_no_temp_directory(self) -> None:
+        long_value = "d" * 50_000
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": long_value}},
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, dry_run=True, fields=("EXIF:UserComment",))
+        created, spy = self._spy_temporary_directory()
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock, patch(
+            "photokin.exiftool.apply.tempfile.TemporaryDirectory", side_effect=spy
+        ):
+            summary = apply_changeset(changeset, cfg)
+        run_mock.assert_not_called()
+        self.assertEqual(summary["files_written"], 1)
+        self.assertEqual(created, [], "a dry run must never create a DATFILE directory")
+
+    def test_an_ordinary_run_of_short_values_creates_no_temp_directory(self) -> None:
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": "A short caption."}},
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        ok_result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        created, spy = self._spy_temporary_directory()
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch(
+            "photokin.exiftool.apply.subprocess.run", return_value=ok_result
+        ) as run_mock, patch(
+            "photokin.exiftool.apply.tempfile.TemporaryDirectory", side_effect=spy
+        ):
+            summary = apply_changeset(changeset, cfg)
+        self.assertEqual(summary["files_written"], 1)
+        self.assertEqual(created, [], "an all-short-values run must never create a DATFILE directory")
+        cmd = run_mock.call_args[0][0]
+        self.assertTrue(any(arg.startswith("-EXIF:UserComment=") for arg in cmd))
+
+    def test_a_run_that_routes_creates_exactly_one_temp_directory_and_cleans_it_up(self) -> None:
+        long_value = "e" * 5_000
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": long_value}},
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        ok_result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        created, spy = self._spy_temporary_directory()
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch(
+            "photokin.exiftool.apply.subprocess.run", return_value=ok_result
+        ), patch(
+            "photokin.exiftool.apply.tempfile.TemporaryDirectory", side_effect=spy
+        ):
+            summary = apply_changeset(changeset, cfg)
+        self.assertEqual(summary["files_written"], 1)
+        self.assertEqual(len(created), 1, "expected exactly one DATFILE directory for the batch")
+        self.assertFalse(os.path.exists(created[0]), "the DATFILE directory must be cleaned up")
+
+
+class TestADatfileWriteFailureIsPerFileNotBatchFatal(_ChangesetFileMixin, unittest.TestCase):
+    """C4: a ``UnicodeEncodeError`` from a routed value must not escape
+    ``apply_changeset``.
+
+    A lone surrogate reaching a routed value -- reachable from a perfectly
+    valid JSON ``\\ud800`` escape, since Python's ``json`` module happily
+    decodes one into a lone-surrogate ``str`` -- raises ``UnicodeEncodeError``
+    when the UTF-8 DATFILE write tries to encode it, and that is a
+    ``ValueError``, not an ``OSError``. Catching only ``OSError`` there let it
+    escape the per-file try and ``apply_changeset`` entirely, aborting every
+    remaining file in the batch rather than being recorded against the one
+    file that caused it.
+    """
+
+    def test_a_lone_surrogate_is_a_per_file_error_and_the_next_file_still_writes(self) -> None:
+        surrogate_value = "\ud800" * 4_001  # over _INLINE_VALUE_MAX, forces routing
+        ordinary_long_value = "y" * 5_000
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": surrogate_value}},
+                },
+                {
+                    "path": "/photos/b.jpg",
+                    "proposed_changes": {"set": {"EXIF:UserComment": ordinary_long_value}},
+                },
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        ok_result = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run", return_value=ok_result):
+            # Must not raise: a UnicodeEncodeError on the first record used to
+            # escape apply_changeset and abort the whole batch.
+            summary = apply_changeset(changeset, cfg)
+
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertEqual(summary["errors"][0]["path"], "/photos/a.jpg")
+        self.assertEqual(summary["files_written"], 1, "the second file must still be written")
 
 
 class TestDatfileNamesDoNotCollideAcrossTagSpellings(_ChangesetFileMixin, unittest.TestCase):

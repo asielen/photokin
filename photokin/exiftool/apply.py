@@ -36,9 +36,11 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Callable, Iterable
+from contextlib import ExitStack
 from datetime import date, datetime
 from json import JSONDecodeError
-from typing import Any, Iterable
+from typing import Any
 
 from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
 from .locate import resolve_exiftool_path
@@ -189,7 +191,7 @@ def _select_datfile_routing(
     cfg: ExiftoolConfig,
     tags: dict[str, str],
     path: str,
-    candidate_paths: dict[str, str],
+    datfile_path_for: Callable[[str], str],
 ) -> dict[str, str]:
     """Decide which of one file's tag values must route through a DATFILE.
 
@@ -206,18 +208,27 @@ def _select_datfile_routing(
         cfg: Wrapper config, for the same reason.
         tags: Ordered tag -> value mapping for one file's write.
         path: The file path the command targets.
-        candidate_paths: Tag -> DATFILE path, precomputed for every tag in
-            ``tags`` regardless of whether it ends up routed.
+        datfile_path_for: Called with a tag to get the DATFILE path it would
+            use. Called ONLY for a tag that actually routes, so a run whose
+            values all stay inline never asks for one -- which is what lets the
+            caller create the temporary directory lazily rather than on every
+            batch. See the call site for why that matters.
 
     Returns:
-        A ``{tag: path}`` mapping -- a subset of ``candidate_paths`` -- for
-        the tags that must be written to a DATFILE and rendered as
-        ``-TAG<=path`` rather than inlined.
+        A ``{tag: path}`` mapping for the tags that must be written to a
+        DATFILE and rendered as ``-TAG<=path`` rather than inlined.
     """
     routed = {tag for tag, value in tags.items() if len(value) > _INLINE_VALUE_MAX}
+    resolved: dict[str, str] = {}
+
+    def _paths_for(tags_routed: set[str]) -> dict[str, str]:
+        for tag in tags_routed:
+            if tag not in resolved:
+                resolved[tag] = datfile_path_for(tag)
+        return {tag: resolved[tag] for tag in tags_routed}
 
     def _command_length() -> int:
-        routed_paths = {tag: candidate_paths[tag] for tag in routed}
+        routed_paths = _paths_for(routed)
         cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed_paths)
         # ``subprocess.list2cmdline`` and not ``" ".join``: it is the exact
         # quoting ``subprocess`` applies before handing the string to
@@ -231,7 +242,14 @@ def _select_datfile_routing(
         # function exists to stay under. The function is pure Python and
         # importable everywhere; POSIX limits are far higher, so measuring the
         # Windows way on every platform is conservative, not wrong.
-        return len(subprocess.list2cmdline(cmd))
+        #
+        # Counted in UTF-16 code units plus the terminating NUL, because that
+        # is the unit CreateProcess measures. Python counts code points, so a
+        # transcription carrying anything outside the BMP -- a historic script,
+        # a musical symbol, an emoji in a modern annotation -- takes two units
+        # per character where ``len`` sees one, and the estimate would be under
+        # by up to half on such text.
+        return len(subprocess.list2cmdline(cmd).encode("utf-16-le")) // 2 + 1
 
     remaining_by_length = sorted(
         (tag for tag in tags if tag not in routed), key=lambda t: len(tags[t]), reverse=True
@@ -241,7 +259,7 @@ def _select_datfile_routing(
             break
         routed.add(tag)
 
-    return {tag: candidate_paths[tag] for tag in routed}
+    return _paths_for(routed)
 
 
 def _build_exiftool_command(
@@ -361,13 +379,28 @@ def apply_changeset(
 
     # One temp directory for the whole batch (E4), not a file per write: a
     # per-write file would need its own cleanup that a crash could skip, and
-    # could collide across concurrent runs. This one directory, opened as a
-    # context manager around the loop below, is removed on the way out
-    # (including on an unhandled exception) and every DATFILE this run writes
-    # lives inside it, named deterministically by (line number, tag) via
-    # `_datfile_name` so a 500-file batch is reproducible.
+    # could collide across concurrent runs. This one directory is removed on
+    # the way out (including on an unhandled exception) and every DATFILE this
+    # run writes lives inside it, named deterministically by (line number, tag)
+    # via `_datfile_name` so a 500-file batch is reproducible.
+    #
+    # Created on first use rather than on entry, because most runs never need
+    # it: a dry run writes nothing at all, and an ordinary run whose values are
+    # all short keeps every one of them inline. Creating it unconditionally
+    # made ``apply_changeset`` raise from a locked-down environment with no
+    # writable temporary root -- including on a dry run, whose whole promise is
+    # that it touches nothing.
+    tmp_dir_holder: list[str] = []
+
+    def _datfile_dir(stack: ExitStack) -> str:
+        if not tmp_dir_holder:
+            tmp_dir_holder.append(
+                stack.enter_context(tempfile.TemporaryDirectory(prefix="photokin-exiftool-"))
+            )
+        return tmp_dir_holder[0]
+
     with (
-        tempfile.TemporaryDirectory(prefix="photokin-exiftool-") as tmp_dir,
+        ExitStack() as tmp_stack,
         open(changeset_path, "r", encoding="utf-8") as handle,
     ):
         for line_number, line in enumerate(handle, start=1):
@@ -418,12 +451,21 @@ def apply_changeset(
                 summary["tags_written"] += len(tags_to_write)
                 continue
 
-            candidate_paths = {
-                tag: os.path.join(tmp_dir, _datfile_name(line_number, tag)) for tag in tags_to_write
-            }
-            datfile_paths = _select_datfile_routing(
-                exiftool, cfg, tags_to_write, path, candidate_paths
-            )
+            def _datfile_path_for(tag: str, _line: int = line_number) -> str:
+                return os.path.join(_datfile_dir(tmp_stack), _datfile_name(_line, tag))
+
+            try:
+                datfile_paths = _select_datfile_routing(
+                    exiftool, cfg, tags_to_write, path, _datfile_path_for
+                )
+            except OSError as exc:
+                # Only reachable when a value needed a DATFILE and the
+                # temporary directory could not be created; a run with nothing
+                # to route never asks for one.
+                summary["errors"].append(
+                    {"path": path, "error": f"Could not create a DATFILE directory: {exc}"}
+                )
+                continue
 
             try:
                 for tag, datfile_path in datfile_paths.items():
@@ -434,7 +476,16 @@ def apply_changeset(
                     # ExifTool's default value charset is already UTF-8.
                     with open(datfile_path, "w", encoding="utf-8", newline="") as datfile:
                         datfile.write(tags_to_write[tag])
-            except OSError as exc:
+            except (OSError, UnicodeError) as exc:
+                # ``UnicodeError`` beside ``OSError`` because the value being
+                # written is model-authored text: a lone surrogate reaching
+                # here from a valid JSON ``\ud800`` escape raises
+                # UnicodeEncodeError, which is a ValueError and would sail past
+                # an OSError-only guard and out of ``apply_changeset``
+                # entirely, aborting every remaining file in the batch. The
+                # same value written inline is caught as a ValueError around
+                # ``subprocess.run`` below, so routing it must not be the thing
+                # that turns a per-file failure into a whole-batch one.
                 summary["errors"].append(
                     {"path": path, "error": f"Failed to write DATFILE for ExifTool: {exc}"}
                 )

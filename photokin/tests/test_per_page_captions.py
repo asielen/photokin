@@ -20,7 +20,9 @@ convergence shape this module also uses.
 import logging
 import unittest
 from typing import ClassVar
+from unittest.mock import patch
 
+from photokin import core
 from photokin.tests.test_read_flag_hazards import _CaptionBlockTestCase
 
 _CORE_LOGGER = "photokin.core"
@@ -78,6 +80,66 @@ class TestEachPageGetsItsOwnDifferentCaption(_CaptionBlockTestCase):
             with self.subTest(file=own_name):
                 for other_text in other_texts:
                     self.assertNotIn(other_text, produced[own_name])
+
+
+class TestCaptionBlockAssemblyIsNotWastedOnAMultipageGroup(_CaptionBlockTestCase):
+    """C2: a multipage group must never assemble a whole-group block it then
+    discards.
+
+    Before this fix, ``caption_block`` was built for every group -- multipage
+    included -- even though a multipage group's per-file loop below it never
+    reads that value: it assembles its own, narrower, per-file block instead,
+    and its own fallback block from a narrower intake when a file has no
+    transcription of its own. The discarded assembly folds every file's
+    stored caption with pairwise comparisons, on exactly the long documents
+    this feature exists to make scale, so the waste is not incidental.
+
+    Pinned by behavior, per the task: ``core._assemble_caption_block`` is
+    wrapped with a counting mock, and the call count is asserted directly
+    rather than timed. For a multipage group whose files are individually
+    attributed, the only calls are one per attributed file (building that
+    file's own block) plus exactly one for the group's fallback intake, which
+    is computed once regardless of whether any file ends up using it. A group
+    block built and thrown away would add exactly one more call than that.
+    """
+
+    def _count_assemble_calls(self, captions: dict[str, str], **kwargs) -> int:
+        real = core._assemble_caption_block
+        with patch(
+            "photokin.core._assemble_caption_block", side_effect=real
+        ) as mock:
+            self.records(captions, **kwargs)
+        return mock.call_count
+
+    def test_a_fully_attributed_multipage_group_never_builds_an_unused_group_block(
+        self,
+    ) -> None:
+        group = {
+            "doc11_001-page1.jpg": "",
+            "doc11_001-page2.jpg": "",
+            "doc11_001-page3.jpg": "",
+        }
+        pages = {
+            "Page 1": "One.",
+            "Page 2": "Two.",
+            "Page 3": "Three.",
+        }
+        call_count = self._count_assemble_calls(group, transcriptions=pages)
+        self.assertEqual(
+            call_count,
+            len(group) + 1,
+            "expected one call per attributed file plus one for the fallback "
+            "intake, and no extra call for a group-wide block nothing consumes",
+        )
+
+    def test_a_non_multipage_group_still_builds_exactly_one_group_block(self) -> None:
+        group = {
+            "box11_101.jpg": "First scan of the print",
+            "box11_101b.jpg": "Second, cleaner scan",
+            "box11_101b-back.jpg": "Return address on the back",
+        }
+        call_count = self._count_assemble_calls(group)
+        self.assertEqual(call_count, 1, "a group of views of one object builds one block")
 
 
 class TestVariantsOfOnePageShareOneCaption(_CaptionBlockTestCase):

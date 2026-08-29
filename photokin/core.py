@@ -3851,13 +3851,26 @@ def process_manifest_stream(
                     (analyses[0][0].get("caption") or "").strip()
                 )
 
-            caption_block = _assemble_caption_block(group_intake, fresh_group_caption)
+            # Built only for a group that will actually use it. A multipage
+            # group takes the per-file path below and, when a file has no
+            # transcription of its own, assembles its own fallback from a
+            # narrower intake -- so assembling the group-wide block here too
+            # would be work thrown away, and not cheap work: the intake it
+            # folds is every file's stored caption, compared pairwise, on
+            # exactly the long documents this change exists to make scale.
+            caption_block = (
+                None
+                if multipage_present
+                else _assemble_caption_block(group_intake, fresh_group_caption)
+            )
 
             # === Each page of a document carries its own caption ===============
             #
-            # The block above is still built for a multipage group -- it is what
-            # a file the model did not transcribe falls back to -- but it is no
-            # longer what most of that group's files receive. A 63-page letter
+            # The block above is what a group of views of one object gets, on
+            # every one of its files, exactly as it always has. A multipage
+            # group does not build it at all: its files each assemble their
+            # own below, and the one that falls back assembles a narrower
+            # block from the files that fell back with it. A 63-page letter
             # wrote the whole book into all 63 files' Description: 63x
             # redundant, and wrong for the reader, who opens page 37 and is
             # shown page 1. Each file gets its OWN part's transcription instead,
