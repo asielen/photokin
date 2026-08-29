@@ -418,7 +418,20 @@ def apply_changeset(
     def _datfile_dir(stack: ExitStack) -> str:
         if not tmp_dir_holder:
             tmp_dir_holder.append(
-                stack.enter_context(tempfile.TemporaryDirectory(prefix="photokin-exiftool-"))
+                stack.enter_context(
+                    # ``ignore_cleanup_errors`` because the files are already
+                    # written by the time this directory is removed. On Windows
+                    # an antivirus scanner can still hold a data file open, and
+                    # the removal then raises out of the ExitStack -- discarding
+                    # a summary that describes writes which really happened, so
+                    # the caller reports a failed apply, or none at all, for
+                    # files it has already modified. A few bytes left in the
+                    # system temporary directory is the smaller loss, and the
+                    # OS clears them.
+                    tempfile.TemporaryDirectory(
+                        prefix="photokin-exiftool-", ignore_cleanup_errors=True
+                    )
+                )
             )
         return tmp_dir_holder[0]
 

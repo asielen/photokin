@@ -3327,7 +3327,14 @@ def process_manifest_stream(
             # describe it once per address. Keep its best claim -- it stays a
             # candidate for the primary, since it is still sent -- and disclose
             # the rest.
-            carried_as: dict[str, str] = {}
+            # The full ``(version, part_key)`` ADDRESS, not just the slot: a
+            # manifest can repeat one path under different explicit versions as
+            # readily as under different roles, and the caption path resolves
+            # attribution by looking the address up in ``variant_parts``. Half
+            # an address sends it to the losing entry's own version, where the
+            # slot is no longer held, so the file falls back and then overwrites
+            # the correctly attributed record for the same path.
+            carried_as: dict[str, tuple[str | None, str]] = {}
             for ver, part_key in sorted(
                 (
                     (ver, part_key)
@@ -3338,18 +3345,19 @@ def process_manifest_stream(
             ):
                 path = variant_parts[ver][part_key]
                 if path not in carried_as:
-                    carried_as[path] = part_key
+                    carried_as[path] = (ver, part_key)
                     continue
                 del variant_parts[ver][part_key]
                 displaced_slots.setdefault(f"{ver or ''}:{part_key}", []).append(path)
+                kept_slot = carried_as[path][1]
                 logger.warning(
                     "Group '%s': %s claims the %s slot as well as the %s slot; "
                     "sending it once, as %s.",
                     stem,
                     path,
                     part_key,
-                    carried_as[path],
-                    carried_as[path],
+                    kept_slot,
+                    kept_slot,
                 )
 
             variant_pairs: dict[str | None, dict[str, str]] = {}
@@ -4005,15 +4013,19 @@ def process_manifest_stream(
                     # correctly attributed record for that same path, because
                     # both entries emit under one key. The path travelled under
                     # exactly one label, so that is the one to attribute it by.
-                    slot_key = carried_as.get(entry["path"], slot_key)
-                    # The label comes from the RETAINED slot too, not from the
-                    # entry: taking the slot's winner while keeping the losing
-                    # entry's label would look up a transcription belonging to
-                    # the address that was discarded.
+                    slot_version, slot_key = carried_as.get(
+                        entry["path"], (entry["version"], slot_key)
+                    )
+                    # The label comes from the RETAINED address too, not from
+                    # the entry: taking the address's winner while keeping the
+                    # losing entry's label would look up a transcription
+                    # belonging to the address that was discarded. So would
+                    # keeping the entry's own version, which is a second way for
+                    # one manifest to name the same path twice.
                     part_label = part_label_for_slot(slot_key)
                     part_value = group_transcriptions.get(part_label)
                     part_text = part_value.strip() if isinstance(part_value, str) else ""
-                    slot_winner = variant_parts.get(entry["version"], {}).get(slot_key)
+                    slot_winner = variant_parts.get(slot_version, {}).get(slot_key)
                     attributed.append(
                         part_text if slot_winner in analyzed_paths else ""
                     )
