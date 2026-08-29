@@ -12,8 +12,11 @@ All notable changes to this project are documented here, in the style of
   print, its back, a rescan — still gets one shared block written
   byte-identically to every file, exactly as before. A group that is instead
   an ordered sequence of pages gives each file only its own page's text,
-  unlabelled, so a `.md` sidecar and its image's Description finally agree
-  about the same document rather than disagreeing the way they did in 0.4.0.
+  unlabelled, so a `.md` sidecar and its image's Description now cover the
+  same page rather than disagreeing about scope the way they did in 0.4.0.
+  They agree on scope, not forever on content: Description is merged and a
+  sidecar is overwritten, so a later run that rewords a page leaves both
+  readings in Description and only the newest in the sidecar.
   A file whose own page never arrived in the model's reply keeps the group's
   whole block as before, and the record now says which of the two it got via
   a new `caption_scope` key (`"part"` or `"group"`). **The migration cost:**

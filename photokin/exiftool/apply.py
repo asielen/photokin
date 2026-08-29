@@ -29,6 +29,7 @@ Code map:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -166,11 +167,21 @@ def _datfile_name(file_index: int, tag: str) -> str:
     Returns:
         A filename unique within one ``apply_changeset`` run and reproducible
         across runs of the same changeset, e.g.
-        ``"000007_XMP-dc_Description.txt"``. Tag punctuation such as ``:`` is
-        replaced because it is not a legal filename character on Windows.
+        ``"000007_XMP-dc_Description_5f2a91c4.txt"``. Tag punctuation such as
+        ``:`` is replaced because it is not a legal filename character on
+        Windows, and a digest of the tag as written follows it because that
+        replacement is lossy: every character outside the safe set folds to the
+        same underscore, so ``XMP-dc:Description`` and ``XMP-dc/Description``
+        -- both reachable through ``--fields``, which validates neither
+        uniqueness nor filename-safety -- would otherwise name one file. Two
+        tags routed to one path means the second write overwrites the first and
+        ExifTool reads the wrong value for one of them, with nothing anywhere
+        reporting it: the run succeeds and a field is silently written with
+        another field's content.
     """
     safe_tag = _TAG_FILENAME_UNSAFE_RE.sub("_", tag)
-    return f"{file_index:06d}_{safe_tag}.txt"
+    digest = hashlib.sha256(tag.encode("utf-8")).hexdigest()[:8]
+    return f"{file_index:06d}_{safe_tag}_{digest}.txt"
 
 
 def _select_datfile_routing(
@@ -208,7 +219,19 @@ def _select_datfile_routing(
     def _command_length() -> int:
         routed_paths = {tag: candidate_paths[tag] for tag in routed}
         cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed_paths)
-        return len(" ".join(cmd))
+        # ``subprocess.list2cmdline`` and not ``" ".join``: it is the exact
+        # quoting ``subprocess`` applies before handing the string to
+        # CreateProcess, so it is what the 32,767-character cap is actually
+        # measured against. Joining on spaces looks close enough and is not:
+        # a value dense in quotes and backslashes gets every one of them
+        # escaped, and the two measures diverge by nearly 2x. Seven tags of
+        # 3,998 characters of `\"` pairs -- each under the per-value threshold,
+        # so none is force-routed -- measure 28,253 joined and 56,219 as
+        # Windows will really see them, which is over the cap this whole
+        # function exists to stay under. The function is pure Python and
+        # importable everywhere; POSIX limits are far higher, so measuring the
+        # Windows way on every platform is conservative, not wrong.
+        return len(subprocess.list2cmdline(cmd))
 
     remaining_by_length = sorted(
         (tag for tag in tags if tag not in routed), key=lambda t: len(tags[t]), reverse=True

@@ -530,5 +530,143 @@ class TestAnAlreadyProcessedArchiveKeepsItsFatCaption(_CaptionBlockTestCase):
             )
 
 
+class TestAnUnseatedFileDoesNotInheritAnotherFilesText(_CaptionBlockTestCase):
+    """F1: resolving a label is not the same as having ridden the payload.
+
+    ``resolve_part_label`` only maps a manifest slot to the name the payload
+    vocabulary uses for it; it has no idea whether the payload actually
+    carried that file. An untagged scan unseated by a real ``-page1`` file
+    still resolves to ``Front`` -- the same label a genuine ``-front`` file in
+    the same group travels under -- and before this was guarded, the lookup
+    below found whatever text the ``-front`` file's own label earned and
+    wrote it into the unseated file's Description under
+    ``caption_scope: "part"``: an affirmative claim that the attribution was
+    made on purpose, for a file that was never even sent to the model.
+    ``analyzed_paths`` is the set the payload actually carried, and checking
+    a file against it is what tells the two situations apart.
+    """
+
+    GROUP: ClassVar[dict[str, str]] = {
+        "ltr.jpg": "",
+        "ltr-front.jpg": "",
+        "ltr-page1.jpg": "",
+        "ltr-page2.jpg": "",
+    }
+    TRANSCRIPTIONS: ClassVar[dict[str, str]] = {
+        "Front": "Cover sheet, filed 1962.",
+        "Page 1": "Dear Committee,",
+        "Page 2": "We regret to inform you.",
+    }
+
+    def test_the_unseated_untagged_file_does_not_inherit_the_fronts_text(self) -> None:
+        records = self.records(self.GROUP, transcriptions=self.TRANSCRIPTIONS)
+
+        # ltr.jpg lost its slot to ltr-page1.jpg (the multipage guardrail's
+        # holder for the front side) and was never in the payload, yet
+        # ``resolve_part_label`` still resolves it to "Front" -- the very
+        # label ltr-front.jpg travelled under and DOES have an answer for.
+        self.assertEqual(records["ltr.jpg"]["caption_scope"], "group")
+        self.assertEqual(records["ltr.jpg"]["caption"], self.ANALYSIS)
+        self.assertNotIn("Cover sheet, filed 1962.", records["ltr.jpg"]["caption"])
+
+        # The file that actually rode the "Front" label gets its text, with
+        # an affirmative scope -- proving the map lookup itself still works,
+        # so the guard above is not merely suppressing every attribution.
+        self.assertEqual(records["ltr-front.jpg"]["caption_scope"], "part")
+        self.assertEqual(records["ltr-front.jpg"]["caption"], "Cover sheet, filed 1962.")
+
+        self.assertEqual(records["ltr-page1.jpg"]["caption"], "Dear Committee,")
+        self.assertEqual(records["ltr-page1.jpg"]["caption_scope"], "part")
+        self.assertEqual(records["ltr-page2.jpg"]["caption"], "We regret to inform you.")
+        self.assertEqual(records["ltr-page2.jpg"]["caption_scope"], "part")
+
+
+class TestTheFallbackBlockOnlyDrawsFromFilesThatAlsoFellBack(_CaptionBlockTestCase):
+    """F2: the fallback block is assembled from the fallen-back files alone.
+
+    Before this fix the block a file with no page of its own fell back to was
+    ``caption_block`` -- the ordinary whole-group intake, built from every
+    file's stored caption regardless of whether that file got its own
+    transcription this run. From the second ``-rw`` pass onward, an answered
+    page's *stored* caption is the thin per-page text this rule itself just
+    wrote, so sweeping it back into another file's fallback handed that file
+    an answered page's words under a ``[Photo N]`` label -- attributing one
+    page's writing to another, and growing by one step every pass a document
+    stayed partially answered. The fix narrows the fallback's own intake to
+    only the files that, this run, also had nothing of their own.
+    """
+
+    def test_pure_fallback_still_reproduces_the_ordinary_group_block(self) -> None:
+        """No ``transcriptions`` at all: every file falls back together.
+
+        This is the half that guards against over-correcting the narrowed
+        intake -- it broke once already while this fix was being written,
+        when a draft that filtered on "was this file sent to the model"
+        rather than "did this file get its own page" left every file here
+        counted as sent and so excluded from its own fallback, producing a
+        block with none of the group's existing captions in it at all. When
+        every file falls back together the result must still be exactly the
+        historic whole-group merge: one identical, fully-labeled block on
+        every file.
+        """
+        group = {
+            "doc8_100-page1.jpg": "Filed at the courthouse, 1958.",
+            "doc8_100-page2.jpg": "Second sheet, water damaged corner.",
+            "doc8_100-back.jpg": "Postal stamp, illegible date.",
+        }
+        block = self.one_block(group)
+        self.assertEqual(
+            block,
+            "[Photo 1] Filed at the courthouse, 1958.\n"
+            "[Photo 2] Second sheet, water damaged corner.\n"
+            "[Back] Postal stamp, illegible date.\n"
+            f"{self.ANALYSIS}",
+        )
+        self.assertEqual(set(self.scopes(group).values()), {"group"})
+
+    def test_a_partial_map_settles_at_pass_two_without_leaking_answered_pages(self) -> None:
+        """Six pages, two never answered: the unanswered pair must never pick
+        up an answered page's text, across repeated ``-rw`` passes.
+
+        The honest limit, stated rather than hidden: unlabelled stored prose
+        is attributed to the file it was read off on the very next read --
+        pre-existing behavior every multipage file had before this change,
+        not a regression it introduces -- so the two unanswered files do not
+        settle until pass 2, not pass 1. What matters is that pass 2 onward
+        never contains a *different* page's answered text, and that pass 2
+        is itself a fixed point.
+        """
+        group = {f"doc9_050-page{n}.jpg": "" for n in range(1, 7)}
+        pages = {
+            "Page 1": "The deed was recorded in March.",
+            "Page 2": "Two witnesses signed below.",
+            "Page 5": "A survey map is attached separately.",
+            "Page 6": "Filed with the county clerk.",
+        }
+        # Pages 3 and 4 are the hole: present in neither the map's keys nor
+        # its values, so both fall back on every pass.
+        held = dict(group)
+        held_passes: list[dict[str, str]] = []
+        for _ in range(3):
+            held = self.blocks(held, transcriptions=pages)
+            held_passes.append(dict(held))
+        pass1, pass2, pass3 = held_passes
+
+        self.assertNotEqual(
+            pass1, pass2, "expected the unanswered pair to still be moving at pass 1"
+        )
+        self.assertEqual(pass2, pass3, "the unanswered pair did not settle by pass 2")
+
+        for held_pass in (pass2, pass3):
+            for name in ("doc9_050-page3.jpg", "doc9_050-page4.jpg"):
+                for label, text in pages.items():
+                    with self.subTest(name=name, label=label):
+                        self.assertNotIn(
+                            text,
+                            held_pass[name],
+                            f"{name} absorbed {label}'s answered text via the fallback block",
+                        )
+
+
 if __name__ == "__main__":
     unittest.main()

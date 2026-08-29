@@ -3922,7 +3922,21 @@ def process_manifest_stream(
             if multipage_present:
                 captions_for_files = []
                 kept_group_block: list[str] = []
-                for entry, entry_meta in zip(group, own_metadata):
+                # Decided for every file before any block is built, because the
+                # fallback block depends on WHICH files fell back.
+                #
+                # Resolving a label is not the same as having travelled under
+                # it. A file that lost its slot -- an untagged scan unseated by
+                # a real ``-front``, a TIFF displaced by its JPEG -- still
+                # resolves to a label, and if some OTHER file rode that label
+                # the lookup below finds a transcription belonging to a
+                # different piece of paper. Writing that into this file's
+                # Description under ``caption_scope: "part"`` would state
+                # affirmatively that the attribution was made on purpose.
+                # ``analyzed_paths`` is the set the payload actually carried,
+                # so it is the question worth asking.
+                attributed: list[str] = []
+                for entry in group:
                     part_label = resolve_part_label(
                         entry,
                         multipage_present=True,
@@ -3930,17 +3944,53 @@ def process_manifest_stream(
                     )
                     part_value = group_transcriptions.get(part_label)
                     part_text = part_value.strip() if isinstance(part_value, str) else ""
+                    attributed.append(
+                        part_text if entry["path"] in analyzed_paths else ""
+                    )
+
+                # The block a file with no transcription of its own falls back
+                # to, built from the stored captions of the files that ALSO
+                # fell back -- never from the ones that got their own page.
+                #
+                # When nothing was attributed this is the group intake entire,
+                # so a group whose reply carried no map at all keeps exactly
+                # today's block on every file, which is what the fallback
+                # promises. When some pages were attributed it matters: their
+                # stored captions are, from the second ``-rw`` pass onward, the
+                # thin per-page captions this rule just wrote, and sweeping
+                # them back in would hand the unanswered file every answered
+                # page's text a second time, each under a ``[Photo N]`` label
+                # attributing one page's words to another. Measured on a
+                # six-page group with two pages unanswered: 56 characters on
+                # pass 1, 127 on pass 2, then stable -- growth of one step,
+                # which is still a file whose caption changed on a run that
+                # found nothing new.
+                fallback_intake = [
+                    (
+                        (entry_meta.get("caption") or "").strip(),
+                        _label_for(entry["is_back"], entry["version"], entry.get("page_num")),
+                    )
+                    for entry, entry_meta, part_text in sorted(
+                        zip(group, own_metadata, attributed),
+                        key=lambda triple: _slot_rank_key(triple[0]),
+                    )
+                    if not part_text
+                ]
+                fallback_block = _assemble_caption_block(
+                    fallback_intake, fresh_group_caption
+                )
+
+                for entry, entry_meta, part_text in zip(group, own_metadata, attributed):
                     if not part_text:
-                        # No map at all, a partial one, or a displaced or
-                        # unseated file that was never in the payload under any
-                        # label. Inventing an attribution nothing supports is the
-                        # one thing this codebase consistently refuses to do, so
-                        # the file keeps exactly today's group block -- and says
-                        # which of the two regimes it is in, so an embedder
-                        # reading a folder that ended up mixed can tell rather
-                        # than guessing from length.
+                        # No map at all, a partial one, or a file that was
+                        # never sent. Inventing an attribution nothing supports
+                        # is the one thing this codebase consistently refuses to
+                        # do, so the file takes the group's transcription
+                        # instead -- and says which of the two regimes it is in,
+                        # so an embedder reading a folder that ended up mixed
+                        # can tell rather than guessing from length.
                         kept_group_block.append(os.path.basename(entry["path"]))
-                        captions_for_files.append((caption_block, "group"))
+                        captions_for_files.append((fallback_block, "group"))
                         continue
                     own_caption = (entry_meta.get("caption") or "").strip()
                     captions_for_files.append(

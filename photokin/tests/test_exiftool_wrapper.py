@@ -10,9 +10,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from photokin import cli
-from photokin.exiftool import ExiftoolConfig, apply_changeset
-from photokin.exiftool import locate
-from photokin.exiftool.apply import _COMMAND_LENGTH_BUDGET, _INLINE_VALUE_MAX, _normalize_exif_datetime
+from photokin.exiftool import ExiftoolConfig, apply_changeset, locate
+from photokin.exiftool.apply import (
+    _COMMAND_LENGTH_BUDGET,
+    _INLINE_VALUE_MAX,
+    _build_exiftool_command,
+    _datfile_name,
+    _normalize_exif_datetime,
+    _select_datfile_routing,
+)
 from photokin.exiftool.config import parse_fields
 
 #: A 283-byte 4x4 baseline JPEG -- the same minimal fixture
@@ -423,6 +429,123 @@ class TestDatfileRoutingForLongValues(_ChangesetFileMixin, unittest.TestCase):
         self.assertEqual(len(summary["errors"]), 1)
         self.assertEqual(len(created), 1)
         self.assertFalse(os.path.exists(created[0]))
+
+
+class TestDatfileRoutingMeasuresTheRealWindowsCommandLine(_ChangesetFileMixin, unittest.TestCase):
+    """F3: the routing budget check has to measure what Windows will actually see.
+
+    ``_select_datfile_routing`` decides a command fits by rebuilding it and
+    measuring its length -- and before this fix that measurement was
+    ``" ".join(cmd)``, which is not what ``CreateProcess`` receives.
+    ``subprocess`` quotes and escapes each argument first
+    (``subprocess.list2cmdline``), and a value dense in quotes and
+    backslashes has every one of them escaped, so the naive join can
+    under-count the real command by nearly 2x. A set of values individually
+    under the per-value threshold -- so none is force-routed on its own --
+    can therefore measure comfortably under the whole-command budget while
+    the command Windows actually receives sails past the 32,767-character
+    OS cap, which is the exact failure this budget check exists to prevent.
+    """
+
+    def test_a_quote_dense_command_is_measured_and_routed_by_the_real_quoting(self) -> None:
+        """Seven values, each under ``_INLINE_VALUE_MAX`` so none is force-routed
+        on its own, built from repeated ``\\"`` pairs so quoting expands them
+        sharply. The property under test is the one the budget exists for:
+        the command ``_select_datfile_routing`` settles on must fit the OS
+        cap as ``subprocess.list2cmdline`` -- and so Windows -- actually
+        measures it, not as a naive space-join would. The exact number of
+        tags routed is deliberately not asserted; only the resulting command
+        actually fitting, and at least one tag having moved, are.
+        """
+        tags = {f"XMP-dc:Field{i}": ('\\"' * 1_999) for i in range(7)}
+        for value in tags.values():
+            self.assertLess(len(value), _INLINE_VALUE_MAX, "value must not force-route alone")
+
+        exiftool = "exiftool"
+        cfg = ExiftoolConfig()
+        path = "/photos/adversarial.jpg"
+        candidate_paths = {
+            tag: f"/tmp/{_datfile_name(1, tag)}" for tag in tags
+        }
+
+        routed = _select_datfile_routing(exiftool, cfg, tags, path, candidate_paths)
+        self.assertGreater(len(routed), 0, "expected quoting overhead to force some routing")
+
+        cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed)
+        real_length = len(subprocess.list2cmdline(cmd))
+        self.assertLessEqual(
+            real_length,
+            _COMMAND_LENGTH_BUDGET,
+            "the command Windows actually sends still exceeds the budget",
+        )
+
+
+class TestDatfileNamesDoNotCollideAcrossTagSpellings(_ChangesetFileMixin, unittest.TestCase):
+    """F4: two tags that fold to the same safe filename must not share a DATFILE.
+
+    ``_datfile_name`` replaces every filename-unsafe character with ``_``, so
+    ``XMP-dc:Description`` and ``XMP-dc/Description`` -- both reachable
+    through ``--fields``, which validates neither uniqueness nor
+    filename-safety -- folded to the identical basename before this fix. Two
+    tags routed to one path meant the second write overwrote the first, and
+    ExifTool read the wrong value back for whichever tag lost the race, with
+    nothing anywhere reporting it: the run reported success and a field
+    silently carried another field's content. The fix appends a short digest
+    of the tag as actually written, so two tags that collide after
+    sanitization still land in different files.
+    """
+
+    def test_two_colliding_spellings_get_different_datfile_basenames(self) -> None:
+        first = _datfile_name(7, "XMP-dc:Description")
+        second = _datfile_name(7, "XMP-dc/Description")
+        self.assertNotEqual(first, second)
+
+    def test_an_apply_changeset_run_writes_each_tags_own_value_to_its_own_file(self) -> None:
+        """Drive a real batch and inspect what each DATFILE held at the moment
+        ExifTool was invoked -- matching this file's own mocked-``subprocess.run``
+        convention -- rather than trusting that routing alone is proof of
+        correctness.
+        """
+        value_for_colon_form = "A" * 5_000
+        value_for_slash_form = "B" * 5_000
+        changeset = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {
+                        "set": {
+                            "XMP-dc:Description": value_for_colon_form,
+                            "XMP-dc/Description": value_for_slash_form,
+                        }
+                    },
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(
+            enabled=True, fields=("XMP-dc:Description", "XMP-dc/Description")
+        )
+        captured_at_invocation: dict[str, str] = {}
+
+        def _run(cmd, **_kw):
+            for tag in ("XMP-dc:Description", "XMP-dc/Description"):
+                prefix = f"-{tag}<="
+                arg = next((a for a in cmd if a.startswith(prefix)), None)
+                if arg is not None:
+                    datfile_path = arg[len(prefix):]
+                    with open(datfile_path, "r", encoding="utf-8") as handle:
+                        captured_at_invocation[tag] = handle.read()
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run", side_effect=_run):
+            summary = apply_changeset(changeset, cfg)
+
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(summary["files_written"], 1)
+        self.assertEqual(captured_at_invocation["XMP-dc:Description"], value_for_colon_form)
+        self.assertEqual(captured_at_invocation["XMP-dc/Description"], value_for_slash_form)
 
 
 class TestExifDatetimeNormalization(unittest.TestCase):
