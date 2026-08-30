@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "photokin"
-version = "0.5.0"
+version = "0.6.0"
 description = "Photo metadata from vision LLMs: verbatim transcription of what's written on scans, plus captions, keywords, and cautious date/location guesses."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,6 +45,15 @@ photokin = "photokin.cli:main"
 [project.urls]
 Homepage = "https://github.com/asielen/photokin"
 Repository = "https://github.com/asielen/photokin"
+
+[tool.setuptools]
+# MANIFEST.in now ships photokin/tests and tests/ so the sdist carries its own
+# suite (see MANIFEST.in). Without this, setuptools' automatic package-data
+# discovery treats every MANIFEST.in-matched file inside a package directory
+# as package data regardless of packages.find's exclude below, and the wheel
+# -- which is meant to exclude tests -- picks them back up too. Explicit
+# [tool.setuptools.package-data] entries are unaffected by this flag.
+include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]

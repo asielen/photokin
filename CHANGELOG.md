@@ -3,6 +3,97 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0]
+
+### Added
+
+- **Rename mode: `--rename PREFIX`.** A grammar-aware mass rename of a
+  folder or manifest's files: it keeps every variant tag the naming
+  grammar already understands (`-b`/`5b`, `-front`/`-back`/`-negative`,
+  `-pageN`, `-crop`), closes the gaps in the numbering, and follows the
+  folder's current order.
+  ```
+  file102.tif          ->  newname-001.tif
+  file105.tif          ->  newname-002.tif
+  file105b.tif          ->  newname-002b.tif
+  file105b-back.tif     ->  newname-002b-back.tif
+  ```
+  `--rename` alone previews; **photokin renames files on disk only with
+  `-w`.** The prefix can be a template — `{date}`, `{today}`, `{folder}`,
+  `{orig}` — so `--rename "{date:yymmdd}-bag" -w` restarts the numbering
+  per date and `--rename "{orig}" -w` just renumbers and cleans up in
+  place. Every apply is journalled before it touches a file, two-phase
+  through hidden temporary names so a gap-closing renumber never
+  collides, and reversible: `--rename-undo` reverses the latest applied
+  run in a folder, `--rename-resume` finishes one an interruption left
+  half-done. `--rename-finish` is the one on-disk operation a catalog
+  wrapper needs from photokin: it renames only the companions and
+  rewrites sidecars for images the catalog application has already
+  renamed itself. Companions sharing an image's stem come along, and a
+  `.md` transcript two same-stem images share — a TIFF master beside its
+  JPEG derivative — follows the same image the analysis half wrote it
+  against, so its `source_file:` line is rewritten rather than left
+  naming a file the rename moved away. **A folder tracked by a catalog
+  application (Lightroom and the like) must be renamed through that
+  application, not through photokin directly** — photokin cannot tell
+  such a folder apart from an ordinary one on its own, so every
+  `--rename` preview says so, and a
+  manifest a catalog application exported (`managed_by`) makes `-w` a
+  usage error rather than a guess. See "Rename mode: `--rename`" in
+  README.md, `docs/rename-mode.md` for the full specification, and
+  `docs/rename-contract.md` for the plan and changeset shapes a wrapper
+  reads.
+
+### Changed
+
+- **`--rename --dry-run --plan-out PATH` now exits 2 when `PATH` cannot be
+  written**, instead of exiting 0 and printing the plan. The dry run used to
+  skip that check on the grounds that it writes nothing, which made it a
+  weaker rehearsal than the command it stands in for -- `--output-file` and
+  `--generate-manifest` have always been checked under `--dry-run`, and
+  `--plan-out` now matches them. A dry run that passes is now evidence that
+  the real run's destinations are usable.
+- **A destination that differs from a file the run needs only by letter case
+  is now refused even on a case-sensitive filesystem.** The guard asks
+  `utils.paths_are_same_file`, which can only fall back to a case-folded
+  comparison when one of the two paths does not exist yet -- and a
+  destination that has not been created is the ordinary case. So on Linux,
+  `--plan-out scans/BOX3_017.JSON` beside an existing `scans/box3_017.json`
+  is now a usage error although those really are two different files there.
+  Refusing a contrived spelling is the side to err on when the alternative is
+  destroying a file's only copy; spell the destination as something that is
+  not a case-variant of a file the run touches.
+
+### Fixed
+
+- **No destination photokin writes may be a file the run depends on, in any
+  mode.** Six review rounds each closed one instance of the same defect — a
+  write that never asked what was already at its destination — as a one-off
+  patch. There is now one guard, asked at the one seam every user-supplied
+  destination already passes through: `--plan-out` and the rename changeset
+  are checked against every photo and companion the run would rename, a file
+  it reports left behind, an earlier run's journal, the input manifest, and
+  the names it is about to rename onto; `--output-file`, `--generate-manifest`
+  and `--log-file` are checked against the input manifest, `--meta`,
+  `--photo-context-file`, an `--output-sidecars` destination and a
+  `--sidecar-md` transcript; and two of a run's own destinations landing on
+  each other is refused the same way. Matching is filesystem identity, not
+  string equality, so a relative path, a `..` detour, a symlink or a hard
+  link onto one of those files is caught too. Attempting it is a usage error
+  (exit 2) naming both the destination and what it is, whether or not `-w`
+  was given and under `--dry-run` alike — previously, `--log-file` reached no
+  such check at all and could empty an input photo under a `--dry-run`
+  preview that exited 0. The seam covers the `photokin` command only:
+  `python -m photokin.exiftool.apply --output PATH` reaches a different
+  `main()` in a different module and is deliberately not guarded, so
+  `--changeset c.ndjson --output c.ndjson` there still truncates its own
+  input.
+- **`--rename-undo`/`--rename-resume JOURNAL` resolve a symlinked journal
+  before reading it**, so a journal reached through a link is read, appended
+  to, and operated on at the folder it really describes rather than the
+  folder holding the link — previously, pointing one at a link left its
+  bookkeeping and its file moves on two different folders.
+
 ## [0.5.0]
 
 ### Changed
@@ -119,5 +210,6 @@ on PyPI that carries document mode. Its compare link below therefore spans from
 0.3.2, and 0.4.0's points at the pull request it landed in rather than at a tag
 that does not exist.
 
+[0.6.0]: https://github.com/asielen/photokin/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/asielen/photokin/compare/v0.3.2...v0.5.0
 [0.4.0]: https://github.com/asielen/photokin/pull/9

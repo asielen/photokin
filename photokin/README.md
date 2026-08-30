@@ -23,6 +23,7 @@ That journey maps onto the files like this:
 - `chunking.py` — `partition_parts`, the pure function that splits an oversized group's parts into contiguous, bounded chunks for `--max-images-per-call`. No imports from `core`, by design — it knows nothing about the model, the provider, or the record shape.
 - `cli.py` — command-line interface; composes core + ExifTool wrapper. One input token — positional, or through the `--folder`/`--manifest` aliases — is classified into a `ResolvedInput` and every kind then runs the same path, so `--output-file`, `--changeset` and the ExifTool write flags mean the same thing whatever was passed. It states its plan on stderr before the first model call, and `--dry-run` stops there.
 - `cli_messages.py` — the wording of every user-facing CLI message, and the `RunPlan` summary. Pure and dependency-free, so the text is testable without importing the pipeline; `cli.py` decides when each one fires.
+- `rename.py` / `rename_apply.py` — rename mode (`--rename`; see [Rename mode](#rename-mode) below). `rename.py` is the planner, a pure function with no filesystem writes; `rename_apply.py` is the only module in the package that renames a file on disk, and it is reached only through `-w`, `--rename-undo`, `--rename-resume` and `--rename-finish`.
 - `public.py` — stable wrappers for embedding in other tools.
 - `prompts_photo_ai/` — shared prompt files (used by all providers).
 
@@ -39,6 +40,19 @@ An unrecognized value raises `ValueError` before the first group: argparse guard
 **There is no primary scan any more.** Nothing gets analyzed on the group's behalf and has its answer copied onto its siblings. `utils.pick_master_index` is gone, `Config.process_all_variants` is replaced by `group_by`, and `update_policy` is dropped from `core.analyze_manifest`, `core.process_manifest_stream` and `public.analyze_manifest` along with the `UPDATE_MASTER_EXACT` / `UPDATE_MERGE_PER_VARIANT` constants — an embedder still passing that keyword gets a `TypeError` and wants `cfg.group_by` instead. What survives of the machinery is the manifest's `preferred` key, which no longer names the one analyzed file, there being no such file, but still breaks a tie between two files claiming the same `(version, part)` slot.
 
 **Part markers.** One analysis per group means one set of keywords merged onto every file in it, so the two keywords that say *which part of the object a file is* have to be reasserted per file afterwards. `utils.PART_MARKER_KEYWORDS` is `{"back", "negative"}`; `core._item_part_marker` decides which one an item earns, and `utils.apply_part_keyword(record, marker, leaked)` appends that one and takes back the markers that leaked onto the record from its siblings. `leaked` is the set the group applied less the set the file itself carried before the merge (`utils.part_markers_in`, read off the pre-merge metadata), so the strip undoes the merge and nothing else: a print hand-tagged `Negative` in the user's catalog keeps that keyword even when a real negative sits beside it in the group. Both markers are kept out of the vocabulary file too, since the model starts proposing "Negative" the moment it is told a `Negative` part is present — approving it there would teach the model to emit a token this same code defines as not being a keyword.
+
+## Rename mode
+
+`--rename` plans a grammar-aware mass rename of a folder or manifest's files and, with `-w`, applies it. Full specification: [`docs/rename-mode.md`](../docs/rename-mode.md). User-facing behavior and the flag table: [Rename mode: `--rename`](../README.md#rename-mode---rename) in the root README.
+
+For an embedder or a wrapper (a catalog application's plugin), there are exactly two contracts, and reading photokin's source is not one of them:
+
+- **The plan** (`photokin.rename.plan_rename`'s return value, or the JSON `--plan-out PATH` writes) — what a rename *would* do: every entry's current path, its target name, its group, and every companion and warning. Pure data, no filesystem writes behind it.
+- **The journal** (`rename_apply.py`'s NDJSON file beside the renamed folder) — what a rename *did*: written, flushed and fsynced before the first file moves, so an interrupted run always leaves an accurate account of itself behind, replayable by `--rename-resume` or reversible by `--rename-undo`.
+
+Both are specified field-by-field, independent of the Python, in [`docs/rename-contract.md`](../docs/rename-contract.md).
+
+`rename_apply.py` is the only module in this package that renames a file on disk — `rename.py` (the planner) and `cli.py`'s rename-mode wiring never call `os.rename` themselves. A catalog application that owns its own files (Lightroom today) does not let photokin rename them; it renames the images itself and calls `--rename-finish` to bring the companions and sidecars along, the one on-disk operation such a wrapper needs from photokin (`docs/rename-mode.md` section 5.5).
 
 ## Providers
 

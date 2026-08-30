@@ -28,6 +28,9 @@ Code map:
 - detected_as, exiftool_fields_with_no_write                  notes, not errors
 - normal_run_command  PUBLIC: the ``-rw`` run to advise, rebuilt from the argv
 - RunPlan           PUBLIC: the plan summary printed before the first model call
+- rename_*                                                    --rename and its executor commands
+- render_rename_preview     PUBLIC: the rename plan's default table (6.2, 5.6)
+- render_rename_run_report  PUBLIC: an apply/undo/resume/finish run's outcome
 """
 
 from __future__ import annotations
@@ -1036,3 +1039,494 @@ class RunPlan:
             lines.append(f"  {label.ljust(_LABEL_WIDTH)} : {first}")
             lines.extend(f"{_VALUE_INDENT}{line}" for line in rest)
         return "\n".join(["Plan for this run:", *lines])
+
+
+# === --rename ===
+#
+# docs/rename-mode.md section 7 is the spec every message below implements;
+# section numbers in a docstring below refer to it. The mode flag is
+# ``--rename``; ``--rename-undo``, ``--rename-resume`` and ``--rename-finish``
+# are the executor commands that read back what it wrote.
+
+
+def rename_needs_folder_or_manifest(display: str) -> UsageMessage:
+    """``--rename`` was given a single photo; it renames a folder's files.
+
+    Args:
+        display: The input token exactly as the user typed it.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`--rename` renames a folder, but `{display}` is a single photo.",
+        "point --rename at the folder instead: photokin ./scans/ --rename PREFIX",
+    )
+
+
+def rename_mode_conflict(first: str, second: str) -> UsageMessage:
+    """Two flags that each drive the run on their own were both given.
+
+    Args:
+        first: The first mode flag, as spelled on the command line.
+        second: The second mode flag.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        (
+            f"`{first}` and `{second}` each run on their own and stop there; "
+            "only one can drive this run."
+        ),
+        f"drop one; run {first} and {second} as two separate commands",
+    )
+
+
+def rename_with_exiftool_write(value: str) -> UsageMessage:
+    """``--exiftool-write`` was given beside ``--rename``, which writes no tags.
+
+    Args:
+        value: The value ``--exiftool-write`` carried.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        (
+            f"`--rename` writes file names, not tags, so `--exiftool-write {value}` "
+            "has nothing to do."
+        ),
+        "drop --exiftool-write; rename mode has its own write switch, -w",
+    )
+
+
+def rename_with_output_file(value: str) -> UsageMessage:
+    """``--output-file`` was given beside ``--rename``, which has its own destination.
+
+    Args:
+        value: The path ``--output-file`` carried.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        (
+            "`--rename` prints a plan, or writes one with --plan-out, so "
+            f"`--output-file {value}` would never be written."
+        ),
+        f"use --plan-out {value} instead",
+    )
+
+
+def rename_write_bundle_contradiction(flag: str, value: str) -> UsageMessage:
+    """``-w`` was given beside a flag that contradicts the rename-mode bundle.
+
+    Args:
+        flag: The contradicting flag, ``--changeset``.
+        value: The value it carried.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        (
+            f"`-w` means --changeset true and apply the plan, but `{flag} {value}` "
+            "was also given."
+        ),
+        "drop one; --changeset true alone records the plan without renaming anything",
+    )
+
+
+def rename_managed_by_refuses_write(app: str | None, catalog: str | None) -> UsageMessage:
+    """``-w`` was given for a manifest a catalog application exported (6.1).
+
+    The guard behind this message keys on ``managed_by`` being present at
+    all, whatever shape the wrapper gave it, so neither field is guaranteed
+    to be there: with no app to name, the message says "a catalog
+    application" rather than inventing one.
+
+    Args:
+        app: The ``managed_by.app`` value, or ``None`` when ``managed_by`` is
+            not an object or carries no non-empty string there.
+        catalog: The ``managed_by.catalog`` value, under the same condition.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    where = f"\n  catalog: {catalog}" if catalog else ""
+    if app is None:
+        return (
+            (
+                "this manifest says it is managed by a catalog application; photokin "
+                f"plans the rename but does not apply it.{where}"
+            ),
+            "apply the plan through that application, or use --plan-out to save it for that step",
+        )
+    return (
+        (
+            f"this manifest was exported by {app}; photokin plans the "
+            f"rename but does not apply it.{where}"
+        ),
+        f"apply the plan through {app}, or use --plan-out to save it for that step",
+    )
+
+
+def output_file_is_needed_by_the_run(
+    role: str, out_path: str, needed_path: str, description: str
+) -> UsageMessage:
+    """A destination names a file the run reads, renames, or writes elsewhere.
+
+    Every destination this CLI writes -- ``--output-file``, ``--plan-out``,
+    ``--log-file``, ``--generate-manifest``, the changeset -- lands with a
+    truncating open or an ``os.replace``, and both take the destination
+    whatever it already held. Pointing one at a file the run itself depends
+    on therefore destroys that file's only copy, and none of it needs ``-w``:
+    a preview run, or a ``--dry-run``, is enough.
+
+    Both halves are named, because either one alone leaves the user guessing:
+    the destination they typed, and what the file at it turned out to be.
+    *description* is that second half in words -- "a photo this run would
+    rename", "the manifest this run reads" -- so the answer is never merely
+    that two paths clashed.
+
+    Args:
+        role: The flag the destination came from, quoted back to the user.
+        out_path: The destination, spelled as the flag carried it.
+        needed_path: Where that file actually is, already resolved to an
+            absolute path by the caller. Shown on a second line only when the
+            user's own spelling differs from it, so naming the file outright
+            prints one line and any other route -- a relative path, a ``..``
+            detour, a hard link -- prints the resolution the guard performed.
+        description: What that file is to this run, as a noun phrase.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    lead = f"{role} names {description}, and would overwrite it:"
+    remedy = f"point {role} at a file this run does not touch"
+    if out_path == needed_path:
+        return (f"{lead}\n  {out_path}", remedy)
+    width = max(len(role), len("that file")) + 2
+    return (
+        (
+            f"{lead}\n"
+            f"  {role + ':':<{width}} {out_path}\n"
+            f"  {'that file:':<{width}} {needed_path}"
+        ),
+        remedy,
+    )
+
+
+def output_destinations_alias(
+    role_a: str, path_a: str, role_b: str, path_b: str
+) -> UsageMessage:
+    """Two of one run's own destinations name the same file.
+
+    Whichever write ran second would silently overwrite the first's output --
+    the plan replaced by the changeset that follows it, the log interleaved
+    into the results stream. Reported before either file is opened, so
+    neither is created.
+
+    The caller orders the pair with the destination easiest to move first,
+    since that is the one the remedy names.
+
+    Args:
+        role_a: How the first destination is named to the user.
+        path_a: Where it points, as spelled.
+        role_b: How the second is named.
+        path_b: Where it points, as spelled. Shown on its own line only when
+            the two spellings differ, which they may while naming one file.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    lead = f"{role_a} and {role_b} are the same file:"
+    remedy = f"point {role_a} at its own file, separate from {role_b}"
+    if path_a == path_b:
+        return (f"{lead}\n  {path_a}", remedy)
+    width = max(len(role_a), len(role_b)) + 2
+    return (
+        (
+            f"{lead}\n"
+            f"  {role_a + ':':<{width}} {path_a}\n"
+            f"  {role_b + ':':<{width}} {path_b}"
+        ),
+        remedy,
+    )
+
+
+def rename_digits_invalid(value: int) -> UsageMessage:
+    """``--digits`` was given a value less than 1.
+
+    Args:
+        value: The value the flag carried.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`--digits {value}` must be at least 1.",
+        "use --digits 3 (the default), or another positive width",
+    )
+
+
+def rename_today_invalid(value: str) -> UsageMessage:
+    """``--today`` was not a date in ``YYYY-MM-DD`` form.
+
+    Args:
+        value: The value the flag carried.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`--today {value}` is not a date in YYYY-MM-DD form.",
+        "use a real calendar date, such as --today 2026-08-29",
+    )
+
+
+def rename_executor_dry_run_refused(flag: str) -> UsageMessage:
+    """``--dry-run`` was given beside an executor command; it always writes.
+
+    ``--rename -w --dry-run`` rehearses through ``rename_apply.apply_plan``'s
+    own ``dry_run`` (preflight and count, nothing written). The three
+    executor commands have no equivalent: ``finish_plan``, ``undo_run`` and
+    ``resume_run`` open a fresh journal segment and start moving files the
+    moment they run, with no ``dry_run`` parameter to intercept that -- so
+    refusing is the faithful answer here, not a rehearsal that would have to
+    lie about what actually happens.
+
+    Args:
+        flag: The executor flag, ``--rename-undo``, ``--rename-resume`` or
+            ``--rename-finish``.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`--dry-run` cannot preview `{flag}`: it starts writing to disk as soon as it runs.",
+        f"drop --dry-run and run {flag} for real; only `--rename -w --dry-run` rehearses",
+    )
+
+
+def rename_command_needs_folder(flag: str, display: str) -> UsageMessage:
+    """A rename executor command was given input that names no folder.
+
+    Args:
+        flag: The command flag, ``--rename-undo`` or ``--rename-resume``.
+        display: The input token exactly as the user typed it, or the empty
+            string when no input was given at all.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    if not display:
+        return (
+            (
+                f"`{flag}` needs the folder to look for a journal in, or a "
+                "journal path of its own."
+            ),
+            f"name the folder: photokin ./scans/ {flag}",
+        )
+    return (
+        f"`{flag}` needs a folder, but `{display}` is not one.",
+        f"point it at that folder, or pass the journal directly: {flag} JOURNAL_PATH",
+    )
+
+
+def rename_no_journal_found(folder: str, verb: str) -> UsageMessage:
+    """No journal in *folder* is in the status *verb* needs (5.4).
+
+    Args:
+        folder: The folder that was checked.
+        verb: ``"undo"`` or ``"resume"``.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    wanted = "applied" if verb == "undo" else "in-progress or needs-attention"
+    return (
+        f"no {wanted} rename journal was found in:\n  {folder}",
+        f"check the folder by hand, or pass the journal path directly to --rename-{verb}",
+    )
+
+
+def rename_plan_unreadable(path: str, reason: str) -> UsageMessage:
+    """A ``--rename-finish`` plan file could not be read as JSON.
+
+    Args:
+        path: The plan path.
+        reason: The parse or OS error's explanation.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`{path}` cannot be read: {_one_line(reason)}.",
+        "re-run --rename --plan-out to make a fresh plan",
+    )
+
+
+def rename_plan_is_not_a_plan(path: str) -> UsageMessage:
+    """A ``--rename-finish`` plan file parsed but is not a plan document.
+
+    Args:
+        path: The plan path.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`{path}` is not a rename plan (no `entries` list).",
+        "point --rename-finish at a file --plan-out wrote",
+    )
+
+
+def _basename(path: str) -> str:
+    """Return the final path segment of *path*.
+
+    A hand-rolled split rather than :func:`os.path.basename`, so this module's
+    own import list stays exactly what its docstring promises -- nothing
+    beyond the standard library's ``dataclasses``.
+
+    Args:
+        path: A path, forward- or back-slash separated.
+
+    Returns:
+        The text after the last path separator, or *path* itself when it has
+        none.
+    """
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+#: The sentence 5.6 requires at the end of every preview: photokin can plan a
+#: rename for a catalog-tracked folder, but only the guard in 6.1 (``managed_by``)
+#: can *know* it is one, so the preview always says this out loud instead.
+_CATALOG_SENTENCE = (
+    "A folder tracked by a catalog application (Lightroom and the like) must "
+    "be renamed through that application, not through photokin directly."
+)
+
+
+def render_rename_preview(plan: dict) -> str:
+    """Render a rename plan as the default human-readable preview (6.2, 5.6).
+
+    One line per entry (current name, then its target or why it has none),
+    each entry's companions indented beneath it, the same-stem files left
+    behind, a summary count, every warning and error the plan carries, and
+    the catalog sentence 5.6 requires -- on every preview, not only when
+    ``managed_by`` is set, since photokin cannot otherwise tell a catalogued
+    folder from an ordinary one.
+
+    Args:
+        plan: The plan dict, shaped per ``docs/rename-mode.md`` section 6.2.
+
+    Returns:
+        The whole preview block, ready to log.
+    """
+    entries = plan.get("entries") or []
+    left_behind = plan.get("left_behind") or []
+    warnings = plan.get("warnings") or []
+    errors = plan.get("errors") or []
+
+    lines = [f"Rename plan for {plan.get('folder')}:"]
+    lines.append(f"  prefix template : {plan.get('prefix_template')}")
+    lines.append(f"  digits          : {plan.get('digits')}")
+    lines.append(f"  order           : {plan.get('order')}")
+    managed_by = plan.get("managed_by")
+    if isinstance(managed_by, dict) and managed_by.get("app"):
+        lines.append(f"  managed by      : {managed_by['app']}")
+    lines.append("")
+
+    renamed = 0
+    for entry in entries:
+        current = _basename(str(entry.get("path") or ""))
+        target = entry.get("target")
+        note = f"  ({', '.join(entry['notes'])})" if entry.get("notes") else ""
+        if target is None:
+            lines.append(f"  {current}  ->  (not planned; see errors below)")
+        elif entry.get("changed"):
+            renamed += 1
+            lines.append(f"  {current}  ->  {target}{note}")
+        else:
+            lines.append(f"  {current}  (unchanged){note}")
+        for companion in entry.get("companions") or []:
+            comp_current = _basename(str(companion.get("path") or ""))
+            comp_target = companion.get("target")
+            if comp_current != comp_target:
+                lines.append(f"    + {comp_current}  ->  {comp_target}")
+
+    for item in left_behind:
+        lines.append(
+            f"  left behind: {_basename(str(item.get('path') or ''))} "
+            f"({item.get('reason')})"
+        )
+
+    lines.append("")
+    lines.append(
+        f"  {renamed} file(s) renamed, {len(entries) - renamed} unchanged, "
+        f"{len(left_behind)} left behind"
+    )
+
+    if warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        lines.extend(f"  - {warning}" for warning in warnings)
+
+    if errors:
+        lines.append("")
+        lines.append("Errors:")
+        lines.extend(f"  - {error}" for error in errors)
+
+    lines.append("")
+    lines.append(_CATALOG_SENTENCE)
+    return "\n".join(lines)
+
+
+def render_rename_run_report(
+    verb: str,
+    status: str,
+    *,
+    journal_path: str | None,
+    renamed: int,
+    companions: int,
+    unchanged: int,
+    left_behind: int,
+    skipped: tuple[str, ...],
+    stranded: tuple[str, ...],
+    warnings: tuple[str, ...],
+) -> str:
+    """Render the outcome of an apply/undo/resume/finish run (5.3, 5.4, 5.5).
+
+    Args:
+        verb: What was asked for -- ``"apply"``, ``"undo"``, ``"resume"`` or
+            ``"finish"`` -- named in the header line.
+        status: One of ``rename_apply``'s ``STATUS_*`` constants.
+        journal_path: The journal written or appended to, or ``None`` when the
+            run had nothing to do.
+        renamed: Image files renamed by this run.
+        companions: Companion files renamed by this run.
+        unchanged: Planned files that already had their target name.
+        left_behind: Same-stem files the planner declined to carry along.
+        skipped: Lines naming what this run declined to do.
+        stranded: Paths a failed rollback left out of place, temporaries first.
+        warnings: Non-fatal problems, principally sidecar rewrites that did
+            not apply.
+
+    Returns:
+        The whole report block, ready to log.
+    """
+    lines = [f"Rename {verb}: {status}"]
+    if journal_path:
+        lines.append(f"  journal    : {journal_path}")
+    lines.append(f"  renamed    : {renamed}")
+    lines.append(f"  companions : {companions}")
+    lines.append(f"  unchanged  : {unchanged}")
+    lines.append(f"  left behind: {left_behind}")
+    lines.extend(f"  warning: {warning}" for warning in warnings)
+    lines.extend(f"  skipped: {line}" for line in skipped)
+    if stranded:
+        lines.append("  needs attention -- these files were left mid-move:")
+        lines.extend(f"    {path}" for path in stranded)
+    return "\n".join(lines)
