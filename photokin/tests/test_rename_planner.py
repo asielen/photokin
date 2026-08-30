@@ -14,6 +14,7 @@ from datetime import date
 from unittest import mock
 
 from photokin import utils
+from photokin.changeset import make_photo_id
 from photokin.rename import (
     DEFAULT_COMPANION_EXTENSIONS,
     RenameItem,
@@ -485,6 +486,49 @@ class IdempotencyTests(unittest.TestCase):
         self.assertEqual(second["warnings"], [])
         for entry in second["entries"]:
             self.assertFalse(entry["changed"], entry)
+
+
+class PhotoIdSurvivesRenameTests(unittest.TestCase):
+    """P2: a wrapper keyed on ``photo_id`` must be able to follow a photo
+    across its own rename. ``photo_id`` alone cannot -- it hashes the
+    pre-rename path, so it changes the instant the file moves -- so every
+    entry also carries ``target_photo_id``, the same hash taken over the
+    post-rename path (docs/rename-contract.md, ``entries[]``)."""
+
+    def test_entry_carries_both_ids_and_they_differ_when_the_name_changes(self) -> None:
+        # "aaa.tif" sorts first, so it takes bucket position 1 and its
+        # target ("bw-001.tif") is not its own current name: a real rename.
+        plan = _plan(["aaa.tif", "bw-002.tif"], "bw")
+        self.assertEqual(plan["errors"], [])
+
+        entry = _entry_for(plan, "aaa.tif")
+        self.assertTrue(entry["changed"], entry)
+        self.assertEqual(entry["target"], "bw-001.tif")
+        self.assertEqual(entry["photo_id"], make_photo_id(_path("aaa.tif")))
+        self.assertEqual(entry["target_photo_id"], make_photo_id(_path("bw-001.tif")))
+        self.assertNotEqual(entry["target_photo_id"], entry["photo_id"])
+
+    def test_ids_are_equal_for_an_unchanged_entry(self) -> None:
+        # "bw-002.tif" sorts second, lands in bucket position 2, and its
+        # target ("bw-002.tif") is exactly its current name: nothing moves.
+        plan = _plan(["aaa.tif", "bw-002.tif"], "bw")
+        self.assertEqual(plan["errors"], [])
+
+        entry = _entry_for(plan, "bw-002.tif")
+        self.assertFalse(entry["changed"], entry)
+        self.assertEqual(entry["target"], "bw-002.tif")
+        self.assertEqual(entry["target_photo_id"], entry["photo_id"])
+
+    def test_unplannable_entry_has_no_target_photo_id(self) -> None:
+        # A group with no date and no --undated gets an entry with every
+        # rendering field null (4.6) -- target_photo_id follows target.
+        plan = _plan(["scan.tif"], "{date}")
+        self.assertEqual(len(plan["errors"]), 1)
+
+        entry = _entry_for(plan, "scan.tif")
+        self.assertIsNone(entry["target"])
+        self.assertIsNone(entry["target_photo_id"])
+        self.assertEqual(entry["photo_id"], make_photo_id(_path("scan.tif")))
 
 
 class RoundTripThroughPlannerTests(unittest.TestCase):

@@ -98,6 +98,16 @@ _JOURNAL_MARKER = "_rename-"
 _JOURNAL_SUFFIX = ".ndjson"
 _SIDECAR_EXT = ".md"
 
+#: How much of the folder's own name a journal name may spend, in bytes. A
+#: journal name is four things -- the folder's name, the marker, the run id and
+#: the suffix -- inside one 255-byte NAME_MAX, and only the first of them can
+#: give: the marker and the folder-derived part are what discovery matches on,
+#: and the run id is what ties the journal to its plan and to the changeset. So
+#: the folder's name is bounded here and the rest is kept whole. Unbounded, a
+#: 220-byte folder name spends the entire budget on its own and every otherwise
+#: valid apply in that folder fails with ENAMETOOLONG before it starts.
+_MAX_JOURNAL_STEM_BYTES = 96
+
 _IMAGE_KIND = "image"
 _COMPANION_KIND = "companion"
 
@@ -109,6 +119,14 @@ _MTIME_TOLERANCE_S = 1e-6
 #: One backslash escape inside a double-quoted YAML scalar, the shape
 #: ``doc_sidecar._yaml_string`` writes.
 _YAML_ESCAPE_RE = re.compile(r"\\(.)")
+
+#: How much of a journal's tail is read at a time when the last record has to
+#: be checked for termination. The journal is one record per renamed file, so
+#: on the mass renames this feature exists for it is the largest thing in the
+#: folder that is not an image, and every footer and every appended segment
+#: asks that one question of it. Walking backward a chunk at a time answers it
+#: in bounded memory, out of the bytes the answer is actually in.
+_TAIL_CHUNK_BYTES = 65536
 
 #: Characters that are illegal in a Windows filename but legal in a run id
 #: (which is an ISO timestamp, so it always contains ``:``).
@@ -298,13 +316,25 @@ def _journal_prefix(folder: str) -> str:
     just written: no automatic ``--rename-resume``, no ``--rename-undo``, and
     no open-journal guard to stop a second run trampling a half-finished one.
 
+    The folder's name is spent against ``_MAX_JOURNAL_STEM_BYTES`` and cut
+    when it runs over, so that a folder named at nearly the length a name may
+    be can still be renamed. The cut belongs here, in the one derivation
+    creation and discovery already share, because a bound applied at only one
+    of them would be the two disagreeing about the name of the same journal.
+
     Args:
         folder: The folder being renamed.
 
     Returns:
-        ``<foldername>_rename-``.
+        ``<foldername>_rename-``, the folder's name cut to the byte budget.
     """
     name = os.path.basename(os.path.normpath(os.path.abspath(folder))) or "folder"
+    encoded = name.encode("utf-8", "surrogateescape")
+    if len(encoded) > _MAX_JOURNAL_STEM_BYTES:
+        # Cut on bytes, then let the decoder drop whatever partial character
+        # the cut landed inside; a name of nothing but undecodable bytes comes
+        # back empty, which is the case a folder with no name of its own is.
+        name = encoded[:_MAX_JOURNAL_STEM_BYTES].decode("utf-8", "ignore") or "folder"
     return f"{name}{_JOURNAL_MARKER}"
 
 
@@ -409,14 +439,15 @@ def _scan(folder: str) -> tuple[set[str], dict[str, tuple[int, float]]]:
     Two answers from one directory walk, because preflight needs both and they
     answer different questions: whether a planned source is the file the plan
     measured is a question about files, while whether a planned target's name
-    is free is a question about *names* -- a directory or a symlink called
-    like a target holds that name just as firmly as a file does.
+    is free is a question about *names* -- a directory or a dangling symlink
+    called like a target holds that name just as firmly as a file does.
 
     Args:
         folder: The directory to walk.
 
     Returns:
-        ``(every name, name -> (size, mtime) for the plain files)``.
+        ``(every name, name -> (size, mtime) for the files, a symlink to a
+        file included)``.
 
     Raises:
         OSError: If the folder cannot be walked.
@@ -426,9 +457,19 @@ def _scan(folder: str) -> tuple[set[str], dict[str, tuple[int, float]]]:
     with os.scandir(folder) as entries:
         for entry in entries:
             names.add(entry.name)
-            if not entry.is_file(follow_symlinks=False):
+            # Symlinks are followed here because they are followed where the
+            # plan was made: ``utils.list_folder_images`` and cli's
+            # ``_list_all_files`` both ask ``is_file()``, and the size and
+            # mtime the plan carries are an ``os.stat`` of what the link
+            # points at. Reading them the other way round here would report a
+            # symlinked image the preview had just offered to rename as "gone
+            # since the plan was made" -- and since one such refusal refuses
+            # the whole run, a single link would take the folder's rename
+            # away. A link to a directory, and a link to nothing, are not
+            # files to any of the three.
+            if not entry.is_file():
                 continue
-            info = entry.stat(follow_symlinks=False)
+            info = entry.stat()
             files[entry.name] = (info.st_size, info.st_mtime)
     return names, files
 
@@ -534,6 +575,14 @@ def _drop_torn_tail(path: str) -> None:
     just bought it. What is dropped here is exactly the bytes no reader ever
     accepted.
 
+    Only the tail is read. Whether the last record was terminated is a
+    question about the last byte, and where that record began is a question
+    about the bytes just before it, so both are answered by seeking to the end
+    and walking back in ``_TAIL_CHUNK_BYTES`` steps -- in bounded memory, and
+    at a cost that does not grow with the journal, which is the file here that
+    grows fastest. A journal with no line break in it at all is one
+    unterminated record and goes entirely, as it always did.
+
     Args:
         path: The journal about to be appended to.
 
@@ -542,12 +591,26 @@ def _drop_torn_tail(path: str) -> None:
             append to a journal it could not seal.
     """
     with open(path, "rb") as handle:
-        raw = handle.read()
-    if not raw or raw.endswith((b"\n", b"\r")):
-        return
+        end = handle.seek(0, os.SEEK_END)
+        if not end:
+            return
+        handle.seek(end - 1)
+        if handle.read(1) in (b"\n", b"\r"):
+            return
+        cut = 0
+        offset = end - 1
+        while offset > 0:
+            start = max(0, offset - _TAIL_CHUNK_BYTES)
+            handle.seek(start)
+            chunk = handle.read(offset - start)
+            index = max(chunk.rfind(b"\n"), chunk.rfind(b"\r"))
+            if index >= 0:
+                cut = start + index + 1
+                break
+            offset = start
     logger.warning("Dropping the unterminated last record of %s; it was never finished.", path)
     with open(path, "r+b") as handle:
-        handle.truncate(max(raw.rfind(b"\n"), raw.rfind(b"\r")) + 1)
+        handle.truncate(cut)
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -803,9 +866,14 @@ def _locate_moves(moves: Sequence[_Move], names: Container[str]) -> tuple[list[s
     the other moves that could have claimed the name it just took, which walks
     a chain in from whichever end is unambiguous. A move still undecided when
     that runs out is a cycle (``a -> b`` beside ``b -> a`` looks identical
-    before and after), and is reported as still at its source -- the
-    conservative reading at all three call sites, because it makes a caller
-    redo a move rather than skip one.
+    before and after), and is reported as still at its source. For a move this
+    executor makes that is the conservative reading, because it makes a caller
+    redo a move rather than skip one. For a move someone else made -- an image
+    a catalog renamed -- it reads as "the catalog has put it back", which is
+    the only reading under which a reversed chain can be undone at all; a
+    cycle among such images is the one shape where that is a guess rather than
+    a deduction, and the guess costs a companion put back beside an image that
+    is where it started under either reading.
 
     Args:
         moves: The run's moves, in the order they were journalled.
@@ -1840,7 +1908,12 @@ def resume_run(journal_path: str) -> ApplyReport:
     problems: list[str] = []
     for op, location in zip(ops, locations, strict=True):
         if op.external:
-            if op.dst not in names:
+            # Whether the catalog's own rename is still in place is the same
+            # chain-wide question the undo asks (:func:`_reverse_ops`): the
+            # image's target name being on disk does not by itself mean this
+            # image is the file under it, since in a renumber that name is
+            # also the *next* image's source.
+            if location != _AT_TARGET:
                 problems.append(f"the image was not renamed after all: {op.dst}")
             continue
         if location == _AT_TMP:
@@ -1915,13 +1988,17 @@ def _reverse_ops(
     at its old name, and the companions of one that is not are reported and
     left alone.
 
-    "Still at its target" is decided from the segment as a whole
-    (:func:`_locate_moves`). Read op by op it is wrong for every gap-closing
-    renumber, which is what this feature is for: after ``file004 ->
-    file003`` and ``file005 -> file004``, a file called ``file004`` is on disk
-    because it is the *second* op's target, and taking that as an unrelated
-    file already holding the first op's old name turns one bogus skip into a
-    refusal of the whole undo.
+    Both questions -- has the catalog put this image back, and is this
+    companion still at its target -- are decided from the segment as a whole
+    (:func:`_locate_moves`). Read op by op either is wrong for every
+    gap-closing renumber, which is what this feature is for: after ``file004
+    -> file003`` and ``file005 -> file004`` have been reversed by the catalog,
+    a file called ``file004`` is on disk because it is the *first* image's
+    restored source, and reading it as something else holding the second
+    image's old name blocks that image, strands its companion under a name the
+    first companion is about to be moved onto, and closes the journal
+    ``rolled_back`` -- which is a status undo will not run on, so the undo can
+    never be retried at all.
 
     Args:
         segment: The completed segment to reverse.
@@ -1933,18 +2010,18 @@ def _reverse_ops(
     """
     safe = _safe_run_id(run_id)
     external = segment.mode == MODE_FINISH
+    locations, _accounted = _locate_moves(_moves_of(segment.ops), names)
     blocked: set[str] = set()
     skipped: list[str] = []
 
-    for op in segment.ops:
+    for op, location in zip(segment.ops, locations, strict=True):
         if not op.external:
             continue
-        if op.src in names and op.dst not in names:
+        if location == _AT_SOURCE:
             continue
         blocked.add(op.photo_id)
         skipped.append(f"image not put back yet: {op.dst}")
 
-    locations, _accounted = _locate_moves(_moves_of(segment.ops), names)
     ops: list[RenameOp] = []
     for op, location in reversed(list(zip(segment.ops, locations, strict=True))):
         if op.photo_id in blocked:

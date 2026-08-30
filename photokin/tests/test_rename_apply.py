@@ -20,6 +20,7 @@ import builtins
 import json
 import os
 import stat
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,97 @@ def _fail_at(monkeypatch: pytest.MonkeyPatch, call: int, error: BaseException) -
         real(src, dst, **kwargs)
 
     monkeypatch.setattr(os, "rename", fake_rename)
+
+
+def _finish_record(
+    src: str, dst: str, tmp: str | None, kind: str, photo_id: str
+) -> dict[str, Any]:
+    """Build one file record of a ``--rename-finish`` journal.
+
+    Its images carry ``renamed_by: external``, since a catalog application
+    renamed them and this executor only recorded that it had.
+    """
+    record: dict[str, Any] = {
+        "record": "file",
+        "from": src,
+        "to": dst,
+        "tmp": tmp,
+        "kind": kind,
+        "photo_id": photo_id,
+    }
+    if kind == "image":
+        record["renamed_by"] = "external"
+    return record
+
+
+def _as_symlink(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Make *name* answer ``os.scandir`` the way a symlink to a file does.
+
+    Windows hands out the privilege to create one only to an administrator or
+    a machine in developer mode, so the two answers a link gives -- not a file
+    when the question excludes symlinks, a file when it follows them -- are
+    modelled here instead, and the test runs on every platform.
+    """
+    real_scandir = os.scandir
+
+    class _Link:
+        """One directory entry, reporting itself as a symlink to a file."""
+
+        def __init__(self, entry: Any) -> None:
+            self._entry = entry
+
+        def is_file(self, *, follow_symlinks: bool = True) -> bool:
+            return follow_symlinks and bool(self._entry.is_file())
+
+        def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+            return False
+
+        def is_symlink(self) -> bool:
+            return True
+
+        def __getattr__(self, attribute: str) -> Any:
+            return getattr(self._entry, attribute)
+
+    def fake_scandir(path: Any) -> AbstractContextManager[list[Any]]:
+        with real_scandir(path) as entries:
+            return nullcontext(
+                [_Link(entry) if entry.name == name else entry for entry in entries]
+            )
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+
+
+def _count_reads(monkeypatch: pytest.MonkeyPatch, path: Path) -> dict[str, int]:
+    """Count every byte read out of *path* in binary read mode from here on."""
+    real_open = builtins.open
+    total = {"bytes": 0}
+
+    class _Counting:
+        """A read-counting stand-in for the file object ``open`` returns."""
+
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def read(self, size: int = -1) -> bytes:
+            data: bytes = self._handle.read(size)
+            total["bytes"] += len(data)
+            return data
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._handle, name)
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._handle.close()
+
+    def fake_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(file, mode, *args, **kwargs)
+        return _Counting(handle) if str(file) == str(path) and mode == "rb" else handle
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    return total
 
 
 def _case_insensitive(folder: Path) -> bool:
@@ -885,6 +977,49 @@ def test_a_source_spelled_in_another_case_is_renamed_under_its_disk_name(
     assert [record["from"] for record in moved] == ["file102.tif"]
 
 
+def test_a_symlinked_image_is_applied_the_way_it_was_planned(tmp_path: Path) -> None:
+    """The scan reads the folder the way the planner read it, links included.
+
+    ``utils.list_folder_images`` and cli's ``_list_all_files`` both follow
+    symlinks, so a symlinked image is planned and previewed like any other.
+    A preflight that does not follow them reports that same file as gone since
+    the plan was made -- and one such refusal refuses the whole run, so a
+    single link would make ``--rename -w`` unusable for the folder it sits in.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    plain = _write(folder / "file102.tif", "first image")
+    linked = _write(tmp_path / "elsewhere.tif", "second image")
+    link = folder / "file105.tif"
+    try:
+        os.symlink(linked, link)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"this platform will not make a symlink: {exc}")
+    plan = _plan(folder, [_entry(plain, "newname-001.tif"), _entry(link, "newname-002.tif")])
+
+    report = apply_plan(plan)
+
+    assert report.status == rename_apply.STATUS_APPLIED
+    assert _names(folder) == {"newname-001.tif", "newname-002.tif"}
+    assert os.path.islink(folder / "newname-002.tif")
+    assert (folder / "newname-002.tif").read_bytes() == b"second image"
+
+
+def test_a_planned_link_is_not_reported_gone_by_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same refusal as above, on the platform that will not make a link.
+
+    One refusal refuses the whole plan, so a folder holding a single symlinked
+    image could not be renamed at all: the preview offered the rename and
+    preflight said the file it had just offered was gone.
+    """
+    _folder, plan = _simple_folder(tmp_path)
+    _as_symlink(monkeypatch, "file105.tif")
+
+    assert preflight(plan) == []
+
+
 def test_a_plan_carrying_errors_is_refused(tmp_path: Path) -> None:
     """The planner's own errors stop the executor too."""
     _folder, plan = _simple_folder(tmp_path)
@@ -1054,6 +1189,91 @@ def test_undo_of_a_finish_journal_waits_for_the_image_to_come_back(tmp_path: Pat
     assert (folder / "newname-001.md").exists()
 
 
+def test_undo_of_a_finish_journal_reverses_a_gap_closing_renumber(tmp_path: Path) -> None:
+    """The catalog put its own renumber back; every freed name is a used one.
+
+    Asking of one name at a time whether an image is back reads ``file004.tif``
+    -- the first image's restored source -- as something else holding the
+    second image's old name. The second image is then blocked and its
+    transcript left under a name the first transcript is about to be moved
+    onto, so the undo collides, rolls back, and closes the journal
+    ``rolled_back``: a status undo refuses, which takes the retry away too.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    first = _write(folder / "file004.tif", "first image")
+    second = _write(folder / "file005.tif", "second image")
+    first_md = _sidecar(folder / "file004.md", "file004.tif")
+    second_md = _sidecar(folder / "file005.md", "file005.tif")
+    plan = _plan(
+        folder,
+        [
+            _entry(first, "file003.tif", {first_md: "file003.md"}),
+            _entry(second, "file004.tif", {second_md: "file004.md"}),
+        ],
+    )
+    first.rename(folder / "file003.tif")
+    second.rename(folder / "file004.tif")
+    applied = finish_plan(plan)
+    assert applied.status == rename_apply.STATUS_APPLIED
+    assert applied.journal_path is not None
+    # The catalog reverses its own images, highest first, as any renumber must.
+    (folder / "file004.tif").rename(folder / "file005.tif")
+    (folder / "file003.tif").rename(folder / "file004.tif")
+
+    undone = undo_run(applied.journal_path)
+
+    assert undone.status == rename_apply.STATUS_UNDONE
+    assert undone.skipped == ()
+    assert undone.companions == 2
+    assert _names(folder) == {"file004.tif", "file004.md", "file005.tif", "file005.md"}
+    assert 'source_file: "file004.tif"' in (folder / "file004.md").read_text(encoding="utf-8")
+    assert 'source_file: "file005.tif"' in (folder / "file005.md").read_text(encoding="utf-8")
+
+
+def test_resume_of_a_finish_journal_refuses_images_that_never_moved(tmp_path: Path) -> None:
+    """A name being on disk is not the same as this image being under it.
+
+    Read one name at a time both images look renamed: the first entry's target
+    is held by a file that has nothing to do with the plan, and the second's is
+    held by the first entry's own un-renamed source. The companions would then
+    be renamed to follow images that never moved, and their transcripts pointed
+    at a stranger's name.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    _write(folder / "file003.tif", "a stranger")
+    _write(folder / "file004.tif", "first image")
+    _write(folder / "file005.tif", "second image")
+    _sidecar(folder / "file004.md", "file004.tif")
+    _sidecar(folder / "file005.md", "file005.tif")
+    records: list[dict[str, Any]] = [
+        {
+            "record": "header",
+            "schema_version": rename_apply.JOURNAL_SCHEMA_VERSION,
+            "run_id": RUN_ID,
+            "folder": str(folder),
+            "mode": rename_apply.MODE_FINISH,
+            "status": rename_apply.STATUS_IN_PROGRESS,
+        },
+        _finish_record("file004.tif", "file003.tif", None, "image", "p1"),
+        _finish_record("file004.md", "file003.md", ".photokin-rename-r-1.md", "companion", "p1"),
+        _finish_record("file005.tif", "file004.tif", None, "image", "p2"),
+        _finish_record("file005.md", "file004.md", ".photokin-rename-r-3.md", "companion", "p2"),
+    ]
+    journal = _write(
+        Path(rename_apply.journal_path_for(str(folder), RUN_ID)),
+        "".join(json.dumps(record) + "\n" for record in records),
+    )
+    before = _names(folder)
+
+    with pytest.raises(RenamePreflightError) as excinfo:
+        resume_run(str(journal))
+
+    assert "the image was not renamed after all: file003.tif" in str(excinfo.value)
+    assert _names(folder) == before
+
+
 # --- Journals ----------------------------------------------------------
 
 
@@ -1138,6 +1358,49 @@ def test_the_journal_lands_inside_the_renamed_folder(tmp_path: Path) -> None:
     assert os.path.basename(report.journal_path) == (
         "scans_rename-2026-08-29T20-14-03Z_a1b2c3d4.ndjson"
     )
+
+
+def test_a_long_folder_name_still_makes_a_journal_name_a_filesystem_takes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The folder's name is bounded; the run id and the discovery prefix are not.
+
+    A folder component may be 255 bytes, and the journal repeats it and then
+    adds the marker, the run id and the suffix -- so a folder whose name is
+    merely long makes every apply inside it fail with ENAMETOOLONG before it
+    starts. What must survive the cut is the agreement between creation and
+    discovery: they share one derivation, so a bounded name is still the name
+    ``--rename-undo``, ``--rename-resume`` and the open-journal guard look for.
+    """
+    folder = str(tmp_path / ("scan-folder-" * 20))
+    journal_name = os.path.basename(rename_apply.journal_path_for(folder, RUN_ID))
+
+    assert len(journal_name.encode("utf-8")) <= 255
+    assert journal_name.endswith(f"{RUN_ID.replace(':', '-')}.ndjson")
+    monkeypatch.setattr(rename_apply, "_list_names", lambda _folder: {journal_name})
+    assert rename_apply._journal_candidates(folder) == [os.path.join(folder, journal_name)]
+
+
+def test_the_torn_tail_check_reads_only_the_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One record per renamed file is the size this question may not be asked of.
+
+    Every footer and every appended undo segment asks whether the journal's
+    last record was terminated, on exactly the mass renames the journal grows
+    largest for. Reading the file into memory to answer it is the whole file's
+    worth of memory and scanning, twice a run, for an answer that lives in its
+    last few bytes.
+    """
+    filler = json.dumps({"record": "file", "from": "x" * 200_000, "to": "y"}) + "\n"
+    journal = _write(tmp_path / "big_rename-run.ndjson", filler * 5 + '{"record": "foot')
+    assert journal.stat().st_size > 4 * rename_apply._TAIL_CHUNK_BYTES
+    read = _count_reads(monkeypatch, journal)
+
+    rename_apply._drop_torn_tail(str(journal))
+
+    assert read["bytes"] <= rename_apply._TAIL_CHUNK_BYTES + 1
+    assert journal.read_text(encoding="utf-8") == filler * 5
 
 
 # --- Sidecars ----------------------------------------------------------

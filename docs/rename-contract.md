@@ -38,6 +38,20 @@ rename record is not versioned on its own schedule, because it lives in that
 same stream and a reader already has to track that number to read anything
 else in it.
 
+**Why `entries[].target_photo_id` (below) did not bump `schema_version`.**
+It is a new key, which the rule above would ordinarily treat as a shape
+change. But it is purely additive: no existing field's presence, type or
+meaning moved, so code written against the old shape reads exactly the same
+plan it always did and is no worse off for the key it doesn't know about --
+the failure mode a bump exists to flag (silently misreading a field that is
+still there but now means something else) cannot happen here. Weighing the
+other way: `rename_apply.py` refuses to act on a plan whose `schema_version`
+does not equal its own pinned constant, by exact match, so bumping this
+number is not a documentation-only move -- it stops every plan this planner
+produces from being applied until that check is updated in step. That
+coupling belongs to `rename_apply.py`, not to this contract, so it is noted
+here rather than acted on.
+
 The rename *journal* (`docs/rename-mode.md` section 5.2) has its own
 `JOURNAL_SCHEMA_VERSION`, but a wrapper following the flow above never reads
 a journal directly -- it is `rename_apply.py`'s own bookkeeping, replayed
@@ -94,6 +108,7 @@ the table is a convenience for a human running the CLI directly.
     {
       "path": "/Volumes/Archive/bag-woodbury/file105b-back.tif",
       "photo_id": "3f2a...",
+      "target_photo_id": "9c1e...",
       "size": 48211904,
       "mtime": 1719346204.0,
       "target": "520601-bag-woodbury-002b-back.tif",
@@ -150,7 +165,8 @@ the last three rows below.
 | Field | Type | Meaning |
 |---|---|---|
 | `path` | string | The image's current absolute path, as it exists on disk right now. |
-| `photo_id` | string | `changeset.make_photo_id(path)`. Stable identity across a rename: the same photo's `photo_id` in the changeset's ordinary metadata records and in this plan's `entries[]` is the same string, so a consumer that already tracks files by `photo_id` does not need a second key for rename mode. |
+| `photo_id` | string | `changeset.make_photo_id(path)` -- the pre-rename identity, a hash of the path in this same `path` field. The same photo's `photo_id` in the changeset's ordinary metadata records (taken before the rename) matches this value, so a consumer already tracking files by `photo_id` recognizes the file here too. It does **not** survive the rename by itself: `make_photo_id` hashes the path, the rename changes the path, so an ordinary metadata run *after* the rename reports a different `photo_id` for the same photo. Use `target_photo_id` (below) to bridge that gap. |
+| `target_photo_id` | string \| `null` | `changeset.make_photo_id(target path)` -- the *post*-rename identity: the same hash `photo_id` would report for this photo the next time anything reads it, once `target` has actually been applied. Equal to `photo_id` for an unchanged entry (`changed: false`, `target` already matches the current name), since the two paths are then the same string. `null` under the same condition as `target` -- a group that could not be rendered has no post-rename path to hash. A wrapper that keys its own records on `photo_id` reads this field off the plan to move that key forward: replace its stored `photo_id` with this entry's `target_photo_id` once the rename is applied, rather than losing the photo or re-matching it by name. |
 | `size` | int \| `null` | Bytes, read from disk when the plan was built. `null` only if the stat itself failed (the file vanished between listing and stat'ing); not a normal case. |
 | `mtime` | float \| `null` | Epoch seconds, same caveat as `size`. Both feed the executor's preflight (`docs/rename-mode.md` 5.1): a file whose size or mtime has moved since planning fails preflight and nothing is renamed. |
 | `target` | string \| `null` | The rendered filename (with extension), e.g. `"520601-bag-woodbury-002b-back.tif"`. `null` only for a member of a group that could not be rendered -- see `errors`. |

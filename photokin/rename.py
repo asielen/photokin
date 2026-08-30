@@ -48,6 +48,15 @@ from .exiftool.apply import _TAG_FILENAME_UNSAFE_RE, EXIF_DATE_FORMAT
 #: Bumped whenever the plan dict's shape changes in a way a consumer (the
 #: executor, a catalog wrapper reading the manifest contract) could care
 #: about, the same rule ``changeset.SCHEMA_VERSION`` follows.
+#:
+#: ``entries[]`` gaining ``target_photo_id`` (see docs/rename-contract.md,
+#: "Schema versioning") did *not* bump this: it is a purely additive key --
+#: no existing field's presence, type or meaning moved, so a reader that
+#: only knows the old shape keeps working unchanged and is no worse off
+#: than before. ``rename_apply.py``'s own ``PLAN_SCHEMA_VERSION`` also
+#: pins this exact number by equality (``_common_refusals``), so a real bump
+#: here is not a documentation-only exercise -- it is a breaking change to
+#: every plan this planner produces until that check is updated too.
 SCHEMA_VERSION = 1
 
 #: Non-image extensions carried along with a renamed image by default (4.6's
@@ -678,6 +687,11 @@ def _build_unplannable_entry(member: _Member, group_display: str) -> dict[str, A
     return {
         "path": member.item.path,
         "photo_id": make_photo_id(member.item.path),
+        # No target, so no path to hash on the other side (4.6): a group
+        # that could not be rendered never moves this file, so there is no
+        # "after" identity to report -- unlike an unchanged entry, where
+        # target == the current basename and the two ids come out equal.
+        "target_photo_id": None,
         "size": member.item.size,
         "mtime": member.item.mtime,
         "target": None,
@@ -968,11 +982,22 @@ def plan_rename(
             if group_plan.used_partial_date:
                 entry_notes.append("partial date")
             changed = os.path.basename(member.item.path) != target_filename
+            # P2: photo_id is a hash of the *current* path, so it goes stale
+            # the moment this entry is applied -- an ordinary metadata run
+            # afterward hashes the new path and gets a different id, which
+            # is exactly the breakage a wrapper's photo_id key exists to
+            # prevent (docs/rename-contract.md). target_photo_id is the same
+            # hash taken over the post-rename path, so a wrapper can map old
+            # id to new id explicitly instead of losing the photo. For an
+            # unchanged entry the two paths are the same string, so the two
+            # ids come out equal, not merely "also present".
+            target_photo_id = make_photo_id(os.path.join(member.dirname, target_filename))
 
             entries.append(
                 {
                     "path": member.item.path,
                     "photo_id": make_photo_id(member.item.path),
+                    "target_photo_id": target_photo_id,
                     "size": member.item.size,
                     "mtime": member.item.mtime,
                     "target": target_filename,
