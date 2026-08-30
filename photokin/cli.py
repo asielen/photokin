@@ -37,11 +37,15 @@ Code map:
 - _resolve_exiftool_config  build ExiftoolConfig (CLI flag > env > default)
 - _preflight_exiftool       stop before the first model call if reads/writes can't run
 - _refuse_unwritable_exiftool_fields  reject tag spellings ExifTool cannot write
-- _preflight_output_file    stop before the first model call if an output is unwritable
+- _ProtectedPath            one file the run depends on, and what it is to the run
+- _preflight_destinations_are_distinct  refuse two destinations that are one file
+- _preflight_output_file    refuse a destination the run needs, or cannot write
+- _analysis_protected_paths what an analysis / --generate-manifest run depends on
 - _write_generated_manifest atomically write a synthesized manifest, pretty-printed
 - _generate_manifest        --generate-manifest: describe the input's grouping, stop
 - _suggest_the_normal_run   offer ``-rw`` to a run that has asked for nothing
 - _apply_exiftool_changeset apply routed fields via ExifTool + append a status line
+- _rename_protected_paths   what a rename run reads, renames, leaves or recovers from
 - _run_rename_mode          --rename: plan a folder/manifest's rename, preview or apply it
 - _run_rename_finish        --rename-finish: companions only, images renamed elsewhere
 - _run_rename_undo_or_resume  --rename-undo / --rename-resume: read the journal back
@@ -63,7 +67,7 @@ import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 from . import cli_messages, rename_apply, utils
 from .utils import Config, normalize_path
@@ -82,6 +86,7 @@ from .core import (
     build_single_photo_manifest,
     process_manifest_stream,
 )
+from .doc_sidecar import sidecar_path_for
 from .errors import ProviderApiError, SELF_EXPLANATORY_ERROR_TYPES
 from .exiftool import (
     ExiftoolConfig,
@@ -1235,24 +1240,122 @@ def _refuse_unwritable_exiftool_fields(value: str | None) -> None:
             )
 
 
-def _preflight_output_file(out_path: str, *, role: str = "--output-file") -> None:
-    """Fail before the first model call when an output destination cannot be written.
+class _ProtectedPath(NamedTuple):
+    """One file this run depends on, and the phrase that says what it is.
 
-    Both artifacts a run produces are checked up front: an unwritable aggregate
-    ``.json`` would otherwise discard a paid batch, and the truncate-on-open the
-    streaming paths rely on destroys the previous run's file before it can fail.
-    Probes with a uniquely named temp file in the destination directory, so no
-    pre-existing file is ever opened, truncated, or removed.
+    Attributes:
+        path: Any spelling of the file -- absolute, relative, or as a plan
+            happens to record it. :func:`_preflight_output_file` resolves it
+            before comparing *and* before reporting it, so callers pass what
+            they already have and no caller has to normalize first.
+        description: What the file is to this run, as a noun phrase that
+            reads after a flag name: "a photo this run would rename". It is
+            the whole point of the guard -- a user told only that two paths
+            clashed still has to work out which of their files was at stake.
+    """
+
+    path: str
+    description: str
+
+
+def _preflight_destinations_are_distinct(destinations: Sequence[tuple[str, str]]) -> None:
+    """Refuse when two of this run's own destinations name the same file.
+
+    Every destination here is written by a truncating open or an
+    ``os.replace``, so two that resolve to one file do not merge: whichever
+    write runs second replaces the first's output, and the run reports
+    success. Checked before any of them is opened, so a refusal leaves
+    neither file created.
+
+    Pairwise because the list is at most five long, and because the pair that
+    matched is exactly what the message has to name.
+
+    Args:
+        destinations: ``(role, path)`` for each destination this run would
+            write, ordered with the one the user can most easily move first.
+
+    Raises:
+        SystemExit: With code 2 when two of them are the same file.
+    """
+    for index, (role_a, path_a) in enumerate(destinations):
+        for role_b, path_b in destinations[index + 1:]:
+            if utils.paths_are_same_file(os.path.abspath(path_a), os.path.abspath(path_b)):
+                _exit_with_usage_error(
+                    *cli_messages.output_destinations_alias(role_a, path_a, role_b, path_b)
+                )
+
+
+def _preflight_output_file(
+    out_path: str,
+    *,
+    role: str = "--output-file",
+    protects: Sequence[_ProtectedPath] = (),
+    creates_its_parent: bool = False,
+) -> None:
+    """Ask what is already at a destination, then whether it can be written.
+
+    The second question was the only one this ever asked, and six review
+    rounds found the same defect wearing different clothes: a write that
+    lands on a file the run itself needs. Every destination here goes down
+    with a truncating open or an ``os.replace``, both of which take the
+    destination whatever it held, so naming one of the run's own inputs
+    destroys that file's only copy -- with no ``-w``, and under ``--dry-run``
+    as readily as without it. So *protects* is asked first: "you named a
+    photo this run renames" is more use than "not writable", and on Windows a
+    read-only source would otherwise preempt it with the wrong answer.
+
+    Matching is :func:`utils.paths_are_same_file`, filesystem identity rather
+    than spelling, so a relative path, a ``..`` detour, a symlink and a hard
+    link are all caught. There is deliberately no "skip this when the
+    destination does not exist" short-circuit: dropping it is what lets the
+    one loop also answer for a destination the run has not created yet -- a
+    rename target, a sidecar it is about to write. The cost is that for a
+    destination that does not exist, ``paths_are_same_file`` can only fall
+    back to a case-folded string compare, so on a case-sensitive filesystem
+    ``--plan-out folder/BOX3_017.JSON`` beside ``box3_017.json`` is refused
+    although POSIX would have allowed both. Refusing a contrived command is
+    the side to err on when the alternative is destroying a file.
+
+    The writability half is unchanged, and probes with a uniquely named temp
+    file in the destination *directory*, so no pre-existing file is ever
+    opened, truncated, or removed.
 
     Args:
         out_path: The resolved destination path.
         role: The flag the destination came from, quoted back in the error text.
+        protects: Every file this run reads, renames, leaves behind, or writes
+            somewhere else. Empty for a caller that has nothing to protect.
+        creates_its_parent: True for a destination whose own writer makes its
+            parent directory (``--log-file`` does, on attach), so a parent
+            that is not there yet is not a refusal. The *protects* question
+            above is still asked -- it is the half that has to run for every
+            destination, whoever creates the directory.
 
     Raises:
-        SystemExit: With code 2 when the destination cannot be written.
+        SystemExit: With code 2 when the destination is one of *protects*, or
+            cannot be written.
     """
-    out_dir = os.path.dirname(os.path.abspath(out_path))
+    destination = os.path.abspath(out_path)
+    for protected in protects:
+        # Resolved once, and the same resolved spelling is what the message
+        # prints: a companion, a left-behind file and a target are all built by
+        # joining the folder as the user spelled it, so for a relative folder
+        # the raw path names no location on its own -- it would send the user
+        # looking for their file against a working directory the message never
+        # states, next to a destination they may have spelled a third way.
+        needed = os.path.abspath(protected.path)
+        if utils.paths_are_same_file(destination, needed):
+            _exit_with_usage_error(
+                *cli_messages.output_file_is_needed_by_the_run(
+                    role, out_path, needed, protected.description
+                )
+            )
+    out_dir = os.path.dirname(destination)
     if not os.path.isdir(out_dir):
+        if creates_its_parent:
+            # Nothing below can be answered about a directory that does not
+            # exist yet, and the writer is about to make it.
+            return
         _exit_with_usage_error(*cli_messages.output_dir_missing(role, out_dir))
     # Caught here rather than at the write: a directory passes every check below
     # (it exists, its parent is writable) and would only fail after the batch had
@@ -1276,6 +1379,67 @@ def _preflight_output_file(out_path: str, *, role: str = "--output-file") -> Non
                 role, out_path, exc.strerror or str(exc)
             )
         )
+
+
+def _analysis_protected_paths(
+    resolved: ResolvedInput, loaded_manifest: dict | None, args: argparse.Namespace
+) -> list[_ProtectedPath]:
+    """Return every file an analysis or ``--generate-manifest`` run depends on.
+
+    Built from what the run already knows at the top of ``main`` -- the input
+    it resolved, the manifest it loaded, the flags it parsed -- because that
+    is the last point above ``--log-file``'s truncating attach, and a guard
+    below that attach cannot save the file the log lands on.
+
+    The sidecar destinations are a deliberate superset: ``--sidecar-md auto``
+    writes only some of the ``.md`` paths it could, and which ones is not
+    knowable until the model has answered. Refusing a destination the run
+    might have written is the correct side of that to be wrong on.
+
+    Args:
+        resolved: The run's input, already classified.
+        loaded_manifest: The manifest document, for manifest input; ``None``
+            otherwise.
+        args: The parsed namespace, read for the read-only paths it names and
+            for the two sidecar switches.
+
+    Returns:
+        One entry per file, in the order a message should prefer to name them:
+        what the run reads first, what it would write beside them after.
+    """
+    protected: list[_ProtectedPath] = []
+    if resolved.kind == "folder":
+        images = utils.list_folder_images(resolved.path)
+    elif resolved.kind == "manifest":
+        protected.append(_ProtectedPath(resolved.path, "the manifest this run reads"))
+        items = (loaded_manifest or {}).get("items") or []
+        images = [path for item in items if (path := normalize_path(item.get("path")))]
+    else:
+        images = [resolved.path, *([args.back] if args.back else [])]
+    protected.extend(_ProtectedPath(path, "a photo this run reads") for path in images)
+    for flag, value, noun in (
+        ("--meta", args.meta, "the metadata"),
+        ("--photo-context-file", args.photo_context_file, "the photo context"),
+        ("--cancel-file", args.cancel_file, "the cancel sentinel"),
+    ):
+        if value:
+            protected.append(_ProtectedPath(value, f"{noun} this run reads ({flag})"))
+    if args.output_sidecars:
+        protected.extend(
+            _ProtectedPath(
+                f"{os.path.splitext(path)[0]}.json",
+                "a sidecar this run writes (--output-sidecars)",
+            )
+            for path in images
+        )
+    if args.sidecar_md != utils.SIDECAR_MD_OFF:
+        protected.extend(
+            _ProtectedPath(
+                sidecar_path_for(path), "a transcript this run writes (--sidecar-md)"
+            )
+            for path in images
+        )
+    return protected
 
 
 def _write_generated_manifest(manifest: dict, out_path: str) -> None:
@@ -1360,7 +1524,11 @@ def _generate_manifest(resolved: ResolvedInput, args: argparse.Namespace, cfg: C
     out_path = args.generate_manifest
     if not out_path.lower().endswith(".json"):
         _exit_with_usage_error(*cli_messages.generate_manifest_extension(out_path))
-    _preflight_output_file(out_path, role="--generate-manifest")
+    _preflight_output_file(
+        out_path,
+        role="--generate-manifest",
+        protects=_analysis_protected_paths(resolved, None, args),
+    )
 
     if resolved.kind == "folder":
         manifest = build_folder_manifest(resolved.path, photo_context_text=cfg.photo_context_text)
@@ -2043,6 +2211,86 @@ def _resolve_rename_write_bundle(args: argparse.Namespace) -> tuple[str, bool]:
     return values["changeset"] or "false", bool(args.write)
 
 
+def _rename_protected_paths(
+    resolved: ResolvedInput, folder: str, plan: dict[str, Any], disk_files: Sequence[str]
+) -> list[_ProtectedPath]:
+    """Return every file a rename run reads, renames, leaves behind or recovers from.
+
+    Built from the plan, because the plan is the first and only place the run
+    knows what it covers -- and it is still ahead of every write, so a
+    destination that lands on any of these is refused before the plan file or
+    the changeset is opened.
+
+    Four kinds of file are easy to miss and were each lost in turn: a file the
+    run only *reports* as left behind is still that file's only copy; a photo
+    the manifest never listed appears nowhere in ``entries``, so only the disk
+    listing sees it; a journal from an earlier run is the undo record for that
+    rename; and a *target* is a path this run is about to move a file onto.
+    The target case loses no data today -- the executor's own preflight
+    refuses an occupied target -- but it refuses after the plan file has
+    already been written, blaming the folder for what the flag did.
+
+    Paths are returned in whatever spelling their source used: ``entries``
+    carry absolute paths while companion and ``left_behind`` records are
+    joined onto the caller's *folder*, which may be relative. The guard
+    resolves each one, so no normalization is done here.
+
+    Args:
+        resolved: The run's input, so manifest input protects its own document.
+        folder: The folder being renamed.
+        plan: The plan :func:`plan_rename` just built.
+        disk_files: Every file directly inside *folder*, as listed for the plan.
+
+    Returns:
+        One entry per file. Order is load-bearing: the guard reports the first
+        match, so the descriptions that pin a file most precisely come first
+        and a file listed twice (a planned photo whose manifest spelling the
+        bystander scan did not recognize) is still named by what it really is.
+    """
+    protected: list[_ProtectedPath] = []
+    if resolved.kind == "manifest":
+        protected.append(_ProtectedPath(resolved.path, "the manifest this run reads"))
+    planned: set[str] = set()
+    # Names, not paths: a target is a bare filename inside *folder*, and it is
+    # kept aside so the files that really exist are described first.
+    target_names: list[str] = []
+    for entry in plan["entries"]:
+        planned.add(os.path.normpath(os.path.abspath(entry["path"])))
+        protected.append(_ProtectedPath(entry["path"], "a photo this run would rename"))
+        for companion in entry.get("companions") or ():
+            protected.append(
+                _ProtectedPath(companion["path"], "a companion file this run would rename")
+            )
+            target_names.append(companion["target"])
+        # None for a group the planner could not render, which names nothing.
+        if entry["target"]:
+            target_names.append(entry["target"])
+    protected.extend(
+        _ProtectedPath(record["path"], "a file this run leaves behind")
+        for record in plan["left_behind"]
+    )
+    protected.extend(
+        _ProtectedPath(path, "a photo in this folder this run did not plan")
+        for path in disk_files
+        if os.path.splitext(path)[1].lower() in utils.VALID_EXTS
+        and os.path.normpath(os.path.abspath(path)) not in planned
+    )
+    protected.extend(
+        _ProtectedPath(path, "a rename journal --rename-undo would read")
+        # Private only because nothing outside rename_apply had asked before;
+        # latest_journal, the public one, answers for a single journal and
+        # every one of them is an undo record this run must not overwrite.
+        for path in rename_apply._journal_candidates(folder)
+    )
+    protected.extend(
+        _ProtectedPath(
+            os.path.join(folder, name), "a path this run would rename a file to"
+        )
+        for name in target_names
+    )
+    return protected
+
+
 def _write_rename_changeset_records(changeset_path: str, plan: dict[str, Any]) -> None:
     """Write one ``kind: rename`` record per changed entry (section 6.3).
 
@@ -2153,22 +2401,12 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
             )
         )
 
-    changeset_path: str | None = None
-    if changeset_requested and not args.dry_run:
-        changeset_path = _derive_changeset_path(resolved, None)
-    if (
-        args.plan_out
-        and changeset_path
-        and os.path.normpath(os.path.abspath(args.plan_out))
-        == os.path.normpath(os.path.abspath(changeset_path))
-    ):
-        _exit_with_usage_error(
-            *cli_messages.rename_plan_out_aliases_changeset(args.plan_out, changeset_path)
-        )
-    if changeset_path:
-        _preflight_output_file(changeset_path, role="--changeset output")
-    if args.plan_out and not args.dry_run:
-        _preflight_output_file(args.plan_out, role="--plan-out")
+    # Derived under --dry-run too. Where the changeset would go is a fact
+    # about the invocation, not about whether this one writes it, and a
+    # --plan-out landing on it is the same usage error either way -- leaving
+    # the path unknown only made the dry run the weaker rehearsal. The two
+    # write sites below are what keep --dry-run from writing one.
+    changeset_path = _derive_changeset_path(resolved, None) if changeset_requested else None
 
     if _template_uses_date(args.rename):
         ecfg = _resolve_exiftool_config(args)
@@ -2189,6 +2427,34 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         photokin_version=_photokin_version(),
         disk_file_stats={path: _stat_for_rename(path) for path in disk_files},
     )
+
+    # Every destination this run has, checked here: the plan is the first
+    # point the run knows what it touches, and nothing has been written yet
+    # (--plan-out is the first write, below). --dry-run is deliberately not
+    # exempt, for either half -- a dry run exists to answer "what would this
+    # command do", and "it would destroy the only copy of box3_017.pdf" is
+    # the most important answer it could give.
+    _preflight_destinations_are_distinct(
+        [
+            (role, path)
+            for role, path in (
+                ("--plan-out", args.plan_out),
+                ("--changeset output", changeset_path),
+                (
+                    "the rename journal",
+                    rename_apply.journal_path_for(folder, plan["run_id"])
+                    if apply_requested
+                    else None,
+                ),
+            )
+            if path
+        ]
+    )
+    protected = _rename_protected_paths(resolved, folder, plan, disk_files)
+    if changeset_path:
+        _preflight_output_file(changeset_path, role="--changeset output", protects=protected)
+    if args.plan_out:
+        _preflight_output_file(args.plan_out, role="--plan-out", protects=protected)
 
     logger.info("%s", cli_messages.render_rename_preview(plan))
 
@@ -2213,7 +2479,7 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
     if not apply_requested:
         # --changeset true without -w records the plan as proposed and stops.
         # Nothing follows that could contradict it, so it is written here.
-        if changeset_path:
+        if changeset_path and not args.dry_run:
             _write_rename_changeset_records(changeset_path, plan)
         return
 
@@ -2243,7 +2509,7 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         # record saying it does. The journal is the record for those runs.
         sys.exit(report.exit_code)
 
-    if changeset_path:
+    if changeset_path and not args.dry_run:
         _write_rename_changeset_records(changeset_path, plan)
 
 
@@ -2833,6 +3099,41 @@ def main() -> None:
         if out_path and not out_path.lower().endswith((".ndjson", ".json")):
             _exit_with_usage_error(*cli_messages.output_file_extension(out_path))
 
+        # Every destination is checked here, against what is already at it and
+        # against each other, because this is the last point above
+        # ``--log-file``'s attach -- and that handler truncates on open, so a
+        # check any lower cannot save the file the log lands on. It is also
+        # above the model call, above --generate-manifest's own write, and
+        # above the first truncating open of the results file, which is what
+        # the writability half was always here for.
+        changeset_path = (
+            _derive_changeset_path(resolved, out_path) if changeset_requested else None
+        )
+        _preflight_destinations_are_distinct(
+            [
+                (role, path)
+                for role, path in (
+                    ("--log-file", args.log_file),
+                    ("--output-file", out_path),
+                    ("--generate-manifest", args.generate_manifest),
+                    ("--changeset output", changeset_path),
+                )
+                if path
+            ]
+        )
+        protected = _analysis_protected_paths(resolved, loaded_manifest, args)
+        if args.log_file:
+            _preflight_output_file(
+                args.log_file,
+                role="--log-file",
+                protects=protected,
+                creates_its_parent=True,
+            )
+        if out_path:
+            _preflight_output_file(out_path, protects=protected)
+        if changeset_path:
+            _preflight_output_file(changeset_path, role="--changeset output", protects=protected)
+
         # After the flag guards above (a wrong flag is wrong whatever the
         # provider) and skipped for --generate-manifest, which never calls a
         # model and so has no business demanding a provider choice.
@@ -2913,16 +3214,29 @@ def main() -> None:
             # default rather than assuming the invariant across the call.
             debug_dir = cfg.debug_dump_dir or os.path.join(os.getcwd(), "debug")
             args.log_file = os.path.join(debug_dir, f"{args.batch_id or 'run'}.log")
+            # -v's default path is derived, but from two things the user
+            # chose (--debug-dump-dir and --batch-id), so it reaches the same
+            # seam as the explicit flag rather than being trusted for being
+            # derived. Checked immediately above its own attach, which
+            # truncates.
+            _preflight_destinations_are_distinct(
+                [
+                    (role, path)
+                    for role, path in (
+                        ("-v's log file", args.log_file),
+                        ("--output-file", out_path),
+                        ("--changeset output", changeset_path),
+                    )
+                    if path
+                ]
+            )
+            _preflight_output_file(
+                args.log_file,
+                role="-v's log file",
+                protects=protected,
+                creates_its_parent=True,
+            )
             _attach_log_file_handler(args.log_file)
-
-        # Every destination is validated before the first truncating open:
-        # those opens destroy the previous run's artifacts, so a later abort
-        # would take the changeset with it.
-        changeset_path = _derive_changeset_path(resolved, out_path) if changeset_requested else None
-        if out_path:
-            _preflight_output_file(out_path)
-        if changeset_path:
-            _preflight_output_file(changeset_path, role="--changeset output")
 
         if loaded_manifest is not None:
             manifest_doc = loaded_manifest

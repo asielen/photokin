@@ -94,6 +94,21 @@ A wrapper feeds `--rename` its own manifest, in the shape folder mode's
 (or in addition, when `--plan-out` is also given); the JSON is the contract,
 the table is a convenience for a human running the CLI directly.
 
+**`PATH` is refused (exit 2, before the file is opened) if it names a file
+this run depends on** -- any image or companion in `entries`, any
+`left_behind` file, a bystander image the folder holds that the manifest did
+not list, the input manifest itself, an existing rename journal in the
+folder, a name this run is about to rename a file *to*, or the path the
+changeset would also be written to. Matching is filesystem identity, not
+string equality: a symlink, a hard link, or a `..` detour onto one of those
+files is refused exactly as the direct spelling is. This holds for a bare
+preview run (no `-w` needed) and under `--dry-run`; a wrapper building its
+own plan file should apply the same check against its own destination rather
+than assume `PATH` is safe merely because it differs textually from every
+path the plan names. See `docs/rename-mode.md` section 7 for the full rule,
+which is one guard shared with the changeset destination and every other
+destination photokin writes, not something specific to this file.
+
 ```json
 {
   "schema_version": 1,

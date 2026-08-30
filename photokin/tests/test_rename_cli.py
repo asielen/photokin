@@ -597,6 +597,101 @@ class TestPlanOutAliasedWithChangesetIsRefused(_CliTestCase):
         self.assertTrue(os.path.isfile(changeset_path))
 
 
+class TestPlanOutOntoARenameSourceIsRefused(_CliTestCase):
+    """P1: the plan write is an ``os.replace`` over its destination, so a
+    ``--plan-out`` that names one of the run's own images or companions
+    replaces that file's contents with the plan JSON. It takes no ``-w`` --
+    a bare preview run, documented as touching nothing, is enough -- and the
+    ``-w`` run that follows then refuses on a stale plan without ever saying
+    the file is gone.
+    """
+
+    _COMPANION_BYTES = b'{"caption": "the only copy of this text"}'
+
+    def _folder_with_a_companion(self) -> tuple[str, str, str]:
+        """Return ``(folder, image, companion)`` for a one-image, one-sidecar folder."""
+        folder = self.make_folder("box3_017.jpg")
+        image = os.path.join(folder, "box3_017.jpg")
+        companion = _write_bytes(os.path.join(folder, "box3_017.json"), self._COMPANION_BYTES)
+        return folder, image, companion
+
+    def _read(self, path: str) -> bytes:
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def test_plan_out_onto_a_planned_companion_is_refused(self) -> None:
+        folder, _image, companion = self._folder_with_a_companion()
+
+        code, stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", companion]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("would rename", stderr)
+        self.assertIn(companion, stderr)
+        self.assertEqual(self._read(companion), self._COMPANION_BYTES)
+        self.assertEqual(stdout, "")
+
+    def test_plan_out_onto_a_planned_image_is_refused(self) -> None:
+        folder, image, _companion = self._folder_with_a_companion()
+        before = self._read(image)
+
+        code, stdout, stderr = self.run_cli([folder, "--rename", "bw", "--plan-out", image])
+
+        self.assertEqual(code, 2)
+        self.assertIn("would rename", stderr)
+        self.assertEqual(self._read(image), before)
+        self.assertEqual(stdout, "")
+
+    def test_plan_out_spelled_through_a_subfolder_hop_is_refused(self) -> None:
+        """The same file, reached by a path no string comparison would match."""
+        folder, _image, companion = self._folder_with_a_companion()
+        os.mkdir(os.path.join(folder, "sub"))
+        detour = os.path.join(folder, "sub", os.pardir, "box3_017.json")
+
+        code, _stdout, stderr = self.run_cli([folder, "--rename", "bw", "--plan-out", detour])
+
+        self.assertEqual(code, 2)
+        self.assertIn("would rename", stderr)
+        # Both spellings are named: the one given, and the file it turned out to be.
+        self.assertIn(detour, stderr)
+        self.assertIn(companion, stderr)
+        self.assertEqual(self._read(companion), self._COMPANION_BYTES)
+
+    def test_plan_out_through_a_hard_link_to_a_source_is_refused(self) -> None:
+        """Filesystem identity, not spelling: a link in another directory
+        shares no part of its path with the companion it names."""
+        folder, _image, companion = self._folder_with_a_companion()
+        alias = os.path.join(self.scratch(), "plan.json")
+        try:
+            os.link(companion, alias)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"hard links unavailable here: {exc}")
+
+        code, _stdout, stderr = self.run_cli([folder, "--rename", "bw", "--plan-out", alias])
+
+        self.assertEqual(code, 2)
+        self.assertIn("would rename", stderr)
+        self.assertIn(companion, stderr)
+        self.assertEqual(self._read(companion), self._COMPANION_BYTES)
+
+    def test_plan_out_at_a_new_path_still_writes_the_plan(self) -> None:
+        """The control: refusing a source must not refuse an ordinary
+        destination, including one inside the folder being renamed."""
+        folder, _image, companion = self._folder_with_a_companion()
+        plan_path = os.path.join(folder, "rename-plan.json")
+
+        code, _stdout, _stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", plan_path]
+        )
+
+        self.assertIsNone(code)
+        with open(plan_path, encoding="utf-8") as handle:
+            written = json.load(handle)
+        self.assertEqual(written["entries"][0]["target"], "bw-001.jpg")
+        self.assertEqual(self._read(companion), self._COMPANION_BYTES)
+
+
 def _write_transcript(path: str, source_file: str) -> None:
     """Write a minimal ``.md`` transcript sidecar naming *source_file*."""
     with open(path, "w", encoding="utf-8") as handle:
@@ -714,6 +809,191 @@ class TestNoJournalFoundWording(unittest.TestCase):
             "no in-progress or needs-attention rename journal was found in:", problem
         )
         self.assertNotIn("no an in-progress", problem)
+
+
+
+class TestNoDestinationLandsOnAFileTheRunNeeds(_CliTestCase):
+    """One rule for every rename-mode destination: a file the run reads,
+    renames, leaves behind or would recover from is never a legal place to
+    write to.
+
+    Six review rounds each patched one instance of the same defect -- a write
+    that never asked what was already at its destination. These are the
+    instances the per-flag patches did not cover; they belong to one guard,
+    so they are asserted as one family.
+    """
+
+    _VICTIM = b"THE ONLY COPY OF THIS FILE"
+
+    def _read(self, path: str) -> bytes:
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def test_plan_out_onto_a_left_behind_file_is_refused(self) -> None:
+        """A file the run reports as left behind is still a file it depends on."""
+        folder = self.make_folder("box3_017.jpg")
+        victim = _write_bytes(os.path.join(folder, "box3_017.pdf"), self._VICTIM)
+
+        code, stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", victim]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("leaves behind", stderr)
+        self.assertIn(victim, stderr)
+        self.assertEqual(self._read(victim), self._VICTIM)
+        self.assertEqual(stdout, "")
+
+    def test_plan_out_onto_a_left_behind_file_is_refused_under_dry_run(self) -> None:
+        """--dry-run answers "what would this command do", so it must say this."""
+        folder = self.make_folder("box3_017.jpg")
+        victim = _write_bytes(os.path.join(folder, "box3_017.pdf"), self._VICTIM)
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", victim, "--dry-run"]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("leaves behind", stderr)
+        self.assertEqual(self._read(victim), self._VICTIM)
+
+    def test_plan_out_onto_an_unplanned_photo_is_refused(self) -> None:
+        """A photo the manifest never listed is not in the plan's entries, so
+        only a check that looks at the folder can see it."""
+        folder = self.make_folder("box3_017.jpg", "box3_099.jpg")
+        bystander = _write_bytes(os.path.join(folder, "box3_099.jpg"), self._VICTIM)
+        manifest = _write_manifest(folder, [{"path": os.path.join(folder, "box3_017.jpg")}])
+
+        code, _stdout, stderr = self.run_cli(
+            [manifest, "--rename", "bw", "--plan-out", bystander]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("did not plan", stderr)
+        self.assertEqual(self._read(bystander), self._VICTIM)
+
+    def test_plan_out_onto_an_existing_journal_is_refused(self) -> None:
+        """The journal is the undo record for the last rename of this folder."""
+        folder = self.make_folder("box3_017.jpg")
+        journal = _write_bytes(
+            rename_apply.journal_path_for(folder, "2020-01-01T00:00:00Z_abcd1234"),
+            self._VICTIM,
+        )
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", journal]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--rename-undo", stderr)
+        self.assertEqual(self._read(journal), self._VICTIM)
+
+    def test_plan_out_onto_the_input_manifest_is_refused(self) -> None:
+        """The manifest is the run's own input; the plan write would replace it."""
+        folder = self.make_folder("box3_017.jpg")
+        manifest = _write_manifest(folder, [{"path": os.path.join(folder, "box3_017.jpg")}])
+        before = self._read(manifest)
+
+        code, _stdout, stderr = self.run_cli(
+            [manifest, "--rename", "bw", "--plan-out", manifest]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("reads", stderr)
+        self.assertEqual(self._read(manifest), before)
+
+    def test_plan_out_onto_a_name_the_run_renames_to_is_refused(self) -> None:
+        """A target is a destination of this run too, and the apply would
+        otherwise die on it long after the plan file was written."""
+        folder = self.make_folder("box3_017.jpg")
+        _write_bytes(os.path.join(folder, "box3_017.json"), self._VICTIM)
+        target = os.path.join(folder, "bw-001.json")
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", target]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("would rename a file to", stderr)
+        self.assertFalse(os.path.exists(target))
+
+    def test_plan_out_spelled_differently_from_the_changeset_is_refused(self) -> None:
+        """The dest-vs-dest check matched two strings, so a case-variant
+        spelling of the same destination went through and the plan was
+        overwritten by the changeset that followed it."""
+        folder = self.make_folder("box3_017.jpg")
+        changeset_name = f"{os.path.basename(folder)}_changeset.ndjson"
+        shouted = os.path.join(folder, changeset_name.upper())
+
+        code, stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--changeset", "true", "--plan-out", shouted]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("same file", stderr)
+        self.assertFalse(os.path.exists(shouted))
+        self.assertFalse(os.path.exists(os.path.join(folder, changeset_name)))
+        self.assertEqual(stdout, "")
+
+    def test_dry_run_still_refuses_a_plan_out_in_a_missing_directory(self) -> None:
+        """The writability probe is not --dry-run exempt either: one seam,
+        one behavior, and the other two modes already worked this way."""
+        folder = self.make_folder("box3_017.jpg")
+        missing = os.path.join(folder, "no-such-dir", "plan.json")
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", missing, "--dry-run"]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--plan-out", stderr)
+
+    def test_the_refusal_names_where_the_victim_actually_is(self) -> None:
+        """The message has to name a location the user can act on.
+
+        A companion's, a left-behind file's and a target's path are all built
+        by joining the *folder as the user spelled it*, so a run given a
+        relative folder carries relative paths through the plan. Printed raw
+        beside a destination the user spelled some other way, the two lines
+        name one file with two strings that match nothing and resolve against
+        a working directory the message never states -- so the user is told a
+        file is at risk without being told which one.
+        """
+        folder = self.make_folder("box3_017.jpg")
+        companion = _write_bytes(os.path.join(folder, "box3_017.json"), self._VICTIM)
+        os.mkdir(os.path.join(folder, "sub"))
+        detour = os.path.join(folder, "sub", os.pardir, "box3_017.json")
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(os.path.dirname(folder))
+
+        code, _stdout, stderr = self.run_cli(
+            [os.path.basename(folder), "--rename", "bw", "--plan-out", detour]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn(companion, stderr)
+        self.assertEqual(self._read(companion), self._VICTIM)
+
+    def test_an_ordinary_destination_beside_the_run_still_writes(self) -> None:
+        """The control: a new file, inside the folder being renamed, with a
+        left-behind file and a journal both sitting next to it."""
+        folder = self.make_folder("box3_017.jpg")
+        _write_bytes(os.path.join(folder, "box3_017.pdf"), self._VICTIM)
+        _write_bytes(
+            rename_apply.journal_path_for(folder, "2020-01-01T00:00:00Z_abcd1234"),
+            self._VICTIM,
+        )
+        plan_path = os.path.join(folder, "rename-plan.json")
+
+        code, _stdout, _stderr = self.run_cli(
+            [folder, "--rename", "bw", "--changeset", "true", "--plan-out", plan_path]
+        )
+
+        self.assertIsNone(code)
+        with open(plan_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["entries"][0]["target"], "bw-001.jpg")
+        self.assertTrue(os.path.isfile(_changeset_path(folder)))
 
 
 if __name__ == "__main__":

@@ -1172,27 +1172,87 @@ def rename_managed_by_refuses_write(app: str | None, catalog: str | None) -> Usa
     )
 
 
-def rename_plan_out_aliases_changeset(plan_out: str, changeset_path: str) -> UsageMessage:
-    """``--plan-out`` names the same file the run's own changeset would be written to.
+def output_file_is_needed_by_the_run(
+    role: str, out_path: str, needed_path: str, description: str
+) -> UsageMessage:
+    """A destination names a file the run reads, renames, or writes elsewhere.
 
-    Written before either file is opened, so whichever write would have run
-    second never gets the chance to silently clobber the first.
+    Every destination this CLI writes -- ``--output-file``, ``--plan-out``,
+    ``--log-file``, ``--generate-manifest``, the changeset -- lands with a
+    truncating open or an ``os.replace``, and both take the destination
+    whatever it already held. Pointing one at a file the run itself depends
+    on therefore destroys that file's only copy, and none of it needs ``-w``:
+    a preview run, or a ``--dry-run``, is enough.
+
+    Both halves are named, because either one alone leaves the user guessing:
+    the destination they typed, and what the file at it turned out to be.
+    *description* is that second half in words -- "a photo this run would
+    rename", "the manifest this run reads" -- so the answer is never merely
+    that two paths clashed.
 
     Args:
-        plan_out: The ``--plan-out`` value, as given.
-        changeset_path: Where ``--changeset true`` (which ``-w`` implies)
-            would write, derived from the input the same way it always is.
+        role: The flag the destination came from, quoted back to the user.
+        out_path: The destination, spelled as the flag carried it.
+        needed_path: Where that file actually is, already resolved to an
+            absolute path by the caller. Shown on a second line only when the
+            user's own spelling differs from it, so naming the file outright
+            prints one line and any other route -- a relative path, a ``..``
+            detour, a hard link -- prints the resolution the guard performed.
+        description: What that file is to this run, as a noun phrase.
 
     Returns:
         The problem line and the remedy line, in that order.
     """
+    lead = f"{role} names {description}, and would overwrite it:"
+    remedy = f"point {role} at a file this run does not touch"
+    if out_path == needed_path:
+        return (f"{lead}\n  {out_path}", remedy)
+    width = max(len(role), len("that file")) + 2
     return (
         (
-            "`--plan-out` and the changeset this run would also write are the same file:\n"
-            f"  --plan-out:  {plan_out}\n"
-            f"  changeset:   {changeset_path}"
+            f"{lead}\n"
+            f"  {role + ':':<{width}} {out_path}\n"
+            f"  {'that file:':<{width}} {needed_path}"
         ),
-        "point --plan-out somewhere else, or pass --changeset false to skip the changeset",
+        remedy,
+    )
+
+
+def output_destinations_alias(
+    role_a: str, path_a: str, role_b: str, path_b: str
+) -> UsageMessage:
+    """Two of one run's own destinations name the same file.
+
+    Whichever write ran second would silently overwrite the first's output --
+    the plan replaced by the changeset that follows it, the log interleaved
+    into the results stream. Reported before either file is opened, so
+    neither is created.
+
+    The caller orders the pair with the destination easiest to move first,
+    since that is the one the remedy names.
+
+    Args:
+        role_a: How the first destination is named to the user.
+        path_a: Where it points, as spelled.
+        role_b: How the second is named.
+        path_b: Where it points, as spelled. Shown on its own line only when
+            the two spellings differ, which they may while naming one file.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    lead = f"{role_a} and {role_b} are the same file:"
+    remedy = f"point {role_a} at its own file, separate from {role_b}"
+    if path_a == path_b:
+        return (f"{lead}\n  {path_a}", remedy)
+    width = max(len(role_a), len(role_b)) + 2
+    return (
+        (
+            f"{lead}\n"
+            f"  {role_a + ':':<{width}} {path_a}\n"
+            f"  {role_b + ':':<{width}} {path_b}"
+        ),
+        remedy,
     )
 
 

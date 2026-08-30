@@ -1977,5 +1977,149 @@ class TestTheCombinedShortFlagIsTheDocumentedNormalRun(_CliTestCase):
         self.assertNotEqual(changeset_row, idle_changeset)
 
 
+
+class TestNoDestinationLandsOnAFileTheRunNeeds(_CliTestCase):
+    """Every destination is checked against what is already at it, in analysis
+    mode too.
+
+    ``--output-file`` was checked against nothing at all, and ``--log-file``
+    never reached the destination pre-flight in the first place: it truncates
+    on open, above every check below it, so it could empty an input photo
+    under ``--dry-run`` and exit 0. Both are the same missing question, so
+    both are asserted together.
+    """
+
+    _VICTIM = b"THE ONLY COPY OF THIS FILE"
+
+    def _read(self, path: str) -> bytes:
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def test_log_file_onto_an_input_photo_is_refused(self) -> None:
+        """The worst of the family: a photo, emptied by a --dry-run preview."""
+        folder = self.make_folder("box3_017.jpg")
+        photo = _write_bytes(os.path.join(folder, "box3_017.jpg"), self._VICTIM)
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--dry-run", "--log-file", photo]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--log-file", stderr)
+        self.assertEqual(self._read(photo), self._VICTIM)
+
+    def test_log_file_onto_an_input_photo_spelled_differently_is_refused(self) -> None:
+        """The same file, reached by a path no string comparison would match."""
+        folder = self.make_folder("box3_017.jpg")
+        photo = _write_bytes(os.path.join(folder, "box3_017.jpg"), self._VICTIM)
+        os.mkdir(os.path.join(folder, "sub"))
+        detour = os.path.join(folder, "sub", os.pardir, "box3_017.jpg")
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--dry-run", "--log-file", detour]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn(photo, stderr)
+        self.assertEqual(self._read(photo), self._VICTIM)
+
+    def test_log_file_onto_a_transcript_the_run_would_write_is_refused(self) -> None:
+        """--sidecar-md's own destination is a file this run depends on."""
+        folder = self.make_folder("box3_017.jpg")
+        transcript = _write_bytes(os.path.join(folder, "box3_017.md"), self._VICTIM)
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--sidecar-md", "all", "--dry-run", "--log-file", transcript]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--sidecar-md", stderr)
+        self.assertEqual(self._read(transcript), self._VICTIM)
+
+    def test_log_file_and_output_file_at_the_same_path_are_refused(self) -> None:
+        """Two destinations of one run, interleaving log lines into the results."""
+        out_path = os.path.join(self.scratch(), "results.ndjson")
+        folder = self.make_folder("box3_017.jpg")
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--dry-run", "--output-file", out_path, "--log-file", out_path]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("same file", stderr)
+
+    def test_output_file_onto_the_input_manifest_is_refused(self) -> None:
+        """A ``.json`` manifest in, the same ``.json`` out: the aggregate write
+        replaces the very document the run was given."""
+        folder = self.make_folder("box3_017.jpg")
+        manifest = _write_manifest(folder, [{"path": os.path.join(folder, "box3_017.jpg")}])
+        before = self._read(manifest)
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli(
+                [manifest, "--output-file", manifest]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("reads", stderr)
+        self.assertEqual(self._read(manifest), before)
+
+    def test_output_file_onto_a_sidecar_the_run_would_write_is_refused(self) -> None:
+        """--output-sidecars derives ``<stem>.json`` beside the image, which is
+        exactly the path --output-file is allowed to name."""
+        folder = self.make_folder("box3_017.jpg")
+        sidecar = _write_bytes(os.path.join(folder, "box3_017.json"), self._VICTIM)
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--output-sidecars", "--output-file", sidecar]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--output-sidecars", stderr)
+        self.assertEqual(self._read(sidecar), self._VICTIM)
+
+    def test_generate_manifest_onto_the_meta_file_is_refused(self) -> None:
+        """--generate-manifest overwrote the metadata document it was told to read."""
+        folder = self.make_folder("box3_017.jpg")
+        image = os.path.join(folder, "box3_017.jpg")
+        meta = _write_bytes(os.path.join(folder, "meta.json"), b'{"title": "keep me"}')
+
+        code, _stdout, stderr = self.run_cli(
+            [image, "--generate-manifest", meta, "--meta", meta]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--meta", stderr)
+        self.assertEqual(self._read(meta), b'{"title": "keep me"}')
+
+    def test_output_file_onto_the_photo_context_file_is_refused(self) -> None:
+        """Every read-only path the run was handed is protected, not just photos."""
+        folder = self.make_folder("box3_017.jpg")
+        context = _write_bytes(os.path.join(folder, "context.json"), self._VICTIM)
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--photo-context-file", context, "--output-file", context]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--photo-context-file", stderr)
+        self.assertEqual(self._read(context), self._VICTIM)
+
+    def test_an_ordinary_destination_still_runs(self) -> None:
+        """The control: a new results file beside the photos is still written."""
+        folder = self.make_folder("box3_017.jpg")
+        out_path = os.path.join(folder, "results.json")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--sidecar-md", "all", "--output-file", out_path]
+            )
+
+        self.assertIsNone(code, stderr)
+        self.assertTrue(os.path.isfile(out_path))
+
+
 if __name__ == "__main__":
     unittest.main()

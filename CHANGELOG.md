@@ -44,6 +44,56 @@ All notable changes to this project are documented here, in the style of
   `docs/rename-contract.md` for the plan and changeset shapes a wrapper
   reads.
 
+### Changed
+
+- **`--rename --dry-run --plan-out PATH` now exits 2 when `PATH` cannot be
+  written**, instead of exiting 0 and printing the plan. The dry run used to
+  skip that check on the grounds that it writes nothing, which made it a
+  weaker rehearsal than the command it stands in for -- `--output-file` and
+  `--generate-manifest` have always been checked under `--dry-run`, and
+  `--plan-out` now matches them. A dry run that passes is now evidence that
+  the real run's destinations are usable.
+- **A destination that differs from a file the run needs only by letter case
+  is now refused even on a case-sensitive filesystem.** The guard asks
+  `utils.paths_are_same_file`, which can only fall back to a case-folded
+  comparison when one of the two paths does not exist yet -- and a
+  destination that has not been created is the ordinary case. So on Linux,
+  `--plan-out scans/BOX3_017.JSON` beside an existing `scans/box3_017.json`
+  is now a usage error although those really are two different files there.
+  Refusing a contrived spelling is the side to err on when the alternative is
+  destroying a file's only copy; spell the destination as something that is
+  not a case-variant of a file the run touches.
+
+### Fixed
+
+- **No destination photokin writes may be a file the run depends on, in any
+  mode.** Six review rounds each closed one instance of the same defect — a
+  write that never asked what was already at its destination — as a one-off
+  patch. There is now one guard, asked at the one seam every user-supplied
+  destination already passes through: `--plan-out` and the rename changeset
+  are checked against every photo and companion the run would rename, a file
+  it reports left behind, an earlier run's journal, the input manifest, and
+  the names it is about to rename onto; `--output-file`, `--generate-manifest`
+  and `--log-file` are checked against the input manifest, `--meta`,
+  `--photo-context-file`, an `--output-sidecars` destination and a
+  `--sidecar-md` transcript; and two of a run's own destinations landing on
+  each other is refused the same way. Matching is filesystem identity, not
+  string equality, so a relative path, a `..` detour, a symlink or a hard
+  link onto one of those files is caught too. Attempting it is a usage error
+  (exit 2) naming both the destination and what it is, whether or not `-w`
+  was given and under `--dry-run` alike — previously, `--log-file` reached no
+  such check at all and could empty an input photo under a `--dry-run`
+  preview that exited 0. The seam covers the `photokin` command only:
+  `python -m photokin.exiftool.apply --output PATH` reaches a different
+  `main()` in a different module and is deliberately not guarded, so
+  `--changeset c.ndjson --output c.ndjson` there still truncates its own
+  input.
+- **`--rename-undo`/`--rename-resume JOURNAL` resolve a symlinked journal
+  before reading it**, so a journal reached through a link is read, appended
+  to, and operated on at the folder it really describes rather than the
+  folder holding the link — previously, pointing one at a link left its
+  bookkeeping and its file moves on two different folders.
+
 ## [0.5.0]
 
 ### Changed

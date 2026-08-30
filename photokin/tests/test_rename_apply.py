@@ -2040,6 +2040,105 @@ def test_the_sidecar_swap_lands_on_the_file_a_link_points_at(
     assert swaps[0][1] == str(target)
 
 
+def _applied_and_mirrored(tmp_path: Path) -> tuple[Path, str, Path]:
+    """Rename one folder, then build a second one holding the same name.
+
+    The mirror is what an undo aimed at the wrong folder renames instead: it
+    carries the applied name over different bytes, and has no journal of its
+    own to be run from.
+
+    Returns:
+        The renamed folder, its journal's path, and the mirror folder.
+    """
+    folder = tmp_path / "archive"
+    folder.mkdir()
+    image = _write(folder / "file102.tif", "the archive's own bytes")
+    report = apply_plan(_plan(folder, [_entry(image, "newname-001.tif")]))
+    assert report.status == rename_apply.STATUS_APPLIED
+    assert report.journal_path is not None
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    _write(mirror / "newname-001.tif", "the mirror's own bytes")
+    return folder, report.journal_path, mirror
+
+
+def _assert_the_archive_was_undone(folder: Path, journal_path: str, mirror: Path) -> None:
+    """The archive is back at its old name, the mirror was never touched."""
+    assert _names(folder) == {"file102.tif"}
+    assert (folder / "file102.tif").read_text(encoding="utf-8") == "the archive's own bytes"
+    assert _names(mirror) == {"newname-001.tif"}
+    assert (mirror / "newname-001.tif").read_text(encoding="utf-8") == "the mirror's own bytes"
+    assert _records(journal_path)[-1]["status"] == rename_apply.STATUS_UNDONE
+
+
+def test_a_journal_reached_through_a_link_reports_the_folder_it_really_sits_in(
+    tmp_path: Path,
+) -> None:
+    """Where a journal really is decides which folder its records are about.
+
+    The folder is derived from the journal's own path and the footer is
+    appended to that same path, so a link left those two ends in different
+    folders: the records read and written through the link belong to the real
+    journal's folder, while the run would move files in the link's.
+    """
+    folder, journal_path, mirror = _applied_and_mirrored(tmp_path)
+    link = mirror / os.path.basename(journal_path)
+    _symlink_or_skip(link, Path(journal_path))
+
+    journal = read_journal(str(link))
+
+    assert journal.path == os.path.realpath(journal_path)
+    assert journal.folder == os.path.realpath(folder)
+
+
+def test_undo_through_a_linked_journal_reverses_the_folder_the_records_describe(
+    tmp_path: Path,
+) -> None:
+    """The damage the resolution above prevents, end to end.
+
+    Run against the link's own folder, the undo renames the mirror's files and
+    appends ``undone`` to the archive's journal -- leaving the archive at its
+    new names with its account of itself closed, so the one recovery it had is
+    permanently spent on a folder it never touched.
+    """
+    folder, journal_path, mirror = _applied_and_mirrored(tmp_path)
+    link = mirror / os.path.basename(journal_path)
+    _symlink_or_skip(link, Path(journal_path))
+
+    report = undo_run(str(link))
+
+    assert report.status == rename_apply.STATUS_UNDONE
+    assert report.journal_path == os.path.realpath(journal_path)
+    _assert_the_archive_was_undone(folder, journal_path, mirror)
+
+
+def test_a_journal_is_resolved_before_it_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same rule as the two tests above, on a runner that cannot link.
+
+    Only the resolution is stood in for. What is checked is that the whole run
+    hangs off it: the bytes are read from the resolved journal rather than
+    from the name it was reached by, the files that move are the resolved
+    journal's own, and the footer closes that same file.
+    """
+    folder, journal_path, mirror = _applied_and_mirrored(tmp_path)
+    stand_in = _write(mirror / os.path.basename(journal_path), "stands in for the link itself")
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(
+        os.path,
+        "realpath",
+        lambda path, **kwargs: journal_path if str(path) == str(stand_in) else real_realpath(path),
+    )
+
+    report = undo_run(str(stand_in))
+
+    assert report.status == rename_apply.STATUS_UNDONE
+    assert report.journal_path == journal_path
+    assert stand_in.read_text(encoding="utf-8") == "stands in for the link itself"
+    _assert_the_archive_was_undone(folder, journal_path, mirror)
+
+
 def test_a_sidecar_that_cannot_be_put_back_needs_attention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

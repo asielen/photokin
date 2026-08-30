@@ -23,7 +23,11 @@ itself sits in is the folder it describes -- which also means a journal stays
 valid when someone moves or renames the whole folder between the apply and the
 undo, and why a journal is looked for by its marker rather than by the folder
 name baked into it. The header's ``folder`` is provenance, not the address
-operations are resolved against.
+operations are resolved against. "Sits in" means where the file really is:
+:func:`read_journal` resolves the path it is handed, so a journal reached
+through a symlink is read, appended to, and *operated on* at the one end --
+never read through the link and closed there while the files move somewhere
+else.
 
 A segment says everything about itself that recovery needs, because recovery
 happens after the process that wrote it is gone: the format it is in, how many
@@ -310,8 +314,9 @@ class Journal:
     """A parsed journal file.
 
     Attributes:
-        path: The journal's own path.
-        folder: The folder it describes, which is the folder it sits in.
+        path: The journal's own path, with every link in it resolved.
+        folder: The folder it describes, which is the folder that resolved
+            path sits in.
         segments: Every run appended to it, oldest first. An undo or a resume
             appends rather than rewriting, so the file is append-only and a
             reader that stops early still sees a truthful prefix.
@@ -857,18 +862,29 @@ def read_journal(path: str) -> Journal:
     that each of those records names a file rather than a path (so a damaged or
     hand-edited journal cannot walk a rename out of the folder).
 
+    The path is resolved before anything is read off it, because where the
+    journal sits is how the folder it describes is derived (:class:`Journal`)
+    and the same path is what a footer is later appended to. Reached through a
+    symlink, those two ends come apart: the records are read and the footer
+    appended through the link, into the real journal in the folder its records
+    are about, while the run would move files in the link's own folder --
+    closing one folder's account of itself over another folder's work, and
+    permanently disabling the recovery of the folder that needed it. Resolving
+    keeps a deliberately linked journal working and keeps both ends on the
+    folder the records belong to.
+
     Args:
-        path: The journal file to read.
+        path: The journal file to read; a link to one is resolved first.
 
     Returns:
-        The parsed :class:`Journal`.
+        The parsed :class:`Journal`, keyed to the resolved path.
 
     Raises:
         RenamePreflightError: If the file cannot be read, if a complete record
             in it does not parse, if it is in a format this photokin does not
             read, or if a segment is short of the records it declares.
     """
-    path = os.path.abspath(path)
+    path = os.path.realpath(path)
     try:
         with open(path, "rb") as handle:
             raw = handle.read()

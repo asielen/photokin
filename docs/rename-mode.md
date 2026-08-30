@@ -289,6 +289,16 @@ place, and runs it through the same executor, appending `status: undone`.
 `needs_attention`, forward. While such a journal exists, a new `--rename -w`
 in that folder is refused until one of the two is run.
 
+A named `JOURNAL` is resolved (`os.path.realpath`) before anything is read
+off it, so a journal reached through a symlink is read, appended to, and
+operated on at the link's real location, not at the folder holding the link.
+Concretely: `--rename-undo B`, where `B` holds only a symlink to `A`'s
+journal, undoes the rename in `A` — the folder the journal's own records
+name — and appends `status: undone` to that same file in `A`; nothing in `B`
+is touched. Resolving first is what keeps a deliberately relocated or shared
+journal working while making it impossible for a journal reached through a
+link to close its account against the wrong folder's files.
+
 ### 5.5 Companions renamed by someone else
 
 `--rename-finish PLAN` is the executor with the images taken as already
@@ -393,6 +403,29 @@ precedent for a second one). `--exiftool-write true` beside `--rename` is a
 usage error, since rename mode writes no tags. `--dry-run` with `-w` prints
 what would be applied and stops. `--output-file` is refused, as it is beside
 `--generate-manifest`; `--plan-out` is the rename-mode equivalent.
+
+**No destination may be a file this run depends on.** Once the plan is built
+(right after 4.6's validation, before `--plan-out` or the changeset is ever
+opened), `--plan-out` and the changeset path `-w` would write are each checked
+against every file the run reads, renames, leaves behind, or would recover
+from: every entry's own path, every companion, every `left_behind` file,
+every image in the folder the manifest did not list (a bystander), every
+existing journal in the folder (`--rename-undo` would read one of them), the
+input manifest, and every filename the run is about to rename a file *to*.
+Matching is filesystem identity (`utils.paths_are_same_file`), not string
+equality, so a relative path, a `sub/..` detour, a symlink or a hard link to
+one of those files is caught exactly as the direct spelling is, and a
+case-variant spelling of another of the run's own destinations (`--plan-out`
+onto the changeset path, spelled in different case) is caught too. A match is
+a usage error, exit 2, naming both the destination and what it is
+("`--plan-out` names a photo this run would rename", "...the manifest this
+run reads", "...a rename journal `--rename-undo` would read"). None of this
+needs `-w`: a bare preview run is enough, because the write already happens
+during planning, and `--dry-run` is not exempt either — a `--dry-run -w`
+still refuses on the same terms, because "what would this command do" has to
+include "destroy this file" when that is the honest answer. The one thing
+`--dry-run` still controls is whether the changeset itself gets written once
+the checks pass; the writability probe on both destinations runs regardless.
 
 Mode options: `--digits N` (default 3), `--order name|natural`, `--undated
 LITERAL`, `--today YYYY-MM-DD`, `--companions EXT[,EXT]` extending the
