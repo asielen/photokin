@@ -1531,6 +1531,52 @@ def test_a_segment_short_of_the_records_it_declares_is_refused(
     assert _names(folder) == before
 
 
+def test_phase_a_is_durable_before_the_journal_says_it_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The folder is synced before the staged marker, not after.
+
+    The marker's soundness rests on the renames it describes already being on
+    the platter: a filesystem may make the marker's own fsync durable while
+    phase A's directory entries sit in cache, and a power cut there leaves a
+    journal claiming ``staged`` over files still at their sources. A resume
+    then reads the marker, deduces every move is already at its target, moves
+    nothing, and closes the run ``applied`` -- for a cycle, over contents that
+    were never swapped.
+    """
+    _folder, plan = _simple_folder(tmp_path)
+    order: list[str] = []
+    real_move = rename_apply._move_all
+    real_sync = rename_apply._fsync_directory
+    real_mark = rename_apply._mark_staged
+
+    def _move(folder: str, ops: Any, *, to_tmp: bool, done: list[Any]) -> None:
+        real_move(folder, ops, to_tmp=to_tmp, done=done)
+        if to_tmp and ops:
+            order.append("phase-a")
+
+    def _sync(path: str) -> None:
+        order.append("sync")
+        real_sync(path)
+
+    def _mark(path: str) -> None:
+        order.append("staged")
+        real_mark(path)
+
+    monkeypatch.setattr(rename_apply, "_move_all", _move)
+    monkeypatch.setattr(rename_apply, "_fsync_directory", _sync)
+    monkeypatch.setattr(rename_apply, "_mark_staged", _mark)
+
+    apply_plan(plan)
+
+    # The journal lives in the folder it describes, so its own write syncs the
+    # same directory before phase A even starts; the sync this test is about is
+    # the one *between* the last phase-A rename and the marker.
+    assert "phase-a" in order and "staged" in order
+    between = order[order.index("phase-a") + 1 : order.index("staged")]
+    assert "sync" in between, f"no directory sync between phase A and the marker: {order}"
+
+
 def test_a_segment_that_declares_no_count_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

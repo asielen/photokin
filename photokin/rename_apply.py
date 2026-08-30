@@ -1905,6 +1905,16 @@ def _execute(
     outcome: tuple[str, list[str], list[str]]
     try:
         _move_all(folder, pending_a, to_tmp=True, done=staged)
+        # Phase A's directory entries go to the platter BEFORE the journal says
+        # phase A finished, and the order is the whole point. A filesystem is
+        # free to make the marker's own fsync durable while the renames it
+        # describes are still in cache, so writing the marker first lets a
+        # power cut leave a journal claiming ``staged`` over files sitting at
+        # their sources. For a cycle that is silent and destructive: both names
+        # are on disk either way, so a resume reading the marker deduces every
+        # move is already at its target, moves nothing, and closes the run
+        # ``applied`` over contents that were never swapped.
+        _fsync_directory(folder)
         # Phase A is complete and durably said to be complete before phase B
         # moves anything, so that a crash inside phase B leaves a folder whose
         # state can be deduced rather than guessed at (:func:`_mark_staged`).
