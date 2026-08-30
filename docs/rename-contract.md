@@ -125,7 +125,9 @@ the table is a convenience for a human running the CLI directly.
       "companions": [
         {
           "path": "/Volumes/Archive/bag-woodbury/file105b-back.md",
-          "target": "520601-bag-woodbury-002b-back.md"
+          "target": "520601-bag-woodbury-002b-back.md",
+          "size": 412,
+          "mtime": 1719346204.0
         }
       ]
     }
@@ -180,7 +182,7 @@ the last three rows below.
 | `crop` | bool | Whether the name carries `-crop`. |
 | `changed` | bool | Whether `target` differs from the file's current basename. `false` for an already-clean file *and* for an unplannable entry (`target: null`) -- check `target is not None` first if you need to tell those apart. |
 | `notes` | array of string | Human-readable normalization notes for this one file, e.g. `"variant form normalized"`, `"part separator normalized"`, `"partial date"`. Same free-text caveat as the top-level `warnings`. |
-| `companions` | array | This entry's non-image files sharing its stem that are in the default or `--companions`-extended set: `{"path": str, "target": str}` (target is `target_stem + companion_ext`, filename only). Empty when the file has none. |
+| `companions` | array | This entry's non-image files sharing its stem that are in the default or `--companions`-extended set: `{"path": str, "target": str, "size": int \| null, "mtime": float \| null}` (target is `target_stem + companion_ext`, filename only). `size`/`mtime` are the same preflight fields the entry's own top-level `size`/`mtime` carry, read from disk when the plan was built -- the executor's preflight (`docs/rename-mode.md` 5.1) reads them off each companion exactly as it reads the image's, so a companion edited between planning and applying fails preflight too, not only a changed image. Empty when the file has none. |
 
 ### `errors`: non-empty means do not apply
 
@@ -249,5 +251,5 @@ the executor's own run report, logged to stderr and readable off
 | `would_apply` | 0 | `--dry-run` beside `-w`: preflight passed, nothing written. |
 | `nothing_to_do` | 0 | The run had nothing to change -- an already-clean plan, a `--rename-finish` whose companions were already in place, or an undo with nothing left to reverse. This is the plan's own answer to "already clean"; see [the note at the top of this file](#rename-contract-the-wire-contract). |
 | `rolled_back` | 1 | A failure was caught mid-run and every completed step was put back; the folder is exactly as it started. |
-| `needs_attention` | 1 | A rollback itself could not finish. The report's `stranded` list names the exact files left mid-move -- resolve those by hand, or by contacting whoever owns the folder, before touching it again. |
+| `needs_attention` | 1 | A rollback itself could not finish. The report's `stranded` list names the exact files left mid-move -- resolve those by hand, or by contacting whoever owns the folder, before touching it again. `stranded` can also name a `.md` transcript whose `source_file` line an otherwise-complete rollback could not rewrite back to the old name; the image and every other file are already restored, only that one line is stale. |
 

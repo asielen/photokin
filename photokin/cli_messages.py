@@ -1158,6 +1158,30 @@ def rename_managed_by_refuses_write(app: str, catalog: str | None) -> UsageMessa
     )
 
 
+def rename_plan_out_aliases_changeset(plan_out: str, changeset_path: str) -> UsageMessage:
+    """``--plan-out`` names the same file the run's own changeset would be written to.
+
+    Written before either file is opened, so whichever write would have run
+    second never gets the chance to silently clobber the first.
+
+    Args:
+        plan_out: The ``--plan-out`` value, as given.
+        changeset_path: Where ``--changeset true`` (which ``-w`` implies)
+            would write, derived from the input the same way it always is.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        (
+            "`--plan-out` and the changeset this run would also write are the same file:\n"
+            f"  --plan-out:  {plan_out}\n"
+            f"  changeset:   {changeset_path}"
+        ),
+        "point --plan-out somewhere else, or pass --changeset false to skip the changeset",
+    )
+
+
 def rename_digits_invalid(value: int) -> UsageMessage:
     """``--digits`` was given a value less than 1.
 

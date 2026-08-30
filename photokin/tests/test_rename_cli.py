@@ -423,6 +423,166 @@ class TestExecutorCommandsRefuseDryRun(_CliTestCase):
         self.assertEqual(_snapshot(folder), before)
 
 
+class TestDryRunDoesNotWritePlanOut(_CliTestCase):
+    """P2 round 4: ``--dry-run``'s global promise is that no destination is
+    touched -- the plan file ``--plan-out`` writes is a destination exactly
+    as much as the changeset already was, and must be skipped the same way."""
+
+    def test_dry_run_with_plan_out_writes_nothing(self) -> None:
+        folder = self.make_folder("box3_017.jpg")
+        plan_path = os.path.join(folder, "plan.json")
+
+        code, _stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", plan_path, "--dry-run"]
+        )
+
+        self.assertIsNone(code)
+        self.assertFalse(os.path.exists(plan_path))
+        self.assertIn("--dry-run", stderr)
+        self.assertIn("nothing was written", stderr)
+        # The preview itself is not a destination -- it still shows the plan.
+        self.assertIn("bw-001.jpg", stderr)
+
+    def test_without_dry_run_plan_out_still_writes(self) -> None:
+        folder = self.make_folder("box3_017.jpg")
+        plan_path = os.path.join(folder, "plan.json")
+
+        code, _stdout, _stderr = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", plan_path]
+        )
+
+        self.assertIsNone(code)
+        self.assertTrue(os.path.isfile(plan_path))
+
+
+class TestPlanOutAliasedWithChangesetIsRefused(_CliTestCase):
+    """P2 round 4: ``--plan-out`` and the run's own changeset destination
+    must not be allowed to name the same file -- whichever write ran second
+    would silently overwrite the other's output."""
+
+    def test_plan_out_matching_the_changeset_path_is_a_usage_error(self) -> None:
+        folder = self.make_folder("box3_017.jpg")
+        aliased_path = os.path.join(folder, f"{os.path.basename(folder)}_changeset.ndjson")
+
+        code, stdout, stderr = self.run_cli(
+            [folder, "--rename", "bw", "--changeset", "true", "--plan-out", aliased_path]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("same file", stderr)
+        self.assertFalse(os.path.exists(aliased_path))
+        self.assertEqual(stdout, "")
+
+    def test_plan_out_beside_the_changeset_still_works(self) -> None:
+        folder = self.make_folder("box3_017.jpg")
+        plan_path = os.path.join(folder, "plan.json")
+
+        code, _stdout, _stderr = self.run_cli(
+            [folder, "--rename", "bw", "--changeset", "true", "--plan-out", plan_path]
+        )
+
+        self.assertIsNone(code)
+        self.assertTrue(os.path.isfile(plan_path))
+        changeset_path = os.path.join(folder, f"{os.path.basename(folder)}_changeset.ndjson")
+        self.assertTrue(os.path.isfile(changeset_path))
+
+
+def _write_transcript(path: str, source_file: str) -> None:
+    """Write a minimal ``.md`` transcript sidecar naming *source_file*."""
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f'---\nsource_file: "{source_file}"\n---\ntranscript\n')
+
+
+class _PartialCatalogUndoCase(_CliTestCase):
+    """Shared setup: a catalog (``--rename-finish``) renames two images, each
+    with a transcript, then puts them back one at a time -- the shape a
+    ``--rename-undo`` of a ``--rename-finish`` journal (5.5) can only
+    partially finish until the second image comes home too."""
+
+    def _finish_two_images(self, folder: str) -> tuple[str, str]:
+        """Plan, then finish-rename two images a catalog has already moved.
+
+        Returns:
+            The two images' original basenames (``file102.tif``,
+            ``file105.tif``), left as a record of what a full undo restores.
+        """
+        first = os.path.join(folder, "file102.tif")
+        second = os.path.join(folder, "file105.tif")
+        _write_bytes(first)
+        _write_bytes(second)
+        _write_transcript(os.path.join(folder, "file102.md"), "file102.tif")
+        _write_transcript(os.path.join(folder, "file105.md"), "file105.tif")
+        plan_path = os.path.join(folder, "plan.json")
+
+        plan_code, _out, _err = self.run_cli(
+            [folder, "--rename", "bw", "--plan-out", plan_path]
+        )
+        self.assertIsNone(plan_code)
+        with open(plan_path, encoding="utf-8") as handle:
+            plan = json.load(handle)
+        targets = {entry["path"]: entry["target"] for entry in plan["entries"]}
+        self.first_target = os.path.join(folder, targets[first])
+        self.second_target = os.path.join(folder, targets[second])
+
+        # The catalog application renames both images itself.
+        os.rename(first, self.first_target)
+        os.rename(second, self.second_target)
+
+        finish_code, _out, _err = self.run_cli(["--rename-finish", plan_path])
+        self.assertIsNone(finish_code)
+        return "file102.tif", "file105.tif"
+
+    def _leave_undo_partial(self, folder: str) -> None:
+        """Run the setup, then put only the first image back and undo once.
+
+        Leaves the journal open (``in_progress``) and marked partial: the
+        first image's companion is home, the second image is still under its
+        catalog-renamed name and so is its companion.
+        """
+        self._finish_two_images(folder)
+        os.rename(self.first_target, os.path.join(folder, "file102.tif"))
+        code, _out, _err = self.run_cli([folder, "--rename-undo"])
+        self.assertIsNone(code)
+
+
+class TestRenameUndoRetriesAPartialCatalogUndo(_PartialCatalogUndoCase):
+    """P4 round: the folder form of ``--rename-undo`` must find a journal a
+    previous partial catalog undo left open, not just a closed ``applied``
+    one -- ``undo_run`` itself already knows how to retry it (5.5); only
+    discovery by folder needed widening."""
+
+    def test_folder_form_finds_and_finishes_the_partial_undo(self) -> None:
+        folder = self.scratch()
+        self._leave_undo_partial(folder)
+        # The catalog has now put the second image back too.
+        os.rename(self.second_target, os.path.join(folder, "file105.tif"))
+
+        code, _out, _err = self.run_cli([folder, "--rename-undo"])
+
+        self.assertIsNone(code)
+        self.assertEqual(
+            _non_journal_names(folder),
+            sorted(["file102.tif", "file102.md", "file105.tif", "file105.md", "plan.json"]),
+        )
+
+
+class TestRenameResumeOnAPartialUndoIsANormalOutcome(_PartialCatalogUndoCase):
+    """P4 round: ``--rename-resume`` on a partial-undo journal is a correct,
+    expected refusal ("there is nothing to finish forward"), not a usage
+    mistake -- it must report through the normal outcome path (exit 1), not
+    the preflight usage-error path (exit 2)."""
+
+    def test_resume_reports_exit_one_not_a_usage_error(self) -> None:
+        folder = self.scratch()
+        self._leave_undo_partial(folder)
+
+        code, _out, stderr = self.run_cli([folder, "--rename-resume"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("This undo stopped part way", stderr)
+        self.assertIn("Run --rename-undo again", stderr)
+
+
 class TestNoJournalFoundWording(unittest.TestCase):
     """``rename_no_journal_found`` must parse as English for both verbs.
 

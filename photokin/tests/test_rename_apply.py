@@ -271,6 +271,22 @@ def _renumber_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
     return folder, _plan(folder, entries)
 
 
+def _cycle_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
+    """A swap: two files trade names, so both names are held before and after.
+
+    The one shape the folder cannot answer for itself. An explicit manifest
+    ``order`` is what asks for it, and nothing in the listing distinguishes
+    the state before the run from the state after it -- which is why the
+    journal has to record that phase A finished.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    first = _write(folder / "x-001.tif", "first image")
+    second = _write(folder / "x-002.tif", "second image")
+    plan = _plan(folder, [_entry(first, "x-002.tif"), _entry(second, "x-001.tif")])
+    return folder, plan
+
+
 def _two_sidecar_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
     """Two images, each with a transcript sidecar of its own."""
     folder = tmp_path / "scans"
@@ -421,6 +437,61 @@ def test_a_case_only_rename_works(tmp_path: Path) -> None:
 
     assert report.status == rename_apply.STATUS_APPLIED
     assert _names(folder) == {"FILE001.tif"}
+
+
+def test_a_swap_applies_and_is_undone_rather_than_refused(tmp_path: Path) -> None:
+    """A run that succeeded may not be unreversible afterwards.
+
+    Both names of a swap are on disk before the run and both are on disk
+    after it, so nothing in the folder tells the two apart and the undo has
+    only the journal to go on. Reading the ambiguity as "still at its source"
+    makes ``--rename-undo`` refuse a run that plainly worked.
+    """
+    folder, plan = _cycle_folder(tmp_path)
+
+    applied = apply_plan(plan)
+
+    assert applied.status == rename_apply.STATUS_APPLIED
+    assert (folder / "x-001.tif").read_bytes() == b"second image"
+    assert (folder / "x-002.tif").read_bytes() == b"first image"
+
+    assert applied.journal_path is not None
+    undone = undo_run(applied.journal_path)
+
+    assert undone.status == rename_apply.STATUS_UNDONE
+    assert (folder / "x-001.tif").read_bytes() == b"first image"
+    assert (folder / "x-002.tif").read_bytes() == b"second image"
+
+
+def test_a_swap_resumed_after_phase_b_is_not_swapped_a_second_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worst outcome this module has: a resume that undoes a finished run.
+
+    Killed between the last rename and the footer, every file of a swap is at
+    its target -- and looks exactly as it did before the run started. A resume
+    that cannot tell those apart stages both files again and swaps them back,
+    putting the original contents under the new names, and then reports
+    ``applied`` over it.
+    """
+    folder, plan = _cycle_folder(tmp_path)
+
+    def crash(path: str, footer: Any) -> None:
+        raise _Crash()
+
+    monkeypatch.setattr(rename_apply, "_append_footer", crash)
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+    assert (folder / "x-001.tif").read_bytes() == b"second image"
+
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    resumed = resume_run(journal)
+
+    assert resumed.status == rename_apply.STATUS_APPLIED
+    assert (folder / "x-001.tif").read_bytes() == b"second image"
+    assert (folder / "x-002.tif").read_bytes() == b"first image"
 
 
 # --- Undo --------------------------------------------------------------
@@ -1231,6 +1302,64 @@ def test_undo_of_a_finish_journal_reverses_a_gap_closing_renumber(tmp_path: Path
     assert 'source_file: "file005.tif"' in (folder / "file005.md").read_text(encoding="utf-8")
 
 
+def _both_finished_folder(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
+    """Two images a catalog has already renamed, each with a transcript."""
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    first = _write(folder / "file102.tif", "first image")
+    second = _write(folder / "file105.tif", "second image")
+    first_md = _sidecar(folder / "file102.md", "file102.tif")
+    second_md = _sidecar(folder / "file105.md", "file105.tif")
+    plan = _plan(
+        folder,
+        [
+            _entry(first, "newname-001.tif", {first_md: "newname-001.md"}),
+            _entry(second, "newname-002.tif", {second_md: "newname-002.md"}),
+        ],
+    )
+    first.rename(folder / "newname-001.tif")
+    second.rename(folder / "newname-002.tif")
+    return folder, plan
+
+
+def test_a_partial_catalog_undo_can_be_run_again(tmp_path: Path) -> None:
+    """An undo that reversed what it could may not close on that state.
+
+    The catalog puts its own images back one at a time, so the first undo
+    reverses the companions of the images that are home and reports the rest.
+    Closing the journal ``undone`` over that is the end of it: undo refuses a
+    closed run, so the companions still under their new names never get back.
+    """
+    folder, plan = _both_finished_folder(tmp_path)
+    applied = finish_plan(plan)
+    assert applied.status == rename_apply.STATUS_APPLIED
+    assert applied.journal_path is not None
+    # The catalog has put back one of its two images so far.
+    (folder / "newname-001.tif").rename(folder / "file102.tif")
+
+    first = undo_run(applied.journal_path)
+
+    assert first.companions == 1
+    assert "image not put back yet: newname-002.tif" in first.skipped
+    assert _names(folder) == {
+        "file102.tif",
+        "file102.md",
+        "newname-002.tif",
+        "newname-002.md",
+    }
+    assert read_journal(applied.journal_path).status == rename_apply.STATUS_IN_PROGRESS
+
+    # The catalog catches up, and the rest of the undo has to still be possible.
+    (folder / "newname-002.tif").rename(folder / "file105.tif")
+    second = undo_run(applied.journal_path)
+
+    assert second.status == rename_apply.STATUS_UNDONE
+    assert second.companions == 1
+    assert _names(folder) == {"file102.tif", "file102.md", "file105.tif", "file105.md"}
+    assert 'source_file: "file105.tif"' in (folder / "file105.md").read_text(encoding="utf-8")
+    assert read_journal(applied.journal_path).status == rename_apply.STATUS_UNDONE
+
+
 def test_resume_of_a_finish_journal_refuses_images_that_never_moved(tmp_path: Path) -> None:
     """A name being on disk is not the same as this image being under it.
 
@@ -1255,6 +1384,7 @@ def test_resume_of_a_finish_journal_refuses_images_that_never_moved(tmp_path: Pa
             "folder": str(folder),
             "mode": rename_apply.MODE_FINISH,
             "status": rename_apply.STATUS_IN_PROGRESS,
+            "ops": 4,
         },
         _finish_record("file004.tif", "file003.tif", None, "image", "p1"),
         _finish_record("file004.md", "file003.md", ".photokin-rename-r-1.md", "companion", "p1"),
@@ -1346,6 +1476,221 @@ def test_an_unterminated_last_record_is_ignored_rather_than_fatal(tmp_path: Path
     ]
 
 
+def test_a_tail_torn_inside_a_character_is_dropped_rather_than_fatal(tmp_path: Path) -> None:
+    """The tear does not land on a character boundary, and usually cannot.
+
+    A crash cuts the file wherever the write got to, which with a Unicode
+    filename or template is as often as not the middle of a multi-byte
+    character. Decoding the whole journal before dropping the torn record
+    raises ``UnicodeDecodeError`` over every fsynced record in front of the
+    tear, so the run that a moment ago was recoverable can be neither resumed
+    nor undone.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    applied = apply_plan(plan)
+    assert applied.journal_path is not None
+    # The first byte of a two-byte 'e-acute', and nothing after it.
+    with open(applied.journal_path, "ab") as handle:
+        handle.write(b'{"record": "footer", "status": "und\xc3')
+
+    assert read_journal(applied.journal_path).status == rename_apply.STATUS_APPLIED
+    undone = undo_run(applied.journal_path)
+
+    assert undone.status == rename_apply.STATUS_UNDONE
+    assert _names(folder) == {"file102.tif", "file105.tif", "file105.md"}
+
+
+def test_a_segment_short_of_the_records_it_declares_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A header plus a prefix of its records is not a run anyone may finish.
+
+    One write and one fsync, but a filesystem may still make only part of it
+    durable -- and a segment that does not say how many files it has reads as
+    a complete run in that state. ``--rename-resume`` would rename the files
+    that happened to land, verify only those, and close the run ``applied``:
+    a three-file rename reported as a success with one file renamed.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    _fail_at(monkeypatch, 1, _Crash())
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    records = _records(journal)
+    assert records[0]["ops"] == 3
+    before = _names(folder)
+    with open(journal, "wb") as handle:
+        handle.write("".join(json.dumps(record) + "\n" for record in records[:2]).encode("utf-8"))
+
+    with pytest.raises(RenamePreflightError) as excinfo:
+        resume_run(journal)
+
+    assert "incomplete" in str(excinfo.value)
+    assert _names(folder) == before
+
+
+def test_a_segment_that_declares_no_count_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A header without a count cannot vouch for the records behind it.
+
+    The count is what makes a segment self-describing, so a header missing it
+    is damaged rather than short: photokin cannot tell a complete run from a
+    truncated one, and says that rather than naming a number it does not have.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    _fail_at(monkeypatch, 1, _Crash())
+    with pytest.raises(_Crash):
+        apply_plan(plan)
+    monkeypatch.undo()
+    journal = latest_journal(str(folder))
+    assert journal is not None
+    records = _records(journal)
+    records[0].pop("ops")
+    before = _names(folder)
+    with open(journal, "wb") as handle:
+        handle.write("".join(json.dumps(record) + "\n" for record in records).encode("utf-8"))
+
+    with pytest.raises(RenamePreflightError) as excinfo:
+        resume_run(journal)
+
+    assert "how many files" in str(excinfo.value)
+    assert _names(folder) == before
+
+
+def test_a_journal_is_still_found_after_its_folder_is_renamed(tmp_path: Path) -> None:
+    """The folder's name is provenance; the journal describes names, not paths.
+
+    Renaming the folder is a thing people do, and this module supports it
+    outright -- a journal records file names only. Looking for a journal by
+    the folder name baked into its own name gives that up: resume, undo and
+    the open-journal guard all miss a journal sitting right there.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    applied = apply_plan(plan)
+    assert applied.journal_path is not None
+    moved = tmp_path / "scans-renamed-by-hand"
+    folder.rename(moved)
+
+    found = latest_journal(str(moved))
+
+    assert found == os.path.join(str(moved), os.path.basename(applied.journal_path))
+    undone = undo_run(found)
+    assert undone.status == rename_apply.STATUS_UNDONE
+    assert _names(moved) == {"file102.tif", "file105.tif", "file105.md"}
+
+
+def _hand_written_journal(folder: Path, records: list[dict[str, Any]]) -> Path:
+    """Write *records* as a journal of *folder*, exactly as given."""
+    return _write(
+        Path(rename_apply.journal_path_for(str(folder), RUN_ID)),
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+    )
+
+
+def _header_record(folder: Path, ops: int, **extra: Any) -> dict[str, Any]:
+    """Build a journal header declaring *ops* file records."""
+    return {
+        "record": "header",
+        "schema_version": rename_apply.JOURNAL_SCHEMA_VERSION,
+        "run_id": RUN_ID,
+        "folder": str(folder),
+        "mode": rename_apply.MODE_APPLY,
+        "status": rename_apply.STATUS_IN_PROGRESS,
+        "ops": ops,
+        **extra,
+    }
+
+
+def test_a_record_holding_a_unicode_line_break_is_still_one_record(tmp_path: Path) -> None:
+    """NDJSON has one delimiter, and a name may legally contain the others.
+
+    ``str.splitlines`` breaks on the Unicode line and paragraph separators
+    among others, and ``json.dumps`` leaves them unescaped, so a file whose
+    name carries one is split through the middle of its own record and the
+    journal read as damaged -- taking away the resume and the undo for a run
+    that was written down perfectly.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    name = "file\u2028102.tif"
+    journal = _hand_written_journal(
+        folder,
+        [
+            _header_record(folder, 1),
+            {
+                "record": "file",
+                "from": name,
+                "to": "newname-001.tif",
+                "tmp": None,
+                "kind": "image",
+                "photo_id": "p1",
+            },
+            {"record": "footer", "status": rename_apply.STATUS_APPLIED},
+        ],
+    )
+
+    parsed = read_journal(str(journal))
+
+    assert parsed.status == rename_apply.STATUS_APPLIED
+    assert parsed.last.ops[0].src == name
+
+
+def test_a_journal_written_by_another_version_is_refused(tmp_path: Path) -> None:
+    """Reading a shape this code does not know is reading it by the wrong rules."""
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    journal = _hand_written_journal(
+        folder,
+        [
+            {
+                **_header_record(folder, 0),
+                "schema_version": rename_apply.JOURNAL_SCHEMA_VERSION + 1,
+            }
+        ],
+    )
+
+    with pytest.raises(RenamePreflightError) as excinfo:
+        read_journal(str(journal))
+
+    assert f"version {rename_apply.JOURNAL_SCHEMA_VERSION + 1}" in str(excinfo.value)
+
+
+def test_a_journal_record_naming_a_path_is_refused(tmp_path: Path) -> None:
+    """A journal's names are resolved against its folder, so they must stay in it.
+
+    The same class as the ``--rename-finish`` target check: a damaged or
+    hand-edited record whose name is a path walks a file out of the folder,
+    where a later resume cannot even see it.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    _write(folder / "file102.md", "a transcript")
+    journal = _hand_written_journal(
+        folder,
+        [
+            _header_record(folder, 1),
+            {
+                "record": "file",
+                "from": "file102.md",
+                "to": "../outside.md",
+                "tmp": ".photokin-rename-r-0.md",
+                "kind": "companion",
+                "photo_id": "p1",
+            },
+        ],
+    )
+
+    with pytest.raises(RenamePreflightError) as excinfo:
+        resume_run(str(journal))
+
+    assert "names a path" in str(excinfo.value)
+    assert (folder / "file102.md").exists()
+    assert not (tmp_path / "outside.md").exists()
+
+
 def test_the_journal_lands_inside_the_renamed_folder(tmp_path: Path) -> None:
     """Named for the folder and the run, beside the files it describes."""
     folder, plan = _simple_folder(tmp_path)
@@ -1379,6 +1724,25 @@ def test_a_long_folder_name_still_makes_a_journal_name_a_filesystem_takes(
     assert journal_name.endswith(f"{RUN_ID.replace(':', '-')}.ndjson")
     monkeypatch.setattr(rename_apply, "_list_names", lambda _folder: {journal_name})
     assert rename_apply._journal_candidates(folder) == [os.path.join(folder, journal_name)]
+
+
+def test_a_temporary_name_fits_inside_the_filename_limit() -> None:
+    """A source name may spend the whole budget; its temporary may not run over.
+
+    The temporary carries the source's extension, and an extension is allowed
+    to be almost the whole of a 255-byte name -- so an unbounded temporary
+    fails phase A with ENAMETOOLONG on a run whose every planned name was
+    legal. What may be cut is the extension only: the prefix, the run id and
+    the index are what say whose temporary this is and keep two of them apart.
+    """
+    long_extension = "." + "e" * 240
+    first = rename_apply._tmp_name(RUN_ID.replace(":", "-"), 0, f"image{long_extension}")
+    second = rename_apply._tmp_name(RUN_ID.replace(":", "-"), 1, f"image{long_extension}")
+
+    assert len(first.encode("utf-8")) <= 255
+    assert len(second.encode("utf-8")) <= 255
+    assert first != second
+    assert first.startswith(".photokin-rename-")
 
 
 def test_the_torn_tail_check_reads_only_the_tail(
@@ -1549,6 +1913,129 @@ def test_a_crash_during_the_sidecar_rewrite_never_costs_the_transcript(
         encoding="utf-8"
     )
 
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    """Point *link* at *target*, skipping the test where that is not permitted.
+
+    Windows hands out the privilege to an administrator or a machine in
+    developer mode only, so the test runs where a link can exist and is
+    skipped where one cannot.
+    """
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - platform dependent
+        pytest.skip(f"symlinks are not available here: {exc}")
+
+
+def test_a_symlinked_sidecar_is_rewritten_through_the_link(tmp_path: Path) -> None:
+    """Somebody who linked a transcript did it on purpose.
+
+    Swapping the new bytes onto the link's own name destroys the link -- the
+    name comes back a plain file, and whatever it pointed at keeps the old
+    bytes, still naming an image that is not there any more.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    store = tmp_path / "transcripts"
+    store.mkdir()
+    image = _write(folder / "file102.tif", "image")
+    target = _sidecar(store / "file102.md", "file102.tif")
+    link = folder / "file102.md"
+    _symlink_or_skip(link, target)
+    plan = _plan(folder, [_entry(image, "newname-001.tif", {link: "newname-001.md"})])
+
+    report = apply_plan(plan)
+
+    assert report.status == rename_apply.STATUS_APPLIED
+    assert report.warnings == ()
+    assert (folder / "newname-001.md").is_symlink()
+    assert 'source_file: "newname-001.tif"' in target.read_text(encoding="utf-8")
+
+
+def test_the_sidecar_swap_lands_on_the_file_a_link_points_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same rule as the test above, on a runner that cannot make a link.
+
+    Only the resolution is stood in for. What is checked is what the swap
+    does with it: the new bytes go onto the resolved file, and they are staged
+    in that file's own folder, since a replace is only atomic within one.
+    """
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    store = tmp_path / "transcripts"
+    store.mkdir()
+    target = _write(store / "file102.md", "old bytes")
+    link = _write(folder / "file102.md", "stands in for the link itself")
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(
+        os.path,
+        "realpath",
+        lambda path, **kwargs: str(target) if str(path) == str(link) else real_realpath(path),
+    )
+    swaps: list[tuple[str, str]] = []
+    real_replace = os.replace
+
+    def spy_replace(src: Any, dst: Any, **kwargs: Any) -> None:
+        swaps.append((str(src), str(dst)))
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+
+    warning = rename_apply._swap_in(
+        str(link), str(folder / ".photokin-rename-r-sidecar-0.md"), b"new bytes"
+    )
+
+    assert warning is None
+    assert target.read_bytes() == b"new bytes"
+    assert link.read_bytes() == b"stands in for the link itself"
+    assert os.path.dirname(swaps[0][0]) == str(store)
+    assert swaps[0][1] == str(target)
+
+
+def test_a_sidecar_that_cannot_be_put_back_needs_attention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``rolled_back`` means the folder is exactly as it started; this is not.
+
+    A rollback puts the files back and rewrites their transcripts back with
+    them. When that rewrite is the step that fails, the run has left a
+    transcript naming an image that no longer exists -- and reporting
+    ``rolled_back`` over it is a success message for a folder nobody has
+    looked at yet.
+    """
+    folder, plan = _simple_folder(tmp_path)
+    bystander = _write(folder / "notes.txt", "untouched")
+    real_swap = rename_apply._swap_in
+    swaps = {"count": 0}
+
+    def failing_second_swap(path: str, tmp: str, payload: bytes) -> str | None:
+        swaps["count"] += 1
+        if swaps["count"] == 2:
+            return f"sidecar not updated (the disk said no): {os.path.basename(path)}"
+        return real_swap(path, tmp, payload)
+
+    real_rename = os.rename
+    renames = {"count": 0}
+
+    def fake_rename(src: Any, dst: Any, **kwargs: Any) -> None:
+        renames["count"] += 1
+        real_rename(src, dst, **kwargs)
+        if renames["count"] == 6:
+            bystander.write_bytes(b"someone else got here first")
+
+    monkeypatch.setattr(rename_apply, "_swap_in", failing_second_swap)
+    monkeypatch.setattr(os, "rename", fake_rename)
+    report = apply_plan(plan)
+    monkeypatch.undo()
+
+    assert report.status == rename_apply.STATUS_NEEDS_ATTENTION
+    assert report.exit_code == 1
+    assert report.stranded == (str(folder / "file105.md"),)
+    assert 'source_file: "newname-002.tif"' in (folder / "file105.md").read_text(
+        encoding="utf-8"
+    )
 
 
 # --- The safety net itself ---------------------------------------------

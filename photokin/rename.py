@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -528,6 +528,7 @@ class _Member:
 
     item: RenameItem
     position: int
+    abs_path: str
     dirname: str
     ext: str
     parsed: utils.ParsedName
@@ -656,6 +657,7 @@ def _build_member(item: RenameItem, position: int) -> _Member:
     return _Member(
         item=item,
         position=position,
+        abs_path=norm_path,
         dirname=dirname,
         ext=ext,
         parsed=parsed,
@@ -685,8 +687,8 @@ class _GroupPlan:
 def _build_unplannable_entry(member: _Member, group_display: str) -> dict[str, Any]:
     """An ``entries[]`` record for a group :func:`_GroupPlan` could not render."""
     return {
-        "path": member.item.path,
-        "photo_id": make_photo_id(member.item.path),
+        "path": member.abs_path,
+        "photo_id": make_photo_id(member.abs_path),
         # No target, so no path to hash on the other side (4.6): a group
         # that could not be rendered never moves this file, so there is no
         # "after" identity to report -- unlike an unchanged entry, where
@@ -723,6 +725,7 @@ def plan_rename(
     managed_by: dict[str, Any] | None = None,
     photokin_version: str = "",
     run_id: str | None = None,
+    disk_file_stats: Mapping[str, tuple[int | None, float | None]] | None = None,
 ) -> dict[str, Any]:
     """Plan a rename of *items*, a pure function over the injected listing.
 
@@ -763,6 +766,14 @@ def plan_rename(
             ``photokin_version`` field.
         run_id: Overrides ``changeset.make_run_id()`` for a reproducible
             plan (tests; the CLI leaves this unset).
+        disk_file_stats: ``path -> (size, mtime)`` for entries in
+            *disk_files*, keyed by the exact string each one appears as in
+            *disk_files*. Optional, and read only for the files that turn
+            out to be companions: a companion's plan entry needs its own
+            size/mtime so the executor's preflight (5.1) can tell it changed
+            since planning, the same way it already can for an image via
+            ``RenameItem.size``/``.mtime``. A path with no entry here (or
+            when this whole mapping is omitted) gets ``None``/``None``.
 
     Returns:
         The plan dict, shaped exactly as section 6.2 specifies
@@ -837,6 +848,29 @@ def plan_rename(
 
     members = [_build_member(item, position) for position, item in enumerate(ordered_items)]
 
+    # A manifest can name one physical file twice, spelled differently (a
+    # drive-letter or directory case difference on a case-insensitive
+    # filesystem) -- two entries, one file. The executor renames by source
+    # path once per entry, so the second rename of that pair always fails
+    # (the first already moved the file out from under it); catching it here,
+    # as a named plan error, is what turns that into a refused plan instead
+    # of a run that fails partway with a confusing "gone since the plan was
+    # made". Bucketed by casefolded path first (mirrors
+    # ``_attach_companions_and_bystanders``'s own fallback) so this stays
+    # O(n) for the overwhelming common case where every item names a
+    # distinct file.
+    first_seen_by_casefold: dict[str, _Member] = {}
+    for member in members:
+        casefold_key = utils.casefold_filename(member.abs_path)
+        first_seen = first_seen_by_casefold.get(casefold_key)
+        if first_seen is None:
+            first_seen_by_casefold[casefold_key] = member
+        elif utils.paths_are_same_file(first_seen.abs_path, member.abs_path):
+            errors.append(
+                "plan names the same source file twice, spelled differently: "
+                f"{first_seen.item.path!r} and {member.item.path!r}"
+            )
+
     for member in members:
         if member.version_error is not None:
             errors.append(f"{os.path.basename(member.item.path)}: {member.version_error}")
@@ -864,7 +898,26 @@ def plan_rename(
             member_names = ", ".join(sorted(os.path.basename(m.item.path) for m in group_members))
             warnings.append(f"group with an empty base id: {member_names}")
 
-        bad_dirs = sorted({m.dirname for m in group_members if m.dirname != normalized_folder})
+        # Filesystem identity, not bare string equality, decides "different
+        # folder": a manifest item's own directory can be spelled
+        # differently from *folder* -- a drive-letter or path-segment case
+        # difference on a case-insensitive filesystem -- without actually
+        # sitting anywhere else, and a plain ``!=`` here read that spelling
+        # difference as a member "in a different folder" that its target's
+        # own rename never actually crosses. The equal-string case (every
+        # item already agreeing with *folder*'s own spelling, the ordinary
+        # folder-mode run) is checked first and short-circuits before
+        # :func:`utils.paths_are_same_file` is even called, so this stays
+        # one string compare per member in the common case and only pays
+        # for the real check when the spellings actually disagree.
+        bad_dirs = sorted(
+            {
+                m.dirname
+                for m in group_members
+                if m.dirname != normalized_folder
+                and not utils.paths_are_same_file(m.dirname, normalized_folder)
+            }
+        )
         if bad_dirs:
             errors.append(
                 f"group '{display}': members sit in different folders "
@@ -991,12 +1044,24 @@ def plan_rename(
             # id to new id explicitly instead of losing the photo. For an
             # unchanged entry the two paths are the same string, so the two
             # ids come out equal, not merely "also present".
-            target_photo_id = make_photo_id(os.path.join(member.dirname, target_filename))
+            #
+            # Joined against normalized_folder, not member.dirname: every
+            # rename this plan drives (rename_apply.py) resolves against
+            # plan["folder"] (normalized_folder, serialized verbatim), which
+            # is the spelling the file will actually carry once applied. A
+            # manifest item's own directory can be spelled differently
+            # (case only, on a case-insensitive filesystem) without being a
+            # different folder at all -- see the ``paths_are_same_file``
+            # check just above -- and hashing that spelling instead would
+            # make target_photo_id disagree with the photo_id an ordinary
+            # run reports for the same file afterward, the exact mismatch
+            # this field exists to prevent.
+            target_photo_id = make_photo_id(os.path.join(normalized_folder, target_filename))
 
             entries.append(
                 {
-                    "path": member.item.path,
-                    "photo_id": make_photo_id(member.item.path),
+                    "path": member.abs_path,
+                    "photo_id": make_photo_id(member.abs_path),
                     "target_photo_id": target_photo_id,
                     "size": member.item.size,
                     "mtime": member.item.mtime,
@@ -1029,8 +1094,9 @@ def plan_rename(
         entries=entries,
         disk_files=sorted(disk_files, key=_name_key),
         normalized_folder=normalized_folder,
-        known_image_paths=[os.path.normpath(os.path.abspath(m.item.path)) for m in members],
+        known_image_paths=[m.abs_path for m in members],
         companion_extensions=effective_companions,
+        disk_file_stats=disk_file_stats,
         left_behind=left_behind,
         warnings=warnings,
         bystander_names=bystander_names,
@@ -1075,6 +1141,7 @@ def _attach_companions_and_bystanders(
     normalized_folder: str,
     known_image_paths: list[str],
     companion_extensions: frozenset[str],
+    disk_file_stats: Mapping[str, tuple[int | None, float | None]] | None,
     left_behind: list[dict[str, Any]],
     warnings: list[str],
     bystander_names: set[str],
@@ -1114,6 +1181,14 @@ def _attach_companions_and_bystanders(
     *known_image_paths*, so it verifies with :func:`utils.paths_are_same_file`
     only against the (typically single) candidate that already agrees on
     spelling modulo case, never against every known path.
+
+    A matched companion's own ``size``/``mtime`` come from *disk_file_stats*,
+    keyed by the exact string it appears as in *disk_files* -- the same
+    preflight staleness check the executor already runs against an image's
+    ``RenameItem.size``/``.mtime`` (5.1) reads these the identical way, so a
+    companion edited between planning and applying is caught exactly as a
+    changed image would be. ``(None, None)`` when *disk_file_stats* is
+    ``None`` or has no entry for that path.
 
     Mutates *entries* (each matched one's ``companions`` list),
     *left_behind*, *warnings* and *bystander_names* in place.
@@ -1167,8 +1242,15 @@ def _attach_companions_and_bystanders(
                     key=lambda i: (os.path.splitext(entries[i]["path"])[1].lower(), entries[i]["path"]),
                 )
                 target_stem = entries[owner]["target_stem"]
+                stat = (disk_file_stats or {}).get(disk_path)
+                size, mtime = stat if stat is not None else (None, None)
                 entries[owner]["companions"].append(
-                    {"path": norm_disk_path, "target": target_stem + ext}
+                    {
+                        "path": norm_disk_path,
+                        "target": target_stem + ext,
+                        "size": size,
+                        "mtime": mtime,
+                    }
                 )
         else:
             left_behind.append({"path": norm_disk_path, "reason": "extension outside companion set"})

@@ -20,9 +20,16 @@ against what this process believes it did.
 The journal records file names, not paths. A rename never crosses a folder
 boundary (``docs/rename-mode.md`` section 11), so the folder the journal
 itself sits in is the folder it describes -- which also means a journal stays
-valid when someone moves the whole folder between the apply and the undo. The
-header's ``folder`` is provenance, not the address operations are resolved
-against.
+valid when someone moves or renames the whole folder between the apply and the
+undo, and why a journal is looked for by its marker rather than by the folder
+name baked into it. The header's ``folder`` is provenance, not the address
+operations are resolved against.
+
+A segment says everything about itself that recovery needs, because recovery
+happens after the process that wrote it is gone: the format it is in, how many
+file records belong to it, and whether phase A finished. The last of those is
+what makes a swap recoverable at all -- two names trading places look the same
+before the run and after it, and nothing in the folder can say which.
 
 Code map:
 - RenamePreflightError  refusal raised before anything on disk is touched
@@ -30,6 +37,7 @@ Code map:
 - ApplyReport           what a run did, its counts, and its exit code
 - JournalSegment        one run's header, file records and final status
 - Journal               a parsed journal file: its segments and current status
+- _mark_staged          record that phase A finished, before phase B starts
 - _locate_moves         where every file of a run is now, read as one mapping
 - preflight             PUBLIC: re-check a plan against the folder
 - apply_plan            PUBLIC: journal, two phases, sidecars, verify
@@ -67,7 +75,18 @@ logger = logging.getLogger(__name__)
 #: care about, on the same rule ``changeset.SCHEMA_VERSION`` follows. A journal
 #: is read back by this module's own undo and resume, so a bump means older
 #: journals must still parse or must be refused by name.
-JOURNAL_SCHEMA_VERSION = 1
+#:
+#: Version 2 made a segment self-describing: its header declares how many file
+#: records follow it, and a ``phase`` record marks the point where phase A
+#: finished. Both are what recovery reads to tell a segment that was fully
+#: written from one a power cut cut short, and a run that has staged every file
+#: from one that has not started -- neither of which version 1 could say.
+JOURNAL_SCHEMA_VERSION = 2
+
+#: The journal formats this executor can read. Refusing anything else is the
+#: point: a journal written to a shape this code does not know is read with the
+#: wrong rules, and every one of those rules decides where a file is.
+_READABLE_JOURNAL_SCHEMAS = frozenset({JOURNAL_SCHEMA_VERSION})
 
 #: The plan shape this executor understands (``docs/rename-mode.md`` 6.2).
 PLAN_SCHEMA_VERSION = 1
@@ -108,6 +127,19 @@ _SIDECAR_EXT = ".md"
 #: valid apply in that folder fails with ENAMETOOLONG before it starts.
 _MAX_JOURNAL_STEM_BYTES = 96
 
+#: The longest a single filename component may be on the filesystems photokin
+#: runs on, in bytes. It bounds the temporaries as well as the journal: a
+#: temporary that runs past it fails phase A on a folder whose every planned
+#: rename was otherwise legal.
+_MAX_NAME_BYTES = 255
+
+#: The record a segment appends when phase A is complete, and the value its
+#: ``phase`` field carries. Everything the run renames is then sitting at its
+#: temporary, which is what tells a later recovery which side of a swap the
+#: folder is on -- see :func:`_locate_moves`.
+_PHASE_RECORD = "phase"
+_PHASE_STAGED = "staged"
+
 _IMAGE_KIND = "image"
 _COMPANION_KIND = "companion"
 
@@ -127,6 +159,15 @@ _YAML_ESCAPE_RE = re.compile(r"\\(.)")
 #: asks that one question of it. Walking backward a chunk at a time answers it
 #: in bounded memory, out of the bytes the answer is actually in.
 _TAIL_CHUNK_BYTES = 65536
+
+#: The one byte that ends a record. NDJSON has exactly one delimiter, and the
+#: reader has to split on exactly that byte and no other: ``str.splitlines``
+#: also breaks on the vertical tab, the form feed, the file, group and
+#: record separators, and the three Unicode breaks json.dumps leaves whole
+#: inside a string -- so a filename or a template carrying one would be split
+#: through the middle of its own record and the journal read as damaged.
+_RECORD_SEPARATOR = b"\n"
+_RECORD_SEPARATOR_TEXT = _RECORD_SEPARATOR.decode()
 
 #: Characters that are illegal in a Windows filename but legal in a run id
 #: (which is an ISO timestamp, so it always contains ``:``).
@@ -200,7 +241,9 @@ class ApplyReport:
         left_behind: Same-stem files the planner declined to carry along.
         skipped: Human-readable lines naming what this run declined to do.
         stranded: Absolute paths of files a failed rollback left out of place,
-            temporaries first. Non-empty only for ``needs_attention``.
+            temporaries first -- and, when the rollback itself completed but
+            could not put a transcript's ``source_file`` line back, that
+            transcript. Non-empty only for ``needs_attention``.
         warnings: Non-fatal problems, principally sidecar rewrites that did
             not apply.
     """
@@ -228,11 +271,26 @@ class ApplyReport:
 
 @dataclass(frozen=True)
 class JournalSegment:
-    """One run recorded in a journal: its header, its files, its final status."""
+    """One run recorded in a journal: its header, its files, its final status.
+
+    Attributes:
+        header: The header record that opened the run.
+        ops: Its file records, in the order they were journalled.
+        status: The status of its last status-bearing record.
+        staged: Phase A finished: every op this executor performs was sitting
+            at its temporary before phase B began. Recovery reads this to know
+            which side of a swap the folder is on (:func:`_locate_moves`).
+        partial: The run closed having deliberately left some of its work
+            undone -- a ``--rename-undo`` of a ``--rename-finish`` journal
+            whose catalog has not put every image back yet. The segment stays
+            open so the rest can be retried.
+    """
 
     header: dict[str, Any]
     ops: tuple[RenameOp, ...]
     status: str
+    staged: bool = False
+    partial: bool = False
 
     @property
     def mode(self) -> str:
@@ -307,20 +365,19 @@ def _safe_run_id(run_id: str) -> str:
 
 
 def _journal_prefix(folder: str) -> str:
-    """Return the name every journal in *folder* begins with.
+    """Return the name a journal written in *folder* today begins with.
 
-    One derivation, used both where a journal is created and where one is
-    looked for. A folder with no basename of its own -- a filesystem root, or
-    a Windows drive root -- stands in ``folder``, and a discovery prefix that
-    did not stand in the same thing would never find the journal the run had
-    just written: no automatic ``--rename-resume``, no ``--rename-undo``, and
-    no open-journal guard to stop a second run trampling a half-finished one.
+    Provenance, not an address: it says which folder the run was started in,
+    and discovery deliberately does not match on it (:func:`_journal_candidates`),
+    since the folder can be renamed afterwards. A folder with no basename of
+    its own -- a filesystem root, or a Windows drive root -- stands in
+    ``folder``.
 
     The folder's name is spent against ``_MAX_JOURNAL_STEM_BYTES`` and cut
     when it runs over, so that a folder named at nearly the length a name may
-    be can still be renamed. The cut belongs here, in the one derivation
-    creation and discovery already share, because a bound applied at only one
-    of them would be the two disagreeing about the name of the same journal.
+    be can still be renamed: unbounded, the name would spend the whole
+    255-byte budget on its own and every otherwise valid apply in that folder
+    would fail with ENAMETOOLONG before it started.
 
     Args:
         folder: The folder being renamed.
@@ -381,8 +438,34 @@ def _fresh_journal(folder: str, plan_run_id: str) -> tuple[str, str]:
 
 
 def _tmp_name(safe_run_id: str, index: int, source_name: str) -> str:
-    """Return the hidden temporary name for one file of a run."""
-    return f"{_TMP_PREFIX}{safe_run_id}-{index}{os.path.splitext(source_name)[1]}"
+    """Return the hidden temporary name for one file of a run.
+
+    The extension is carried so the staged file is still the kind of file it
+    was, and it is also the only part of the name that may be cut: the prefix
+    says whose temporary this is, the run id says which run, and the index is
+    what makes it unique. A source name is allowed to be 255 bytes on its own,
+    so an unbounded extension puts the temporary past ``NAME_MAX`` and fails
+    phase A of a run whose every planned name was legal. Cutting the extension
+    cannot make two temporaries collide, because what distinguishes them
+    already sits in front of it.
+
+    Args:
+        safe_run_id: The run's folded id.
+        index: The op's position in the run.
+        source_name: The name of the file being staged.
+
+    Returns:
+        A hidden name of at most :data:`_MAX_NAME_BYTES` bytes.
+    """
+    stem = f"{_TMP_PREFIX}{safe_run_id}-{index}"
+    extension = os.path.splitext(source_name)[1]
+    budget = _MAX_NAME_BYTES - len(stem.encode("utf-8", "surrogateescape"))
+    encoded = extension.encode("utf-8", "surrogateescape")
+    if len(encoded) > budget:
+        # Cut on bytes, then let the decoder drop whatever partial character
+        # the cut landed inside, exactly as the journal name is cut.
+        extension = encoded[: max(budget, 0)].decode("utf-8", "ignore")
+    return f"{stem}{extension}"
 
 
 # --- Disk primitives ---------------------------------------------------
@@ -528,6 +611,58 @@ def _op_from_record(record: Mapping[str, Any]) -> RenameOp:
     )
 
 
+def _checked_op(path: str, number: int, record: Mapping[str, Any]) -> RenameOp:
+    """Read one file record, refusing any name that is not a bare filename.
+
+    A journal's names are resolved against the folder the journal sits in, so a
+    path-valued one walks a rename out of that folder -- the same class of
+    damage the ``--rename-finish`` target check refuses, and refused the same
+    way (:func:`_is_bare_filename`), since a journal can be damaged or
+    hand-edited exactly as a plan can.
+
+    Args:
+        path: The journal being read, for the message.
+        number: The record's line number, for the message.
+        record: The file record.
+
+    Returns:
+        The op the record describes.
+
+    Raises:
+        RenamePreflightError: If any of its three names is a path.
+    """
+    op = _op_from_record(record)
+    for name in (op.src, op.dst, op.tmp):
+        if name and not _is_bare_filename(name):
+            raise RenamePreflightError(
+                f"This rename journal names a path, not a file, at line {number}.",
+                "Check the folder by hand; photokin will not guess what it describes.",
+                [name, path],
+            )
+    return op
+
+
+def _check_journal_schema(path: str, header: Mapping[str, Any]) -> None:
+    """Refuse a journal segment written in a format this executor cannot read.
+
+    Args:
+        path: The journal being read.
+        header: Its header record.
+
+    Raises:
+        RenamePreflightError: If the header declares an unreadable version.
+    """
+    version = header.get("schema_version")
+    if version in _READABLE_JOURNAL_SCHEMAS:
+        return
+    raise RenamePreflightError(
+        f"This rename journal is version {version!r}; "
+        f"photokin reads version {JOURNAL_SCHEMA_VERSION}.",
+        "Use the photokin that wrote it, or check the folder by hand.",
+        [path],
+    )
+
+
 def _write_segment(
     path: str, header: Mapping[str, Any], ops: Sequence[RenameOp], *, append: bool = False
 ) -> None:
@@ -538,6 +673,16 @@ def _write_segment(
     the first rename, not after it. The first segment of a journal is created
     with ``x`` so an existing file is never clobbered by a run id collision;
     later segments append.
+
+    The header declares how many file records follow it, and that number is
+    what makes a segment self-describing. A power cut can persist the header
+    and only a prefix of the records -- one write, one fsync, but a filesystem
+    is free to make part of it durable -- and without the count that prefix
+    reads as a complete run. ``--rename-resume`` would then apply only the
+    files that happened to land, verify only that subset, and close the run
+    ``applied``: a two-file rename reported as a success with one file
+    renamed. The count is written here, in the same call that writes the
+    records it counts, so the two can never disagree.
 
     Args:
         path: The journal path.
@@ -555,7 +700,7 @@ def _write_segment(
     if append:
         _drop_torn_tail(path)
     mode = "a" if append else "x"
-    lines = [json.dumps(dict(header), ensure_ascii=False)]
+    lines = [json.dumps({**dict(header), "ops": len(ops)}, ensure_ascii=False)]
     lines.extend(json.dumps(_op_record(op), ensure_ascii=False) for op in ops)
     with open(path, mode, encoding="utf-8", newline="\n") as handle:
         handle.write("".join(f"{line}\n" for line in lines))
@@ -595,7 +740,7 @@ def _drop_torn_tail(path: str) -> None:
         if not end:
             return
         handle.seek(end - 1)
-        if handle.read(1) in (b"\n", b"\r"):
+        if handle.read(1) == _RECORD_SEPARATOR:
             return
         cut = 0
         offset = end - 1
@@ -603,7 +748,7 @@ def _drop_torn_tail(path: str) -> None:
             start = max(0, offset - _TAIL_CHUNK_BYTES)
             handle.seek(start)
             chunk = handle.read(offset - start)
-            index = max(chunk.rfind(b"\n"), chunk.rfind(b"\r"))
+            index = chunk.rfind(_RECORD_SEPARATOR)
             if index >= 0:
                 cut = start + index + 1
                 break
@@ -615,13 +760,76 @@ def _drop_torn_tail(path: str) -> None:
         os.fsync(handle.fileno())
 
 
-def _append_footer(path: str, footer: Mapping[str, Any]) -> None:
-    """Append a run's closing record and flush it to disk."""
+def _append_record(path: str, record: Mapping[str, Any]) -> None:
+    """Append one record to a journal and flush it to disk.
+
+    Args:
+        path: The journal to append to.
+        record: The record to write.
+
+    Raises:
+        OSError: If the record cannot be written or synced.
+    """
     _drop_torn_tail(path)
     with open(path, "a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(dict(footer), ensure_ascii=False) + "\n")
+        handle.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _append_footer(path: str, footer: Mapping[str, Any]) -> None:
+    """Append a run's closing record and flush it to disk."""
+    _append_record(path, footer)
+
+
+def _mark_staged(path: str) -> None:
+    """Record that phase A finished, before phase B moves anything.
+
+    This is the record that makes a swap recoverable. Two names that trade
+    places -- ``x-001 -> x-002`` beside ``x-002 -> x-001``, which an explicit
+    manifest ``order`` can ask for -- are both on disk before the run and both
+    on disk after it, so nothing in the folder distinguishes the two states and
+    :func:`_locate_moves` has nothing to eliminate against. Without this record
+    a resume after a crash between phase B and the footer performs the swap a
+    second time, putting the original contents back under the new names, and
+    then reports ``applied``; an undo, reading the same ambiguity the other
+    way, refuses a run that in fact succeeded.
+
+    The journal is append-only and already fsynced at the points that matter,
+    so the durable progress marker costs one more record and one more sync per
+    run, once, between the two phases.
+
+    Args:
+        path: The journal of the run that has just finished phase A.
+
+    Raises:
+        OSError: If the record cannot be written; the caller must not begin
+            phase B, since nothing would be able to tell afterwards that it
+            had.
+    """
+    _append_record(path, {"record": _PHASE_RECORD, "phase": _PHASE_STAGED})
+
+
+def _terminated_prefix(raw: bytes) -> bytes:
+    """Return *raw* up to and including its last record separator.
+
+    The cut is made on bytes, before anything is decoded, and that ordering is
+    the point. A crash tears the file mid-record, and with a Unicode filename
+    or template that tear lands inside a multi-byte character as often as not
+    -- so decoding first raises ``UnicodeDecodeError`` over the whole journal,
+    including every fsynced record in front of the tear, and takes away the
+    resume and the undo the journal exists to make possible.
+
+    Args:
+        raw: The journal's bytes.
+
+    Returns:
+        The bytes of every record that was finished being written.
+    """
+    if not raw or raw.endswith(_RECORD_SEPARATOR):
+        return raw
+    index = raw.rfind(_RECORD_SEPARATOR)
+    return raw[: index + 1] if index >= 0 else b""
 
 
 def read_journal(path: str) -> Journal:
@@ -632,14 +840,22 @@ def read_journal(path: str) -> Journal:
     records rather than rewriting, so the current state of the folder is the
     status of the last status-bearing record.
 
-    A last line with no newline on the end of it is dropped rather than
-    refused. That is the one damage a crash can do to this file: the machine
-    died while a record was being appended, so the bytes that made it down are
-    a record nobody finished writing, while every record before it was fsynced
-    and still describes a recoverable folder. Refusing the file for it would
-    take resume and undo away at exactly the moment the journal exists for. A
-    *terminated* record that does not parse is different -- that is damage
-    from somewhere else, and it stays an error.
+    A last record with no newline on the end of it is dropped rather than
+    refused, and it is dropped as *bytes* (:func:`_terminated_prefix`) before
+    anything is decoded. That is the one damage a crash can do to this file:
+    the machine died while a record was being appended, so the bytes that made
+    it down are a record nobody finished writing, while every record before it
+    was fsynced and still describes a recoverable folder. Refusing the file for
+    it would take resume and undo away at exactly the moment the journal exists
+    for. A *terminated* record that does not parse is different -- that is
+    damage from somewhere else, and it stays an error.
+
+    Three things a segment must say about itself are checked here, because
+    every one of them decides where a file is: the format it was written in
+    (``schema_version``), how many file records it has (``ops``, so a header
+    followed by a truncated run of records is not read as a complete run), and
+    that each of those records names a file rather than a path (so a damaged or
+    hand-edited journal cannot walk a rename out of the folder).
 
     Args:
         path: The journal file to read.
@@ -648,13 +864,14 @@ def read_journal(path: str) -> Journal:
         The parsed :class:`Journal`.
 
     Raises:
-        RenamePreflightError: If the file cannot be read, or a complete record
-            in it does not parse.
+        RenamePreflightError: If the file cannot be read, if a complete record
+            in it does not parse, if it is in a format this photokin does not
+            read, or if a segment is short of the records it declares.
     """
     path = os.path.abspath(path)
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
+        with open(path, "rb") as handle:
+            raw = handle.read()
     except OSError as exc:
         raise RenamePreflightError(
             "This rename journal cannot be read.",
@@ -662,72 +879,136 @@ def read_journal(path: str) -> Journal:
             [path],
         ) from exc
 
-    raw_lines = text.splitlines()
-    if raw_lines and not text.endswith(("\n", "\r")):
+    terminated = _terminated_prefix(raw)
+    if terminated != raw:
         logger.warning(
             "Ignoring the unterminated last record of %s; it was never finished.", path
         )
-        raw_lines.pop()
+    try:
+        text = terminated.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RenamePreflightError(
+            "This rename journal is damaged: it is not UTF-8.",
+            "Check the folder by hand; photokin will not guess what it describes.",
+            [path],
+        ) from exc
 
     segments: list[JournalSegment] = []
     header: dict[str, Any] | None = None
     ops: list[RenameOp] = []
     status = STATUS_IN_PROGRESS
+    staged = False
+    partial = False
 
     def _close() -> None:
-        if header is not None:
-            segments.append(JournalSegment(header=header, ops=tuple(ops), status=status))
+        if header is None:
+            return
+        declared = header.get("ops")
+        advice = "Check the folder by hand; photokin will not guess what it describes."
+        if not isinstance(declared, int) or isinstance(declared, bool):
+            raise RenamePreflightError(
+                "This rename journal is damaged: a run does not say how many files it covers.",
+                advice,
+                [path],
+            )
+        if declared != len(ops):
+            raise RenamePreflightError(
+                f"This rename journal is incomplete: a run recorded {len(ops)} "
+                f"of the {declared} files it declares.",
+                advice,
+                [path],
+            )
+        segments.append(
+            JournalSegment(
+                header=header, ops=tuple(ops), status=status, staged=staged, partial=partial
+            )
+        )
 
-    for number, line in enumerate(raw_lines, start=1):
+    def _damaged(number: int) -> RenamePreflightError:
+        return RenamePreflightError(
+            f"This rename journal is damaged at line {number}.",
+            "Check the folder by hand; photokin will not guess what it describes.",
+            [path],
+        )
+
+    for number, line in enumerate(text.split(_RECORD_SEPARATOR_TEXT), start=1):
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise RenamePreflightError(
-                f"This rename journal is damaged at line {number}.",
-                "Check the folder by hand; photokin will not guess what it describes.",
-                [path],
-            ) from exc
+            raise _damaged(number) from exc
         if not isinstance(record, dict):
-            raise RenamePreflightError(
-                f"This rename journal is damaged at line {number}.",
-                "Check the folder by hand; photokin will not guess what it describes.",
-                [path],
-            )
+            raise _damaged(number)
         kind = record.get("record")
         if kind == "header":
             _close()
+            _check_journal_schema(path, record)
             header = record
             ops = []
             status = str(record.get("status") or STATUS_IN_PROGRESS)
+            staged = False
+            partial = False
         elif kind == "file":
-            ops.append(_op_from_record(record))
+            ops.append(_checked_op(path, number, record))
+        elif kind == _PHASE_RECORD:
+            staged = staged or record.get("phase") == _PHASE_STAGED
         elif isinstance(record.get("status"), str):
             status = str(record["status"])
+            partial = record.get("partial") is True
     _close()
 
     return Journal(path=path, folder=os.path.dirname(path), segments=tuple(segments))
 
 
+def _journal_run_token(name: str) -> str:
+    """Return the run token *name* carries as a journal, or ``""`` if it is none.
+
+    Args:
+        name: A file name from the folder's listing.
+
+    Returns:
+        Everything between the last marker and the suffix.
+    """
+    if not name.endswith(_JOURNAL_SUFFIX):
+        return ""
+    stem = name[: -len(_JOURNAL_SUFFIX)]
+    marker = stem.rfind(_JOURNAL_MARKER)
+    return stem[marker + len(_JOURNAL_MARKER) :] if marker >= 0 else ""
+
+
 def _journal_candidates(folder: str) -> list[str]:
     """Return the rename journals in *folder*, newest run id first.
 
-    A run id starts with a UTC ISO timestamp, so the file name sorts by age on
-    its own; the name is the tie-break, which only matters for two runs that
-    started in the same second.
+    A journal is recognized by its marker and its suffix, not by the folder
+    name baked into the front of it. That name is provenance: it was the
+    folder's name when the run started, and it stops being it the moment
+    somebody renames the folder -- which is a thing people do to an archive
+    folder, and which this module otherwise supports outright, since a journal
+    records file names and never paths (see the module docstring). Matching on
+    it would mean a renamed folder loses its own resume, its own undo, and the
+    guard that stops a second run trampling a half-finished one, with the
+    journal sitting right there.
+
+    A run id starts with a UTC ISO timestamp, so the token after the marker
+    sorts by age on its own; the whole name is the tie-break, which only
+    matters for two runs that started in the same second.
+
+    Args:
+        folder: The folder to look in.
+
+    Returns:
+        Absolute paths, newest run first.
     """
     folder = os.path.abspath(folder)
     try:
         names = _list_names(folder)
     except OSError:
         return []
-    prefix = _journal_prefix(folder)
     matched = sorted(
-        (name for name in names if name.startswith(prefix) and name.endswith(_JOURNAL_SUFFIX)),
-        reverse=True,
+        ((token, name) for name in names if (token := _journal_run_token(name))), reverse=True
     )
-    return [os.path.join(folder, name) for name in matched]
+    return [os.path.join(folder, name) for _token, name in matched]
 
 
 def latest_journal(folder: str, statuses: Iterable[str] | None = None) -> str | None:
@@ -847,7 +1128,9 @@ def _moves_of(ops: Iterable[RenameOp]) -> list[_Move]:
     return [(op.src, op.dst, op.tmp) for op in ops]
 
 
-def _locate_moves(moves: Sequence[_Move], names: Container[str]) -> tuple[list[str], set[str]]:
+def _locate_moves(
+    moves: Sequence[_Move], names: Container[str], *, staged: bool = False
+) -> tuple[list[str], set[str]]:
     """Say where each file of a run is now, reading the run as a whole.
 
     Asked about one move on its own the question has no honest answer for the
@@ -864,20 +1147,32 @@ def _locate_moves(moves: Sequence[_Move], names: Container[str]) -> tuple[list[s
     Everything after that is elimination: a move with only one of its two
     names free is where that name says it is, and each such decision releases
     the other moves that could have claimed the name it just took, which walks
-    a chain in from whichever end is unambiguous. A move still undecided when
-    that runs out is a cycle (``a -> b`` beside ``b -> a`` looks identical
-    before and after), and is reported as still at its source. For a move this
-    executor makes that is the conservative reading, because it makes a caller
-    redo a move rather than skip one. For a move someone else made -- an image
-    a catalog renamed -- it reads as "the catalog has put it back", which is
-    the only reading under which a reversed chain can be undone at all; a
-    cycle among such images is the one shape where that is a guess rather than
-    a deduction, and the guess costs a companion put back beside an image that
-    is where it started under either reading.
+    a chain in from whichever end is unambiguous.
+
+    A move still undecided when that runs out is a cycle -- ``x-001 -> x-002``
+    beside ``x-002 -> x-001``, which an explicit manifest ``order`` can ask for
+    -- and a cycle is the one shape the folder cannot answer for itself: both
+    names are present before the run and both are present after it, so there is
+    nothing to eliminate against and elimination is not the wrong tool, it is
+    an empty one. What answers it is the journal, which recorded whether phase
+    A finished (:func:`_mark_staged`): *staged* means every move this executor
+    performs had reached its temporary, so one whose temporary is gone has been
+    placed, and *not staged* means no move had left its source yet. Deduced
+    from a durable record either way, never guessed.
+
+    A move with no temporary is one this executor does not perform -- an image
+    a catalog renamed -- and the phase marker says nothing about those, so an
+    undecided one reads as still at its source. That is the only reading under
+    which a reversed chain can be undone at all; a cycle among such images is
+    the one shape where it is a guess, and the guess costs a companion put back
+    beside an image that is where it started under either reading.
 
     Args:
         moves: The run's moves, in the order they were journalled.
         names: The folder's current names, as the filesystem spells them.
+        staged: The journal records that phase A of this segment finished.
+            ``False`` for a mapping that is not a journalled run's, where the
+            question is asked of the plan and nothing has been staged.
 
     Returns:
         One location per move, in the same order (``_AT_TMP``, ``_AT_SOURCE``,
@@ -915,9 +1210,12 @@ def _locate_moves(moves: Sequence[_Move], names: Container[str]) -> tuple[list[s
         queue.extend(other for other in holders[held] if locations[other] == _UNDECIDED)
 
     for index, location in enumerate(locations):
-        if location == _UNDECIDED:
-            locations[index] = _AT_SOURCE
-            claimed.add(moves[index][0])
+        if location != _UNDECIDED:
+            continue
+        source, target, tmp = moves[index]
+        placed = staged and bool(tmp)
+        locations[index] = _AT_TARGET if placed else _AT_SOURCE
+        claimed.add(target if placed else source)
     return locations, claimed
 
 
@@ -1287,22 +1585,34 @@ def _swap_in(path: str, tmp_path: str, payload: bytes) -> str | None:
     old bytes or the new ones, never zero. Do not "restore consistency" by
     changing it back to an in-place write.
 
+    A symlinked transcript is rewritten *through* the link, not over it: the
+    swap is made onto the file the link resolves to, and the staging temporary
+    moves to that file's own folder so the replace stays atomic and stays on
+    one filesystem. Replacing the link itself would destroy it -- the name
+    would come back a plain file holding the new bytes, and whatever the link
+    pointed at would keep the old ones, still naming an image that no longer
+    exists. Somebody who linked a transcript did it on purpose.
+
     Args:
         path: The file whose content is being replaced.
-        tmp_path: Sibling temporary to stage the new bytes in; it must sit in
-            the same folder as *path*, or the swap is not atomic.
+        tmp_path: Temporary to stage the new bytes in. Its name is used as
+            given; its folder is *path*'s, or the resolved file's when *path*
+            is a link, since the swap is only atomic within one folder.
         payload: The complete new content.
 
     Returns:
         A warning line when the swap did not happen, or ``None`` on success.
     """
+    resolved = os.path.realpath(path)
+    if resolved != path:
+        tmp_path = os.path.join(os.path.dirname(resolved), os.path.basename(tmp_path))
     try:
         with open(tmp_path, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        _carry_protection(path, tmp_path)
-        os.replace(tmp_path, path)
+        _carry_protection(resolved, tmp_path)
+        os.replace(tmp_path, resolved)
     except OSError as exc:
         if os.path.lexists(tmp_path):
             try:
@@ -1400,8 +1710,16 @@ def _rewrite_sidecar(md_path: str, was: str, now: str, tmp_path: str) -> str | N
     return f"sidecar not updated (no source_file line): {os.path.basename(md_path)}"
 
 
-def _apply_sidecars(folder: str, ops: Sequence[RenameOp], run_token: str) -> list[str]:
-    """Rewrite every renamed sidecar's ``source_file``; return the warnings.
+def _apply_sidecars(
+    folder: str, ops: Sequence[RenameOp], run_token: str
+) -> list[tuple[str, str | None]]:
+    """Rewrite every renamed sidecar's ``source_file``; report each outcome.
+
+    One result per rewrite attempted, in a fixed order, because the caller
+    compares the forward pass against the reversing one position by position:
+    the same ops filtered by the same rule give the same sequence, and what
+    tells a sidecar that could not be *restored* from one that was never
+    rewritten in the first place is which of the two passes it failed in.
 
     Args:
         folder: The folder every name is resolved against.
@@ -1410,9 +1728,9 @@ def _apply_sidecars(folder: str, ops: Sequence[RenameOp], run_token: str) -> lis
             temporary from colliding with another run's.
 
     Returns:
-        One warning line per sidecar that was not rewritten.
+        ``(sidecar name, warning or None)`` per sidecar this pass touched.
     """
-    warnings: list[str] = []
+    results: list[tuple[str, str | None]] = []
     for index, (sidecar_name, was, now) in enumerate(_sidecar_rewrites(ops)):
         tmp = f"{_TMP_PREFIX}{run_token}-sidecar-{index}{_SIDECAR_EXT}"
         warning = _rewrite_sidecar(
@@ -1420,8 +1738,8 @@ def _apply_sidecars(folder: str, ops: Sequence[RenameOp], run_token: str) -> lis
         )
         if warning is not None:
             logger.warning("%s", warning)
-            warnings.append(warning)
-    return warnings
+        results.append((sidecar_name, warning))
+    return results
 
 
 # --- The two phases ----------------------------------------------------
@@ -1583,13 +1901,17 @@ def _execute(
     staged: list[RenameOp] = list(staged_before)
     placed: list[RenameOp] = list(placed_before)
     warnings: list[str] = []
-    sidecars_rewritten = False
+    forward: list[tuple[str, str | None]] = []
     outcome: tuple[str, list[str], list[str]]
     try:
         _move_all(folder, pending_a, to_tmp=True, done=staged)
+        # Phase A is complete and durably said to be complete before phase B
+        # moves anything, so that a crash inside phase B leaves a folder whose
+        # state can be deduced rather than guessed at (:func:`_mark_staged`).
+        _mark_staged(journal)
         _move_all(folder, staged, to_tmp=False, done=placed)
-        warnings = _apply_sidecars(folder, ops, run_token)
-        sidecars_rewritten = True
+        forward = _apply_sidecars(folder, ops, run_token)
+        warnings = [warning for _name, warning in forward if warning]
         problems = _verify(folder, ops, before, os.path.basename(journal))
         if problems:
             raise _VerifyFailed(problems)
@@ -1603,18 +1925,31 @@ def _execute(
         # as it started", and it would still be holding half of a run nobody
         # asked for, with no open journal left to resume or undo it from.
         stranded = _reverse(folder, [*staged, *placed_before], placed)
+        if not stranded and forward:
+            # Verification can fail after the sidecars have been rewritten, so
+            # they have to follow the files back or the rollback would leave
+            # every sidecar pointing at a name that is not on disk.
+            back = _apply_sidecars(folder, [_reversed_op(op) for op in ops], run_token)
+            warnings.extend(warning for _name, warning in back if warning)
+            # A sidecar this run rewrote and could not put back is a transcript
+            # naming an image that is not there any more, which ``rolled_back``
+            # -- "the folder is exactly as it started" -- would report as a
+            # success. One the forward pass never rewrote is a different thing:
+            # nothing happened to it in either direction, so its warning is the
+            # same one the apply already reported and it is not a failed
+            # restoration. Position tells the two apart; the passes filter the
+            # same ops by the same rule.
+            failed_forward = {index for index, (_n, w) in enumerate(forward) if w}
+            stranded = [
+                os.path.join(folder, name)
+                for index, (name, warning) in enumerate(back)
+                if warning and index not in failed_forward
+            ]
         if stranded:
             # A reversal that could not finish is not a state to keep editing
             # files in: every remaining decision belongs to a person.
             outcome = (STATUS_NEEDS_ATTENTION, stranded, warnings)
         else:
-            if sidecars_rewritten:
-                # Verification can fail after the sidecars have been rewritten,
-                # so they have to follow the files back or the rollback would
-                # leave every sidecar pointing at a name that is not on disk.
-                warnings.extend(
-                    _apply_sidecars(folder, [_reversed_op(op) for op in ops], run_token)
-                )
             outcome = (STATUS_ROLLED_BACK, stranded, warnings)
     else:
         outcome = (STATUS_APPLIED, [], warnings)
@@ -1890,6 +2225,15 @@ def resume_run(journal_path: str) -> ApplyReport:
             "Use --rename-undo to reverse it.",
             [journal.path],
         )
+    if segment.partial:
+        # An undo that stopped part way is open on purpose, not interrupted.
+        # Every file it recorded is already back; what is left is the work it
+        # declined to record, which only a fresh undo can build.
+        raise RenamePreflightError(
+            "This undo stopped part way; there is nothing to finish forward.",
+            "Run --rename-undo again once the images are back at their old names.",
+            [journal.path],
+        )
 
     folder = journal.folder
     names = _list_names(folder)
@@ -1901,7 +2245,7 @@ def resume_run(journal_path: str) -> ApplyReport:
     # targets is also the *source* name of the op before it, so each op looks
     # both moved and unmoved at once and the collision check refuses the only
     # way out of the folder.
-    locations, accounted = _locate_moves(_moves_of(ops), names)
+    locations, accounted = _locate_moves(_moves_of(ops), names, staged=segment.staged)
     staged: list[RenameOp] = []
     placed: list[RenameOp] = []
     pending: list[RenameOp] = []
@@ -1977,9 +2321,44 @@ def resume_run(journal_path: str) -> ApplyReport:
     )
 
 
+def _without_blocked(
+    ops: list[RenameOp], names: Container[str], skipped: list[str]
+) -> list[RenameOp]:
+    """Drop every reversal whose destination is held by something else.
+
+    A name a reversal moves onto is free when nothing is under it, or when
+    what is under it is another reversal of this same run, which is about to
+    move away -- every old name in a gap-closing renumber is some other file's
+    new name, so anything stricter refuses the shape this feature exists to
+    produce. What is left over is a file nobody in this run accounts for, and
+    renaming onto it is the one thing this module may never do.
+
+    Asking it once is not enough: dropping a reversal means the name it was
+    going to vacate stays held, which can block another. The question is
+    re-asked until the answer stops changing.
+
+    Args:
+        ops: The reversals built so far, in the direction they will run.
+        names: The folder's current names.
+        skipped: Accumulator for what this refuses, in the caller's words.
+
+    Returns:
+        The reversals that may go ahead.
+    """
+    while True:
+        freed = {op.src for op in ops if not op.external}
+        blocked = {
+            op for op in ops if not op.external and op.dst in names and op.dst not in freed
+        }
+        if not blocked:
+            return ops
+        skipped.extend(f"something is already called that: {op.dst}" for op in ops if op in blocked)
+        ops = [op for op in ops if op not in blocked]
+
+
 def _reverse_ops(
     segment: JournalSegment, names: set[str], run_id: str
-) -> tuple[list[RenameOp], list[str]]:
+) -> tuple[list[RenameOp], list[str], bool]:
     """Build the reverse of a completed segment, and report what cannot go back.
 
     An ordinary run reverses whole: every file must still be at its target.
@@ -2006,11 +2385,16 @@ def _reverse_ops(
         run_id: The undo run's id, which names the new temporaries.
 
     Returns:
-        ``(ops, skipped)``.
+        ``(ops, skipped, deferred)``. *deferred* says a later undo would still
+        have something to do -- an image the catalog has not put back, or a
+        name a stranger is holding -- as against a companion that is simply
+        home already, which nothing is waiting on.
     """
     safe = _safe_run_id(run_id)
     external = segment.mode == MODE_FINISH
-    locations, _accounted = _locate_moves(_moves_of(segment.ops), names)
+    locations, _accounted = _locate_moves(
+        _moves_of(segment.ops), names, staged=segment.staged
+    )
     blocked: set[str] = set()
     skipped: list[str] = []
 
@@ -2038,13 +2422,43 @@ def _reverse_ops(
             skipped.append(f"something is already called that: {op.src}")
             continue
         ops.append(_reversed_op(op, _tmp_name(safe, len(ops), op.dst)))
+    kept = _without_blocked(ops, names, skipped)
     if not external and skipped:
         raise RenamePreflightError(
             "The folder has moved on since this rename; it cannot be undone.",
             "Check it by hand; photokin will not guess.",
             skipped,
         )
-    return ops, skipped
+    return kept, skipped, bool(blocked) or len(kept) != len(ops)
+
+
+def _segment_to_undo(journal: Journal) -> JournalSegment:
+    """Return the segment an undo should reverse.
+
+    Ordinarily the last one. But an undo of a ``--rename-finish`` journal
+    reverses only the entries whose images the catalog has already put back,
+    and leaves the rest for later (:func:`_reverse_ops`) -- so that segment is
+    closed ``in_progress``, marked partial, precisely so the rest stays
+    retryable. Retrying it means reversing the original segment again against
+    the folder as it is now: the companions already put back are read off the
+    disk as done, and the ones whose image has since come home are reversed.
+    Undoing the partial segment itself instead would put back what was just
+    put back.
+
+    Args:
+        journal: The journal being undone.
+
+    Returns:
+        The segment to reverse.
+    """
+    segment = journal.last
+    if segment.mode != MODE_UNDO or not segment.partial:
+        return segment
+    undoes = segment.header.get("undoes")
+    for earlier in reversed(journal.segments[:-1]):
+        if earlier.run_id == undoes:
+            return earlier
+    return segment
 
 
 def undo_run(journal_path: str) -> ApplyReport:
@@ -2067,7 +2481,7 @@ def undo_run(journal_path: str) -> ApplyReport:
             files are no longer where it left them.
     """
     journal = read_journal(journal_path)
-    segment = journal.last
+    segment = _segment_to_undo(journal)
     if segment.status in OPEN_STATUSES:
         raise RenamePreflightError(
             f"This rename run is still {segment.status}; it cannot be undone yet.",
@@ -2084,7 +2498,7 @@ def undo_run(journal_path: str) -> ApplyReport:
     folder = journal.folder
     run_id = make_run_id()
     safe = _safe_run_id(run_id)
-    ops, skipped = _reverse_ops(segment, _list_names(folder), run_id)
+    ops, skipped, deferred = _reverse_ops(segment, _list_names(folder), run_id)
     counts = (
         sum(1 for op in ops if op.kind == _IMAGE_KIND and not op.external),
         sum(1 for op in ops if op.kind == _COMPANION_KIND),
@@ -2105,7 +2519,17 @@ def undo_run(journal_path: str) -> ApplyReport:
     status, stranded, warnings = _execute(folder, ops, journal=journal.path, run_token=safe)
     if status == STATUS_APPLIED:
         status = STATUS_UNDONE
-    _append_footer(journal.path, _footer(status, counts, stranded))
+    # An undo that reversed what it could and left the rest for the catalog is
+    # not a finished undo, and a footer saying it is closes the journal on a
+    # state nobody asked for: closed, it can never be run again, so the
+    # companions still sitting under their new names have no way home. It is
+    # recorded open and marked partial instead, and a later --rename-undo picks
+    # up where this one stopped (:func:`_segment_to_undo`).
+    partial = deferred and status == STATUS_UNDONE
+    footer = _footer(STATUS_IN_PROGRESS if partial else status, counts, stranded)
+    if partial:
+        footer["partial"] = True
+    _append_footer(journal.path, footer)
     return ApplyReport(
         status,
         journal.path,

@@ -359,7 +359,8 @@ Printed as a table by default; `--plan-out PATH` writes it as JSON.
      "notes": [],
      "companions": [
        {"path": "/Volumes/Archive/bag-woodbury/file105b-back.md",
-        "target": "520601-bag-woodbury-002b-back.md"}
+        "target": "520601-bag-woodbury-002b-back.md",
+        "size": 412, "mtime": 1719346204.0}
      ]}
   ],
   "left_behind": [],

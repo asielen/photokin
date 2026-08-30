@@ -33,7 +33,12 @@ _FOLDER = "/scans"
 
 
 def _path(name: str) -> str:
-    return os.path.normpath(f"{_FOLDER}/{name}")
+    # Absolute, matching what plan_rename now serializes to entries[].path
+    # (C-P2-4): _FOLDER ("/scans") is already absolute on POSIX, so this is a
+    # no-op there, but on Windows it is not ("/scans" has no drive letter),
+    # so the abspath call is load-bearing for keeping this helper in step
+    # with the planner's own output on every platform CI runs.
+    return os.path.normpath(os.path.abspath(f"{_FOLDER}/{name}"))
 
 
 def _plan(
@@ -882,6 +887,50 @@ class CaseMismatchFallbackPerformanceTests(unittest.TestCase):
         self.assertLessEqual(spy.call_count, n, spy.call_count)
 
 
+class EntryPathIsAbsoluteTests(unittest.TestCase):
+    """P2 round 4: a folder-generated plan must serialize ``entries[].path``
+    as absolute, matching what docs/rename-contract.md already documents
+    that field to be -- a relative one (what a relative ``folder`` argument
+    produces, since ``utils.list_folder_images`` only normalizes, it does
+    not ``abspath``) does not resolve the same way from a different working
+    directory, which is exactly the failure C9 already fixed for the plan's
+    own top-level ``folder`` field."""
+
+    def test_relative_item_path_is_serialized_absolute(self) -> None:
+        item_path = os.path.join(".", "scans", "aaa.tif")
+        plan = plan_rename(
+            folder=os.path.join(".", "scans"),
+            disk_files=[item_path],
+            items=[RenameItem(path=item_path)],
+            prefix_template="x",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertEqual(plan["errors"], [])
+        (entry,) = plan["entries"]
+        self.assertTrue(os.path.isabs(entry["path"]), entry["path"])
+        self.assertEqual(entry["path"], os.path.normpath(os.path.abspath(item_path)))
+
+    def test_relative_item_path_is_absolute_even_for_an_unplannable_entry(self) -> None:
+        # A group that could not be rendered (here: no date, no --undated)
+        # still gets an entry per member (4.6) -- entries[].path must be
+        # absolute on that path too, not only on the happy path.
+        item_path = os.path.join(".", "scans", "scan.tif")
+        plan = plan_rename(
+            folder=os.path.join(".", "scans"),
+            disk_files=[item_path],
+            items=[RenameItem(path=item_path)],
+            prefix_template="{date}",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertEqual(len(plan["errors"]), 1)
+        (entry,) = plan["entries"]
+        self.assertIsNone(entry["target"])
+        self.assertTrue(os.path.isabs(entry["path"]), entry["path"])
+        self.assertEqual(entry["path"], os.path.normpath(os.path.abspath(item_path)))
+
+
 class FolderNormalizationTests(unittest.TestCase):
     """C9: the plan must not store a relative folder -- a later
     ``--rename-finish`` run from a different working directory would
@@ -965,6 +1014,131 @@ class PlatformIndependentCaseFoldingTests(unittest.TestCase):
                 run_id="test-run",
             )
         self.assertEqual(plan["errors"], [])
+
+
+class DuplicatePhysicalSourceTests(unittest.TestCase):
+    """P2 round 4: a plan must refuse a manifest that names the same
+    physical file twice, spelled differently -- the executor renames by
+    source path once per entry, and the second rename of that pair always
+    fails the first has already moved the file out from under it. This is
+    caught in the planner as a named error, not left for the executor to
+    discover mid-run."""
+
+    def test_same_file_named_twice_with_different_spelling_is_an_error(self) -> None:
+        spelling_a = _path("SAME-001.TIF")
+        spelling_b = _path("same-001.tif")
+        plan = plan_rename(
+            folder=_FOLDER,
+            disk_files=[spelling_b],
+            items=[RenameItem(path=spelling_a), RenameItem(path=spelling_b)],
+            prefix_template="x",
+            digits=3,
+            run_id="test-run",
+        )
+        matches = [e for e in plan["errors"] if "same source file twice" in e]
+        self.assertEqual(len(matches), 1, plan["errors"])
+        self.assertIn(os.path.basename(spelling_a), matches[0])
+        self.assertIn(os.path.basename(spelling_b), matches[0])
+
+    def test_two_distinct_files_are_not_flagged_as_duplicates(self) -> None:
+        plan = _plan(["aaa.tif", "bbb.tif"], "x")
+        self.assertEqual(plan["errors"], [])
+
+
+class GroupDirectoryIdentityTests(unittest.TestCase):
+    """P2 round 4: a group's members are compared against *folder* by
+    filesystem identity (``paths_are_same_file``), not string equality --
+    a manifest item's directory spelled with different case from *folder*
+    on a case-insensitive filesystem is not "a different folder", and must
+    not be reported as C6's "members sit in different folders" error."""
+
+    def test_case_only_directory_spelling_difference_is_not_a_different_folder(
+        self,
+    ) -> None:
+        folder = os.path.join(os.path.abspath(os.sep), "Scans")
+        item_path = os.path.join(os.path.abspath(os.sep), "scans", "aaa.tif")
+        plan = plan_rename(
+            folder=folder,
+            disk_files=[item_path],
+            items=[RenameItem(path=item_path)],
+            prefix_template="x",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertEqual(plan["errors"], [])
+
+    def test_genuinely_different_directory_is_still_an_error(self) -> None:
+        folder = os.path.join(os.path.abspath(os.sep), "scans")
+        item_path = os.path.join(os.path.abspath(os.sep), "elsewhere", "aaa.tif")
+        plan = plan_rename(
+            folder=folder,
+            disk_files=[item_path],
+            items=[RenameItem(path=item_path)],
+            prefix_template="x",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertTrue(
+            any("different folders" in e for e in plan["errors"]), plan["errors"]
+        )
+
+
+class TargetPhotoIdSpellingTests(unittest.TestCase):
+    """P2 round 4: ``target_photo_id`` must be derived from the folder
+    spelling the plan itself carries (``plan["folder"]``, what
+    ``rename_apply.py`` actually renames into) rather than from whatever
+    directory spelling the source item happened to arrive with -- otherwise
+    a wrapper's post-rename id disagrees with the ``photo_id`` an ordinary
+    run reports for the same file afterward."""
+
+    def test_target_photo_id_uses_the_plans_folder_spelling_not_the_items(
+        self,
+    ) -> None:
+        folder = os.path.join(os.path.abspath(os.sep), "Scans")
+        item_path = os.path.join(os.path.abspath(os.sep), "scans", "aaa.tif")
+        plan = plan_rename(
+            folder=folder,
+            disk_files=[item_path],
+            items=[RenameItem(path=item_path)],
+            prefix_template="bw",
+            digits=3,
+            run_id="test-run",
+        )
+        self.assertEqual(plan["errors"], [])
+        (entry,) = plan["entries"]
+        expected = make_photo_id(os.path.join(plan["folder"], entry["target"]))
+        self.assertEqual(entry["target_photo_id"], expected)
+
+
+class CompanionStatsTests(unittest.TestCase):
+    """P2 round 4: a companion's own size/mtime must be recorded in the
+    plan, the same way an image's already are (``RenameItem.size``/
+    ``.mtime``), so the executor's stale-plan preflight (5.1) can tell a
+    companion changed since planning -- without them, ``rename_apply.py``'s
+    generic ``record.get("size")``/``.get("mtime")`` staleness check reads
+    ``None`` for every companion and can never catch one."""
+
+    def test_companion_carries_its_own_size_and_mtime(self) -> None:
+        companion_path = _path("photo.md")
+        plan = _plan(
+            ["photo.tif"],
+            "x",
+            disk_files=[_path("photo.tif"), companion_path],
+            disk_file_stats={companion_path: (321, 123456.5)},
+        )
+        entry = _entry_for(plan, "photo.tif")
+        (companion,) = entry["companions"]
+        self.assertEqual(companion["size"], 321)
+        self.assertEqual(companion["mtime"], 123456.5)
+
+    def test_companion_stats_default_to_none_when_not_supplied(self) -> None:
+        plan = _plan(
+            ["photo.tif"], "x", disk_files=[_path("photo.tif"), _path("photo.md")]
+        )
+        entry = _entry_for(plan, "photo.tif")
+        (companion,) = entry["companions"]
+        self.assertIsNone(companion["size"])
+        self.assertIsNone(companion["mtime"])
 
 
 if __name__ == "__main__":

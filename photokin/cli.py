@@ -2144,17 +2144,28 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
     changeset_path: str | None = None
     if changeset_requested and not args.dry_run:
         changeset_path = _derive_changeset_path(resolved, None)
+    if (
+        args.plan_out
+        and changeset_path
+        and os.path.normpath(os.path.abspath(args.plan_out))
+        == os.path.normpath(os.path.abspath(changeset_path))
+    ):
+        _exit_with_usage_error(
+            *cli_messages.rename_plan_out_aliases_changeset(args.plan_out, changeset_path)
+        )
+    if changeset_path:
         _preflight_output_file(changeset_path, role="--changeset output")
-    if args.plan_out:
+    if args.plan_out and not args.dry_run:
         _preflight_output_file(args.plan_out, role="--plan-out")
 
     if _template_uses_date(args.rename):
         ecfg = _resolve_exiftool_config(args)
         _hydrate_rename_dates(items, ecfg)
 
+    disk_files = _list_all_files(folder)
     plan = plan_rename(
         folder=folder,
-        disk_files=_list_all_files(folder),
+        disk_files=disk_files,
         items=items,
         prefix_template=args.rename,
         digits=args.digits,
@@ -2164,12 +2175,22 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         companion_extensions=companions,
         managed_by=managed_by,
         photokin_version=_photokin_version(),
+        disk_file_stats={path: _stat_for_rename(path) for path in disk_files},
     )
 
     logger.info("%s", cli_messages.render_rename_preview(plan))
 
-    if args.plan_out:
+    if args.plan_out and not args.dry_run:
         _write_generated_manifest(plan, args.plan_out)
+    elif args.plan_out:
+        # --dry-run's global promise is that no destination is touched, and
+        # a plan file is a destination exactly as much as the changeset
+        # already treated as one above -- the preview table above still
+        # shows the plan, only the file itself is skipped.
+        logger.info(
+            "--dry-run: would write the rename plan to %s; nothing was written.",
+            args.plan_out,
+        )
 
     if changeset_path and not plan["errors"]:
         open(changeset_path, "w", encoding="utf-8").close()
@@ -2265,7 +2286,9 @@ def _run_rename_undo_or_resume(args: argparse.Namespace, *, verb: str) -> None:
 
     Raises:
         SystemExit: 2 for a usage problem or a preflight refusal, 1 if the
-            run did not finish cleanly, 0 otherwise.
+            run did not finish cleanly (including a resume that finds nothing
+            left to finish forward -- see ``partial_forward_resume`` below),
+            0 otherwise.
     """
     flag = f"--rename-{verb}"
     raw = args.rename_undo if verb == "undo" else args.rename_resume
@@ -2277,8 +2300,17 @@ def _run_rename_undo_or_resume(args: argparse.Namespace, *, verb: str) -> None:
             _exit_with_usage_error(
                 *cli_messages.rename_command_needs_folder(flag, resolved.display)
             )
+        # An undo left open by a partial catalog undo (rename-mode.md 5.5) is
+        # closed ``in_progress``, not ``applied`` -- it is retried, not
+        # resumed, so undo's own filter must widen to find it too. A run
+        # that is ``in_progress`` for the ordinary reason (unfinished, not
+        # partial) is not excluded here: ``undo_run`` itself refuses that
+        # case with "finish it with --rename-resume first", which is the
+        # right message and does not need this filter to pre-empt it.
         statuses = (
-            (rename_apply.STATUS_APPLIED,) if verb == "undo" else tuple(rename_apply.OPEN_STATUSES)
+            (rename_apply.STATUS_APPLIED, rename_apply.STATUS_IN_PROGRESS)
+            if verb == "undo"
+            else tuple(rename_apply.OPEN_STATUSES)
         )
         try:
             journal_path = rename_apply.latest_journal(resolved.path, statuses)
@@ -2287,6 +2319,20 @@ def _run_rename_undo_or_resume(args: argparse.Namespace, *, verb: str) -> None:
         if journal_path is None:
             _exit_with_usage_error(*cli_messages.rename_no_journal_found(resolved.path, verb))
 
+    # A ``--rename-resume`` of a journal a partial undo left open on purpose
+    # (rename_apply.resume_run refuses it: "there is nothing to finish
+    # forward") is not a usage mistake -- the caller asked a reasonable
+    # question and got a true, expected answer. It is reported as a normal
+    # outcome (exit 1, the run's own report path) rather than a preflight
+    # usage error (exit 2, below).
+    partial_forward_resume = False
+    if verb == "resume":
+        try:
+            journal = rename_apply.read_journal(journal_path)
+        except rename_apply.RenamePreflightError as exc:
+            _exit_with_rename_preflight_error(exc)
+        partial_forward_resume = bool(journal.segments) and journal.last.partial
+
     try:
         report = (
             rename_apply.undo_run(journal_path)
@@ -2294,6 +2340,9 @@ def _run_rename_undo_or_resume(args: argparse.Namespace, *, verb: str) -> None:
             else rename_apply.resume_run(journal_path)
         )
     except rename_apply.RenamePreflightError as exc:
+        if partial_forward_resume:
+            logger.error("%s", str(exc))
+            sys.exit(1)
         _exit_with_rename_preflight_error(exc)
 
     logger.info(
