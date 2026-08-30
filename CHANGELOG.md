@@ -29,10 +29,15 @@ All notable changes to this project are documented here, in the style of
   half-done. `--rename-finish` is the one on-disk operation a catalog
   wrapper needs from photokin: it renames only the companions and
   rewrites sidecars for images the catalog application has already
-  renamed itself. **A folder tracked by a catalog application (Lightroom
-  and the like) must be renamed through that application, not through
-  photokin directly** — photokin cannot tell such a folder apart from an
-  ordinary one on its own, so every `--rename` preview says so, and a
+  renamed itself. Companions sharing an image's stem come along, and a
+  `.md` transcript two same-stem images share — a TIFF master beside its
+  JPEG derivative — follows the same image the analysis half wrote it
+  against, so its `source_file:` line is rewritten rather than left
+  naming a file the rename moved away. **A folder tracked by a catalog
+  application (Lightroom and the like) must be renamed through that
+  application, not through photokin directly** — photokin cannot tell
+  such a folder apart from an ordinary one on its own, so every
+  `--rename` preview says so, and a
   manifest a catalog application exported (`managed_by`) makes `-w` a
   usage error rather than a guess. See "Rename mode: `--rename`" in
   README.md, `docs/rename-mode.md` for the full specification, and
@@ -155,5 +160,6 @@ on PyPI that carries document mode. Its compare link below therefore spans from
 0.3.2, and 0.4.0's points at the pull request it landed in rather than at a tag
 that does not exist.
 
+[0.6.0]: https://github.com/asielen/photokin/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/asielen/photokin/compare/v0.3.2...v0.5.0
 [0.4.0]: https://github.com/asielen/photokin/pull/9

@@ -372,7 +372,7 @@ A prefix that renders differently per file (any template using `{date}`) starts 
 
 **Photokin renames files on disk only with `-w`.** A folder tracked by a catalog application (Lightroom and the like) must be renamed through that application, not through photokin directly — photokin cannot tell such a folder apart from an ordinary one on its own, so every `--rename` preview says so. When a manifest was exported *by* that application (it carries `managed_by`), `-w` becomes a usage error rather than a guess: photokin plans the rename and, with `--plan-out PATH`, writes it out for the application to apply.
 
-See [`docs/rename-mode.md`](docs/rename-mode.md) for the full specification and [`docs/rename-contract.md`](docs/rename-contract.md) for the manifest, plan and changeset shapes a wrapper reads.
+See [`docs/rename-mode.md`](https://github.com/asielen/photokin/blob/v0.6.0/docs/rename-mode.md) for the full specification and [`docs/rename-contract.md`](https://github.com/asielen/photokin/blob/v0.6.0/docs/rename-contract.md) for the manifest, plan and changeset shapes a wrapper reads.
 
 ## Reading and writing your files
 
@@ -481,7 +481,7 @@ A multipage document is the case where that same reasoning inverts, not the rule
 
 This is also what brings the `.md` sidecar (see ["A readable transcript beside each scan"](#a-readable-transcript-beside-each-scan)) and `XMP-dc:Description` into line for a document: both now hold that one page's own text, where before the sidecar showed page 37 and Description showed the whole book. They agree on scope rather than forever on content — Description is merged and a sidecar is overwritten, so if a later run transcribes the page in different words, Description keeps both readings side by side (see [What happens to a caption you already have](#what-happens-to-a-caption-you-already-have)) while the sidecar simply shows the newest. That is the same rule every caption follows, and it is why the sidecar is the one to read when you want only the latest transcription.
 
-A page whose own text never arrived — the model's reply carried no `transcriptions` map at all, or this page was displaced or unseated and rode the payload under no label — keeps the group's whole block exactly as it would have before, rather than photokin inventing an attribution nothing in the reply supports. A folder can end up with some files in each state; that is legible rather than a mystery, because the record says which one applies per file (see the `caption_scope` note in [photokin/README.md](photokin/README.md#when-calls-succeed)).
+A page whose own text never arrived — the model's reply carried no `transcriptions` map at all, or this page was displaced or unseated and rode the payload under no label — keeps the group's whole block exactly as it would have before, rather than photokin inventing an attribution nothing in the reply supports. A folder can end up with some files in each state; that is legible rather than a mystery, because the record says which one applies per file (see the `caption_scope` note in [photokin/README.md](https://github.com/asielen/photokin/blob/v0.6.0/photokin/README.md#when-calls-succeed)).
 
 **The migration cost, in one sentence:** an archive already processed keeps the whole-document caption it already holds — re-running does not clear it — so a folder you re-run after upgrading ends up mixed, with newly analyzed documents holding per-page captions and previously analyzed ones still holding the whole book, and photokin does not reconcile the two.
 
@@ -789,7 +789,7 @@ See [Rename mode: --rename](#rename-mode---rename) above for what it does. `--re
 | `--undated LITERAL`     | Stand in for `{date}` in a group with no date, instead of refusing to plan it; those groups form their own numbering bucket |
 | `--today YYYY-MM-DD`    | Override `{today}` (default: the run's own date), so a batch scanned earlier can carry its own date and a plan stays reproducible |
 | `--companions EXT[,EXT]` | Extra non-image extensions carried along with a renamed image, beyond the default `.md`, `.json`, `.xmp`, `.txt` |
-| `--plan-out PATH`       | Write the plan as JSON to `PATH` (see [`docs/rename-contract.md`](docs/rename-contract.md)), instead of — or beside — the preview table |
+| `--plan-out PATH`       | Write the plan as JSON to `PATH` (see [`docs/rename-contract.md`](https://github.com/asielen/photokin/blob/v0.6.0/docs/rename-contract.md)), instead of — or beside — the preview table |
 | `--rename-undo [JOURNAL]` | Reverse the latest applied rename in the positional folder, or the named journal file |
 | `--rename-resume [JOURNAL]` | Finish an interrupted rename run in the positional folder, or the named journal file, forward |
 | `--rename-finish PLAN`  | Rename only the companions of a `--rename` plan whose images a catalog application has already renamed |
@@ -922,7 +922,7 @@ Prints this build's contract as JSON and exits, before any input is required —
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "0.6.0",
   "ndjson_schema_version": 3,
   "changeset_schema_version": 2,
   "canonical_tags": {

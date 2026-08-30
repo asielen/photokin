@@ -30,6 +30,7 @@ Code map:
 - _Member                      one parsed, override-applied planner item
 - _GroupPlan                   one group's members plus its rendered prefix
 - _build_unplannable_entry     an entry for a group that could not be rendered
+- _companion_owner_key         which same-stem image owns a shared companion
 """
 
 from __future__ import annotations
@@ -79,10 +80,12 @@ class RenameItem:
     are honored exactly as ``core._resolve_manifest_entry`` honors the same
     two manifest fields: ``None`` means "no override, read the filename"; an
     explicit value always wins and materializes into the rendered name.
-    ``preferred`` is accepted for parity with that override set, but no rule
-    in section 4 reads it -- the plan's own overrides table (4.1) lists it
-    without describing an effect on a rendered name, so it is carried
-    through and otherwise ignored here.
+    ``preferred`` changes no rendered name -- the plan's own overrides table
+    (4.1) lists it without describing one, and section 4 has no rule that
+    reads it. The single thing it decides here is which of two same-stem
+    images owns a companion they share (:func:`_companion_owner_key`), where
+    ignoring it would put the planner at odds with ``core``, whose sidecar
+    owner it does decide.
 
     Args:
         path: Absolute path of an image file, as it exists on disk today.
@@ -98,7 +101,8 @@ class RenameItem:
             alone; an empty (or all-whitespace) string explicitly clears an
             existing variant letter, mirroring how the manifest override
             already behaves in ``core.py``.
-        preferred: Accepted, unused -- see the class docstring.
+        preferred: Ranks this file ahead of a same-stem sibling as the owner
+            of a companion they share -- see the class docstring.
         size: The file's size in bytes, carried into the plan's preflight
             record (section 5.1 is what actually reads it).
         mtime: The file's modification time, carried the same way.
@@ -1095,6 +1099,7 @@ def plan_rename(
         disk_files=sorted(disk_files, key=_name_key),
         normalized_folder=normalized_folder,
         known_image_paths=[m.abs_path for m in members],
+        preferred_paths=frozenset(m.abs_path for m in members if m.item.preferred),
         companion_extensions=effective_companions,
         disk_file_stats=disk_file_stats,
         left_behind=left_behind,
@@ -1134,12 +1139,65 @@ def plan_rename(
     }
 
 
+#: Fidelity order for same-stem files that differ only by extension, and the
+#: rank an extension outside it takes. A verbatim copy of ``core._FORMAT_RANK``
+#: / ``core._UNRANKED_FORMAT``, because the two halves of photokin have to
+#: answer "which of these twins is the object" identically: ANALYSIS writes one
+#: ``<stem>.md`` transcript per group and gives it to the file this order ranks
+#: first (``core``'s ``sidecar_owner``, built from ``_slot_rank_key``), so a
+#: planner that picked the other twin would carry the transcript along under
+#: that twin's identity and the executor would then find a ``source_file:``
+#: line naming a file its op knows nothing about, leave it alone, and warn
+#: ("it names another file") -- on the commonest shape in an archive, a TIFF
+#: master beside its JPEG derivative. Copied rather than imported because a
+#: pure planner does not import ``core``; see the module docstring.
+_FORMAT_RANK: dict[str, int] = {".tif": 0, ".tiff": 0, ".png": 1, ".jpg": 2, ".jpeg": 2}
+_UNRANKED_FORMAT = 3
+
+
+def _companion_owner_key(
+    entry: dict[str, Any], preferred_paths: frozenset[str]
+) -> tuple[int, int, int, int, int, str, int, str, str]:
+    """Rank one entry as a candidate owner of a companion sharing its stem.
+
+    Component for component the key ``core._slot_rank_key`` ranks the same
+    group's files by, read off the plan entry's already-override-resolved
+    fields instead of a grouping entry's: crop-ness first, then ``preferred``,
+    then part kind, page, unversioned-before-versioned, then format fidelity,
+    then the path. Only the last three ever separate two files sharing a stem
+    on disk today -- the rest are equal by construction unless the caller's
+    ``is_back``/``version``/``preferred`` overrides pull the two apart, which
+    is exactly the case ``core`` resolves by this same order.
+
+    Args:
+        entry: A plan entry (6.2) whose ``target_stem`` is not ``None``.
+        preferred_paths: Absolute paths of the items the caller marked
+            ``preferred``; the one field the plan entry does not carry.
+
+    Returns:
+        A sort key; the smallest among the candidates owns the companion.
+    """
+    extension = os.path.splitext(entry["path"])[1].lower()
+    return (
+        1 if entry["crop"] else 0,
+        0 if entry["path"] in preferred_paths else 1,
+        utils.PART_RANK.get(entry["part"] or "none", utils.UNRANKED_PART),
+        0 if entry["page"] is None else entry["page"],
+        0 if entry["variant"] is None else 1,
+        entry["variant"] or "",
+        _FORMAT_RANK.get(extension, _UNRANKED_FORMAT),
+        entry["path"].lower(),
+        entry["path"],
+    )
+
+
 def _attach_companions_and_bystanders(
     *,
     entries: list[dict[str, Any]],
     disk_files: Sequence[str],
     normalized_folder: str,
     known_image_paths: list[str],
+    preferred_paths: frozenset[str],
     companion_extensions: frozenset[str],
     disk_file_stats: Mapping[str, tuple[int | None, float | None]] | None,
     left_behind: list[dict[str, Any]],
@@ -1157,9 +1215,12 @@ def _attach_companions_and_bystanders(
     attaching it to every matching entry makes the same rendered companion
     target appear twice, which :func:`_validate_targets` then reports as a
     duplicate and refuses the whole plan (C6's regression is this exact
-    folder). The owner is the matching entry whose extension sorts first
-    (``.jpg`` before ``.tif``), tie-broken by path -- deterministic and
-    independent of *entries*' or the filesystem's own ordering.
+    folder). The owner is the matching entry :func:`_companion_owner_key`
+    ranks first -- the same file the analysis half of photokin gives that
+    stem's ``.md`` transcript to -- deterministic and independent of
+    *entries*' or the filesystem's own ordering. *preferred_paths* is passed
+    straight through to that key: it is the only input the ranking needs
+    that a plan entry does not itself carry.
 
     An image file in *disk_files* that is not one of *entries*' own source
     paths is a bystander: its current name, case-folded, is added to
@@ -1239,7 +1300,7 @@ def _attach_companions_and_bystanders(
             if plannable:
                 owner = min(
                     plannable,
-                    key=lambda i: (os.path.splitext(entries[i]["path"])[1].lower(), entries[i]["path"]),
+                    key=lambda i: _companion_owner_key(entries[i], preferred_paths),
                 )
                 target_stem = entries[owner]["target_stem"]
                 stat = (disk_file_stats or {}).get(disk_path)

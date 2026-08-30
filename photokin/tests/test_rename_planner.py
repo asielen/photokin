@@ -1,19 +1,23 @@
 """Tests for the rename-mode planner, ``photokin.rename.plan_rename``.
 
-Pure-function tests only: every case here constructs an in-memory listing
-and reads the returned plan dict back -- nothing touches a filesystem. The
-worked examples in ``docs/rename-mode.md`` sections 1, 4.5 and 4.7 are
+Pure-function tests, with one deliberate exception: every case here
+constructs an in-memory listing and reads the returned plan dict back
+without touching a filesystem, except ``TranscriptSourceFileTests``, whose
+whole point is that the planner's companion-owner choice survives an actual
+``rename_apply`` run on a real folder -- the ``source_file:`` line it has to
+keep true only exists on disk. The worked examples in ``docs/rename-mode.md`` sections 1, 4.5 and 4.7 are
 reproduced verbatim (as data, not paraphrased), because those are the
 plan's own binding examples; everything else exercises one rule at a time,
 per section 9's enumeration.
 """
 
 import os
+import tempfile
 import unittest
 from datetime import date
 from unittest import mock
 
-from photokin import utils
+from photokin import core, doc_sidecar, rename_apply, utils
 from photokin.changeset import make_photo_id
 from photokin.rename import (
     DEFAULT_COMPANION_EXTENSIONS,
@@ -51,18 +55,20 @@ def _plan(
     orders=None,
     is_backs=None,
     versions=None,
+    preferreds=None,
     **kwargs,
 ):
     """Build a :func:`plan_rename` call from a bare list of filenames.
 
-    ``dates``/``orders``/``is_backs``/``versions``, when given, are dicts
-    keyed by filename overriding that one item's field; everything else
-    defaults to "nothing known".
+    ``dates``/``orders``/``is_backs``/``versions``/``preferreds``, when
+    given, are dicts keyed by filename overriding that one item's field;
+    everything else defaults to "nothing known".
     """
     dates = dates or {}
     orders = orders or {}
     is_backs = is_backs or {}
     versions = versions or {}
+    preferreds = preferreds or {}
     items = []
     for name in names:
         metadata = None
@@ -75,6 +81,7 @@ def _plan(
                 order=orders.get(name),
                 is_back=is_backs.get(name),
                 version=versions.get(name),
+                preferred=bool(preferreds.get(name)),
             )
         )
     files = disk_files if disk_files is not None else [_path(name) for name in names]
@@ -727,16 +734,18 @@ class SharedCompanionSingleOwnerTests(unittest.TestCase):
         total_companions = len(tif_entry["companions"]) + len(jpg_entry["companions"])
         self.assertEqual(total_companions, 1, (tif_entry, jpg_entry))
 
-    def test_owner_is_the_entry_whose_extension_sorts_first(self) -> None:
-        # ".jpg" sorts before ".tif"; the companion belongs to that entry.
+    def test_owner_is_the_master_the_analysis_half_picked(self) -> None:
+        # The owner is decided by core's rank, not by the extension's
+        # alphabetical order, which would pick ".jpg" -- see
+        # CompanionOwnerAgreesWithAnalysisTests for why that mattered.
         names = ["photo.tif", "photo.jpg"]
         disk_files = [_path(n) for n in names] + [_path("photo.md")]
         plan = _plan(names, "x", disk_files=disk_files)
         jpg_entry = _entry_for(plan, "photo.jpg")
         tif_entry = _entry_for(plan, "photo.tif")
-        self.assertEqual(len(jpg_entry["companions"]), 1)
-        self.assertEqual(jpg_entry["companions"][0]["target"], "x-001.md")
-        self.assertEqual(len(tif_entry["companions"]), 0)
+        self.assertEqual(len(tif_entry["companions"]), 1)
+        self.assertEqual(tif_entry["companions"][0]["target"], "x-001.md")
+        self.assertEqual(len(jpg_entry["companions"]), 0)
 
 
 class VersionOverrideValidationTests(unittest.TestCase):
@@ -1139,6 +1148,197 @@ class CompanionStatsTests(unittest.TestCase):
         (companion,) = entry["companions"]
         self.assertIsNone(companion["size"])
         self.assertIsNone(companion["mtime"])
+
+
+class CompanionOwnerAgreesWithAnalysisTests(unittest.TestCase):
+    """The planner and ``core`` must name the SAME file as the owner of a
+    stem's ``.md`` transcript.
+
+    ANALYSIS writes one ``<stem>.md`` per group and gives it to the file
+    ``core._slot_rank_key`` ranks first -- format fidelity, so the TIFF
+    master, not its JPEG derivative. The planner used to pick the owner by
+    the extension's alphabetical order, which picks the opposite file
+    (``.jpg`` < ``.tif``): the transcript then travelled under the JPEG's
+    identity, and ``rename_apply`` -- which only rewrites a ``source_file:``
+    line naming the image its own op renamed -- found a line naming the TIFF,
+    left it alone, and warned "it names another file", on the commonest shape
+    in a scan archive.
+    """
+
+    @staticmethod
+    def _ranked(names_or_paths, preferred=()):
+        """The paths in ``core._slot_rank_key`` order, best first."""
+        group = [
+            {
+                "path": path,
+                "is_crop": False,
+                "preferred": path in preferred,
+                "part_kind": "none",
+                "page_num": None,
+                "version": None,
+            }
+            for path in names_or_paths
+        ]
+        return [entry["path"] for entry in sorted(group, key=core._slot_rank_key)]
+
+    def _assert_owns_the_md(self, plan, name, *, others=()):
+        entry = _entry_for(plan, name)
+        self.assertEqual([c["path"] for c in entry["companions"]], [_path("scan_001.md")])
+        for other in others:
+            self.assertEqual(_entry_for(plan, other)["companions"], [])
+
+    def test_tif_master_owns_the_transcript_it_shares_with_its_jpeg(self) -> None:
+        names = ["scan_001.tif", "scan_001.jpg"]
+        disk_files = [_path(n) for n in names] + [_path("scan_001.md")]
+        plan = _plan(names, "img", disk_files=disk_files)
+
+        self.assertEqual(plan["errors"], [])
+        self.assertEqual(self._ranked([_path(n) for n in names])[0], _path("scan_001.tif"))
+        self._assert_owns_the_md(plan, "scan_001.tif", others=["scan_001.jpg"])
+
+    def test_single_image_still_owns_its_transcript(self) -> None:
+        plan = _plan(
+            ["scan_001.tif"],
+            "img",
+            disk_files=[_path("scan_001.tif"), _path("scan_001.md")],
+        )
+        self.assertEqual(plan["errors"], [])
+        self._assert_owns_the_md(plan, "scan_001.tif")
+
+    def test_derivative_alone_owns_its_transcript(self) -> None:
+        # No master beside it, so the JPEG is the file core wrote the
+        # transcript against and the file the planner must hand it to.
+        plan = _plan(
+            ["scan_001.jpg"],
+            "img",
+            disk_files=[_path("scan_001.jpg"), _path("scan_001.md")],
+        )
+        self.assertEqual(plan["errors"], [])
+        self.assertEqual(self._ranked([_path("scan_001.jpg")])[0], _path("scan_001.jpg"))
+        self._assert_owns_the_md(plan, "scan_001.jpg")
+
+    def test_preferred_moves_the_owner_exactly_as_it_moves_cores(self) -> None:
+        # ``preferred`` outranks format fidelity in core._slot_rank_key, so a
+        # manifest marking the derivative preferred moves the transcript onto
+        # it -- and the planner has to move with it, or the two disagree
+        # again, this time the other way round.
+        names = ["scan_001.tif", "scan_001.jpg"]
+        disk_files = [_path(n) for n in names] + [_path("scan_001.md")]
+        plan = _plan(names, "img", disk_files=disk_files, preferreds={"scan_001.jpg": True})
+
+        self.assertEqual(plan["errors"], [])
+        ranked = self._ranked([_path(n) for n in names], preferred={_path("scan_001.jpg")})
+        self.assertEqual(ranked[0], _path("scan_001.jpg"))
+        self._assert_owns_the_md(plan, "scan_001.jpg", others=["scan_001.tif"])
+
+
+class TranscriptSourceFileTests(unittest.TestCase):
+    """End to end, on a real folder: after a rename, every transcript's
+    ``source_file:`` line must name a file that is actually there.
+
+    This is the assertion the owner mismatch failed. The planner tests above
+    pin the choice; this one proves what that choice buys, through the real
+    executor and the real sidecar writer -- the ``.md`` files here are
+    written by ``doc_sidecar.write_markdown_sidecar`` against the image
+    ``core``'s own rank picks, which is exactly what an analysis run leaves
+    in the folder.
+    """
+
+    #: A twin, a lone master, a lone derivative -- the three shapes the owner
+    #: rule has to get right, in one folder so one run covers all of them.
+    GROUPS = (("scan_001.tif", "scan_001.jpg"), ("scan_002.tif",), ("scan_003.jpg",))
+
+    def _folder_with_transcripts(self, folder: str) -> None:
+        for names in self.GROUPS:
+            paths = [os.path.join(folder, name) for name in names]
+            for index, path in enumerate(paths):
+                with open(path, "wb") as handle:
+                    handle.write(bytes(index + 1))
+            group = [
+                {
+                    "path": path,
+                    "is_crop": False,
+                    "preferred": False,
+                    "part_kind": "none",
+                    "page_num": None,
+                    "version": None,
+                }
+                for path in paths
+            ]
+            owner = min(group, key=core._slot_rank_key)["path"]
+            written = doc_sidecar.write_markdown_sidecar(
+                {"transcriptions": {"Front": "pencil on the back of the card"}},
+                {"path": owner},
+                doc_sidecar.SidecarContext(
+                    group_id=os.path.splitext(names[0])[0],
+                    part_label="Front",
+                    group_files=tuple(os.path.basename(p) for p in paths),
+                    page_count=None,
+                    page_number=None,
+                ),
+                utils.Config(),
+            )
+            self.assertIsNotNone(written)
+
+    @staticmethod
+    def _plan_folder(folder: str, prefix: str) -> dict:
+        """Plan *folder* the way the CLI does: real listing, real stats."""
+        paths = [os.path.join(folder, name) for name in sorted(os.listdir(folder))]
+        stats = {}
+        for path in paths:
+            info = os.stat(path)
+            stats[path] = (info.st_size, info.st_mtime)
+        items = [
+            RenameItem(path=path, size=stats[path][0], mtime=stats[path][1])
+            for path in paths
+            if os.path.splitext(path)[1].lower() in utils.VALID_EXTS
+        ]
+        return plan_rename(
+            folder=folder,
+            disk_files=paths,
+            items=items,
+            prefix_template=prefix,
+            disk_file_stats=stats,
+        )
+
+    @staticmethod
+    def _source_file_of(md_path: str) -> str:
+        with open(md_path, encoding="utf-8") as handle:
+            for line in handle.read().splitlines()[1:]:
+                if line.strip() == "---":
+                    break
+                if line.startswith("source_file:"):
+                    return line.partition(":")[2].strip().strip('"')
+        raise AssertionError(f"no source_file line in {md_path}")
+
+    def test_every_transcript_names_a_file_that_exists_after_the_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.realpath(tmp)
+            self._folder_with_transcripts(folder)
+            plan = self._plan_folder(folder, "img")
+            self.assertEqual(plan["errors"], [])
+
+            report = rename_apply.apply_plan(plan)
+
+            self.assertEqual(report.status, rename_apply.STATUS_APPLIED)
+            self.assertEqual(report.warnings, ())
+            transcripts = sorted(n for n in os.listdir(folder) if n.endswith(".md"))
+            self.assertEqual(transcripts, ["img-001.md", "img-002.md", "img-003.md"])
+            for name in transcripts:
+                named = self._source_file_of(os.path.join(folder, name))
+                self.assertTrue(
+                    os.path.exists(os.path.join(folder, named)),
+                    f"{name} names {named}, which is not in the folder",
+                )
+            named_by = {n: self._source_file_of(os.path.join(folder, n)) for n in transcripts}
+            self.assertEqual(
+                named_by,
+                {
+                    "img-001.md": "img-001.tif",
+                    "img-002.md": "img-002.tif",
+                    "img-003.md": "img-003.jpg",
+                },
+            )
 
 
 if __name__ == "__main__":

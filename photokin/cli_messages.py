@@ -1138,21 +1138,35 @@ def rename_write_bundle_contradiction(flag: str, value: str) -> UsageMessage:
     )
 
 
-def rename_managed_by_refuses_write(app: str, catalog: str | None) -> UsageMessage:
+def rename_managed_by_refuses_write(app: str | None, catalog: str | None) -> UsageMessage:
     """``-w`` was given for a manifest a catalog application exported (6.1).
 
+    The guard behind this message keys on ``managed_by`` being present at
+    all, whatever shape the wrapper gave it, so neither field is guaranteed
+    to be there: with no app to name, the message says "a catalog
+    application" rather than inventing one.
+
     Args:
-        app: The ``managed_by.app`` value.
-        catalog: The ``managed_by.catalog`` value, or ``None`` when absent.
+        app: The ``managed_by.app`` value, or ``None`` when ``managed_by`` is
+            not an object or carries no non-empty string there.
+        catalog: The ``managed_by.catalog`` value, under the same condition.
 
     Returns:
         The problem line and the remedy line, in that order.
     """
-    where = f" ({catalog})" if catalog else ""
+    where = f"\n  catalog: {catalog}" if catalog else ""
+    if app is None:
+        return (
+            (
+                "this manifest says it is managed by a catalog application; photokin "
+                f"plans the rename but does not apply it.{where}"
+            ),
+            "apply the plan through that application, or use --plan-out to save it for that step",
+        )
     return (
         (
-            f"this manifest was exported by {app}{where}; photokin plans the "
-            "rename but does not apply it."
+            f"this manifest was exported by {app}; photokin plans the "
+            f"rename but does not apply it.{where}"
         ),
         f"apply the plan through {app}, or use --plan-out to save it for that step",
     )

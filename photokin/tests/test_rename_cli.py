@@ -13,6 +13,7 @@ renames a file outside one.
 import json
 import os
 import unittest
+from typing import Any
 from unittest.mock import patch
 
 from photokin import cli_messages, rename_apply
@@ -53,6 +54,24 @@ def _non_journal_names(folder: str) -> list[str]:
     return sorted(n for n in os.listdir(folder) if not n.endswith(".ndjson"))
 
 
+def _changeset_path(folder: str) -> str:
+    """Return the changeset path a run over *folder* derives for itself."""
+    return os.path.join(folder, f"{os.path.basename(folder)}_changeset.ndjson")
+
+
+def _rename_records(changeset_path: str) -> list[dict[str, Any]]:
+    """Return the ``kind: "rename"`` records the changeset at *changeset_path* carries.
+
+    A changeset that was never written is an empty list: "this run claimed no
+    rename" is the property under test, and a missing file claims none.
+    """
+    if not os.path.isfile(changeset_path):
+        return []
+    with open(changeset_path, encoding="utf-8") as handle:
+        records = [json.loads(line) for line in handle if line.strip()]
+    return [record for record in records if record.get("kind") == "rename"]
+
+
 class TestRenamePreviewWritesNothing(_CliTestCase):
     """``--rename PREFIX`` alone is the preview: it touches nothing on disk."""
 
@@ -90,13 +109,10 @@ class TestWriteBundleExpandsInRenameMode(_CliTestCase):
         self.assertEqual(_non_journal_names(folder), sorted(["bw-001.jpg", "bw-001b.tif"]))
         self.assertIn("Rename apply: applied", stderr)
 
-        changeset_path = os.path.join(folder, f"{os.path.basename(folder)}_changeset.ndjson")
+        changeset_path = _changeset_path(folder)
         self.assertTrue(os.path.isfile(changeset_path))
-        with open(changeset_path, encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
-        records = [json.loads(line) for line in lines if line.strip()]
+        records = _rename_records(changeset_path)
         self.assertEqual(len(records), 2)
-        self.assertTrue(all(r["kind"] == "rename" for r in records))
         self.assertEqual(
             sorted((r["from"], r["to"]) for r in records),
             sorted(
@@ -119,8 +135,43 @@ class TestWriteBundleExpandsInRenameMode(_CliTestCase):
         self.assertIsNone(code)
         # The image itself is untouched -- only the changeset artifact is new.
         self.assertEqual(_non_journal_names(folder), before)
-        changeset_path = os.path.join(folder, f"{os.path.basename(folder)}_changeset.ndjson")
-        self.assertTrue(os.path.isfile(changeset_path))
+        self.assertTrue(os.path.isfile(_changeset_path(folder)))
+
+    def test_an_apply_refused_by_preflight_records_no_rename(self) -> None:
+        """A refused apply leaves no rename in the audit trail.
+
+        ``apply_plan``'s own preflight runs after the plan is built and can
+        still stop the run with nothing renamed; the changeset exists to be
+        trusted later, so it must not record what that run did not do.
+        """
+        folder = self.make_folder("box3_017.jpg", "box3_017-b.tif")
+        before = _non_journal_names(folder)
+        problem = rename_apply.RenamePreflightError(
+            "The folder no longer matches the plan; nothing was renamed.",
+            "Re-run --rename to make a fresh plan.",
+        )
+
+        with patch("photokin.cli.rename_apply.apply_plan", side_effect=problem):
+            code, _stdout, _stderr = self.run_cli([folder, "--rename", "bw", "-w"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(_rename_records(_changeset_path(folder)), [])
+        self.assertEqual(_non_journal_names(folder), before)
+
+    def test_a_rolled_back_apply_records_no_rename(self) -> None:
+        """``rolled_back`` means every file is back where it started, so the
+        audit trail must not say the renames happened."""
+        folder = self.make_folder("box3_017.jpg")
+        fake_report = rename_apply.ApplyReport(
+            status=rename_apply.STATUS_ROLLED_BACK,
+            journal_path=os.path.join(folder, "fake_rename-x.ndjson"),
+        )
+
+        with patch("photokin.cli.rename_apply.apply_plan", return_value=fake_report):
+            code, _stdout, _stderr = self.run_cli([folder, "--rename", "bw", "-w"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(_rename_records(_changeset_path(folder)), [])
 
     def test_dash_w_beside_a_contradicting_changeset_false_is_refused(self) -> None:
         folder = self.make_folder("box3_017.jpg")
@@ -167,10 +218,19 @@ class TestIncompatibleFlagsAreRefused(_CliTestCase):
         self.assertEqual(stdout, "")
 
 
+#: The object shape 6.1 documents, the one a wrapper is expected to send.
+_LIGHTROOM = {"app": "lightroom", "catalog": "/Volumes/Archive/archive.lrcat"}
+
+#: The shapes 6.1 also invites ("any shape the wrapper wants"). Each marks the
+#: archive as catalog-tracked exactly as the object above does.
+_NON_OBJECT_MANAGED_BY: tuple[Any, ...] = ("Lightroom Classic", ["Lightroom Classic"], True, 7)
+
+
 class TestManagedByGuardsTheWriteSwitch(_CliTestCase):
     """A ``managed_by`` manifest (6.1) makes ``-w`` a usage error; ``--plan-out`` still works."""
 
-    def _managed_manifest(self, folder: str) -> str:
+    def _managed_manifest(self, folder: str, managed_by: Any = _LIGHTROOM) -> str:
+        """Write a one-image manifest into *folder* carrying *managed_by* verbatim."""
         image = _write_bytes(os.path.join(folder, "box3_017.jpg"))
         manifest_path = _write_manifest(
             folder,
@@ -179,7 +239,7 @@ class TestManagedByGuardsTheWriteSwitch(_CliTestCase):
         )
         with open(manifest_path, "r", encoding="utf-8") as handle:
             document = json.load(handle)
-        document["managed_by"] = {"app": "lightroom", "catalog": "/Volumes/Archive/archive.lrcat"}
+        document["managed_by"] = managed_by
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(document, handle)
         return manifest_path
@@ -212,10 +272,60 @@ class TestManagedByGuardsTheWriteSwitch(_CliTestCase):
         self.assertEqual(sorted(n for n in _names(folder) if n != "plan.json"), before)
         with open(plan_path, "r", encoding="utf-8") as handle:
             plan = json.load(handle)
-        self.assertEqual(plan["managed_by"], {"app": "lightroom", "catalog": "/Volumes/Archive/archive.lrcat"})
+        self.assertEqual(plan["managed_by"], _LIGHTROOM)
         self.assertEqual(len(plan["entries"]), 1)
         self.assertEqual(plan["entries"][0]["target"], "bw-001.jpg")
         self.assertIn("Rename plan for", stderr)
+
+    def test_a_non_object_managed_by_still_refuses_dash_w(self) -> None:
+        """The guard keys on presence, not shape (6.1).
+
+        A manifest that marks its archive catalog-tracked with a string, a
+        list, a bool or a number is catalog-tracked all the same -- and none
+        of those shapes may crash the refusal on their way to the message.
+        """
+        for managed_by in _NON_OBJECT_MANAGED_BY:
+            with self.subTest(managed_by=managed_by):
+                folder = self.scratch()
+                manifest_path = self._managed_manifest(folder, managed_by)
+                before = _names(folder)
+
+                code, stdout, stderr = self.run_cli([manifest_path, "--rename", "bw", "-w"])
+
+                self.assertEqual(code, 2)
+                self.assertEqual(_names(folder), before)
+                self.assertIn("managed by a catalog application", stderr)
+                self.assertIn("use --plan-out", stderr)
+                self.assertEqual(stdout, "")
+
+    def test_a_non_object_managed_by_reaches_the_plan_verbatim(self) -> None:
+        """Whatever shape the wrapper wrote is the shape the plan hands back (6.1)."""
+        for managed_by in _NON_OBJECT_MANAGED_BY:
+            with self.subTest(managed_by=managed_by):
+                folder = self.scratch()
+                manifest_path = self._managed_manifest(folder, managed_by)
+                plan_path = os.path.join(folder, "plan.json")
+
+                code, _stdout, _stderr = self.run_cli(
+                    [manifest_path, "--rename", "bw", "--plan-out", plan_path]
+                )
+
+                self.assertIsNone(code)
+                with open(plan_path, "r", encoding="utf-8") as handle:
+                    plan = json.load(handle)
+                # Compared as JSON text rather than with assertEqual: `True ==
+                # 1` in Python, and carrying a bool back as a bool is the point.
+                self.assertEqual(json.dumps(plan["managed_by"]), json.dumps(managed_by))
+
+    def test_an_explicit_null_managed_by_is_not_a_managed_manifest(self) -> None:
+        """Presence means a value: an explicit ``null`` reads as no key at all."""
+        folder = self.scratch()
+        manifest_path = self._managed_manifest(folder, None)
+
+        code, _stdout, _stderr = self.run_cli([manifest_path, "--rename", "bw", "-w"])
+
+        self.assertIsNone(code)
+        self.assertEqual(_non_journal_names(folder), ["bw-001.jpg", "lightroom-export.json"])
 
 
 class TestExitCodes(_CliTestCase):

@@ -1,2 +1,16 @@
 include README.md
 recursive-include photokin/prompts_photo_ai *
+# The sdist ships its own test suite (photokin/tests and tests) so that
+# `pip download --no-binary :all:` (or any other sdist-only install) leaves a
+# downstream packager with something to run pytest against -- see
+# pyproject.toml's `testpaths`, which silently skips a path that isn't there.
+recursive-include photokin/tests *.py
+recursive-include photokin/tests/fixtures *
+recursive-include tests *.py
+# photokin/tests/test_docs_alignment.py reads these two subsystem READMEs
+# (alongside the top-level one) to confirm every CLI flag is documented
+# somewhere; without them here, that test fails inside the unpacked sdist
+# on the ExifTool-wrapper-only flags they alone document.
+include photokin/README.md
+include photokin/exiftool/README.md
+global-exclude __pycache__/* *.py[cod]

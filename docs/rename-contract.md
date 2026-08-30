@@ -79,13 +79,13 @@ A wrapper feeds `--rename` its own manifest, in the shape folder mode's
 
 | Field | Type | Meaning |
 |---|---|---|
-| `managed_by` | object, top-level, optional | `{"app": str, "catalog": str}` (or any shape the wrapper wants -- only `app` and `catalog` are read). Present, `-w` becomes a usage error (exit 2): the plan is still produced and can still be written with `--plan-out`, but photokin refuses to rename the files itself. Copied verbatim into the plan's own `managed_by`. |
+| `managed_by` | any JSON value, top-level, optional | `{"app": str, "catalog": str}`, or any other shape the wrapper wants -- the guard reads **presence, not shape**. Any non-`null` value (an object, an empty object, a string, a list, a number, `true`) marks the archive as catalog-tracked and makes `-w` a usage error (exit 2): the plan is still produced and can still be written with `--plan-out`, but photokin refuses to rename the files itself. An explicit `null` reads as an absent key -- unmanaged. `app` and `catalog` are read only to word that refusal, and only when the value is an object carrying them as non-empty strings; every other shape gets the same refusal in wording that names no application. Copied verbatim into the plan's own `managed_by`, whatever its shape. |
 | `items[].path` | string, required | Absolute path of an image already on disk. Everything else on the item is optional. |
 | `items[].order` | integer, optional | The item's explicit position. When **every** item in the manifest carries one, it replaces alphabetical order and the plan's `order` field reports `"manifest"`. A manifest where only some items carry `order` falls back to the normal `name`/`natural` order for all of them -- there is no partial-override mode. |
 | `items[].metadata["EXIF:DateTimeOriginal"]` | string, optional | `%Y:%m:%d %H:%M:%S`, `%Y:%m:%d`, a partial `"1952"`/`"1952:06"`, or ISO 8601. Feeds `{date}`. A folder input gets this hydrated automatically by one ExifTool call when the template uses `{date}`; a manifest wrapper that already has the date should put it here rather than rely on hydration re-deriving it. |
 | `items[].is_back` | bool, optional | Overrides the filename's own front/back reading. `true`/`false`/`1`/`0`/`"yes"`/`"no"` are all accepted, the same tri-state spellings `core._coerce_manifest_bool` reads elsewhere in the manifest. |
 | `items[].version` | string, optional | Overrides the parsed variant letter. An empty string clears an existing letter rather than leaving it alone. |
-| `items[].preferred` | bool, optional | Accepted for parity with the manifest shape the rest of photokin already reads; no rule in the planner gives it an effect on a rendered name. |
+| `items[].preferred` | bool, optional | No rule in the planner gives it an effect on a rendered *image* name. It does decide which of two same-stem images owns a companion they share — the planner picks a shared sidecar's owner by the same rule the analysis half uses to write it, and `preferred` is one component of that rule — so marking the derivative of a TIFF/JPEG twin moves the shared `.md` onto the derivative. |
 
 ## 2. Plan out
 
@@ -149,7 +149,7 @@ the table is a convenience for a human running the CLI directly.
 | `prefix_template` | string | The `--rename PREFIX` template verbatim, before rendering. |
 | `digits` | int | The zero-padded number width in effect (`--digits`, default 3). |
 | `order` | `"name"` \| `"natural"` \| `"manifest"` | Which ordering rule actually decided position -- `"manifest"` only when every item supplied an explicit `order` (section 1 above); otherwise `"name"` or whatever `--order` asked for. |
-| `managed_by` | object \| `null` | Copied verbatim from the manifest input (section 1), or `null` for a folder input or a manifest that carried none. |
+| `managed_by` | any JSON value \| `null` | Copied verbatim from the manifest input (section 1) -- the value that manifest carried, object or not, unchanged -- or `null` for a folder input or a manifest that carried none. |
 | `entries` | array | One record per image (section below). |
 | `left_behind` | array | Same-stem files the planner declined to carry along -- `{"path": str, "reason": str}`. `reason` is currently always `"extension outside companion set"`. |
 | `warnings` | array of string | Non-fatal notices: normalizations applied, a date disagreement inside a group, a prefix ending in a digit, a companion stem matching two groups, a left-behind file. Human-readable sentences, not a coded shape -- match by substring if you need to react to one, and expect the wording to be able to change between releases the way any other log line can. |
@@ -228,6 +228,19 @@ gets none.
 | `from` | string | The image's basename before the rename (filename only, no directory). |
 | `to` | string | The image's basename after the rename -- the plan entry's `target`. |
 | `companions` | array | `{"from": str, "to": str}` per companion, basenames only. This is the plan entry's *whole* `companions` list carried over verbatim -- it is not re-filtered to companions whose own name is actually changing, so a companion whose extension-derived target happens to equal its current name can still appear here with `from == to`. |
+
+### When these records are written
+
+Under `-w`, **after** the rename has actually been applied. A run whose
+preflight refused (exit 2), whose failure was rolled back (`rolled_back`), or
+whose rollback could not finish (`needs_attention`) writes no rename record at
+all: none of those folders match the plan, and this file exists to be trusted
+later. The journal, and the run report's `stranded` list, are the record for
+those runs.
+
+With `--changeset true` alone -- no `-w`, so nothing is applied -- the records
+are written for the plan as proposed, which is what that flag has always
+meant. `--dry-run` writes no changeset either way.
 
 The journal `rename_apply.py` writes (`docs/rename-mode.md` section 5.2) is
 the *operational* record an interrupted or resumed run is replayed from;

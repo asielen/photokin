@@ -2044,21 +2044,26 @@ def _resolve_rename_write_bundle(args: argparse.Namespace) -> tuple[str, bool]:
 
 
 def _write_rename_changeset_records(changeset_path: str, plan: dict[str, Any]) -> None:
-    """Append one ``kind: rename`` record per changed entry (section 6.3).
+    """Write one ``kind: rename`` record per changed entry (section 6.3).
 
     The rename journal (``rename_apply``) is the operational record; this is
     the audit one, in the same NDJSON stream a metadata write's changeset
     already uses -- so a rename shows up beside every other proposed change
     to a folder, not in a file of its own.
 
+    Called once per run, and only for a run whose renames really happened
+    (or, without ``-w``, never happened at all): a record here is an assertion
+    about the folder that outlives the run, so it is written after the apply
+    it describes, not before. It truncates the changeset itself, the way every
+    other mode opens that file fresh for its own run.
+
     Args:
-        changeset_path: The changeset file, already truncated open for this
-            run.
+        changeset_path: The changeset file this run writes.
         plan: The plan just built (section 6.2).
     """
     run_id = str(plan.get("run_id") or "")
     created_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with open(changeset_path, "a", encoding="utf-8") as handle:
+    with open(changeset_path, "w", encoding="utf-8") as handle:
         for entry in plan.get("entries") or []:
             if not entry.get("changed") or not entry.get("target"):
                 continue
@@ -2117,15 +2122,17 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
     if resolved.kind == "photo":
         _exit_with_usage_error(*cli_messages.rename_needs_folder_or_manifest(resolved.display))
 
-    managed_by: dict[str, Any] | None = None
+    # Any JSON value the wrapper wrote, carried to the plan verbatim (6.1):
+    # a shape this code does not recognize is still a shape that says "a
+    # catalog tracks this archive", so it is typed as loosely as it is read.
+    managed_by: Any = None
     if resolved.kind == "folder":
         _validate_folder_input(resolved)
         folder = resolved.path
         items = _build_rename_items_from_folder(folder)
     else:
         loaded_manifest = _load_manifest_input(resolved)
-        raw_managed_by = loaded_manifest.get("managed_by")
-        managed_by = raw_managed_by if isinstance(raw_managed_by, dict) else None
+        managed_by = loaded_manifest.get("managed_by")
         items = _build_rename_items_from_manifest(loaded_manifest)
         folder = _rename_folder_from_items(items, resolved)
 
@@ -2133,11 +2140,16 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
     changeset_requested = changeset_flag == "true"
 
     if managed_by is not None and apply_requested:
-        app = str(managed_by.get("app") or "a catalog application")
-        catalog = managed_by.get("catalog")
+        # The guard is on presence (6.1). ``app``/``catalog`` only sharpen the
+        # wording, so they are read when the value happens to be an object and
+        # skipped -- not coerced -- when it is a string, list, number or bool.
+        named = managed_by if isinstance(managed_by, dict) else {}
+        app = named.get("app")
+        catalog = named.get("catalog")
         _exit_with_usage_error(
             *cli_messages.rename_managed_by_refuses_write(
-                app, catalog if isinstance(catalog, str) else None
+                app if isinstance(app, str) and app else None,
+                catalog if isinstance(catalog, str) and catalog else None,
             )
         )
 
@@ -2192,10 +2204,6 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
             args.plan_out,
         )
 
-    if changeset_path and not plan["errors"]:
-        open(changeset_path, "w", encoding="utf-8").close()
-        _write_rename_changeset_records(changeset_path, plan)
-
     if plan["errors"]:
         # A plan that cannot be applied is a validation failure, whether or
         # not -w was even given: --rename alone is a preview, but not one a
@@ -2203,6 +2211,10 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         sys.exit(2)
 
     if not apply_requested:
+        # --changeset true without -w records the plan as proposed and stops.
+        # Nothing follows that could contradict it, so it is written here.
+        if changeset_path:
+            _write_rename_changeset_records(changeset_path, plan)
         return
 
     try:
@@ -2226,7 +2238,13 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         ),
     )
     if report.exit_code != 0:
+        # rolled_back put every file back and needs_attention left some
+        # mid-move: neither folder matches the plan, so neither gets an audit
+        # record saying it does. The journal is the record for those runs.
         sys.exit(report.exit_code)
+
+    if changeset_path:
+        _write_rename_changeset_records(changeset_path, plan)
 
 
 def _run_rename_finish(plan_path: str) -> None:
