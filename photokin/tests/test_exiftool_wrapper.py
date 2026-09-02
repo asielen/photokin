@@ -41,9 +41,24 @@ class TestExiftoolConfig(unittest.TestCase):
         self.assertIsNone(cfg.path)
         self.assertIsNone(cfg.cache_dir)
         self.assertFalse(cfg.enabled)
+        # The one place the complete default write set is spelled out: every
+        # canonical tag, in the README table's order, plus EXIF:CreateDate. A
+        # narrower default here silently dropped captions, keywords, titles
+        # and locations for every -rw run that did not pass --exiftool-fields.
         self.assertEqual(
             cfg.fields,
-            ("EXIF:DateTimeOriginal", "EXIF:CreateDate", "EXIF:UserComment"),
+            (
+                "EXIF:UserComment",
+                "XMP-dc:Description",
+                "XMP-dc:Subject",
+                "XMP-dc:Title",
+                "EXIF:DateTimeOriginal",
+                "EXIF:CreateDate",
+                "IPTC:Country-PrimaryLocationName",
+                "IPTC:Province-State",
+                "IPTC:City",
+                "IPTC:Sub-location",
+            ),
         )
         self.assertFalse(cfg.dry_run)
         self.assertTrue(cfg.overwrite_original)
@@ -70,7 +85,9 @@ class TestExiftoolConfig(unittest.TestCase):
                 os.environ.pop(name, None)
             cfg = ExiftoolConfig.from_env()
         self.assertFalse(cfg.enabled)
-        self.assertEqual(cfg.fields, ("EXIF:UserComment",))
+        # The env default agrees with the dataclass default; the exact tuple
+        # is pinned once, in test_defaults above.
+        self.assertEqual(cfg.fields, ExiftoolConfig().fields)
         self.assertIsNone(cfg.path)
 
     def test_from_env_overrides_win(self):
@@ -901,7 +918,9 @@ class TestCliExiftoolConfigResolution(unittest.TestCase):
                 os.environ.pop(name, None)
             cfg = cli._resolve_exiftool_config(self._args(), dry_run=True)
         self.assertFalse(cfg.enabled)
-        self.assertEqual(cfg.fields, ("EXIF:UserComment",))
+        # The CLI default is the full canonical write set; the exact tuple is
+        # pinned once, in TestExiftoolConfig.test_defaults.
+        self.assertEqual(cfg.fields, ExiftoolConfig().fields)
         self.assertTrue(cfg.dry_run)
         self.assertTrue(cfg.overwrite_original)
 

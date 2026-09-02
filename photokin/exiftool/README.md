@@ -44,7 +44,9 @@ layer entirely.
 
 `ExiftoolConfig.from_env()` builds the pipeline config from environment
 variables — `EXIFTOOL_WRITE_ENABLED` (default false), `EXIFTOOL_PATH`,
-`EXIFTOOL_FIELDS` (comma-separated, default `EXIF:UserComment`) — with
+`EXIFTOOL_FIELDS` (comma-separated, default: every canonical tag photokin
+produces, `DEFAULT_PIPELINE_FIELDS` in `config.py`; a caller that writes some
+tags itself, the way the Lightroom plug-in does, narrows it explicitly) — with
 explicit keyword overrides winning. The main CLI's `--exiftool-write`,
 `--exiftool-fields` and `--exiftool-path` flags layer on top
 (flag > env > default), and `-w` is the shorthand that turns writing on.

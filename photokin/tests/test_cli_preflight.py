@@ -937,7 +937,7 @@ class TestNothingIsWrittenWithoutAnOptIn(_WriteFixtureTestCase):
 
                 self.assertIsNone(code)
                 apply.assert_called_once()
-                self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+                self.assertIn("write     : ExifTool EXIF:UserComment, XMP-dc:Description", stderr)
 
 
 class TestWriteBundleGuards(_WriteFixtureTestCase):
@@ -1037,7 +1037,7 @@ class TestWriteBundleGuards(_WriteFixtureTestCase):
                 # the changeset file exists because --changeset true was set,
                 # and apply ran because --exiftool-write true was.
                 apply.assert_called_once()
-                self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+                self.assertIn("write     : ExifTool EXIF:UserComment, XMP-dc:Description", stderr)
                 # Named by the input's own stem, so the three inputs produce
                 # three different filenames; the suffix is the invariant.
                 self.assertTrue(
@@ -1070,7 +1070,7 @@ class TestWriteBundleGuards(_WriteFixtureTestCase):
 
         self.assertIsNone(code)
         apply.assert_called_once()
-        self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+        self.assertIn("write     : ExifTool EXIF:UserComment, XMP-dc:Description", stderr)
 
 
 class TestABlankInputTokenIsRefused(_CliTestCase):

@@ -2924,7 +2924,10 @@ def main() -> None:
         ap.add_argument(
             "--exiftool-fields",
             default=None,
-            help="Comma-separated ExifTool tags to write (default: env EXIFTOOL_FIELDS, else EXIF:UserComment)",
+            help="Comma-separated ExifTool tags to write (default: env EXIFTOOL_FIELDS, "
+                 "else every canonical tag photokin produces -- see --capabilities). "
+                 "A launcher that writes some tags itself, the way the Lightroom "
+                 "plug-in does, should narrow this explicitly.",
         )
         ap.add_argument(
             "--exiftool-path",

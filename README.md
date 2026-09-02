@@ -653,12 +653,12 @@ spent on anything else.
 | `-r`, `--read`                  | Before analysis, read `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` out of the files and send them to the model, for every input type. Only fills what the input does not already carry; nothing is written. Mirrors `-w` |
 | `-w`, `--write`                 | Shorthand for `--changeset true --exiftool-write true`: record the proposed writes and apply them. An explicit flag that contradicts it is an error rather than a guess |
 | `--exiftool-write {true,false}` | Apply changeset fields to the files after analysis (default `false`; nothing is written without an explicit opt-in) |
-| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write (default `EXIF:UserComment`) |
+| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write. The default is every tag in the [What gets written where](#what-gets-written-where) table — a plain `-rw` writes everything the analysis produced. A launcher that writes some tags itself (the Lightroom plug-in writes the XMP tags through the catalog SDK) should narrow this explicitly, e.g. `--exiftool-fields EXIF:UserComment` |
 | `--exiftool-path PATH`          | ExifTool binary to use (default: auto-detect) |
 
 `-r` is the read half and `-w` the write half; the short letters are deliberately symmetrical, and they combine as `-rw` (or `-wr`) exactly like any other pair of short flags — that combined form is the one to reach for, for the reason given above. `-R` is **reserved** for the recursive-folder flag that is still deferred (it changes grouping semantics across directories and interacts with write safety, so it gets its own change), and must not be spent on anything else.
 
-### Rename mode
+### Rename mode [BETA FEATURE]
 
 See [Rename mode: `--rename`](#beta-feature-rename-mode---rename) below for what it does. `--rename` is a mode flag: like `--generate-manifest`, it stops the run before any model call, and it takes a folder or manifest input — not a single photo.
 
@@ -741,7 +741,7 @@ Runs `photokin/tests/` and `tests/`, which `pyproject.toml` sets as the test pat
 
 ## Integrating photokin as a subprocess
 
-Everything above is for a human at a terminal. This section is for the other kind of caller: a plugin or script that launches `photokin` (or `python -m photokin.cli`) as a subprocess, cannot read a return value, and often cannot even read stderr — the Lightroom plugin this was built for launches fire-and-forget (`start /B` on Windows, output discarded) and learns what happened only from the files photokin wrote. Everything here exists to make that mode of use safe and observable.
+This section is for a plugin or script that launches `photokin` (or `python -m photokin.cli`) as a subprocess, cannot read a return value, and often cannot even read stderr — the Lightroom plugin this was built for launches fire-and-forget (`start /B` on Windows, output discarded) and learns what happened only from the files photokin wrote. Everything here exists to make that mode of use safe and observable.
 
 ### The problem this solves
 

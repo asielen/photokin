@@ -1151,7 +1151,7 @@ class TestTheWriteShorthand(_WriteFixtureTestCase):
                     self.assertNotEqual(
                         handle.read(), original, "-w did not expand to --exiftool-write true"
                     )
-                self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+                self.assertIn("write     : ExifTool EXIF:UserComment, XMP-dc:Description", stderr)
                 _write_bytes(image, original)
                 for stale in changesets:
                     os.remove(os.path.join(folder, stale))
@@ -1749,7 +1749,7 @@ class TestThePlanAdvisesTheNormalRun(_CliTestCase):
                 self.assertIn(
                     "  read      : ExifTool " + ", ".join(DEFAULT_EXIFTOOL_FIELDS), pasted
                 )
-                self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+                self.assertIn("  write     : ExifTool EXIF:UserComment, XMP-dc:Description", pasted)
                 # Same input, same grouping, same provider: everything the first
                 # plan said, which is what makes it a next step and not a
                 # different run.
@@ -1780,7 +1780,7 @@ class TestThePlanAdvisesTheNormalRun(_CliTestCase):
                 self.assertEqual(shlex.split(command, posix=True), ["photokin", *argv, "-rw"])
                 code, pasted = self.paste(command, exiftool_path)
                 self.assertIsNone(code, f"the suggested command was refused: {pasted!r}")
-                self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+                self.assertIn("  write     : ExifTool EXIF:UserComment, XMP-dc:Description", pasted)
 
     def test_a_trailing_separator_survives_the_round_trip(self) -> None:
         """``C:\\Scans\\`` is how a path arrives from Explorer, and it is the shape
@@ -1797,7 +1797,7 @@ class TestThePlanAdvisesTheNormalRun(_CliTestCase):
         self.assertEqual(shlex.split(command, posix=True), ["photokin", folder, "-rw"])
         code, pasted = self.paste(command, exiftool_path)
         self.assertIsNone(code, f"the suggested command was refused: {pasted!r}")
-        self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+        self.assertIn("  write     : ExifTool EXIF:UserComment, XMP-dc:Description", pasted)
 
     def test_a_run_that_has_already_declared_itself_is_not_advised(self) -> None:
         folder = self.make_folder()
