@@ -465,6 +465,21 @@ def verbose_bundle_contradiction(flag: str, value: str) -> UsageMessage:
     )
 
 
+def sidecar_bundle_contradiction(value: str) -> UsageMessage:
+    """``-s`` was given beside a ``--sidecar-md`` value that contradicts it.
+
+    Args:
+        value: The contradicting ``--sidecar-md`` value, ``off`` or ``all``.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`-s` means --sidecar-md auto, but `--sidecar-md {value}` was also given.",
+        "drop one; --sidecar-md auto alone means the same thing as -s",
+    )
+
+
 def write_needs_changeset() -> UsageMessage:
     """Writing was asked for with no changeset to write from.
 

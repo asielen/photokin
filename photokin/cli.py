@@ -1006,6 +1006,35 @@ def _refuse_generate_manifest_verbose_flags(args: argparse.Namespace) -> None:
             )
 
 
+def _resolve_sidecar_bundle(args: argparse.Namespace) -> str:
+    """Expand ``-s`` and reject an explicit ``--sidecar-md`` that contradicts it.
+
+    Mirrors :func:`_resolve_write_bundle` for the one flag ``-s`` is shorthand
+    for: ``-s`` beside an explicit ``--sidecar-md off`` or ``--sidecar-md all``
+    is a contradiction to refuse, not a value to silently pick between, while
+    an explicit ``--sidecar-md auto`` merely agrees with it.
+
+    Args:
+        args: The parsed namespace. ``--sidecar-md`` defaults to ``None`` there
+            so "unset" is distinguishable from an explicit value that happens
+            to agree with the expansion.
+
+    Returns:
+        The resolved ``--sidecar-md`` value, one of
+        :data:`utils.SIDECAR_MD_VALUES`.
+
+    Raises:
+        SystemExit: With code 2 when ``-s`` is given beside a contradicting
+            ``--sidecar-md`` value.
+    """
+    given = args.sidecar_md
+    if args.sidecar_auto:
+        if given is not None and given != utils.SIDECAR_MD_AUTO:
+            _exit_with_usage_error(*cli_messages.sidecar_bundle_contradiction(given))
+        return utils.SIDECAR_MD_AUTO
+    return given if given is not None else utils.SIDECAR_MD_OFF
+
+
 def _derive_changeset_path(resolved: ResolvedInput, out_path: str | None) -> str:
     """Return where the changeset goes: ``dirname(--output-file or input)``.
 
@@ -2725,14 +2754,26 @@ def main() -> None:
         ap.add_argument(
             "--sidecar-md",
             choices=list(utils.SIDECAR_MD_VALUES),
-            default=utils.SIDECAR_MD_OFF,
+            # None rather than "off" so _resolve_sidecar_bundle can tell an
+            # explicit value from an unset flag; it resolves None to "off".
+            default=None,
             help="Write a Markdown transcript sidecar (<stem>.md) beside each analyzed "
-                 "file (default: %(default)s). off: nothing new written. auto: written "
+                 "file (default: off). off: nothing new written. auto: written "
                  "when the group's category is Document or Postcard. all: written for "
                  "every emitted file, any category, except crops. Valid for every input "
                  "type -- single file, folder and manifest all flow through the same "
                  "emit loop. --sidecar-xmp and --sidecar-json are reserved spellings for "
                  "the same three values, for other sidecar formats to come.",
+        )
+        ap.add_argument(
+            "-s",
+            action="store_true",
+            dest="sidecar_auto",
+            help="Shorthand for --sidecar-md auto: write Markdown transcript sidecars "
+                 "for the groups the model calls Document or Postcard. Combines with "
+                 "the other short flags (-rws). An explicit --sidecar-md value that "
+                 "contradicts it is an error rather than a guess, the same contract "
+                 "-w and -v follow.",
         )
         ap.add_argument(
             "--max-images-per-call",
@@ -3094,6 +3135,11 @@ def main() -> None:
         # _apply_manifest_debug_settings) sees one resolved value instead of
         # re-deriving the bundle.
         args.debug_dump_llm_request, args.debug_dump_hydration = _resolve_verbose_bundle(args)
+
+        # -s's expansion is written back the same way, so every downstream
+        # reader -- _analysis_protected_paths, the plan summary, the cfg --
+        # sees one resolved --sidecar-md value instead of two flags.
+        args.sidecar_md = _resolve_sidecar_bundle(args)
 
         out_path = args.output_file
         if out_path and not out_path.lower().endswith((".ndjson", ".json")):

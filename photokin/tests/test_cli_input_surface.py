@@ -743,6 +743,16 @@ class TestTheMessageMatrix(_CliTestCase):
                 "`--changeset false` was also given.",
             ),
             (
+                "-s contradicted by --sidecar-md off",
+                [folder, "-s", "--sidecar-md", "off"],
+                "`-s` means --sidecar-md auto, but `--sidecar-md off` was also given.",
+            ),
+            (
+                "-s contradicted by --sidecar-md all",
+                [folder, "-s", "--sidecar-md", "all"],
+                "`-s` means --sidecar-md auto, but `--sidecar-md all` was also given.",
+            ),
+            (
                 "a write with nothing to write from",
                 [folder, "--exiftool-write", "true"],
                 "`--exiftool-write true` needs a changeset to apply, but --changeset is false.",
@@ -1495,6 +1505,28 @@ class TestThePlanNamesWhatSidecarModeWillWrite(_CliTestCase):
             "model calls",
             stderr,
         )
+        self.assertIn("Document or Postcard (--sidecar-md auto)", stderr)
+
+    def test_the_s_shorthand_expands_to_sidecar_md_auto(self) -> None:
+        # -s is shorthand for --sidecar-md auto, the same relationship -w has
+        # to its bundle: the plan clause is the auto clause, verbatim.
+        folder = self.make_folder("box3_025.jpg")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli([folder, "-s"])
+
+        self.assertIsNone(code, stderr)
+        self.assertIn("Document or Postcard (--sidecar-md auto)", stderr)
+
+    def test_an_explicit_sidecar_md_auto_agrees_with_the_shorthand(self) -> None:
+        # Agreement is not a contradiction: spelling both is redundant, legal,
+        # and means what either alone means.
+        folder = self.make_folder("box3_025.jpg")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli([folder, "-s", "--sidecar-md", "auto"])
+
+        self.assertIsNone(code, stderr)
         self.assertIn("Document or Postcard (--sidecar-md auto)", stderr)
 
     def test_dry_run_previews_the_sidecar_clause_before_anything_is_written(self) -> None:
