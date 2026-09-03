@@ -190,6 +190,34 @@ class TestApplyChangeset(_ChangesetFileMixin, unittest.TestCase):
         self.assertEqual(summary["files_suppressed"], 1)
         self.assertEqual(summary["files_written"], 0)
 
+    def test_rejected_operations_still_count_as_proposals(self):
+        # A record whose every operation is rejected into warnings -- an
+        # oversized keyword, a malformed payload -- asked for a write the run
+        # then discarded, and must not read as an empty changeset to the
+        # strict verdict.
+        path = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {
+                        "set": {},
+                        "keywords_add": ["k" * (_INLINE_VALUE_MAX + 1)],
+                    },
+                },
+                {"path": "/photos/b.jpg", "proposed_changes": {"set": "garbage"}},
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("XMP-dc:Subject",))
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
+            summary = apply_changeset(path, cfg)
+
+        run_mock.assert_not_called()
+        self.assertEqual(summary["files_with_proposals"], 2)
+        self.assertEqual(summary["files_written"], 0)
+
     def test_keyword_deltas_reach_exiftool_as_list_operations(self):
         # Keywords never travel in proposed_changes.set -- the emitter diffs
         # them into keywords_add / keywords_remove -- so before the applier

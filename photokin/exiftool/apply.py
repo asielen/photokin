@@ -553,11 +553,16 @@ def apply_changeset(
 
             proposed = record.get("proposed_changes") or {}
             if not isinstance(proposed, dict):
+                # A malformed payload still asked for something: counted as a
+                # proposal so a changeset of nothing but rejects fails the
+                # strict verdict instead of passing as an empty changeset.
+                summary["files_with_proposals"] += 1
                 summary["warnings"].append({"path": path, "warning": "Invalid proposed_changes payload."})
                 continue
 
             set_changes = proposed.get("set") or {}
             if not isinstance(set_changes, dict):
+                summary["files_with_proposals"] += 1
                 summary["warnings"].append({"path": path, "warning": "Invalid proposed_changes.set payload."})
                 continue
 
