@@ -1913,8 +1913,12 @@ def _apply_exiftool_changeset(
 
     # Reported after the status record is written, not instead of it: the
     # summary is how a caller finds out which files failed and why, and it has
-    # to survive the run being called a failure.
-    return strict and files_seen > 0 and files_written == 0
+    # to survive the run being called a failure. ``errors`` gates the verdict:
+    # a total failure always leaves per-file errors behind, while a changeset
+    # that proposed nothing for any file -- every record suppressed or empty
+    # -- writes nothing, errors nothing, and is a quiet success rather than a
+    # claimed failure with no errors to inspect.
+    return strict and files_seen > 0 and files_written == 0 and bool(errors)
 
 
 def _refuse_rename_mode_conflicts(args: argparse.Namespace) -> None:

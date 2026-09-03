@@ -2233,7 +2233,7 @@ class TestHydrationFailureSuppressesWrites(ManifestGroupingTestCase):
             {"path": "s/scan001.jpg", utils.HYDRATION_FAILED_KEY: True},
             {"path": "s/scan002.jpg"},
         ]
-        _calls, _records, warnings = self.run_manifest(
+        _calls, records, warnings = self.run_manifest(
             items, model_keywords=["Family"], changeset_writer=changeset.append
         )
 
@@ -2251,6 +2251,17 @@ class TestHydrationFailureSuppressesWrites(ManifestGroupingTestCase):
             any("could not read this file" in w for w in warnings),
             "the suppression must be announced, not silent",
         )
+
+        # The changeset is only one of the two write vehicles: a manifest-mode
+        # integration (the Lightroom plug-in) applies the per-item record's
+        # ``patch`` through its own writer, so that must be suppressed too --
+        # and flagged, so a reader can tell "nothing to write" from
+        # "unreadable".
+        recs = {os.path.basename(r["path"]): r for r in records}
+        self.assertEqual(recs["scan001.jpg"]["patch"], {})
+        self.assertTrue(recs["scan001.jpg"].get("hydration_failed"))
+        self.assertNotEqual(recs["scan002.jpg"]["patch"], {})
+        self.assertNotIn("hydration_failed", recs["scan002.jpg"])
 
 
 if __name__ == "__main__":

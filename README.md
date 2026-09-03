@@ -373,7 +373,7 @@ A file `-r` asked for but could not read gets **no proposed writes at all**, wit
 Files are written independently — a failure on one never touches its neighbors. To find out what happened and pick up again:
 
 * The per-file reasons are logged as `[ExifTool] Errors:` before the run ends. Treat a listed file as unverified rather than untouched: ExifTool can write some of a file's tags and miss others in the same pass, so photokin counts nothing on that file as written — re-running it is the fix, not proof that something was lost.
-* If **nothing** was written, the run exits 2: some setting is wrong for every file (an unwritable `--exiftool-fields` tag, a read-only folder, a binary that will not run). Fix the setting and re-run.
+* If writes were attempted and **none** succeeded, the run exits 2: some setting is wrong for every file (an unwritable `--exiftool-fields` tag, a read-only folder, a binary that will not run). Fix the setting and re-run. A run whose changeset simply proposed nothing to write exits 0.
 * If only **some** files failed, the run exits 0: the settings were right, and one locked or corrupt file among many is ordinary. Fix those files and re-run the same command — captions merge instead of duplicating (see [Captions](#captions)), so already-written files come out unchanged. Note a re-run does call the model again for every group.
 
 Manifest mode is the exception and always exits 0: the Lightroom plug-in reads per-item records, not exit codes.

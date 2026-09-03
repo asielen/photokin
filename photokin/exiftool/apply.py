@@ -571,8 +571,15 @@ def apply_changeset(
             def _datfile_path_for(tag: str, _line: int = line_number) -> str:
                 if cfg.dry_run:
                     # A path for measurement only: a dry run creates neither
-                    # the batch temporary directory nor any file (C3).
-                    return os.path.join(tempfile.gettempdir(), _datfile_name(_line, tag))
+                    # the batch temporary directory nor any file (C3). Padded
+                    # past the real TemporaryDirectory name (the prefix plus
+                    # 8 random characters) so the preview never measures a
+                    # routed argument shorter than the real run would build.
+                    return os.path.join(
+                        tempfile.gettempdir(),
+                        "photokin-exiftool-" + "M" * 12,
+                        _datfile_name(_line, tag),
+                    )
                 return os.path.join(_datfile_dir(tmp_stack), _datfile_name(_line, tag))
 
             try:

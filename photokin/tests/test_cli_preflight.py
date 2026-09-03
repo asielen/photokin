@@ -1897,6 +1897,18 @@ class TestARunThatWroteNothingSaysSo(_CliTestCase):
         self.assertIsNone(code)
         self.assertNotIn("nothing was written", stderr)
 
+    def test_a_changeset_that_proposed_nothing_is_not_a_failed_run(self) -> None:
+        """Records seen but nothing attempted -- every one suppressed or empty
+        -- writes nothing and errors nothing. A total failure always leaves
+        per-file errors behind; zero writes with zero errors is a quiet
+        success, not a failure with no errors to inspect."""
+        code, _stdout, stderr = self._run_with_summary(
+            {"files_seen": 3, "files_written": 0, "tags_written": 0,
+             "errors": [], "warnings": []}
+        )
+        self.assertIsNone(code)
+        self.assertNotIn("nothing was written", stderr)
+
     def test_manifest_input_keeps_the_plugin_contract(self) -> None:
         """Manifest mode reports per item and exits 0, here as everywhere else.
 

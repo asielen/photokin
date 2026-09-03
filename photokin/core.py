@@ -4351,6 +4351,21 @@ def process_manifest_stream(
 
                 merged["_merge"] = report
                 patch, patch_meta = build_canonical_patch(merged, cfg)
+                hydration_failed = bool(it.get(utils.HYDRATION_FAILED_KEY))
+                if hydration_failed:
+                    # -r asked for this file's metadata and could not read it,
+                    # so any write instruction would be diffed against
+                    # emptiness and could overwrite values the file really
+                    # holds. Unread is not empty: propose nothing -- in BOTH
+                    # write vehicles, the changeset (the ExifTool applier) and
+                    # the emitted patch, which a manifest-mode integration
+                    # such as the Lightroom plug-in applies through its own
+                    # writer.
+                    logger.warning(
+                        "%s: -r could not read this file, so no writes are proposed for it.",
+                        os.path.basename(it["path"]),
+                    )
+                    patch = {}
 
                 if changeset_writer and run_id:
                     # ``own_meta`` and not ``per_meta``: the changeset is
@@ -4361,19 +4376,14 @@ def process_manifest_stream(
                     # have brought this file up to the group's shared answer
                     # was silently dropped.
                     before_snapshot = canonical_values_from_metadata(own_meta, cfg)
-                    after_snapshot = canonical_values_from_patch(patch)
-                    if it.get(utils.HYDRATION_FAILED_KEY):
-                        # -r asked for this file's metadata and could not read
-                        # it, so the diff below would compare against emptiness
-                        # and propose overwriting values the file may really
-                        # hold. Unread is not empty: propose nothing.
-                        logger.warning(
-                            "%s: -r could not read this file, so no writes are proposed for it.",
-                            os.path.basename(it["path"]),
-                        )
+                    if hydration_failed:
+                        # Deliberately not diffed: with the patch emptied, a
+                        # diff would read the file's own values as removals.
                         proposed_changes = {"set": {}, "keywords_add": [], "keywords_remove": []}
                     else:
-                        proposed_changes = diff_canonical_metadata(before_snapshot, after_snapshot)
+                        proposed_changes = diff_canonical_metadata(
+                            before_snapshot, canonical_values_from_patch(patch)
+                        )
                     emit_changeset_record(
                         changeset_writer,
                         run_id=run_id,
@@ -4386,7 +4396,12 @@ def process_manifest_stream(
                     )
 
                 results[it["path"]] = merged
-                _emit(it["path"], "ok", {"result": merged, "patch": patch, "patch_meta": patch_meta, "usage": {"prompt_tokens": (merged.get("_usage") or {}).get("prompt_tokens"), "completion_tokens": (merged.get("_usage") or {}).get("completion_tokens"), "total_tokens": (merged.get("_usage") or {}).get("total_tokens"), "model": (merged.get("_usage") or {}).get("model")}})
+                item_payload = {"result": merged, "patch": patch, "patch_meta": patch_meta, "usage": {"prompt_tokens": (merged.get("_usage") or {}).get("prompt_tokens"), "completion_tokens": (merged.get("_usage") or {}).get("completion_tokens"), "total_tokens": (merged.get("_usage") or {}).get("total_tokens"), "model": (merged.get("_usage") or {}).get("model")}}
+                if hydration_failed:
+                    # Says why the patch is empty, so an integration reading
+                    # the record can tell "nothing to write" from "unreadable".
+                    item_payload["hydration_failed"] = True
+                _emit(it["path"], "ok", item_payload)
                 emitted_ok.add(it["path"])
 
         # Exception (not BaseException) so KeyboardInterrupt/SystemExit still abort.
