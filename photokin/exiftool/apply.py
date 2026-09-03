@@ -42,6 +42,7 @@ from datetime import date, datetime
 from json import JSONDecodeError
 from typing import Any
 
+from ..canonical import CANONICAL_KEYWORDS_TAG
 from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
 from .locate import resolve_exiftool_path
 
@@ -272,12 +273,56 @@ def _select_datfile_routing(
     return _paths_for(routed)
 
 
+def _keyword_delta_args(
+    proposed: dict[str, Any], path: str, warnings: list[dict[str, Any]]
+) -> list[str]:
+    """Return the ExifTool argv fragments for a record's keyword deltas.
+
+    Keywords never travel in ``proposed_changes.set``: the changeset emitter
+    diffs them into ``keywords_add`` / ``keywords_remove`` so an apply cannot
+    clobber keywords some other tool put on the file between runs. The applier
+    therefore writes them as ExifTool list operations rather than an
+    assignment: ``-TAG-=kw`` removes one entry, and an add is the dupe-safe
+    ``-TAG-=kw`` ``-TAG+=kw`` pair, which leaves exactly one copy whether or
+    not the file already held it.
+
+    Args:
+        proposed: The record's ``proposed_changes`` payload.
+        path: The record's file path, named in warnings.
+        warnings: The summary's warning list, appended to in place.
+
+    Returns:
+        argv fragments in remove-then-add order; empty when the record
+        carries no usable deltas.
+    """
+    args: list[str] = []
+    for key in ("keywords_remove", "keywords_add"):
+        values = proposed.get(key) or []
+        if not isinstance(values, list):
+            warnings.append(
+                {"path": path, "warning": f"Invalid proposed_changes.{key} payload."}
+            )
+            continue
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                warnings.append(
+                    {"path": path, "warning": f"Skipping a non-string or empty {key} entry."}
+                )
+                continue
+            keyword = value.strip()
+            args.append(f"-{CANONICAL_KEYWORDS_TAG}-={keyword}")
+            if key == "keywords_add":
+                args.append(f"-{CANONICAL_KEYWORDS_TAG}+={keyword}")
+    return args
+
+
 def _build_exiftool_command(
     exiftool: str,
     cfg: ExiftoolConfig,
     tags: dict[str, str],
     path: str,
     datfile_paths: dict[str, str] | None = None,
+    extra_args: list[str] | None = None,
 ) -> list[str]:
     """Assemble the ExifTool argv for one file's tag writes.
 
@@ -292,6 +337,10 @@ def _build_exiftool_command(
             absent from this mapping is inlined; ``tags[tag]`` is unused for a
             routed tag here -- the caller must already have written that
             value to the given path before running this command.
+        extra_args: Ready-made argv fragments appended after the ``set``
+            tags -- the keyword delta operations from
+            :func:`_keyword_delta_args`. Keyword values are short, so they
+            are never DATFILE-routed.
 
     Returns:
         The argv list to hand to ``subprocess.run`` (no shell involved, so
@@ -321,6 +370,7 @@ def _build_exiftool_command(
             cmd.append(f"-{tag}<={datfile_paths[tag]}")
         else:
             cmd.append(f"-{tag}={value}")
+    cmd.extend(extra_args or [])
     cmd.append(path)
     return cmd
 
@@ -479,12 +529,19 @@ def apply_changeset(
                     continue
                 tags_to_write[tag] = value
 
-            if not tags_to_write:
+            # Keywords ride the record as add/remove deltas rather than in
+            # ``set`` (see _keyword_delta_args), so the keywords tag in the
+            # allow-list is honored here or not at all.
+            keyword_args: list[str] = []
+            if CANONICAL_KEYWORDS_TAG in allowed_fields:
+                keyword_args = _keyword_delta_args(proposed, path, summary["warnings"])
+
+            if not tags_to_write and not keyword_args:
                 continue
 
             if cfg.dry_run:
                 summary["files_written"] += 1
-                summary["tags_written"] += len(tags_to_write)
+                summary["tags_written"] += len(tags_to_write) + (1 if keyword_args else 0)
                 continue
 
             def _datfile_path_for(tag: str, _line: int = line_number) -> str:
@@ -527,7 +584,9 @@ def apply_changeset(
                 )
                 continue
 
-            cmd = _build_exiftool_command(exiftool, cfg, tags_to_write, path, datfile_paths)
+            cmd = _build_exiftool_command(
+                exiftool, cfg, tags_to_write, path, datfile_paths, keyword_args
+            )
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             except (OSError, ValueError) as exc:
@@ -572,7 +631,7 @@ def apply_changeset(
                 continue
 
             summary["files_written"] += 1
-            summary["tags_written"] += len(tags_to_write)
+            summary["tags_written"] += len(tags_to_write) + (1 if keyword_args else 0)
 
     return summary
 

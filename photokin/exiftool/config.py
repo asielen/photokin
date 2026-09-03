@@ -11,24 +11,30 @@ from ..canonical import (
     CANONICAL_DATE_TAG,
     CANONICAL_DESCRIPTION_TAG,
     CANONICAL_KEYWORDS_TAG,
-    CANONICAL_LOCATION_TAGS,
     CANONICAL_TITLE_TAG,
     CANONICAL_USER_COMMENT_TAG,
 )
 
-# Every tag the analysis can propose, in the order the README's "What gets
-# written where" table documents them. This is the default write set for
-# every caller: the point of a plain -rw run is that it writes everything the
-# analysis produced, and a default narrower than the changeset silently
-# dropped captions, keywords, titles and locations for anyone who did not
-# also pass --exiftool-fields. A launcher that writes some of these tags
-# itself -- the Lightroom plug-in routes only EXIF:UserComment through
-# photokin and writes the XMP tags via the catalog SDK -- must narrow the
-# set explicitly with --exiftool-fields or EXIFTOOL_FIELDS; a narrow default
-# here cannot serve both callers, and the CLI is the one that has no other
-# way to say what it wants. EXIF:CreateDate is not a canonical output tag,
-# but changesets from other producers may carry it and the applier knows how
-# to normalize it, so it stays allowed.
+# Every tag the analysis proposes AND hydration reads back first, in the order
+# the README's "What gets written where" table documents them. This is the
+# default write set for every caller: the point of a plain -rw run is that it
+# writes what the analysis produced, and a default narrower than the changeset
+# silently dropped captions, keywords and titles for anyone who did not also
+# pass --exiftool-fields. A launcher that writes some of these tags itself --
+# the Lightroom plug-in routes only EXIF:UserComment through photokin and
+# writes the XMP tags via the catalog SDK -- must narrow the set explicitly
+# with --exiftool-fields or EXIFTOOL_FIELDS; a narrow default here cannot
+# serve both callers, and the CLI is the one that has no other way to say
+# what it wants.
+#
+# The IPTC location tags (CANONICAL_LOCATION_TAGS) are deliberately NOT here:
+# hydration (exiftool/manifest.py's DEFAULT_EXIFTOOL_FIELDS) does not read
+# them, so a confident model guess would be diffed against an empty
+# before-snapshot and overwrite a location someone already curated in the
+# file, unread. Until the read side learns those tags, writing them is an
+# explicit --exiftool-fields opt-in. EXIF:CreateDate is not a canonical
+# output tag, but changesets from other producers may carry it and the
+# applier knows how to normalize it, so it stays allowed.
 DEFAULT_PIPELINE_FIELDS: tuple[str, ...] = (
     CANONICAL_USER_COMMENT_TAG,
     CANONICAL_DESCRIPTION_TAG,
@@ -36,7 +42,6 @@ DEFAULT_PIPELINE_FIELDS: tuple[str, ...] = (
     CANONICAL_TITLE_TAG,
     CANONICAL_DATE_TAG,
     "EXIF:CreateDate",
-    *CANONICAL_LOCATION_TAGS.values(),
 )
 
 #: The one tag shape ExifTool reliably refuses: ``XMP:<namespace>:<Tag>``, e.g.

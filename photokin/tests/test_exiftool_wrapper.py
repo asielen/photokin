@@ -42,9 +42,12 @@ class TestExiftoolConfig(unittest.TestCase):
         self.assertIsNone(cfg.cache_dir)
         self.assertFalse(cfg.enabled)
         # The one place the complete default write set is spelled out: every
-        # canonical tag, in the README table's order, plus EXIF:CreateDate. A
-        # narrower default here silently dropped captions, keywords, titles
-        # and locations for every -rw run that did not pass --exiftool-fields.
+        # canonical tag hydration also reads, in the README table's order,
+        # plus EXIF:CreateDate. A narrower default silently dropped captions,
+        # keywords and titles for every -rw run that did not pass
+        # --exiftool-fields; the IPTC location tags are deliberately absent
+        # because hydration does not read them yet, so a default location
+        # write would overwrite curated location metadata unread.
         self.assertEqual(
             cfg.fields,
             (
@@ -54,10 +57,6 @@ class TestExiftoolConfig(unittest.TestCase):
                 "XMP-dc:Title",
                 "EXIF:DateTimeOriginal",
                 "EXIF:CreateDate",
-                "IPTC:Country-PrimaryLocationName",
-                "IPTC:Province-State",
-                "IPTC:City",
-                "IPTC:Sub-location",
             ),
         )
         self.assertFalse(cfg.dry_run)
@@ -161,6 +160,77 @@ class TestApplyChangeset(_ChangesetFileMixin, unittest.TestCase):
         self.assertEqual(summary["files_written"], 1)
         self.assertEqual(summary["tags_written"], 2)
         self.assertTrue(summary["dry_run"])
+
+    def test_keyword_deltas_reach_exiftool_as_list_operations(self):
+        # Keywords never travel in proposed_changes.set -- the emitter diffs
+        # them into keywords_add / keywords_remove -- so before the applier
+        # learned these deltas, XMP-dc:Subject in the allow-list wrote
+        # nothing at all on a normal -rw run.
+        path = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {
+                        "set": {},
+                        "keywords_add": ["Postcard", "1940s"],
+                        "keywords_remove": ["Scanned Image"],
+                    },
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("XMP-dc:Subject",))
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
+            run_mock.return_value = type(
+                "Result", (), {"returncode": 0, "stdout": "", "stderr": ""}
+            )()
+            summary = apply_changeset(path, cfg)
+
+        self.assertEqual(summary["files_written"], 1)
+        self.assertEqual(summary["tags_written"], 1)
+        cmd = run_mock.call_args[0][0]
+        # Removes come first; an add is the dupe-safe -= += pair, so the file
+        # ends with exactly one copy whether or not it already held it.
+        self.assertEqual(
+            [arg for arg in cmd if "XMP-dc:Subject" in arg],
+            [
+                "-XMP-dc:Subject-=Scanned Image",
+                "-XMP-dc:Subject-=Postcard",
+                "-XMP-dc:Subject+=Postcard",
+                "-XMP-dc:Subject-=1940s",
+                "-XMP-dc:Subject+=1940s",
+            ],
+        )
+
+    def test_keyword_deltas_respect_the_field_allow_list(self):
+        # The Lightroom pipeline narrows fields to EXIF:UserComment precisely
+        # because it writes keywords itself; the deltas must honor that.
+        path = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {
+                        "set": {"EXIF:UserComment": "Hello"},
+                        "keywords_add": ["Postcard"],
+                    },
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
+            run_mock.return_value = type(
+                "Result", (), {"returncode": 0, "stdout": "", "stderr": ""}
+            )()
+            summary = apply_changeset(path, cfg)
+
+        self.assertEqual(summary["tags_written"], 1)
+        cmd = run_mock.call_args[0][0]
+        self.assertFalse(any("XMP-dc:Subject" in arg for arg in cmd))
 
     def test_missing_binary_reports_error(self):
         path = self._write_changeset([])

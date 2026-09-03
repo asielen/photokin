@@ -2313,6 +2313,10 @@ class TestCapabilities(_CliTestCase):
         self.assertEqual(payload["ndjson_schema_version"], cli._NDJSON_SCHEMA_VERSION)
         self.assertIn("--verbose", payload["flags"])
         self.assertIn("--cancel-file", payload["flags"])
+        # Short spellings are advertised too: -s has no long-form synonym, so
+        # without it the flag list could not distinguish a build that has the
+        # shorthand from one that only has --sidecar-md.
+        self.assertIn("-s", payload["flags"])
         self.assertEqual(payload["canonical_tags"]["caption"], "XMP-dc:Description")
         self.assertIn("anthropic", payload["providers"])
 

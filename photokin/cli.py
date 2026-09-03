@@ -285,9 +285,11 @@ def _build_capabilities(ap: argparse.ArgumentParser) -> dict:
         A JSON-serializable dict.
     """
     version = _photokin_version()
-    flags = sorted(
-        {opt for action in ap._actions for opt in action.option_strings if opt.startswith("--")}
-    )
+    # Every option string, short spellings included: -s has no long-form
+    # synonym, so filtering to "--" made a build with the shorthand advertise
+    # the same flag list as one without it -- exactly the version-specific
+    # guess this document exists to replace.
+    flags = sorted({opt for action in ap._actions for opt in action.option_strings})
     return {
         "version": version,
         "ndjson_schema_version": _NDJSON_SCHEMA_VERSION,
@@ -2953,7 +2955,9 @@ def main() -> None:
             "--exiftool-fields",
             default=None,
             help="Comma-separated ExifTool tags to write (default: env EXIFTOOL_FIELDS, "
-                 "else every canonical tag photokin produces -- see --capabilities). "
+                 "else every canonical tag photokin both produces and reads back -- "
+                 "see --capabilities; the IPTC location tags are excluded until "
+                 "hydration reads them, so writing locations is an explicit opt-in). "
                  "A launcher that writes some tags itself, the way the Lightroom "
                  "plug-in does, should narrow this explicitly.",
         )
