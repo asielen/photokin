@@ -568,12 +568,11 @@ def apply_changeset(
                 continue
             write = _FileWrite(tags_to_write, keyword_args)
 
-            if cfg.dry_run:
-                summary["files_written"] += 1
-                summary["tags_written"] += len(tags_to_write) + (1 if keyword_args else 0)
-                continue
-
             def _datfile_path_for(tag: str, _line: int = line_number) -> str:
+                if cfg.dry_run:
+                    # A path for measurement only: a dry run creates neither
+                    # the batch temporary directory nor any file (C3).
+                    return os.path.join(tempfile.gettempdir(), _datfile_name(_line, tag))
                 return os.path.join(_datfile_dir(tmp_stack), _datfile_name(_line, tag))
 
             try:
@@ -595,7 +594,10 @@ def apply_changeset(
                 # budget: every routable ``set`` value has already moved to a
                 # DATFILE, and keyword args cannot. Failing here is a named
                 # per-file error instead of ExifTool failing to start with an
-                # error that looks like a missing binary.
+                # error that looks like a missing binary -- and it is checked
+                # before the dry-run branch below, so a preview errors exactly
+                # where the real run would rather than counting the file as
+                # writable.
                 summary["errors"].append(
                     {
                         "path": path,
@@ -603,6 +605,11 @@ def apply_changeset(
                         "budget; nothing on this file was written.",
                     }
                 )
+                continue
+
+            if cfg.dry_run:
+                summary["files_written"] += 1
+                summary["tags_written"] += len(tags_to_write) + (1 if keyword_args else 0)
                 continue
 
             try:

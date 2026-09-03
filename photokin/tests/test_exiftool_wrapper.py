@@ -272,6 +272,37 @@ class TestApplyChangeset(_ChangesetFileMixin, unittest.TestCase):
         self.assertEqual(len(summary["errors"]), 1)
         self.assertIn("command-line length budget", summary["errors"][0]["error"])
 
+    def test_a_dry_run_reports_the_keyword_flood_error_too(self):
+        # The preview's whole job is counting what a real run would write, so
+        # a changeset the real run refuses over the command-length budget must
+        # error in the preview as well, not be counted as writable.
+        keyword_len = _INLINE_VALUE_MAX - 10
+        count = _COMMAND_LENGTH_BUDGET // keyword_len + 2
+        path = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {
+                        "set": {},
+                        "keywords_add": [
+                            f"{'k' * (keyword_len - 6)}{i:06d}" for i in range(count)
+                        ],
+                    },
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, dry_run=True, fields=("XMP-dc:Subject",))
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
+            summary = apply_changeset(path, cfg)
+
+        run_mock.assert_not_called()
+        self.assertEqual(summary["files_written"], 0)
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertIn("command-line length budget", summary["errors"][0]["error"])
+
     def test_keyword_deltas_respect_the_field_allow_list(self):
         # The Lightroom pipeline narrows fields to EXIF:UserComment precisely
         # because it writes keywords itself; the deltas must honor that.

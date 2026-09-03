@@ -158,6 +158,12 @@ def hydrate_item_metadata(
         src = rec.get("SourceFile") or ""
         if not src:
             continue
+        # An unreadable input can still yield a record: SourceFile plus an
+        # Error tag and nothing else -- run_exiftool_json deliberately parses
+        # nonzero-exit output. That is a failed read wearing a record's
+        # shape, so the path stays in ``unseen`` and is marked below.
+        if _find_tag_value(rec, "Error") is not None:
+            continue
         # ExifTool emits SourceFile with forward slashes even on Windows, while
         # wanted_by_path is keyed by normalize_path() output (os.path.normpath,
         # which uses backslashes on Windows). Normalize the record path the same

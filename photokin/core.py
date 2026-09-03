@@ -4353,7 +4353,14 @@ def process_manifest_stream(
                 patch, patch_meta = build_canonical_patch(merged, cfg)
 
                 if changeset_writer and run_id:
-                    before_snapshot = canonical_values_from_metadata(per_meta, cfg)
+                    # ``own_meta`` and not ``per_meta``: the changeset is
+                    # per-file write instructions, so each file diffs against
+                    # what it itself held. Diffing against the group-combined
+                    # metadata treated a value found only on a sibling as
+                    # already present on this file, and the write that should
+                    # have brought this file up to the group's shared answer
+                    # was silently dropped.
+                    before_snapshot = canonical_values_from_metadata(own_meta, cfg)
                     after_snapshot = canonical_values_from_patch(patch)
                     if it.get(utils.HYDRATION_FAILED_KEY):
                         # -r asked for this file's metadata and could not read

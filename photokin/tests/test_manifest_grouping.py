@@ -2184,6 +2184,38 @@ class TestPartMarkersOnlyStripWhatTheGroupApplies(ManifestGroupingTestCase):
                 )
 
 
+class TestChangesetDiffsAgainstEachFilesOwnMetadata(ManifestGroupingTestCase):
+    """The changeset before-snapshot is the file's own metadata, not the group's.
+
+    The changeset is per-file write instructions. Diffing against the
+    group-combined metadata treated a keyword found only on a sibling as
+    already present on this file, so the write that should have brought the
+    file up to the group's shared answer was silently dropped -- the written
+    files ended up inconsistent with their own result records.
+    """
+
+    def test_a_siblings_keyword_is_still_proposed_for_the_file_lacking_it(self):
+        changeset: list[str] = []
+        items = [
+            {"path": "s/box3_017.jpg", "metadata": {"keywords": ["Family"]}},
+            {"path": "s/box3_017-back.jpg"},
+        ]
+        self.run_manifest(items, changeset_writer=changeset.append)
+
+        docs = {os.path.basename(d["path"]): d for d in map(json.loads, changeset)}
+        self.assertNotIn(
+            "Family",
+            docs["box3_017.jpg"]["proposed_changes"]["keywords_add"],
+            "the file that already holds the keyword needs no write for it",
+        )
+        self.assertIn(
+            "Family",
+            docs["box3_017-back.jpg"]["proposed_changes"]["keywords_add"],
+            "the sibling's keyword is shared group metadata the back does not "
+            "yet hold, so its write must be proposed",
+        )
+
+
 class TestHydrationFailureSuppressesWrites(ManifestGroupingTestCase):
     """A file ``-r`` asked for and could not read gets no proposed writes.
 
