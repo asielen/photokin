@@ -465,6 +465,21 @@ def verbose_bundle_contradiction(flag: str, value: str) -> UsageMessage:
     )
 
 
+def sidecar_bundle_contradiction(value: str) -> UsageMessage:
+    """``-s`` was given beside a ``--sidecar-md`` value that contradicts it.
+
+    Args:
+        value: The contradicting ``--sidecar-md`` value, ``off`` or ``all``.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`-s` means --sidecar-md auto, but `--sidecar-md {value}` was also given.",
+        "drop one; --sidecar-md auto alone means the same thing as -s",
+    )
+
+
 def write_needs_changeset() -> UsageMessage:
     """Writing was asked for with no changeset to write from.
 
@@ -1080,6 +1095,22 @@ def rename_mode_conflict(first: str, second: str) -> UsageMessage:
             "only one can drive this run."
         ),
         f"drop one; run {first} and {second} as two separate commands",
+    )
+
+
+def rename_with_sidecar(mode: str, flag: str) -> UsageMessage:
+    """A transcript sidecar flag was given beside a rename mode, which makes no model call.
+
+    Args:
+        mode: The rename-mode flag driving the run, such as ``--rename``.
+        flag: The sidecar flag as it was spelled, ``-s`` or ``--sidecar-md <value>``.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`{mode}` makes no model call, so `{flag}` has nothing to write.",
+        f"drop it; run {mode} and the analysis as two separate commands",
     )
 
 

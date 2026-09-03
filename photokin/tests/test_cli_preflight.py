@@ -937,7 +937,7 @@ class TestNothingIsWrittenWithoutAnOptIn(_WriteFixtureTestCase):
 
                 self.assertIsNone(code)
                 apply.assert_called_once()
-                self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+                self.assertIn("write     : ExifTool EXIF:UserComment, XMP-dc:Description", stderr)
 
 
 class TestWriteBundleGuards(_WriteFixtureTestCase):
@@ -1037,7 +1037,7 @@ class TestWriteBundleGuards(_WriteFixtureTestCase):
                 # the changeset file exists because --changeset true was set,
                 # and apply ran because --exiftool-write true was.
                 apply.assert_called_once()
-                self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+                self.assertIn("write     : ExifTool EXIF:UserComment, XMP-dc:Description", stderr)
                 # Named by the input's own stem, so the three inputs produce
                 # three different filenames; the suffix is the invariant.
                 self.assertTrue(
@@ -1070,7 +1070,7 @@ class TestWriteBundleGuards(_WriteFixtureTestCase):
 
         self.assertIsNone(code)
         apply.assert_called_once()
-        self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+        self.assertIn("write     : ExifTool EXIF:UserComment, XMP-dc:Description", stderr)
 
 
 class TestABlankInputTokenIsRefused(_CliTestCase):
@@ -1304,6 +1304,21 @@ class TestGenerateManifestRemediesTerminate(_CliTestCase):
         self.assertIn("Wrote manifest for 1 file(s) in 1 group(s)", stderr)
         stream.assert_not_called()
 
+    def test_an_explicit_sidecar_md_off_is_not_refused(self) -> None:
+        # off asks for nothing, so there is nothing the manifest run fails to
+        # honor -- the same reason an explicit --changeset false is permitted.
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "out.json")
+
+        with patch("photokin.cli.process_manifest_stream", Mock()) as stream:
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--generate-manifest", out_path, "--sidecar-md", "off"]
+            )
+
+        self.assertIsNone(code)
+        self.assertIn("Wrote manifest for 1 file(s) in 1 group(s)", stderr)
+        stream.assert_not_called()
+
     def test_each_write_flag_keeps_its_own_wording(self) -> None:
         # Reordering the guards must not collapse four distinct answers into
         # whichever one happens to be checked first.
@@ -1323,6 +1338,16 @@ class TestGenerateManifestRemediesTerminate(_CliTestCase):
                 (
                     "`--generate-manifest` writes a manifest and stops, so `--output-file "
                     "r.ndjson` would never be written."
+                ),
+            ),
+            # The sidecar request rides an analysis the same way the dumps do;
+            # before its guard existed it was silently discarded instead.
+            (["-s"], "`--generate-manifest` makes no model call, so `-s` has nothing to write."),
+            (
+                ["--sidecar-md", "all"],
+                (
+                    "`--generate-manifest` makes no model call, so `--sidecar-md all` has "
+                    "nothing to write."
                 ),
             ),
         )
@@ -1872,6 +1897,38 @@ class TestARunThatWroteNothingSaysSo(_CliTestCase):
         self.assertIsNone(code)
         self.assertNotIn("nothing was written", stderr)
 
+    def test_a_changeset_that_proposed_nothing_is_not_a_failed_run(self) -> None:
+        """Records seen but nothing proposed -- the idempotent re-run over
+        already-written files -- writes nothing and errors nothing, and is
+        the one quiet success rather than a claimed failure with no errors
+        to inspect."""
+        code, _stdout, stderr = self._run_with_summary(
+            {"files_seen": 3, "files_written": 0, "tags_written": 0,
+             "errors": [], "warnings": []}
+        )
+        self.assertIsNone(code)
+        self.assertNotIn("nothing was written", stderr)
+
+    def test_proposals_filtered_to_nothing_still_fails_the_run(self) -> None:
+        """An allow-list matching nothing in the changeset leaves neither
+        errors nor warnings -- but the records proposed writes, so zero
+        written is the documented setting-wrong-for-every-file shape."""
+        code, _stdout, _stderr = self._run_with_summary(
+            {"files_seen": 3, "files_written": 0, "files_with_proposals": 3,
+             "tags_written": 0, "errors": [], "warnings": []}
+        )
+        self.assertEqual(code, 2)
+
+    def test_an_all_suppressed_changeset_fails_the_run(self) -> None:
+        """A whole-batch -r failure suppresses every record; after paying for
+        every model call, exit 0 would report success for a run that wrote
+        nothing."""
+        code, _stdout, _stderr = self._run_with_summary(
+            {"files_seen": 3, "files_written": 0, "files_suppressed": 3,
+             "tags_written": 0, "errors": [], "warnings": []}
+        )
+        self.assertEqual(code, 2)
+
     def test_manifest_input_keeps_the_plugin_contract(self) -> None:
         """Manifest mode reports per item and exits 0, here as everywhere else.
 
@@ -2288,6 +2345,10 @@ class TestCapabilities(_CliTestCase):
         self.assertEqual(payload["ndjson_schema_version"], cli._NDJSON_SCHEMA_VERSION)
         self.assertIn("--verbose", payload["flags"])
         self.assertIn("--cancel-file", payload["flags"])
+        # Short spellings are advertised too: -s has no long-form synonym, so
+        # without it the flag list could not distinguish a build that has the
+        # shorthand from one that only has --sidecar-md.
+        self.assertIn("-s", payload["flags"])
         self.assertEqual(payload["canonical_tags"]["caption"], "XMP-dc:Description")
         self.assertIn("anthropic", payload["providers"])
 

@@ -743,6 +743,31 @@ class TestTheMessageMatrix(_CliTestCase):
                 "`--changeset false` was also given.",
             ),
             (
+                "-s contradicted by --sidecar-md off",
+                [folder, "-s", "--sidecar-md", "off"],
+                "`-s` means --sidecar-md auto, but `--sidecar-md off` was also given.",
+            ),
+            (
+                "-s contradicted by --sidecar-md all",
+                [folder, "-s", "--sidecar-md", "all"],
+                "`-s` means --sidecar-md auto, but `--sidecar-md all` was also given.",
+            ),
+            (
+                "-s beside --rename",
+                [folder, "--rename", "pfx", "-s"],
+                "`--rename` makes no model call, so `-s` has nothing to write.",
+            ),
+            (
+                "--sidecar-md beside --rename",
+                [folder, "--rename", "pfx", "--sidecar-md", "all"],
+                "`--rename` makes no model call, so `--sidecar-md all` has nothing to write.",
+            ),
+            (
+                "-s beside --rename-undo",
+                [folder, "--rename-undo", "-s"],
+                "`--rename-undo` makes no model call, so `-s` has nothing to write.",
+            ),
+            (
                 "a write with nothing to write from",
                 [folder, "--exiftool-write", "true"],
                 "`--exiftool-write true` needs a changeset to apply, but --changeset is false.",
@@ -846,6 +871,22 @@ class TestTheMessageMatrix(_CliTestCase):
                 "ExifTool wants it",
             ],
         )
+
+    def test_the_env_var_spelling_is_refused_the_same_way(self) -> None:
+        # EXIFTOOL_FIELDS is the same setting arriving by the other door; it
+        # used to slip past this guard and fail every write downstream with
+        # only warnings to show for it.
+        folder = self.make_folder()
+        stream = _StreamSpy()
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "-w"], env={"EXIFTOOL_FIELDS": "XMP:dc:Description"}
+            )
+
+        self.assertEqual(code, 2)
+        self.assertFalse(stream.called, "a run that cannot write must not call the model")
+        self.assertIn("[ERROR] ExifTool cannot write `XMP:dc:Description`.", stderr)
 
     def test_the_refusal_names_the_tag_the_user_typed_not_a_canned_example(self) -> None:
         # Each rejected tag must be echoed back with its own correction, or the
@@ -1141,7 +1182,7 @@ class TestTheWriteShorthand(_WriteFixtureTestCase):
                     self.assertNotEqual(
                         handle.read(), original, "-w did not expand to --exiftool-write true"
                     )
-                self.assertIn("write     : ExifTool EXIF:UserComment", stderr)
+                self.assertIn("write     : ExifTool EXIF:UserComment, XMP-dc:Description", stderr)
                 _write_bytes(image, original)
                 for stale in changesets:
                     os.remove(os.path.join(folder, stale))
@@ -1497,6 +1538,28 @@ class TestThePlanNamesWhatSidecarModeWillWrite(_CliTestCase):
         )
         self.assertIn("Document or Postcard (--sidecar-md auto)", stderr)
 
+    def test_the_s_shorthand_expands_to_sidecar_md_auto(self) -> None:
+        # -s is shorthand for --sidecar-md auto, the same relationship -w has
+        # to its bundle: the plan clause is the auto clause, verbatim.
+        folder = self.make_folder("box3_025.jpg")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli([folder, "-s"])
+
+        self.assertIsNone(code, stderr)
+        self.assertIn("Document or Postcard (--sidecar-md auto)", stderr)
+
+    def test_an_explicit_sidecar_md_auto_agrees_with_the_shorthand(self) -> None:
+        # Agreement is not a contradiction: spelling both is redundant, legal,
+        # and means what either alone means.
+        folder = self.make_folder("box3_025.jpg")
+
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, stderr = self.run_cli([folder, "-s", "--sidecar-md", "auto"])
+
+        self.assertIsNone(code, stderr)
+        self.assertIn("Document or Postcard (--sidecar-md auto)", stderr)
+
     def test_dry_run_previews_the_sidecar_clause_before_anything_is_written(self) -> None:
         folder = self.make_folder("box3_025.jpg")
         stream = _StreamSpy()
@@ -1717,7 +1780,7 @@ class TestThePlanAdvisesTheNormalRun(_CliTestCase):
                 self.assertIn(
                     "  read      : ExifTool " + ", ".join(DEFAULT_EXIFTOOL_FIELDS), pasted
                 )
-                self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+                self.assertIn("  write     : ExifTool EXIF:UserComment, XMP-dc:Description", pasted)
                 # Same input, same grouping, same provider: everything the first
                 # plan said, which is what makes it a next step and not a
                 # different run.
@@ -1748,7 +1811,7 @@ class TestThePlanAdvisesTheNormalRun(_CliTestCase):
                 self.assertEqual(shlex.split(command, posix=True), ["photokin", *argv, "-rw"])
                 code, pasted = self.paste(command, exiftool_path)
                 self.assertIsNone(code, f"the suggested command was refused: {pasted!r}")
-                self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+                self.assertIn("  write     : ExifTool EXIF:UserComment, XMP-dc:Description", pasted)
 
     def test_a_trailing_separator_survives_the_round_trip(self) -> None:
         """``C:\\Scans\\`` is how a path arrives from Explorer, and it is the shape
@@ -1765,7 +1828,7 @@ class TestThePlanAdvisesTheNormalRun(_CliTestCase):
         self.assertEqual(shlex.split(command, posix=True), ["photokin", folder, "-rw"])
         code, pasted = self.paste(command, exiftool_path)
         self.assertIsNone(code, f"the suggested command was refused: {pasted!r}")
-        self.assertIn("  write     : ExifTool EXIF:UserComment", pasted)
+        self.assertIn("  write     : ExifTool EXIF:UserComment, XMP-dc:Description", pasted)
 
     def test_a_run_that_has_already_declared_itself_is_not_advised(self) -> None:
         folder = self.make_folder()

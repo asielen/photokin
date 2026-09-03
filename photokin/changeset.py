@@ -106,6 +106,16 @@ def _normalize_keyword_list(values: Any) -> list[str]:
     return out
 
 
+#: The marker key a write-suppressed changeset record carries inside
+#: ``proposed_changes``, beside the empty ``set``/delta fields, valued with
+#: the reason (currently only ``"hydration_failed"``). It lets the applier --
+#: and any other consumer -- tell "nothing to write" from "unreadable"
+#: without a schema change to the record itself; the applier counts these so
+#: a run whose every record was suppressed can end loudly instead of as a
+#: silent success.
+WRITE_SUPPRESSED_KEY = "suppressed"
+
+
 def diff_canonical_metadata(before: dict, after: dict) -> dict:
     """Compute a compact diff in canonical tag space (set/keywords_add/keywords_remove)."""
     before_keywords = _normalize_keyword_list(before.get(CANONICAL_KEYWORDS_TAG))

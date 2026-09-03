@@ -7,9 +7,42 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-# Fields written by the Lightroom pipeline by default (EXIF:UserComment is the
-# one field the Lightroom SDK cannot write itself).
-DEFAULT_PIPELINE_FIELDS: tuple[str, ...] = ("EXIF:UserComment",)
+from ..canonical import (
+    CANONICAL_DATE_TAG,
+    CANONICAL_DESCRIPTION_TAG,
+    CANONICAL_KEYWORDS_TAG,
+    CANONICAL_TITLE_TAG,
+    CANONICAL_USER_COMMENT_TAG,
+)
+
+# Every tag the analysis proposes AND hydration reads back first, in the order
+# the README's "What gets written where" table documents them. This is the
+# default write set for every caller: the point of a plain -rw run is that it
+# writes what the analysis produced, and a default narrower than the changeset
+# silently dropped captions, keywords and titles for anyone who did not also
+# pass --exiftool-fields. A launcher that writes some of these tags itself --
+# the Lightroom plug-in routes only EXIF:UserComment through photokin and
+# writes the XMP tags via the catalog SDK -- must narrow the set explicitly
+# with --exiftool-fields or EXIFTOOL_FIELDS; a narrow default here cannot
+# serve both callers, and the CLI is the one that has no other way to say
+# what it wants.
+#
+# The IPTC location tags (CANONICAL_LOCATION_TAGS) are deliberately NOT here:
+# hydration (exiftool/manifest.py's DEFAULT_EXIFTOOL_FIELDS) does not read
+# them, so a confident model guess would be diffed against an empty
+# before-snapshot and overwrite a location someone already curated in the
+# file, unread. Until the read side learns those tags, writing them is an
+# explicit --exiftool-fields opt-in. EXIF:CreateDate is not a canonical
+# output tag, but changesets from other producers may carry it and the
+# applier knows how to normalize it, so it stays allowed.
+DEFAULT_PIPELINE_FIELDS: tuple[str, ...] = (
+    CANONICAL_USER_COMMENT_TAG,
+    CANONICAL_DESCRIPTION_TAG,
+    CANONICAL_KEYWORDS_TAG,
+    CANONICAL_TITLE_TAG,
+    CANONICAL_DATE_TAG,
+    "EXIF:CreateDate",
+)
 
 #: The one tag shape ExifTool reliably refuses: ``XMP:<namespace>:<Tag>``, e.g.
 #: ``XMP:dc:Description``. It answers "doesn't exist or isn't writable", exits 1
@@ -87,11 +120,7 @@ class ExiftoolConfig:
     path: str | None = None
     cache_dir: str | None = None
     enabled: bool = False
-    fields: tuple[str, ...] = (
-        "EXIF:DateTimeOriginal",
-        "EXIF:CreateDate",
-        "EXIF:UserComment",
-    )
+    fields: tuple[str, ...] = DEFAULT_PIPELINE_FIELDS
     dry_run: bool = False
     overwrite_original: bool = True
     write_sidecar_only: bool = False
@@ -102,11 +131,12 @@ class ExiftoolConfig:
 
         Reads ``EXIFTOOL_WRITE_ENABLED`` (default false), ``EXIFTOOL_PATH``,
         and ``EXIFTOOL_FIELDS`` (comma-separated, default
-        ``("EXIF:UserComment",)``). Writing to the user's files requires an
-        explicit opt-in, so the default here agrees with the dataclass rather
-        than quietly overriding it. Explicit keyword overrides win over the
-        environment; overrides with value ``None`` are ignored so callers can
-        pass through optional CLI flags directly.
+        :data:`DEFAULT_PIPELINE_FIELDS` -- every canonical tag, agreeing with
+        the dataclass rather than quietly overriding it). Writing to the
+        user's files still requires the explicit ``enabled`` opt-in; the
+        fields only say what an enabled write may touch. Explicit keyword
+        overrides win over the environment; overrides with value ``None`` are
+        ignored so callers can pass through optional CLI flags directly.
         """
         values: dict[str, Any] = {
             "enabled": _parse_bool_env("EXIFTOOL_WRITE_ENABLED", False),

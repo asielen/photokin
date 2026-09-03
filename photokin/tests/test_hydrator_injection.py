@@ -94,6 +94,9 @@ class TestHydrateItemMetadata(unittest.TestCase):
             hydrate_item_metadata(items, ExiftoolConfig())
         self.assertEqual(items[0]["metadata"]["userComment"], "")
         self.assertIn("not found", logs.output[0])
+        # Every item whose read was requested and never confirmed is marked,
+        # so the changeset emitter can decline to propose writes for it.
+        self.assertTrue(all(item.get(utils.HYDRATION_FAILED_KEY) for item in items))
 
     def test_noop_when_exiftool_read_fails(self):
         items = self._items()
@@ -107,6 +110,54 @@ class TestHydrateItemMetadata(unittest.TestCase):
             hydrate_item_metadata(items, ExiftoolConfig())
         self.assertEqual(items[0]["metadata"]["userComment"], "")
         self.assertIn("boom", logs.output[0])
+        self.assertTrue(all(item.get(utils.HYDRATION_FAILED_KEY) for item in items))
+
+    def test_an_error_bearing_record_is_marked_hydration_failed(self):
+        # An unreadable input can still yield a record: SourceFile plus an
+        # ExifTool:Error tag and nothing else, because run_exiftool_json
+        # parses nonzero-exit output. A failed read wearing a record's shape
+        # must be marked exactly like a missing record.
+        items = self._items()
+        records = [
+            {"SourceFile": "/photos/a.jpg", "EXIF:UserComment": "From file A"},
+            {"SourceFile": "/photos/b.jpg", "ExifTool:Error": "File format error"},
+            {"SourceFile": "/photos/c.jpg", "EXIF:UserComment": "From file C"},
+        ]
+        with patch(
+            "photokin.exiftool.hydrate.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch(
+            "photokin.exiftool.manifest.run_exiftool_json", return_value=records
+        ), self.assertLogs("photokin.exiftool.hydrate", level="WARNING") as logs:
+            hydrate_item_metadata(items, ExiftoolConfig())
+
+        self.assertNotIn(utils.HYDRATION_FAILED_KEY, items[0])
+        self.assertTrue(items[1][utils.HYDRATION_FAILED_KEY])
+        self.assertNotIn(utils.HYDRATION_FAILED_KEY, items[2])
+        self.assertIn("could not read 1 file(s)", logs.output[-1])
+
+    def test_a_file_with_no_record_is_marked_hydration_failed(self):
+        # A record comes back for every file ExifTool could open, so one
+        # missing means that file's read failed -- which is not the same as a
+        # successful read of a file holding no metadata, and must not be
+        # diffed as if it were.
+        items = self._items()
+        records = [
+            {"SourceFile": "/photos/a.jpg", "EXIF:UserComment": "From file A"},
+            {"SourceFile": "/photos/c.jpg", "EXIF:UserComment": "From file C"},
+        ]
+        with patch(
+            "photokin.exiftool.hydrate.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch(
+            "photokin.exiftool.manifest.run_exiftool_json", return_value=records
+        ), self.assertLogs("photokin.exiftool.hydrate", level="WARNING") as logs:
+            hydrate_item_metadata(items, ExiftoolConfig())
+
+        self.assertNotIn(utils.HYDRATION_FAILED_KEY, items[0])
+        self.assertTrue(items[1][utils.HYDRATION_FAILED_KEY])
+        self.assertNotIn(utils.HYDRATION_FAILED_KEY, items[2])
+        self.assertIn("could not read 1 file(s)", logs.output[-1])
 
     def test_make_manifest_hydrator_wraps_config(self):
         items = self._items()

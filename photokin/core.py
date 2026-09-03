@@ -63,6 +63,7 @@ import os
 import re
 import traceback
 from pathlib import Path
+from dataclasses import dataclass
 from datetime import date
 from typing import Callable, Dict, Any, List
 from copy import deepcopy
@@ -80,6 +81,7 @@ from .changeset import (
     make_run_id,
     ordered_group_keys,
     select_forwarded_metadata,
+    WRITE_SUPPRESSED_KEY,
     diff_canonical_metadata,
     emit_changeset_record,
 )
@@ -2724,6 +2726,10 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
         "preferred": bool(raw.get("preferred")),
         "metadata": raw.get("metadata"),
         "metadata_path": raw.get("metadata_path"),
+        # Set by the ExifTool hydrator (which runs before bucketing) when -r
+        # asked for this file's metadata and the read could not be confirmed;
+        # the changeset emitter proposes no writes for such a file.
+        utils.HYDRATION_FAILED_KEY: bool(raw.get(utils.HYDRATION_FAILED_KEY)),
     }
 
 
@@ -2742,6 +2748,88 @@ def _item_part_marker(entry: dict) -> str | None:
     if entry["is_back"]:
         return "back"
     return "negative" if entry["part_kind"] == "negative" else None
+
+
+@dataclass
+class _WriteDecision:
+    """One file's write verdict and both vehicles derived from it.
+
+    Attributes:
+        patch: The per-item record's patch -- empty when suppressed.
+        suppressed: True when the file's ``-r`` read could not be confirmed
+            and no writes may be proposed for it.
+        before_snapshot: The file's own canonical values, the diff baseline;
+            ``None`` when no changeset is being written this run.
+        proposed_changes: The changeset diff (or the explicit suppressed
+            no-op); ``None`` when no changeset is being written this run.
+    """
+
+    patch: Dict[str, Any]
+    suppressed: bool
+    before_snapshot: Dict[str, Any] | None
+    proposed_changes: Dict[str, Any] | None
+
+
+def _file_write_instructions(
+    patch: Dict[str, Any],
+    own_meta: Dict[str, Any],
+    cfg: utils.Config,
+    entry: dict,
+    want_diff: bool,
+) -> _WriteDecision:
+    """Return one file's write vehicles, with every write gate applied to all.
+
+    The run states its writes twice: the per-item record's ``patch`` (what a
+    manifest-mode integration such as the Lightroom plug-in applies through
+    its own writer) and the changeset's ``proposed_changes`` (what the
+    ExifTool applier consumes). A gate applied to only one of them is a
+    defect this function exists to prevent -- the hydration-failure
+    suppression shipped that way once -- so every rule deciding whether a
+    file may be written lives here, both vehicles and the record's
+    ``hydration_failed`` flag all derive from its one ``suppressed`` verdict.
+
+    The diff baseline is ``own_meta``, this file's own metadata, and not the
+    group-combined metadata: a value found only on a sibling is not yet on
+    this file, and the write that brings the file up to the group's shared
+    answer must be proposed.
+
+    Args:
+        patch: The canonical patch built from the merged result.
+        own_meta: This file's own metadata, the diff baseline.
+        cfg: The run configuration, for the canonical-value thresholds.
+        entry: The file's grouping entry, read for the hydration-failure mark
+            this run's hydrator may have set.
+        want_diff: Whether a changeset is being written this run. When False
+            the snapshot and diff are skipped entirely -- a plain analysis
+            run pays for neither.
+
+    Returns:
+        The decision. For a suppressed file the patch is empty and the
+        proposed changes are the explicit no-op carrying
+        :data:`WRITE_SUPPRESSED_KEY` -- deliberately not a diff, which would
+        read the file's own values as removals. Unread is not empty: a write
+        diffed against an unseen before-snapshot could overwrite metadata
+        the file really holds.
+    """
+    suppressed = bool(entry.get(utils.HYDRATION_FAILED_KEY))
+    if suppressed:
+        logger.warning(
+            "%s: -r could not read this file, so no writes are proposed for it.",
+            os.path.basename(entry["path"]),
+        )
+    if not want_diff:
+        return _WriteDecision({} if suppressed else patch, suppressed, None, None)
+    before_snapshot = canonical_values_from_metadata(own_meta, cfg)
+    if suppressed:
+        proposed: Dict[str, Any] = {
+            "set": {},
+            "keywords_add": [],
+            "keywords_remove": [],
+            WRITE_SUPPRESSED_KEY: "hydration_failed",
+        }
+        return _WriteDecision({}, True, before_snapshot, proposed)
+    proposed = diff_canonical_metadata(before_snapshot, canonical_values_from_patch(patch))
+    return _WriteDecision(patch, False, before_snapshot, proposed)
 
 
 def _escape_pair_half(half: str) -> str:
@@ -3107,6 +3195,14 @@ def process_manifest_stream(
         forward_fields = None
 
     items = man.get("items", [])
+    # The hydration-failure mark is runtime state owned by this run's own
+    # hydrator, never manifest vocabulary: a stale key persisted by an earlier
+    # --generate-manifest run, or echoed back into a manifest from an emitted
+    # record, would otherwise suppress the file's writes forever -- even after
+    # the read that once failed now succeeds.
+    for raw in items:
+        if isinstance(raw, dict):
+            raw.pop(utils.HYDRATION_FAILED_KEY, None)
     # Provenance is the caller's fact to state, not ours to infer. This used to
     # read ``metadata_hydrator is not None``, but "a hydrator ran" is not "these
     # values came out of the files' own tags": the README invites embedders to
@@ -4347,11 +4443,18 @@ def process_manifest_stream(
 
                 merged["_merge"] = report
                 patch, patch_meta = build_canonical_patch(merged, cfg)
+                # One decision for both write vehicles and the record flag --
+                # see the helper's docstring for why a gate must never touch
+                # just one of them.
+                decision = _file_write_instructions(
+                    patch, own_meta, cfg, it, want_diff=bool(changeset_writer and run_id)
+                )
 
                 if changeset_writer and run_id:
-                    before_snapshot = canonical_values_from_metadata(per_meta, cfg)
-                    after_snapshot = canonical_values_from_patch(patch)
-                    proposed_changes = diff_canonical_metadata(before_snapshot, after_snapshot)
+                    # want_diff was True exactly for this branch, so the
+                    # decision carries both; the asserts narrow the Optionals.
+                    assert decision.before_snapshot is not None
+                    assert decision.proposed_changes is not None
                     emit_changeset_record(
                         changeset_writer,
                         run_id=run_id,
@@ -4359,12 +4462,28 @@ def process_manifest_stream(
                         group_key=stem,
                         path=it["path"],
                         sent_to_model=sent_to_model_snapshot,
-                        file_metadata=before_snapshot,
-                        proposed_changes=proposed_changes,
+                        file_metadata=decision.before_snapshot,
+                        proposed_changes=decision.proposed_changes,
                     )
 
                 results[it["path"]] = merged
-                _emit(it["path"], "ok", {"result": merged, "patch": patch, "patch_meta": patch_meta, "usage": {"prompt_tokens": (merged.get("_usage") or {}).get("prompt_tokens"), "completion_tokens": (merged.get("_usage") or {}).get("completion_tokens"), "total_tokens": (merged.get("_usage") or {}).get("total_tokens"), "model": (merged.get("_usage") or {}).get("model")}})
+                usage = merged.get("_usage") or {}
+                item_payload: Dict[str, Any] = {
+                    "result": merged,
+                    "patch": decision.patch,
+                    "patch_meta": patch_meta,
+                    "usage": {
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "total_tokens": usage.get("total_tokens"),
+                        "model": usage.get("model"),
+                    },
+                }
+                if decision.suppressed:
+                    # Says why the patch is empty, so an integration reading
+                    # the record can tell "nothing to write" from "unreadable".
+                    item_payload[utils.HYDRATION_FAILED_KEY] = True
+                _emit(it["path"], "ok", item_payload)
                 emitted_ok.add(it["path"])
 
         # Exception (not BaseException) so KeyboardInterrupt/SystemExit still abort.
