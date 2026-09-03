@@ -2228,19 +2228,42 @@ class TestHydrationFailureSuppressesWrites(ManifestGroupingTestCase):
     """
 
     def test_a_marked_file_gets_an_empty_proposed_changes(self):
+        # The mark is planted by a hydrator, the way photokin's own does it:
+        # it is runtime state only this run's hydrator may set, and the
+        # intake strips it from the manifest items themselves.
         changeset: list[str] = []
+        lines: list[str] = []
         items = [
-            {"path": "s/scan001.jpg", utils.HYDRATION_FAILED_KEY: True},
+            {"path": "s/scan001.jpg"},
             {"path": "s/scan002.jpg"},
         ]
-        _calls, records, warnings = self.run_manifest(
-            items, model_keywords=["Family"], changeset_writer=changeset.append
-        )
+
+        def failing_hydrator(raw_items: list[dict]) -> None:
+            raw_items[0][utils.HYDRATION_FAILED_KEY] = True
+
+        with (
+            self.assertLogs("photokin.core", level="INFO") as logs,
+            _recording(["Family"], real_patch_builder=True),
+        ):
+            core.process_manifest_stream(
+                manifest={"items": items},
+                cfg=utils.Config(dry_run=True, group_by=utils.GROUP_BY_OBJECT),
+                ndjson_writer=lines.append,
+                changeset_writer=changeset.append,
+                metadata_hydrator=failing_hydrator,
+            )
+        warnings = [r.getMessage() for r in logs.records if r.levelno >= logging.WARNING]
+        records = [json.loads(line) for line in lines]
 
         docs = {os.path.basename(d["path"]): d for d in map(json.loads, changeset)}
         self.assertEqual(
             docs["scan001.jpg"]["proposed_changes"],
-            {"set": {}, "keywords_add": [], "keywords_remove": []},
+            {
+                "set": {},
+                "keywords_add": [],
+                "keywords_remove": [],
+                "suppressed": "hydration_failed",
+            },
         )
         self.assertNotEqual(
             docs["scan002.jpg"]["proposed_changes"]["keywords_add"],
@@ -2262,6 +2285,25 @@ class TestHydrationFailureSuppressesWrites(ManifestGroupingTestCase):
         self.assertTrue(recs["scan001.jpg"].get("hydration_failed"))
         self.assertNotEqual(recs["scan002.jpg"]["patch"], {})
         self.assertNotIn("hydration_failed", recs["scan002.jpg"])
+
+    def test_a_stale_mark_in_the_manifest_itself_is_ignored(self):
+        # The mark is runtime state owned by this run's hydrator, never
+        # manifest vocabulary: a key persisted by an earlier
+        # --generate-manifest run, or echoed back from an emitted record,
+        # must not suppress the file's writes forever after the read that
+        # once failed now succeeds.
+        changeset: list[str] = []
+        items = [{"path": "s/scan001.jpg", utils.HYDRATION_FAILED_KEY: True}]
+        self.run_manifest(
+            items, model_keywords=["Family"], changeset_writer=changeset.append
+        )
+
+        doc = json.loads(changeset[0])
+        self.assertNotEqual(
+            doc["proposed_changes"]["keywords_add"],
+            [],
+            "a stale manifest key must not survive intake and suppress writes",
+        )
 
 
 if __name__ == "__main__":

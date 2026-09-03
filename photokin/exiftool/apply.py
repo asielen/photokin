@@ -44,12 +44,19 @@ from json import JSONDecodeError
 from typing import Any
 
 from ..canonical import CANONICAL_KEYWORDS_TAG
+from ..changeset import WRITE_SUPPRESSED_KEY
 from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
 from .locate import resolve_exiftool_path
 
 logger = logging.getLogger(__name__)
 
 EXIF_DATE_TAGS = {"EXIF:DateTimeOriginal", "EXIF:CreateDate"}
+
+#: Prefix of the batch's DATFILE temporary directory. One definition for both
+#: the real ``TemporaryDirectory`` and the dry-run measurement path, so the
+#: two can never drift and let a preview measure a shorter command than the
+#: real run would build.
+_TMP_DIR_PREFIX = "photokin-exiftool-"
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
 _EXIF_DT_RE = re.compile(r"^\d{4}:\d{2}:\d{2}( \d{2}:\d{2}:\d{2})?$")
 
@@ -418,12 +425,18 @@ def apply_changeset(
     into ``summary["errors"]`` rather than raised, so one bad file never aborts a
     batch. Honors ``cfg.dry_run`` (preview without writing).
 
-    Returns a summary dict: ``files_seen``, ``files_written``, ``tags_written``,
-    ``errors``, ``warnings``, ``dry_run``.
+    Returns a summary dict: ``files_seen``, ``files_written``,
+    ``files_with_proposals`` (records that proposed any write at all, before
+    allow-list filtering -- what the strict verdict measures "attempted"
+    against), ``files_suppressed`` (records the emitter marked
+    write-suppressed), ``tags_written``, ``errors``, ``warnings``,
+    ``dry_run``.
     """
     summary: dict[str, Any] = {
         "files_seen": 0,
         "files_written": 0,
+        "files_with_proposals": 0,
+        "files_suppressed": 0,
         "tags_written": 0,
         "errors": [],
         "warnings": [],
@@ -462,15 +475,15 @@ def apply_changeset(
     # hand it to ExifTool once per file and reproduce, per file, the very
     # message this warning exists to say once instead.
     unwritable_fields = set()
-    for field in allowed_fields:
-        better = suggest_writable_spelling(field)
+    for tag_name in allowed_fields:
+        better = suggest_writable_spelling(tag_name)
         if better:
-            unwritable_fields.add(field)
+            unwritable_fields.add(tag_name)
             summary["warnings"].append(
                 {
-                    "tag": field,
+                    "tag": tag_name,
                     "warning": (
-                        f"{field!r} is not a writable ExifTool tag name; use "
+                        f"{tag_name!r} is not a writable ExifTool tag name; use "
                         f"{better!r} instead. Nothing will be written for this tag."
                     ),
                 }
@@ -507,7 +520,7 @@ def apply_changeset(
                     # system temporary directory is the smaller loss, and the
                     # OS clears them.
                     tempfile.TemporaryDirectory(
-                        prefix="photokin-exiftool-", ignore_cleanup_errors=True
+                        prefix=_TMP_DIR_PREFIX, ignore_cleanup_errors=True
                     )
                 )
             )
@@ -548,6 +561,19 @@ def apply_changeset(
                 summary["warnings"].append({"path": path, "warning": "Invalid proposed_changes.set payload."})
                 continue
 
+            # Counted before allow-list filtering: a record that proposed
+            # writes which then all get filtered away is precisely the
+            # "setting wrong for every file" shape the strict verdict must
+            # see, and it leaves neither errors nor warnings of its own.
+            if proposed.get(WRITE_SUPPRESSED_KEY):
+                summary["files_suppressed"] += 1
+            if (
+                set_changes
+                or proposed.get("keywords_add")
+                or proposed.get("keywords_remove")
+            ):
+                summary["files_with_proposals"] += 1
+
             tags_to_write: dict[str, str] = {}
             for tag in allowed_fields:
                 if tag not in set_changes:
@@ -567,17 +593,20 @@ def apply_changeset(
             if not tags_to_write and not keyword_args:
                 continue
             write = _FileWrite(tags_to_write, keyword_args)
+            # Computed once so the dry-run preview and the real write can
+            # never count differently.
+            tags_count = len(tags_to_write) + (1 if keyword_args else 0)
 
             def _datfile_path_for(tag: str, _line: int = line_number) -> str:
                 if cfg.dry_run:
                     # A path for measurement only: a dry run creates neither
-                    # the batch temporary directory nor any file (C3). Padded
-                    # past the real TemporaryDirectory name (the prefix plus
-                    # 8 random characters) so the preview never measures a
-                    # routed argument shorter than the real run would build.
+                    # the batch temporary directory nor any file (C3). The 12
+                    # padding characters stay past mkdtemp's 8-character
+                    # random suffix, so the preview never measures a routed
+                    # argument shorter than the real run would build.
                     return os.path.join(
                         tempfile.gettempdir(),
-                        "photokin-exiftool-" + "M" * 12,
+                        _TMP_DIR_PREFIX + "M" * 12,
                         _datfile_name(_line, tag),
                     )
                 return os.path.join(_datfile_dir(tmp_stack), _datfile_name(_line, tag))
@@ -616,7 +645,7 @@ def apply_changeset(
 
             if cfg.dry_run:
                 summary["files_written"] += 1
-                summary["tags_written"] += len(tags_to_write) + (1 if keyword_args else 0)
+                summary["tags_written"] += tags_count
                 continue
 
             try:
@@ -687,7 +716,7 @@ def apply_changeset(
                 continue
 
             summary["files_written"] += 1
-            summary["tags_written"] += len(tags_to_write) + (1 if keyword_args else 0)
+            summary["tags_written"] += tags_count
 
     return summary
 

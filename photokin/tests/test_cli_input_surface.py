@@ -872,6 +872,22 @@ class TestTheMessageMatrix(_CliTestCase):
             ],
         )
 
+    def test_the_env_var_spelling_is_refused_the_same_way(self) -> None:
+        # EXIFTOOL_FIELDS is the same setting arriving by the other door; it
+        # used to slip past this guard and fail every write downstream with
+        # only warnings to show for it.
+        folder = self.make_folder()
+        stream = _StreamSpy()
+
+        with patch("photokin.cli.process_manifest_stream", stream):
+            code, _stdout, stderr = self.run_cli(
+                [folder, "-w"], env={"EXIFTOOL_FIELDS": "XMP:dc:Description"}
+            )
+
+        self.assertEqual(code, 2)
+        self.assertFalse(stream.called, "a run that cannot write must not call the model")
+        self.assertIn("[ERROR] ExifTool cannot write `XMP:dc:Description`.", stderr)
+
     def test_the_refusal_names_the_tag_the_user_typed_not_a_canned_example(self) -> None:
         # Each rejected tag must be echoed back with its own correction, or the
         # message is a lecture rather than an answer.

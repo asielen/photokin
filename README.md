@@ -357,7 +357,7 @@ ExifTool reads the metadata a file already holds (`-r`) and writes the analysis 
 | `keywords` | `XMP-dc:Subject` |
 | `title` | `XMP-dc:Title` |
 | `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` |
-| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location` — not written by default: `-r` doesn't read these tags yet, so a location already in the file would be overwritten unread; opt in by naming them in `--exiftool-fields` |
+| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location` — not written by default: `-r` doesn't read these tags yet, so a location already in the file would be overwritten unread; opt in by naming them in `--exiftool-fields` — which replaces the whole list, so include the default tags you still want alongside them |
 
 ### Why read first
 
@@ -611,7 +611,7 @@ type instead of detecting it; passing a positional *and* an alias is an error.
 
 ### Context
 
-If you are processing a large number of photos related to a single event, you can add context around that event that will be shiped with the LLM call. For example if the whole photo set is part of a wedding. The context could include dates, locations, people to help make the LLMs job easier.
+If you are processing a large number of photos related to a single event, you can add context around that event that will be shipped with the LLM call. For example if the whole photo set is part of a wedding. The context could include dates, locations, people to help make the LLMs job easier.
 
 | Flag                        | What it does |
 |-----------------------------|---|
@@ -655,7 +655,7 @@ spent on anything else.
 | `-r`, `--read`                  | Before analysis, read `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` out of the files and send them to the model, for every input type. Only fills what the input does not already carry; nothing is written. Mirrors `-w` |
 | `-w`, `--write`                 | Shorthand for `--changeset true --exiftool-write true`: record the proposed writes and apply them. An explicit flag that contradicts it is an error rather than a guess |
 | `--exiftool-write {true,false}` | Apply changeset fields to the files after analysis (default `false`; nothing is written without an explicit opt-in) |
-| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write. The default is every tag in the [What gets written where](#what-gets-written-where) table except the location tags — those are an explicit opt-in until `-r` learns to read them, so a curated location is never overwritten unread. A launcher that writes some tags itself (the Lightroom plug-in writes the XMP tags through the catalog SDK) should narrow this explicitly, e.g. `--exiftool-fields EXIF:UserComment` |
+| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write. The default is every tag in the [What gets written where](#what-gets-written-where) table except the location tags — those are an explicit opt-in until `-r` learns to read them, so a curated location is never overwritten unread. The flag **replaces** the default list rather than adding to it, so name every tag you want written. A launcher that writes some tags itself (the Lightroom plug-in writes the XMP tags through the catalog SDK) should narrow this explicitly, e.g. `--exiftool-fields EXIF:UserComment` |
 | `--exiftool-path PATH`          | ExifTool binary to use (default: auto-detect) |
 
 `-r` is the read half and `-w` the write half; the short letters are deliberately symmetrical, and they combine as `-rw` (or `-wr`) exactly like any other pair of short flags — that combined form is the one to reach for, for the reason given above. `-R` is **reserved** for the recursive-folder flag that is still deferred (it changes grouping semantics across directories and interacts with write safety, so it gets its own change), and must not be spent on anything else.

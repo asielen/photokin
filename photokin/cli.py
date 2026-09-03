@@ -1008,42 +1008,78 @@ def _refuse_generate_manifest_verbose_flags(args: argparse.Namespace) -> None:
             )
 
 
+#: The rename executor flags and their argparse destinations. Split from
+#: :data:`_RENAME_MODE_FLAGS` because the ``--dry-run`` refusal applies only
+#: to the three executors -- ``--rename`` itself rehearses faithfully.
+_RENAME_EXECUTOR_FLAGS: tuple[tuple[str, str], ...] = (
+    ("--rename-undo", "rename_undo"),
+    ("--rename-resume", "rename_resume"),
+    ("--rename-finish", "rename_finish"),
+)
+
+#: Every rename-mode flag, in refusal-report order -- the one enumeration all
+#: rename-mode guards read. A fifth mode added here is covered by the
+#: mutual-exclusion check and the sidecar refusal at once, instead of a
+#: hand-copied list going stale in one of them, which is exactly how a
+#: silently-discarded-flag bug starts.
+_RENAME_MODE_FLAGS: tuple[tuple[str, str], ...] = (
+    ("--rename", "rename"),
+    *_RENAME_EXECUTOR_FLAGS,
+)
+
+
+def _given_rename_modes(args: argparse.Namespace) -> list[str]:
+    """Return the rename-mode flags present on *args*, in report order.
+
+    Args:
+        args: The parsed namespace.
+
+    Returns:
+        The flags as spelled on the command line; empty when no rename mode
+        was given.
+    """
+    return [flag for flag, dest in _RENAME_MODE_FLAGS if getattr(args, dest) is not None]
+
+
+def _given_sidecar_request(args: argparse.Namespace) -> str | None:
+    """Return the transcript-sidecar request as it was spelled, or ``None``.
+
+    ``-s`` first, then a non-off ``--sidecar-md``: both ask for an output only
+    an analysis can produce, so every mode that makes no model call refuses
+    whichever was given rather than silently discarding it. An explicit
+    ``--sidecar-md off`` asks for nothing and is never reported.
+
+    Args:
+        args: The parsed namespace, before ``-s``'s expansion is written back.
+
+    Returns:
+        ``"-s"``, ``"--sidecar-md <value>"``, or ``None``.
+    """
+    if args.sidecar_auto:
+        return "-s"
+    if args.sidecar_md is not None and args.sidecar_md != utils.SIDECAR_MD_OFF:
+        return f"--sidecar-md {args.sidecar_md}"
+    return None
+
+
 def _refuse_rename_mode_sidecar_flags(args: argparse.Namespace) -> None:
     """Refuse ``-s`` and a non-off ``--sidecar-md`` beside any rename mode.
 
     Every rename mode returns before analysis, so a transcript sidecar request
     would be silently discarded -- the same reasoning
     :func:`_refuse_generate_manifest_sidecar_flags` applies to
-    ``--generate-manifest``. An explicit ``--sidecar-md off`` asks for
-    nothing and is not refused.
+    ``--generate-manifest``.
 
     Args:
         args: The parsed namespace, before ``-s``'s expansion is written back.
 
     Raises:
-        SystemExit: With code 2 for the first conflicting flag found.
+        SystemExit: With code 2 when a sidecar flag rides a rename mode.
     """
-    mode = next(
-        (
-            flag
-            for flag, given in (
-                ("--rename", args.rename is not None),
-                ("--rename-undo", args.rename_undo is not None),
-                ("--rename-resume", args.rename_resume is not None),
-                ("--rename-finish", args.rename_finish is not None),
-            )
-            if given
-        ),
-        None,
-    )
-    if mode is None:
-        return
-    if args.sidecar_auto:
-        _exit_with_usage_error(*cli_messages.rename_with_sidecar(mode, "-s"))
-    if args.sidecar_md is not None and args.sidecar_md != utils.SIDECAR_MD_OFF:
-        _exit_with_usage_error(
-            *cli_messages.rename_with_sidecar(mode, f"--sidecar-md {args.sidecar_md}")
-        )
+    modes = _given_rename_modes(args)
+    requested = _given_sidecar_request(args)
+    if modes and requested is not None:
+        _exit_with_usage_error(*cli_messages.rename_with_sidecar(modes[0], requested))
 
 
 def _refuse_generate_manifest_sidecar_flags(args: argparse.Namespace) -> None:
@@ -1054,23 +1090,17 @@ def _refuse_generate_manifest_sidecar_flags(args: argparse.Namespace) -> None:
     :func:`_refuse_generate_manifest_write_flags` applies to ``-w`` and the dump
     bundle. Before this guard the sidecar request was silently discarded, which
     is exactly the inconsistency the other bundles' refusals exist to prevent.
-    An explicit ``--sidecar-md off`` is not refused: it asks for nothing, so
-    there is nothing the manifest run fails to honor.
 
     Args:
         args: The parsed namespace, before ``-s``'s expansion is written back.
 
     Raises:
-        SystemExit: With code 2 for the first conflicting flag found.
+        SystemExit: With code 2 when a sidecar flag rides the manifest run.
     """
-    if args.sidecar_auto:
+    requested = _given_sidecar_request(args)
+    if requested is not None:
         _exit_with_usage_error(
-            *cli_messages.generate_manifest_with_write_flag("-s", "write", "-s")
-        )
-    if args.sidecar_md is not None and args.sidecar_md != utils.SIDECAR_MD_OFF:
-        spelled = f"--sidecar-md {args.sidecar_md}"
-        _exit_with_usage_error(
-            *cli_messages.generate_manifest_with_write_flag(spelled, "write", spelled)
+            *cli_messages.generate_manifest_with_write_flag(requested, "write", requested)
         )
 
 
@@ -1557,6 +1587,13 @@ def _write_generated_manifest(manifest: dict, out_path: str) -> None:
         manifest: The synthesized manifest document.
         out_path: Destination, already pre-flighted.
     """
+    # The hydration-failure mark is this run's own runtime state, not manifest
+    # vocabulary: serialized, a transient read failure would ride the manifest
+    # into every later replay (the stream strips it on intake, but an external
+    # reader of the file would still see it as if it meant something).
+    for raw in manifest.get("items") or []:
+        if isinstance(raw, dict):
+            raw.pop(utils.HYDRATION_FAILED_KEY, None)
     tmp_path = out_path + ".tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -1886,6 +1923,8 @@ def _apply_exiftool_changeset(
 
     files_seen = int(exif_summary.get("files_seen") or 0)
     files_written = int(exif_summary.get("files_written") or 0)
+    files_with_proposals = int(exif_summary.get("files_with_proposals") or 0)
+    files_suppressed = int(exif_summary.get("files_suppressed") or 0)
     tags_written = int(exif_summary.get("tags_written") or 0)
     raw_errors = exif_summary.get("errors")
     raw_warnings = exif_summary.get("warnings")
@@ -1913,12 +1952,19 @@ def _apply_exiftool_changeset(
 
     # Reported after the status record is written, not instead of it: the
     # summary is how a caller finds out which files failed and why, and it has
-    # to survive the run being called a failure. ``errors`` gates the verdict:
-    # a total failure always leaves per-file errors behind, while a changeset
-    # that proposed nothing for any file -- every record suppressed or empty
-    # -- writes nothing, errors nothing, and is a quiet success rather than a
-    # claimed failure with no errors to inspect.
-    return strict and files_seen > 0 and files_written == 0 and bool(errors)
+    # to survive the run being called a failure. Zero writes is a failure when
+    # something asked to be written: per-file errors, or records that carried
+    # proposals the run filtered or failed (an allow-list matching nothing in
+    # the changeset leaves neither errors nor warnings), or a run where every
+    # record was write-suppressed (an -r hydration failure across the whole
+    # batch must not end as a silent success after every model call was paid
+    # for). A changeset that genuinely proposed nothing -- the idempotent
+    # re-run over already-written files -- is the one quiet success.
+    return strict and files_written == 0 and (
+        bool(errors)
+        or files_with_proposals > 0
+        or (files_seen > 0 and files_suppressed == files_seen)
+    )
 
 
 def _refuse_rename_mode_conflicts(args: argparse.Namespace) -> None:
@@ -1935,13 +1981,7 @@ def _refuse_rename_mode_conflicts(args: argparse.Namespace) -> None:
     Raises:
         SystemExit: With code 2 when more than one mode flag was given.
     """
-    modes = [
-        ("--rename", args.rename is not None),
-        ("--rename-undo", args.rename_undo is not None),
-        ("--rename-resume", args.rename_resume is not None),
-        ("--rename-finish", args.rename_finish is not None),
-    ]
-    given = [name for name, present in modes if present]
+    given = _given_rename_modes(args)
     if len(given) > 1:
         _exit_with_usage_error(*cli_messages.rename_mode_conflict(given[0], given[1]))
     if given and args.generate_manifest:
@@ -1974,12 +2014,8 @@ def _refuse_executor_dry_run(args: argparse.Namespace) -> None:
     """
     if not args.dry_run:
         return
-    for flag, given in (
-        ("--rename-finish", args.rename_finish is not None),
-        ("--rename-undo", args.rename_undo is not None),
-        ("--rename-resume", args.rename_resume is not None),
-    ):
-        if given:
+    for flag, dest in _RENAME_EXECUTOR_FLAGS:
+        if getattr(args, dest) is not None:
             _exit_with_usage_error(*cli_messages.rename_executor_dry_run_refused(flag))
 
 
@@ -3201,8 +3237,15 @@ def main() -> None:
 
         # Before the write-bundle guards: an unwritable tag name is wrong however
         # the run is configured, and saying so is more use than "add --changeset
-        # true" for a tag that would write nothing even with the flag.
-        _refuse_unwritable_exiftool_fields(args.exiftool_fields)
+        # true" for a tag that would write nothing even with the flag. The env
+        # var is checked too when no flag was given -- it is the same setting
+        # arriving by the other door, and it used to slip past this guard and
+        # fail every write downstream with only warnings to show for it.
+        _refuse_unwritable_exiftool_fields(
+            args.exiftool_fields
+            if args.exiftool_fields is not None
+            else os.environ.get("EXIFTOOL_FIELDS")
+        )
 
         changeset_flag, exiftool_write = _resolve_write_bundle(args)
         changeset_requested = changeset_flag == "true"

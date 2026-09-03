@@ -1898,16 +1898,36 @@ class TestARunThatWroteNothingSaysSo(_CliTestCase):
         self.assertNotIn("nothing was written", stderr)
 
     def test_a_changeset_that_proposed_nothing_is_not_a_failed_run(self) -> None:
-        """Records seen but nothing attempted -- every one suppressed or empty
-        -- writes nothing and errors nothing. A total failure always leaves
-        per-file errors behind; zero writes with zero errors is a quiet
-        success, not a failure with no errors to inspect."""
+        """Records seen but nothing proposed -- the idempotent re-run over
+        already-written files -- writes nothing and errors nothing, and is
+        the one quiet success rather than a claimed failure with no errors
+        to inspect."""
         code, _stdout, stderr = self._run_with_summary(
             {"files_seen": 3, "files_written": 0, "tags_written": 0,
              "errors": [], "warnings": []}
         )
         self.assertIsNone(code)
         self.assertNotIn("nothing was written", stderr)
+
+    def test_proposals_filtered_to_nothing_still_fails_the_run(self) -> None:
+        """An allow-list matching nothing in the changeset leaves neither
+        errors nor warnings -- but the records proposed writes, so zero
+        written is the documented setting-wrong-for-every-file shape."""
+        code, _stdout, _stderr = self._run_with_summary(
+            {"files_seen": 3, "files_written": 0, "files_with_proposals": 3,
+             "tags_written": 0, "errors": [], "warnings": []}
+        )
+        self.assertEqual(code, 2)
+
+    def test_an_all_suppressed_changeset_fails_the_run(self) -> None:
+        """A whole-batch -r failure suppresses every record; after paying for
+        every model call, exit 0 would report success for a run that wrote
+        nothing."""
+        code, _stdout, _stderr = self._run_with_summary(
+            {"files_seen": 3, "files_written": 0, "files_suppressed": 3,
+             "tags_written": 0, "errors": [], "warnings": []}
+        )
+        self.assertEqual(code, 2)
 
     def test_manifest_input_keeps_the_plugin_contract(self) -> None:
         """Manifest mode reports per item and exits 0, here as everywhere else.

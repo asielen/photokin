@@ -162,6 +162,34 @@ class TestApplyChangeset(_ChangesetFileMixin, unittest.TestCase):
         self.assertEqual(summary["tags_written"], 2)
         self.assertTrue(summary["dry_run"])
 
+    def test_proposal_and_suppression_counting(self):
+        # files_with_proposals counts before allow-list filtering (a record
+        # whose every proposed tag gets filtered is the setting-wrong shape
+        # the strict verdict must see), and files_suppressed counts the
+        # emitter's write-suppressed marker.
+        path = self._write_changeset(
+            [
+                {"path": "/photos/a.jpg", "proposed_changes": {"set": {"XMP-dc:Title": "T"}}},
+                {
+                    "path": "/photos/b.jpg",
+                    "proposed_changes": {"set": {}, "suppressed": "hydration_failed"},
+                },
+                {"path": "/photos/c.jpg", "proposed_changes": {"set": {}}},
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("EXIF:UserComment",))
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
+            summary = apply_changeset(path, cfg)
+
+        run_mock.assert_not_called()
+        self.assertEqual(summary["files_seen"], 3)
+        self.assertEqual(summary["files_with_proposals"], 1)
+        self.assertEqual(summary["files_suppressed"], 1)
+        self.assertEqual(summary["files_written"], 0)
+
     def test_keyword_deltas_reach_exiftool_as_list_operations(self):
         # Keywords never travel in proposed_changes.set -- the emitter diffs
         # them into keywords_add / keywords_remove -- so before the applier

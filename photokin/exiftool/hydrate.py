@@ -71,12 +71,14 @@ def hydrate_item_metadata(
 
     Non-fatal by design: the CLI pre-flights the binary when ``-r`` is given, so
     a failure here is a mid-run one -- a locked file, a corrupt image, a timeout
-    -- which warns and continues rather than costing the whole batch. What a
-    failure does leave behind is a mark: every item whose requested read could
-    not be confirmed gets :data:`photokin.utils.HYDRATION_FAILED_KEY` set, so
-    the changeset emitter can decline to propose writes for a file whose
-    "before" it never saw. Unread is not empty -- a diff taken against
-    emptiness would overwrite whatever the file really holds.
+    -- which warns, marks, and continues. The analysis still runs (and is still
+    paid for), but every item whose requested read could not be confirmed gets
+    :data:`photokin.utils.HYDRATION_FAILED_KEY` set, so the changeset emitter
+    proposes no writes for a file whose "before" it never saw -- unread is not
+    empty, and a diff taken against emptiness would overwrite whatever the file
+    really holds. A write run whose every record ends up suppressed this way is
+    reported as a failure by the CLI's strict apply verdict rather than as a
+    silent success.
     """
     # Imported here rather than at module scope so the run_exiftool_json a test
     # patches onto photokin.exiftool.manifest is the one this call reaches.
@@ -168,8 +170,11 @@ def hydrate_item_metadata(
         # wanted_by_path is keyed by normalize_path() output (os.path.normpath,
         # which uses backslashes on Windows). Normalize the record path the same
         # way so the lookup matches on every platform.
-        unseen.discard(normalize_path(src))
-        for raw, wanted, rescue_date_marker in wanted_by_path.get(normalize_path(src), []):
+        src_key = normalize_path(src)
+        if not src_key:
+            continue
+        unseen.discard(src_key)
+        for raw, wanted, rescue_date_marker in wanted_by_path.get(src_key, []):
             for tag, key in _HYDRATED_TAGS:
                 if key not in wanted:
                     continue
@@ -203,11 +208,12 @@ def hydrate_item_metadata(
         # A record came back for every readable file; one missing means
         # ExifTool could not read that file at all, which is a failed read,
         # not an empty one.
-        _mark_failed(sorted(unseen))
+        failed = sorted(unseen)
+        _mark_failed(failed)
         logger.warning(
-            "-r could not read %d file(s); no writes will be proposed for them: %s",
-            len(unseen),
-            ", ".join(sorted(unseen)),
+            "-r could not read %d file(s); no writes will be proposed for them:\n%s",
+            len(failed),
+            "\n".join(failed),
         )
 
 
