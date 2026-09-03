@@ -2184,5 +2184,42 @@ class TestPartMarkersOnlyStripWhatTheGroupApplies(ManifestGroupingTestCase):
                 )
 
 
+class TestHydrationFailureSuppressesWrites(ManifestGroupingTestCase):
+    """A file ``-r`` asked for and could not read gets no proposed writes.
+
+    Unread is not empty: the changeset diffs the model's answer against the
+    file's before-snapshot, and for a file whose read failed that snapshot is
+    emptiness -- every proposed write would overwrite whatever the file really
+    holds. The hydrator marks such items with
+    ``utils.HYDRATION_FAILED_KEY`` and the emitter proposes nothing for them,
+    while their unaffected siblings keep their writes.
+    """
+
+    def test_a_marked_file_gets_an_empty_proposed_changes(self):
+        changeset: list[str] = []
+        items = [
+            {"path": "s/scan001.jpg", utils.HYDRATION_FAILED_KEY: True},
+            {"path": "s/scan002.jpg"},
+        ]
+        _calls, _records, warnings = self.run_manifest(
+            items, model_keywords=["Family"], changeset_writer=changeset.append
+        )
+
+        docs = {os.path.basename(d["path"]): d for d in map(json.loads, changeset)}
+        self.assertEqual(
+            docs["scan001.jpg"]["proposed_changes"],
+            {"set": {}, "keywords_add": [], "keywords_remove": []},
+        )
+        self.assertNotEqual(
+            docs["scan002.jpg"]["proposed_changes"]["keywords_add"],
+            [],
+            "the unmarked sibling must still get its writes",
+        )
+        self.assertTrue(
+            any("could not read this file" in w for w in warnings),
+            "the suppression must be announced, not silent",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

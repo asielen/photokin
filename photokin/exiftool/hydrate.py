@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from ..utils import normalize_path
+from ..utils import HYDRATION_FAILED_KEY, normalize_path
 from .config import ExiftoolConfig
 from .locate import resolve_exiftool_path
 from .manifest import _TAG_TO_MANIFEST_KEY, DEFAULT_EXIFTOOL_FIELDS
@@ -71,7 +71,12 @@ def hydrate_item_metadata(
 
     Non-fatal by design: the CLI pre-flights the binary when ``-r`` is given, so
     a failure here is a mid-run one -- a locked file, a corrupt image, a timeout
-    -- which warns and continues rather than costing the whole batch.
+    -- which warns and continues rather than costing the whole batch. What a
+    failure does leave behind is a mark: every item whose requested read could
+    not be confirmed gets :data:`photokin.utils.HYDRATION_FAILED_KEY` set, so
+    the changeset emitter can decline to propose writes for a file whose
+    "before" it never saw. Unread is not empty -- a diff taken against
+    emptiness would overwrite whatever the file really holds.
     """
     # Imported here rather than at module scope so the run_exiftool_json a test
     # patches onto photokin.exiftool.manifest is the one this call reaches.
@@ -80,12 +85,6 @@ def hydrate_item_metadata(
         manifest_value,
         run_exiftool_json,
     )
-
-    try:
-        exiftool = resolve_exiftool_path(cfg)
-    except (FileNotFoundError, OSError) as exc:
-        logger.warning("Skipping metadata hydration: %s", exc)
-        return
 
     paths_needing: list[str] = []
     wanted_by_path: dict[str, list[tuple[dict, set[str], bool]]] = {}
@@ -130,6 +129,18 @@ def hydrate_item_metadata(
     if not paths_needing:
         return
 
+    def _mark_failed(paths: list[str]) -> None:
+        for p in paths:
+            for raw, _wanted, _rescue in wanted_by_path.get(p, []):
+                raw[HYDRATION_FAILED_KEY] = True
+
+    try:
+        exiftool = resolve_exiftool_path(cfg)
+    except (FileNotFoundError, OSError) as exc:
+        _mark_failed(paths_needing)
+        logger.warning("Skipping metadata hydration: %s", exc)
+        return
+
     try:
         records = run_exiftool_json(
             exiftool_path=exiftool,
@@ -138,9 +149,11 @@ def hydrate_item_metadata(
             timeout_sec=max(60, len(paths_needing) * 2),
         )
     except (FileNotFoundError, RuntimeError, OSError) as exc:
+        _mark_failed(paths_needing)
         logger.warning("Skipping metadata hydration: ExifTool read failed: %s", exc)
         return
 
+    unseen = set(wanted_by_path)
     for rec in records:
         src = rec.get("SourceFile") or ""
         if not src:
@@ -149,6 +162,7 @@ def hydrate_item_metadata(
         # wanted_by_path is keyed by normalize_path() output (os.path.normpath,
         # which uses backslashes on Windows). Normalize the record path the same
         # way so the lookup matches on every platform.
+        unseen.discard(normalize_path(src))
         for raw, wanted, rescue_date_marker in wanted_by_path.get(normalize_path(src), []):
             for tag, key in _HYDRATED_TAGS:
                 if key not in wanted:
@@ -178,6 +192,17 @@ def hydrate_item_metadata(
                 target[key] = value
                 if key == "title" and title_from_file is not None:
                     title_from_file.add(id(target))
+
+    if unseen:
+        # A record came back for every readable file; one missing means
+        # ExifTool could not read that file at all, which is a failed read,
+        # not an empty one.
+        _mark_failed(sorted(unseen))
+        logger.warning(
+            "-r could not read %d file(s); no writes will be proposed for them: %s",
+            len(unseen),
+            ", ".join(sorted(unseen)),
+        )
 
 
 class _ManifestHydrator:

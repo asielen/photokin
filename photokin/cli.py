@@ -1008,6 +1008,44 @@ def _refuse_generate_manifest_verbose_flags(args: argparse.Namespace) -> None:
             )
 
 
+def _refuse_rename_mode_sidecar_flags(args: argparse.Namespace) -> None:
+    """Refuse ``-s`` and a non-off ``--sidecar-md`` beside any rename mode.
+
+    Every rename mode returns before analysis, so a transcript sidecar request
+    would be silently discarded -- the same reasoning
+    :func:`_refuse_generate_manifest_sidecar_flags` applies to
+    ``--generate-manifest``. An explicit ``--sidecar-md off`` asks for
+    nothing and is not refused.
+
+    Args:
+        args: The parsed namespace, before ``-s``'s expansion is written back.
+
+    Raises:
+        SystemExit: With code 2 for the first conflicting flag found.
+    """
+    mode = next(
+        (
+            flag
+            for flag, given in (
+                ("--rename", args.rename is not None),
+                ("--rename-undo", args.rename_undo is not None),
+                ("--rename-resume", args.rename_resume is not None),
+                ("--rename-finish", args.rename_finish is not None),
+            )
+            if given
+        ),
+        None,
+    )
+    if mode is None:
+        return
+    if args.sidecar_auto:
+        _exit_with_usage_error(*cli_messages.rename_with_sidecar(mode, "-s"))
+    if args.sidecar_md is not None and args.sidecar_md != utils.SIDECAR_MD_OFF:
+        _exit_with_usage_error(
+            *cli_messages.rename_with_sidecar(mode, f"--sidecar-md {args.sidecar_md}")
+        )
+
+
 def _refuse_generate_manifest_sidecar_flags(args: argparse.Namespace) -> None:
     """Refuse ``-s`` and a non-off ``--sidecar-md`` beside ``--generate-manifest``.
 
@@ -3095,6 +3133,7 @@ def main() -> None:
         # branch happened to run first.
         _refuse_rename_mode_conflicts(args)
         _refuse_executor_dry_run(args)
+        _refuse_rename_mode_sidecar_flags(args)
         if args.rename_finish is not None:
             _run_rename_finish(args.rename_finish)
             return

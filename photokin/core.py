@@ -2724,6 +2724,10 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
         "preferred": bool(raw.get("preferred")),
         "metadata": raw.get("metadata"),
         "metadata_path": raw.get("metadata_path"),
+        # Set by the ExifTool hydrator (which runs before bucketing) when -r
+        # asked for this file's metadata and the read could not be confirmed;
+        # the changeset emitter proposes no writes for such a file.
+        utils.HYDRATION_FAILED_KEY: bool(raw.get(utils.HYDRATION_FAILED_KEY)),
     }
 
 
@@ -4351,7 +4355,18 @@ def process_manifest_stream(
                 if changeset_writer and run_id:
                     before_snapshot = canonical_values_from_metadata(per_meta, cfg)
                     after_snapshot = canonical_values_from_patch(patch)
-                    proposed_changes = diff_canonical_metadata(before_snapshot, after_snapshot)
+                    if it.get(utils.HYDRATION_FAILED_KEY):
+                        # -r asked for this file's metadata and could not read
+                        # it, so the diff below would compare against emptiness
+                        # and propose overwriting values the file may really
+                        # hold. Unread is not empty: propose nothing.
+                        logger.warning(
+                            "%s: -r could not read this file, so no writes are proposed for it.",
+                            os.path.basename(it["path"]),
+                        )
+                        proposed_changes = {"set": {}, "keywords_add": [], "keywords_remove": []}
+                    else:
+                        proposed_changes = diff_canonical_metadata(before_snapshot, after_snapshot)
                     emit_changeset_record(
                         changeset_writer,
                         run_id=run_id,

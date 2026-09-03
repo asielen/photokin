@@ -15,6 +15,7 @@ from photokin.exiftool import ExiftoolConfig, apply_changeset, locate
 from photokin.exiftool.apply import (
     _COMMAND_LENGTH_BUDGET,
     _INLINE_VALUE_MAX,
+    _FileWrite,
     _build_exiftool_command,
     _datfile_name,
     _normalize_exif_datetime,
@@ -203,6 +204,73 @@ class TestApplyChangeset(_ChangesetFileMixin, unittest.TestCase):
                 "-XMP-dc:Subject+=1940s",
             ],
         )
+
+    def test_an_oversized_keyword_is_skipped_with_a_warning(self):
+        # A keyword cannot be DATFILE-routed the way a set value can, so one
+        # past the per-value inline cap is dropped by name rather than
+        # allowed to sink the whole command line.
+        path = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {
+                        "set": {},
+                        "keywords_add": ["k" * (_INLINE_VALUE_MAX + 1), "Postcard"],
+                    },
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("XMP-dc:Subject",))
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
+            run_mock.return_value = type(
+                "Result", (), {"returncode": 0, "stdout": "", "stderr": ""}
+            )()
+            summary = apply_changeset(path, cfg)
+
+        self.assertTrue(
+            any("characters" in w.get("warning", "") for w in summary["warnings"])
+        )
+        cmd = run_mock.call_args[0][0]
+        self.assertEqual(
+            [arg for arg in cmd if "XMP-dc:Subject" in arg],
+            ["-XMP-dc:Subject-=Postcard", "-XMP-dc:Subject+=Postcard"],
+        )
+
+    def test_a_keyword_flood_fails_that_file_cleanly(self):
+        # Keyword operations count against the same command-length budget the
+        # set values are routed under, and they cannot be routed themselves --
+        # so deltas that alone exceed the budget must become a named per-file
+        # error instead of ExifTool failing to start with an error that looks
+        # like a missing binary (WinError 206).
+        keyword_len = _INLINE_VALUE_MAX - 10
+        count = _COMMAND_LENGTH_BUDGET // keyword_len + 2
+        path = self._write_changeset(
+            [
+                {
+                    "path": "/photos/a.jpg",
+                    "proposed_changes": {
+                        "set": {},
+                        "keywords_add": [
+                            f"{'k' * (keyword_len - 6)}{i:06d}" for i in range(count)
+                        ],
+                    },
+                }
+            ]
+        )
+        cfg = ExiftoolConfig(enabled=True, fields=("XMP-dc:Subject",))
+        with patch(
+            "photokin.exiftool.apply.resolve_exiftool_path",
+            return_value="/fake/exiftool",
+        ), patch("photokin.exiftool.apply.subprocess.run") as run_mock:
+            summary = apply_changeset(path, cfg)
+
+        run_mock.assert_not_called()
+        self.assertEqual(summary["files_written"], 0)
+        self.assertEqual(len(summary["errors"]), 1)
+        self.assertIn("command-line length budget", summary["errors"][0]["error"])
 
     def test_keyword_deltas_respect_the_field_allow_list(self):
         # The Lightroom pipeline narrows fields to EXIF:UserComment precisely
@@ -561,14 +629,14 @@ class TestDatfileRoutingMeasuresTheRealWindowsCommandLine(_ChangesetFileMixin, u
             asked_for.append(tag)
             return f"/tmp/{_datfile_name(1, tag)}"
 
-        routed = _select_datfile_routing(exiftool, cfg, tags, path, _path_for)
+        routed = _select_datfile_routing(exiftool, cfg, _FileWrite(tags), path, _path_for)
         self.assertGreater(len(routed), 0, "expected quoting overhead to force some routing")
         self.assertEqual(
             set(asked_for), set(routed),
             "a path was requested for a tag that was never routed",
         )
 
-        cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed)
+        cmd = _build_exiftool_command(exiftool, cfg, _FileWrite(tags), path, routed)
         real_length = len(subprocess.list2cmdline(cmd).encode("utf-16-le")) // 2 + 1
         self.assertLessEqual(
             real_length,
@@ -609,14 +677,14 @@ class TestDatfileRoutingCountsNonBMPCharactersAsWindowsDoes(_ChangesetFileMixin,
         def _path_for(tag: str) -> str:
             return f"/tmp/{_datfile_name(1, tag)}"
 
-        routed = _select_datfile_routing(exiftool, cfg, tags, path, _path_for)
+        routed = _select_datfile_routing(exiftool, cfg, _FileWrite(tags), path, _path_for)
         self.assertGreater(
             len(routed),
             0,
             "expected non-BMP text to be measured at its real UTF-16 cost and routed",
         )
 
-        cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed)
+        cmd = _build_exiftool_command(exiftool, cfg, _FileWrite(tags), path, routed)
         real_length = len(subprocess.list2cmdline(cmd).encode("utf-16-le")) // 2 + 1
         self.assertLessEqual(
             real_length,
@@ -648,7 +716,7 @@ class TestBuildCommandDeclaresUtf8FilenameCharsetOnlyWhenRouting(
         cmd = _build_exiftool_command(
             "/fake/exiftool",
             ExiftoolConfig(),
-            {"XMP-dc:Description": "irrelevant once routed"},
+            _FileWrite({"XMP-dc:Description": "irrelevant once routed"}),
             "/photos/a.jpg",
             {"XMP-dc:Description": "/tmp/000001_XMP-dc_Description_deadbeef.txt"},
         )
@@ -659,7 +727,7 @@ class TestBuildCommandDeclaresUtf8FilenameCharsetOnlyWhenRouting(
         cmd = _build_exiftool_command(
             "/fake/exiftool",
             ExiftoolConfig(),
-            {"EXIF:UserComment": "Hello"},
+            _FileWrite({"EXIF:UserComment": "Hello"}),
             "/photos/a.jpg",
             None,
         )

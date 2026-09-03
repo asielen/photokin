@@ -297,7 +297,7 @@ Multipage documents are the one exception:
 * A group of page-numbered files (`letter-page1.jpg`, `letter-page2.jpg`, ...) is still analyzed together, but each page's caption gets only that page's own transcription — it doesn't make sense to write a 63-page story into the metadata of all 63 files. This is not configurable; the closest lever is `--group-by none`, which analyzes every file alone.
 * To get a full, readable transcript, add `-s` (short for `--sidecar-md auto`), which writes a Markdown transcript file beside each page when the model categorizes the object as a `Document` or `Postcard` — see [A readable transcript beside each scan](#a-readable-transcript-beside-each-scan). It combines with the other short flags, so the archival run with transcripts is `-rws`.
 
-**A run without `-rw` still calls the model but writes nothing back.** `photokin C:\Scans` analyzes, prints the JSON to your terminal and touches nothing. Its plan summary ends with one extra row naming the next step:
+**A run without `-w` still calls the model but writes nothing back.** `photokin C:\Scans` analyzes, prints the JSON to your terminal and touches nothing. Its plan summary ends with one extra row naming the next step:
 
 ```
 [INFO] Plan for this run:
@@ -365,6 +365,8 @@ With `-r`, photokin reads `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Desc
 
 * **Dates.** The file's own date is treated as evidence, not truth: on a flatbed scan `DateTimeOriginal` is the day you scanned the print, not the day the photograph was taken, so it never overwrites the model's `date_guess` — but it is what the date-correction heuristic compares that guess against before writing anything.
 * **Titles.** Scanner software routinely writes "Scanned Image" or the bare filename into `XMP:Title`, so a title read out of a file does not beat the model. A title you supplied yourself, in a manifest or `--meta`, always wins.
+
+A file `-r` asked for but could not read gets **no proposed writes at all**, with a warning naming it — unread is not empty, and writing against a before-snapshot that was never seen could overwrite metadata the file really holds. Fix whatever blocked the read (a locked or corrupt file) and re-run.
 
 ### If a write fails
 

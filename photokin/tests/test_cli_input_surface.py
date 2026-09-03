@@ -753,6 +753,21 @@ class TestTheMessageMatrix(_CliTestCase):
                 "`-s` means --sidecar-md auto, but `--sidecar-md all` was also given.",
             ),
             (
+                "-s beside --rename",
+                [folder, "--rename", "pfx", "-s"],
+                "`--rename` makes no model call, so `-s` has nothing to write.",
+            ),
+            (
+                "--sidecar-md beside --rename",
+                [folder, "--rename", "pfx", "--sidecar-md", "all"],
+                "`--rename` makes no model call, so `--sidecar-md all` has nothing to write.",
+            ),
+            (
+                "-s beside --rename-undo",
+                [folder, "--rename-undo", "-s"],
+                "`--rename-undo` makes no model call, so `-s` has nothing to write.",
+            ),
+            (
                 "a write with nothing to write from",
                 [folder, "--exiftool-write", "true"],
                 "`--exiftool-write true` needs a changeset to apply, but --changeset is false.",

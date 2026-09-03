@@ -38,6 +38,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Iterable
 from contextlib import ExitStack
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from json import JSONDecodeError
 from typing import Any
@@ -187,10 +188,55 @@ def _datfile_name(file_index: int, tag: str) -> str:
     return f"{file_index:06d}_{safe_tag}_{digest}.txt"
 
 
+@dataclass
+class _FileWrite:
+    """One file's assembled write: ``set`` tag values plus keyword delta args.
+
+    Bundled so the command builder and the routing measurement take one
+    argument for one file's write -- which keeps the keyword operations inside
+    every command-length measurement instead of appended after the budget was
+    already spent.
+    """
+
+    tags: dict[str, str]
+    keyword_args: list[str] = field(default_factory=list)
+
+
+def _command_length_units(cmd: list[str]) -> int:
+    """Return *cmd*'s length as Windows' CreateProcess will measure it.
+
+    ``subprocess.list2cmdline`` and not ``" ".join``: it is the exact quoting
+    ``subprocess`` applies before handing the string to CreateProcess, so it
+    is what the 32,767-character cap is actually measured against. Joining on
+    spaces looks close enough and is not: a value dense in quotes and
+    backslashes gets every one of them escaped, and the two measures diverge
+    by nearly 2x. The function is pure Python and importable everywhere;
+    POSIX limits are far higher, so measuring the Windows way on every
+    platform is conservative, not wrong.
+
+    Counted in UTF-16 code units plus the terminating NUL, because that is
+    the unit CreateProcess measures. Python counts code points, so a
+    transcription carrying anything outside the BMP takes two units where
+    ``len`` sees one. ``surrogatepass`` because this is a measurement, not a
+    write: a valid JSON ``\\ud800`` escape puts a lone surrogate in a value,
+    a strict encode would raise from inside a measurement, and one surrogate
+    is one UTF-16 unit -- exactly what Windows would count. Writing that
+    value still fails, per-file, at the actual write.
+
+    Args:
+        cmd: The argv list as it would be handed to ``subprocess.run``.
+
+    Returns:
+        The command-line length in UTF-16 code units, including the NUL.
+    """
+    rendered = subprocess.list2cmdline(cmd)
+    return len(rendered.encode("utf-16-le", errors="surrogatepass")) // 2 + 1
+
+
 def _select_datfile_routing(
     exiftool: str,
     cfg: ExiftoolConfig,
-    tags: dict[str, str],
+    write: _FileWrite,
     path: str,
     datfile_path_for: Callable[[str], str],
 ) -> dict[str, str]:
@@ -207,7 +253,9 @@ def _select_datfile_routing(
         exiftool: Path to the ExifTool executable (needed to measure the
             actual assembled command, not just the tag arguments).
         cfg: Wrapper config, for the same reason.
-        tags: Ordered tag -> value mapping for one file's write.
+        write: One file's assembled write. The keyword delta args are part of
+            every measurement here, so they consume the same budget the
+            ``set`` values are routed under.
         path: The file path the command targets.
         datfile_path_for: Called with a tag to get the DATFILE path it would
             use. Called ONLY for a tag that actually routes, so a run whose
@@ -219,6 +267,7 @@ def _select_datfile_routing(
         A ``{tag: path}`` mapping for the tags that must be written to a
         DATFILE and rendered as ``-TAG<=path`` rather than inlined.
     """
+    tags = write.tags
     routed = {tag for tag, value in tags.items() if len(value) > _INLINE_VALUE_MAX}
     resolved: dict[str, str] = {}
 
@@ -229,38 +278,8 @@ def _select_datfile_routing(
         return {tag: resolved[tag] for tag in tags_routed}
 
     def _command_length() -> int:
-        routed_paths = _paths_for(routed)
-        cmd = _build_exiftool_command(exiftool, cfg, tags, path, routed_paths)
-        # ``subprocess.list2cmdline`` and not ``" ".join``: it is the exact
-        # quoting ``subprocess`` applies before handing the string to
-        # CreateProcess, so it is what the 32,767-character cap is actually
-        # measured against. Joining on spaces looks close enough and is not:
-        # a value dense in quotes and backslashes gets every one of them
-        # escaped, and the two measures diverge by nearly 2x. Seven tags of
-        # 3,998 characters of `\"` pairs -- each under the per-value threshold,
-        # so none is force-routed -- measure 28,253 joined and 56,219 as
-        # Windows will really see them, which is over the cap this whole
-        # function exists to stay under. The function is pure Python and
-        # importable everywhere; POSIX limits are far higher, so measuring the
-        # Windows way on every platform is conservative, not wrong.
-        #
-        # Counted in UTF-16 code units plus the terminating NUL, because that
-        # is the unit CreateProcess measures. Python counts code points, so a
-        # transcription carrying anything outside the BMP -- a historic script,
-        # a musical symbol, an emoji in a modern annotation -- takes two units
-        # per character where ``len`` sees one, and the estimate would be under
-        # by up to half on such text.
-        #
-        # ``surrogatepass`` because this is a measurement, not a write. A value
-        # can legitimately carry a lone surrogate -- a valid JSON ``\ud800``
-        # escape puts one there -- and a strict encode would raise from inside
-        # this function, which is called before either of the guards that make
-        # a bad value one file's error rather than the whole batch's. A lone
-        # surrogate is one UTF-16 unit, which is exactly what Windows would
-        # count, so passing it through measures the truth as well as avoiding
-        # the raise. Writing that value still fails, per-file, further down.
-        rendered = subprocess.list2cmdline(cmd)
-        return len(rendered.encode("utf-16-le", errors="surrogatepass")) // 2 + 1
+        cmd = _build_exiftool_command(exiftool, cfg, write, path, _paths_for(routed))
+        return _command_length_units(cmd)
 
     remaining_by_length = sorted(
         (tag for tag in tags if tag not in routed), key=lambda t: len(tags[t]), reverse=True
@@ -310,6 +329,17 @@ def _keyword_delta_args(
                 )
                 continue
             keyword = value.strip()
+            if len(keyword) > _INLINE_VALUE_MAX:
+                # A "keyword" this long is malformed output, and unlike a set
+                # value it cannot be routed to a DATFILE, so it is dropped by
+                # name rather than allowed to sink the whole command line.
+                warnings.append(
+                    {
+                        "path": path,
+                        "warning": f"Skipping a {key} entry over {_INLINE_VALUE_MAX} characters.",
+                    }
+                )
+                continue
             args.append(f"-{CANONICAL_KEYWORDS_TAG}-={keyword}")
             if key == "keywords_add":
                 args.append(f"-{CANONICAL_KEYWORDS_TAG}+={keyword}")
@@ -319,10 +349,9 @@ def _keyword_delta_args(
 def _build_exiftool_command(
     exiftool: str,
     cfg: ExiftoolConfig,
-    tags: dict[str, str],
+    write: _FileWrite,
     path: str,
     datfile_paths: dict[str, str] | None = None,
-    extra_args: list[str] | None = None,
 ) -> list[str]:
     """Assemble the ExifTool argv for one file's tag writes.
 
@@ -330,17 +359,16 @@ def _build_exiftool_command(
         exiftool: Path to the ExifTool executable.
         cfg: Wrapper config; controls ``-overwrite_original`` vs. the sidecar
             ``-o`` form.
-        tags: Ordered tag -> value mapping to write.
+        write: The file's assembled write: the ordered ``set`` tag values,
+            plus the keyword delta args from :func:`_keyword_delta_args`,
+            appended after them. Keyword values are length-capped rather than
+            DATFILE-routed.
         path: Path to the file the command targets.
         datfile_paths: Tag -> DATFILE path for tags rendered as
             ``-TAG<=path`` instead of inlined as ``-TAG=value`` (E3). A tag
-            absent from this mapping is inlined; ``tags[tag]`` is unused for a
-            routed tag here -- the caller must already have written that
-            value to the given path before running this command.
-        extra_args: Ready-made argv fragments appended after the ``set``
-            tags -- the keyword delta operations from
-            :func:`_keyword_delta_args`. Keyword values are short, so they
-            are never DATFILE-routed.
+            absent from this mapping is inlined; the tag's value in ``write``
+            is unused for a routed tag here -- the caller must already have
+            written that value to the given path before running this command.
 
     Returns:
         The argv list to hand to ``subprocess.run`` (no shell involved, so
@@ -365,12 +393,12 @@ def _build_exiftool_command(
         cmd.extend(["-o", "%d%f.xmp"])
     elif cfg.overwrite_original:
         cmd.append("-overwrite_original")
-    for tag, value in tags.items():
+    for tag, value in write.tags.items():
         if tag in datfile_paths:
             cmd.append(f"-{tag}<={datfile_paths[tag]}")
         else:
             cmd.append(f"-{tag}={value}")
-    cmd.extend(extra_args or [])
+    cmd.extend(write.keyword_args)
     cmd.append(path)
     return cmd
 
@@ -538,6 +566,7 @@ def apply_changeset(
 
             if not tags_to_write and not keyword_args:
                 continue
+            write = _FileWrite(tags_to_write, keyword_args)
 
             if cfg.dry_run:
                 summary["files_written"] += 1
@@ -549,7 +578,7 @@ def apply_changeset(
 
             try:
                 datfile_paths = _select_datfile_routing(
-                    exiftool, cfg, tags_to_write, path, _datfile_path_for
+                    exiftool, cfg, write, path, _datfile_path_for
                 )
             except OSError as exc:
                 # Only reachable when a value needed a DATFILE and the
@@ -557,6 +586,22 @@ def apply_changeset(
                 # to route never asks for one.
                 summary["errors"].append(
                     {"path": path, "error": f"Could not create a DATFILE directory: {exc}"}
+                )
+                continue
+
+            cmd = _build_exiftool_command(exiftool, cfg, write, path, datfile_paths)
+            if _command_length_units(cmd) > _COMMAND_LENGTH_BUDGET:
+                # Only reachable when the keyword operations alone exceed the
+                # budget: every routable ``set`` value has already moved to a
+                # DATFILE, and keyword args cannot. Failing here is a named
+                # per-file error instead of ExifTool failing to start with an
+                # error that looks like a missing binary.
+                summary["errors"].append(
+                    {
+                        "path": path,
+                        "error": "Keyword operations exceed the command-line length "
+                        "budget; nothing on this file was written.",
+                    }
                 )
                 continue
 
@@ -584,9 +629,6 @@ def apply_changeset(
                 )
                 continue
 
-            cmd = _build_exiftool_command(
-                exiftool, cfg, tags_to_write, path, datfile_paths, keyword_args
-            )
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             except (OSError, ValueError) as exc:

@@ -105,6 +105,15 @@ SIDECAR_MD_VALUES: tuple[str, ...] = (SIDECAR_MD_OFF, SIDECAR_MD_AUTO, SIDECAR_M
 #: sidecar format.
 SIDECAR_AUTO_CATEGORIES: frozenset[str] = frozenset({"Document", "Postcard"})
 
+#: Manifest-item key the ExifTool hydrator sets when ``-r`` asked for a file's
+#: metadata and the read could not be confirmed -- the batch read failed, or
+#: ExifTool returned no record for the file. The changeset emitter reads it and
+#: proposes no writes for that file: unread is not empty, and a diff taken
+#: against emptiness would overwrite whatever the file really holds. Defined
+#: here rather than in the wrapper because the core reads it and the core
+#: never imports the wrapper.
+HYDRATION_FAILED_KEY = "hydration_failed"
+
 @dataclass
 class Config:
     """Runtime configuration for an analysis run, with environment-variable defaults.
