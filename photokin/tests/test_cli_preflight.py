@@ -1304,6 +1304,21 @@ class TestGenerateManifestRemediesTerminate(_CliTestCase):
         self.assertIn("Wrote manifest for 1 file(s) in 1 group(s)", stderr)
         stream.assert_not_called()
 
+    def test_an_explicit_sidecar_md_off_is_not_refused(self) -> None:
+        # off asks for nothing, so there is nothing the manifest run fails to
+        # honor -- the same reason an explicit --changeset false is permitted.
+        folder = self.make_folder()
+        out_path = os.path.join(folder, "out.json")
+
+        with patch("photokin.cli.process_manifest_stream", Mock()) as stream:
+            code, _stdout, stderr = self.run_cli(
+                [folder, "--generate-manifest", out_path, "--sidecar-md", "off"]
+            )
+
+        self.assertIsNone(code)
+        self.assertIn("Wrote manifest for 1 file(s) in 1 group(s)", stderr)
+        stream.assert_not_called()
+
     def test_each_write_flag_keeps_its_own_wording(self) -> None:
         # Reordering the guards must not collapse four distinct answers into
         # whichever one happens to be checked first.
@@ -1323,6 +1338,16 @@ class TestGenerateManifestRemediesTerminate(_CliTestCase):
                 (
                     "`--generate-manifest` writes a manifest and stops, so `--output-file "
                     "r.ndjson` would never be written."
+                ),
+            ),
+            # The sidecar request rides an analysis the same way the dumps do;
+            # before its guard existed it was silently discarded instead.
+            (["-s"], "`--generate-manifest` makes no model call, so `-s` has nothing to write."),
+            (
+                ["--sidecar-md", "all"],
+                (
+                    "`--generate-manifest` makes no model call, so `--sidecar-md all` has "
+                    "nothing to write."
                 ),
             ),
         )

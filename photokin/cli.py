@@ -1006,6 +1006,34 @@ def _refuse_generate_manifest_verbose_flags(args: argparse.Namespace) -> None:
             )
 
 
+def _refuse_generate_manifest_sidecar_flags(args: argparse.Namespace) -> None:
+    """Refuse ``-s`` and a non-off ``--sidecar-md`` beside ``--generate-manifest``.
+
+    A transcript sidecar is written from an analysis, and ``--generate-manifest``
+    exits before any model call -- the same reasoning
+    :func:`_refuse_generate_manifest_write_flags` applies to ``-w`` and the dump
+    bundle. Before this guard the sidecar request was silently discarded, which
+    is exactly the inconsistency the other bundles' refusals exist to prevent.
+    An explicit ``--sidecar-md off`` is not refused: it asks for nothing, so
+    there is nothing the manifest run fails to honor.
+
+    Args:
+        args: The parsed namespace, before ``-s``'s expansion is written back.
+
+    Raises:
+        SystemExit: With code 2 for the first conflicting flag found.
+    """
+    if args.sidecar_auto:
+        _exit_with_usage_error(
+            *cli_messages.generate_manifest_with_write_flag("-s", "write", "-s")
+        )
+    if args.sidecar_md is not None and args.sidecar_md != utils.SIDECAR_MD_OFF:
+        spelled = f"--sidecar-md {args.sidecar_md}"
+        _exit_with_usage_error(
+            *cli_messages.generate_manifest_with_write_flag(spelled, "write", spelled)
+        )
+
+
 def _resolve_sidecar_bundle(args: argparse.Namespace) -> str:
     """Expand ``-s`` and reject an explicit ``--sidecar-md`` that contradicts it.
 
@@ -3122,6 +3150,7 @@ def main() -> None:
         if args.generate_manifest:
             _refuse_generate_manifest_write_flags(args)
             _refuse_generate_manifest_verbose_flags(args)
+            _refuse_generate_manifest_sidecar_flags(args)
 
         # Before the write-bundle guards: an unwritable tag name is wrong however
         # the run is configured, and saying so is more use than "add --changeset

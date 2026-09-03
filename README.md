@@ -32,7 +32,7 @@ Now run your first analysis:
 photokin scan_042.jpg --back scan_042-back.jpg
 ```
 
-This calls the model but does not modify your files: the result is one JSON document printed to your terminal — keyed by image path, one entry per file, so the back gets its own record — and nothing else is created. (To also save everything sent to and received from the model — request payloads and a log, in a `./debug` folder — add `-v`.) Abridged output:
+This calls the model but does not modify your photos: the result is one JSON document printed to your terminal — keyed by image path, one entry per file, so the back gets its own record. The one file it may touch is photokin's own keyword vocabulary (part of its install, not your pictures), where a newly proposed keyword can be added — `--no-update-vocab` turns that off. (To also save what each model call was built from — the request payloads, the assembled metadata, and a log, in a `./debug` folder — add `-v`.) Abridged output:
 
 ```json
 {
@@ -288,7 +288,7 @@ photokin box3_017.jpg --back box3_017-back.jpg -rw
 Point photokin at a folder and it works through every image in it (non-recursively). By default:
 
 * All scans of one physical object — a front and its back, a rescan and the original — are sent to the model together and analyzed as one unit.
-* The results are combined into one coherent set, and every file in the group gets the same metadata written back. If the front and the back both carry writing, the caption of both files includes both transcriptions.
+* The results are combined into one coherent set of analysis fields shared across the group — if the front and the back both carry writing, the caption of both files includes both transcriptions. Two things stay per-file: the `back`/`negative` part keyword, and, for documents, each page's own caption (see the exception below).
 * Grouping goes by file name only, following the [naming conventions](#naming-conventions) below. The model is never asked to guess which files belong together.
 * A group with no front scan — only pages, only a negative, only a back — is analyzed like any other object.
 
@@ -325,7 +325,7 @@ Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-
 | `box3_025-b.jpg` or `box3_025b.jpg` | another scan of the same object (variant letter, with or without dash after a digit) |
 | `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
 | `album-page1.jpg`, `album-page2.jpg` | ordered pages of one document |
-| `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but never analyzed as an object of its own |
+| `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but not analyzed as its own object while its parent is present — a crop with no parent fills the missing slot, and `--group-by none` analyzes every crop alone |
 | `box3_025.tif` beside `box3_025.jpg` | the same scan in two formats — one object, not two photos |
 
 The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other numbered pages.
@@ -368,9 +368,9 @@ With `-r`, photokin reads `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Desc
 
 ### If a write fails
 
-A failed write leaves the file exactly as it was — files are written independently, and a failure on one never half-writes it or touches its neighbors. To find out what happened and pick up again:
+Files are written independently — a failure on one never touches its neighbors. To find out what happened and pick up again:
 
-* The per-file reasons are logged as `[ExifTool] Errors:` before the run ends.
+* The per-file reasons are logged as `[ExifTool] Errors:` before the run ends. Treat a listed file as unverified rather than untouched: ExifTool can write some of a file's tags and miss others in the same pass, so photokin counts nothing on that file as written — re-running it is the fix, not proof that something was lost.
 * If **nothing** was written, the run exits 2: some setting is wrong for every file (an unwritable `--exiftool-fields` tag, a read-only folder, a binary that will not run). Fix the setting and re-run.
 * If only **some** files failed, the run exits 0: the settings were right, and one locked or corrupt file among many is ordinary. Fix those files and re-run the same command — captions merge instead of duplicating (see [Captions](#captions)), so already-written files come out unchanged. Note a re-run does call the model again for every group.
 
@@ -633,7 +633,7 @@ If you are processing a large number of photos related to a single event, you ca
 | `--pretty-json {true,false}` | Indent the stdout result document (and an aggregate `.json` `--output-file`) for human reading (default `true`). Pass `false` for compact single-line output, e.g. when a script parses stdout itself rather than reading it with a JSON library |
 | `--output-sidecars`        | Also write a per-photo sidecar JSON next to each image (default off) |
 | `--sidecar-md {off,auto,all}` | Also write a per-part Markdown transcript sidecar next to each image. `off`: nothing (default). `all`: every emitted file except crops. `auto`: only for a group whose category is `Document` or `Postcard` |
-| `-s`                       | Shorthand for `--sidecar-md auto`; combines with the other short flags as `-rws`. A `--sidecar-md` value that contradicts it is an error rather than a guess |
+| `-s`                       | Shorthand for `--sidecar-md auto`; combines with the other short flags as `-rws`. A `--sidecar-md` value that contradicts it is an error rather than a guess, and like `-w` and `-v` it is refused beside `--generate-manifest`, which makes no model call |
 | `--max-images-per-call N`  | Cap on images sent in one model call. A group whose payload exceeds it is split into contiguous chunks (a front/back pair is never split across chunks) plus one text-only consolidation call that merges the chunks' metadata and corrects page order; a group at or under it is unaffected (default 8, `0` disables chunking) |
 | `--generate-manifest PATH` | Write the manifest folder or single-photo input would be grouped into, then exit without calling the model (not valid with manifest input) |
 | `--batch-id ID`            | Identifier added to each record on the `.ndjson` streaming path, and used to name debug-dump files. It does not appear in the aggregate `.json` or on stdout |
