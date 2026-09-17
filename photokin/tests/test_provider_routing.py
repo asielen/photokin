@@ -992,6 +992,18 @@ class TestClaudeCodeProviderClient(unittest.TestCase):
             client = core._build_provider_client(cfg)
         self.assertEqual(client.binary_path, "/usr/local/bin/claude")
 
+    def test_inconclusive_probe_raises_retryable_api_status_not_missing_api_key(self):
+        """A probe that didn't complete (authenticated=None) is a one-off hiccup,
+        not a confirmed logged-out CLI -- it must NOT be run-fatal the way
+        missing_api_key is, or one flaky `claude auth status` call would abort
+        an otherwise healthy batch run."""
+        cfg = types.SimpleNamespace(provider="claude-code")
+        status = {"binary_found": True, "binary_path": "/usr/local/bin/claude", "authenticated": None}
+        with patch.object(utils, "claude_code_cli_status", return_value=status):
+            with self.assertRaises(ProviderApiError) as ctx:
+                core._build_provider_client(cfg)
+        self.assertEqual(ctx.exception.error_type, "api_status")
+
 
 class TestClaudeCodeCliStatus(unittest.TestCase):
     """utils.claude_code_cli_status probes `which claude` + `claude auth status`."""
@@ -1000,7 +1012,9 @@ class TestClaudeCodeCliStatus(unittest.TestCase):
         with patch.object(utils.shutil, "which", return_value=None):
             status = utils.claude_code_cli_status()
         self.assertFalse(status["binary_found"])
-        self.assertFalse(status["authenticated"])
+        # A confirmed, non-transient state -- there's no CLI to be logged
+        # into -- so this is False, not the probe-inconclusive None.
+        self.assertIs(status["authenticated"], False)
 
     def test_binary_found_and_logged_in(self):
         completed = types.SimpleNamespace(stdout=b'{"loggedIn": true, "authMethod": "oauth_token"}')
@@ -1018,9 +1032,14 @@ class TestClaudeCodeCliStatus(unittest.TestCase):
         ):
             status = utils.claude_code_cli_status()
         self.assertTrue(status["binary_found"])
-        self.assertFalse(status["authenticated"])
+        # The probe completed and explicitly reported logged out -- a
+        # confirmed False, distinct from the probe-inconclusive None below.
+        self.assertIs(status["authenticated"], False)
 
-    def test_auth_status_timeout_reports_unauthenticated_not_a_crash(self):
+    def test_auth_status_timeout_reports_inconclusive_not_a_crash(self):
+        """A timed-out probe is a one-off hiccup, not evidence the CLI is
+        logged out -- it must report None (inconclusive), not False
+        (confirmed logged out), or a caller can't tell the two apart."""
         import subprocess as subprocess_module
 
         with patch.object(utils.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
@@ -1028,7 +1047,7 @@ class TestClaudeCodeCliStatus(unittest.TestCase):
         ):
             status = utils.claude_code_cli_status()
         self.assertTrue(status["binary_found"])
-        self.assertFalse(status["authenticated"])
+        self.assertIsNone(status["authenticated"])
 
 
 class TestClaudeCodeAdapter(unittest.TestCase):
@@ -1079,11 +1098,32 @@ class TestClaudeCodeAdapter(unittest.TestCase):
         self.assertEqual(image_block["source"]["media_type"], "image/png")
         self.assertEqual(image_block["source"]["data"], "aGVsbG8=")
 
-    def test_authentication_error_maps_to_missing_api_key(self):
+    def test_generic_temporary_auth_error_maps_to_retryable_api_status(self):
+        """The CLI's own generic auth-flavored message hedges that the cause
+        may be transient -- core._build_provider_client's preflight already
+        confirmed login before this call, so this must NOT be the run-fatal
+        missing_api_key (that would abort the whole batch on one flaky
+        response); it falls through to the retryable default instead."""
         from photokin import api_claude_code
 
         result_line = json.dumps(
-            {"type": "result", "is_error": True, "result": "Authentication error · please try again"}
+            {
+                "type": "result",
+                "is_error": True,
+                "result": "Authentication error · This may be a temporary network issue, please try again",
+            }
+        )
+        completed = self._completed([result_line], returncode=1)
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed):
+            with self.assertRaises(ProviderApiError) as ctx:
+                api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
+        self.assertEqual(ctx.exception.error_type, "api_status")
+
+    def test_unambiguous_logged_out_message_maps_to_missing_api_key(self):
+        from photokin import api_claude_code
+
+        result_line = json.dumps(
+            {"type": "result", "is_error": True, "result": "You are not logged in. Run `claude setup-token`."}
         )
         completed = self._completed([result_line], returncode=1)
         with patch.object(api_claude_code.subprocess, "run", return_value=completed):
@@ -1091,6 +1131,19 @@ class TestClaudeCodeAdapter(unittest.TestCase):
                 api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
         self.assertEqual(ctx.exception.error_type, "missing_api_key")
         self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_model_not_found_message_maps_to_model_not_found(self):
+        from photokin import api_claude_code
+
+        result_line = json.dumps(
+            {"type": "result", "is_error": True, "result": "model 'claude-bogus-0' not found"}
+        )
+        completed = self._completed([result_line], returncode=1)
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed):
+            with self.assertRaises(ProviderApiError) as ctx:
+                api_claude_code.call_claude_code_model(self._client(), "claude-bogus-0", [], [])
+        self.assertEqual(ctx.exception.error_type, "model_not_found")
+        self.assertEqual(ctx.exception.status_code, 404)
 
     def test_rate_limit_message_maps_to_rate_limit(self):
         from photokin import api_claude_code

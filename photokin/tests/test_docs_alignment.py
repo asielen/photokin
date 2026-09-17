@@ -49,6 +49,7 @@ _FOREIGN_FLAGS = frozenset(
     {
         "--version",
         "--bare",
+        "--safe-mode",
         "--system-prompt",
         "--disallowed-tools",
         "--input-format",

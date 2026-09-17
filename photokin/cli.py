@@ -1409,8 +1409,14 @@ def _build_show_config(args: argparse.Namespace) -> dict:
             },
             # claude-code has no API key -- it authenticates through a locally
             # logged-in `claude` CLI instead, so it is reported separately
-            # rather than forced into the api_keys shape above.
-            "claude_code_cli": utils.claude_code_cli_status(),
+            # rather than forced into the api_keys shape above. Only probed
+            # when claude-code is actually selected: `claude auth status` is
+            # a real subprocess spawn, and --show-config must stay instant
+            # and side-effect-free for every other provider even when a
+            # `claude` binary happens to be on PATH.
+            "claude_code_cli": (
+                utils.claude_code_cli_status() if selected_provider == "claude-code" else None
+            ),
         },
         "models": {
             "openai": args.openai_model,

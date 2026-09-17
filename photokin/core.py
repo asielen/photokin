@@ -871,12 +871,24 @@ def _build_provider_client(config: utils.Config):
                 "claude-code provider selected but the `claude` CLI was not found on PATH. "
                 "Install Claude Code (https://claude.com/claude-code) and retry.",
             )
-        if not status["authenticated"]:
+        if status["authenticated"] is False:
             raise ProviderApiError(
                 "missing_api_key",
                 "claude-code provider selected but the local `claude` CLI is not logged in. "
                 "Run `claude setup-token` (recommended for unattended/batch use) or "
                 "`claude auth login`, then retry.",
+            )
+        if status["authenticated"] is None:
+            # The probe itself didn't complete (timeout / unparsable output) --
+            # distinct from a confirmed logged-out CLI. This is called once per
+            # photo/group, so treating it the same as missing_api_key (which
+            # _is_run_fatal aborts the whole batch on) would let one flaky
+            # `claude auth status` call kill an otherwise healthy run; api_status
+            # is a per-photo failure instead, and the next photo probes again.
+            raise ProviderApiError(
+                "api_status",
+                "Could not confirm the local `claude` CLI's login status "
+                "(the `claude auth status` probe did not complete).",
             )
         return SimpleNamespace(binary_path=status["binary_path"])
     try:

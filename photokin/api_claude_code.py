@@ -1,6 +1,11 @@
 """Claude Code CLI adapter: runs prompts through a local, subscription-authenticated
 ``claude`` binary instead of the Anthropic SDK.
 
+EXPERIMENTAL: whether this actually bills against a Claude subscription's
+included usage, versus metered API-rate usage credits, is disputed upstream
+even for OAuth-authenticated ``claude -p`` calls -- see the "Claude Code CLI"
+section of README.md before relying on this for a real batch run.
+
 Unlike the other adapters in this package, there is no HTTP client and no API
 key -- ``client`` here is whatever :func:`photokin.core._build_provider_client`
 built for the ``claude-code`` provider (a small object carrying the resolved
@@ -8,77 +13,41 @@ built for the ``claude-code`` provider (a small object carrying the resolved
 Each call spawns ``claude -p`` as a subprocess, feeding it one stream-json
 message on stdin and reading its stream-json events back off stdout.
 
-Costs are billed against the operator's Claude subscription usage, not a
-per-token API key, and the CLI's own rolling usage limits apply instead of
-the Messages API's rate limits. See the "Claude Code CLI" section of
-README.md before choosing this provider for a large batch run.
+``--safe-mode`` (not ``--bare``) is what keeps this deterministic: ``--bare``
+also strips OAuth/keychain auth (Claude Code then requires
+``ANTHROPIC_API_KEY``, which this provider deliberately never sets, so every
+call would fail authentication) -- confirmed by direct trial. ``--safe-mode``
+disables the same CLAUDE.md/hooks/skills/MCP/plugins auto-discovery while
+leaving auth alone.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
-import mimetypes
 import subprocess
 from typing import Any, Callable, Dict, List
-from urllib.parse import urlparse
 
+from .api_claude import _data_url_to_image_block as _data_url_to_content_block
 from .errors import ProviderApiError
 
 logger = logging.getLogger(__name__)
 
 # Generous relative to a typical single-photo response, but still well short
-# of a batch run silently hanging on one stuck subprocess -- mirrors the
-# reasoning behind api_gemini's client-level timeout.
+# of a batch run silently hanging on one stuck subprocess.
 CLAUDE_CODE_TIMEOUT_SECONDS = 180
-
-_SUPPORTED_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-
-
-def _data_url_to_content_block(data_url: str) -> Dict[str, Any]:
-    """Convert a data URL to the image content block the CLI's stream-json
-    input expects -- the same shape as the Anthropic Messages API's image
-    blocks (confirmed by direct trial: the CLI accepts this shape on stdin).
-    """
-    if not data_url.startswith("data:"):
-        raise ProviderApiError("invalid_input", "Claude Code image input must be a data URL.")
-    header, _, encoded = data_url.partition(",")
-    if not encoded:
-        raise ProviderApiError("invalid_input", "Claude Code image input data URL was empty.")
-
-    mime = "image/jpeg"
-    if ";base64" in header:
-        parsed_mime = header[5:].split(";", 1)[0].strip()
-        if parsed_mime:
-            mime = parsed_mime
-
-    if mime not in _SUPPORTED_MIMES:
-        guessed, _ = mimetypes.guess_type(urlparse(data_url).path)
-        if guessed in _SUPPORTED_MIMES:
-            mime = guessed
-        else:
-            raise ProviderApiError("invalid_input", f"Unsupported image MIME type for Claude Code: {mime}")
-
-    try:
-        base64.b64decode(encoded, validate=True)
-    except ValueError as exc:
-        raise ProviderApiError("invalid_input", "Claude Code image input is not valid base64.") from exc
-
-    return {
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": mime,
-            "data": encoded,
-        },
-    }
 
 
 def _build_command(binary_path: str, model: str) -> List[str]:
     return [
         binary_path,
-        "--bare",
+        # NOT --bare: --bare also disables OAuth/keychain auth (Claude Code
+        # then requires ANTHROPIC_API_KEY, which this provider never sets),
+        # so every call would fail with an authentication error -- confirmed
+        # by direct trial. --safe-mode gives the same deterministic,
+        # side-effect-free invocation (no CLAUDE.md/hooks/skills/MCP/plugins
+        # auto-discovery) without touching how auth is resolved.
+        "--safe-mode",
         "-p",
         "--system-prompt",
         "",
@@ -102,14 +71,29 @@ def _classify_error_message(text: str) -> tuple[str, int | None]:
     the way the Anthropic SDK's typed exceptions do -- only a human-readable
     ``result`` string. This maps the substrings observed in practice; refine
     as more failure modes are seen against a real logged-in CLI.
+
+    Deliberately narrow on the auth case: ``core._build_provider_client``'s
+    preflight already confirmed ``claude auth status`` reports the CLI
+    logged in before any call reaches here, so a broad ``"auth"`` substring
+    match would treat a merely auth-flavored but likely transient failure --
+    including the CLI's own generic "Authentication error ... may be a
+    temporary network issue" message, seen in practice when auth is
+    misconfigured in an unrelated way -- as a permanent, run-fatal
+    credential problem (``missing_api_key`` is run-fatal; see
+    ``core._RUN_FATAL_ERROR_TYPES``). Only an unambiguous "you are logged
+    out" phrasing is classified that way; anything else auth-flavored falls
+    through to the retryable default so one flaky response doesn't abort an
+    otherwise-healthy batch.
     """
     lowered = text.lower()
-    if "auth" in lowered or "not logged in" in lowered or "login" in lowered:
+    if "not logged in" in lowered or "please log in" in lowered or "invalid api key" in lowered:
         return "missing_api_key", 401
     if "rate limit" in lowered or "rate_limit" in lowered or "usage limit" in lowered:
         return "rate_limit", 429
     if "overloaded" in lowered:
         return "overloaded", 529
+    if "model" in lowered and ("not found" in lowered or "does not exist" in lowered or "unknown model" in lowered):
+        return "model_not_found", 404
     return "api_status", None
 
 

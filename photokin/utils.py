@@ -226,18 +226,28 @@ def claude_code_cli_status() -> Dict[str, Any]:
     """Probe the local ``claude`` CLI for the ``claude-code`` provider.
 
     Returns:
-        ``{"binary_found": bool, "binary_path": str | None, "authenticated": bool}``.
-        ``authenticated`` is only meaningful when ``binary_found`` is True; a
-        missing binary, a timeout, or unparsable output all report False
-        rather than raising -- callers decide what a failed probe means.
+        ``{"binary_found": bool, "binary_path": str | None, "authenticated": bool | None}``.
+        ``authenticated`` is ``True``/``False`` once the probe completes and
+        parses a ``loggedIn`` value -- a confirmed, deliberate state. It is
+        ``None`` when the probe itself didn't complete (timeout, launch
+        failure, unparsable output): a one-off hiccup, not evidence the CLI
+        is actually logged out. Callers that treat "logged out" as run-fatal
+        (aborting an entire batch) should NOT treat ``None`` the same way --
+        this is called once per photo/group (see ``core._build_provider_client``),
+        so a transient probe failure must not be indistinguishable from a
+        confirmed missing credential, or one flaky call kills an otherwise
+        healthy run. ``authenticated`` is only meaningful when
+        ``binary_found`` is True; with no binary it is reported ``False``
+        (a confirmed, non-transient state) rather than ``None``.
     """
     binary_path = shutil.which("claude")
     status: Dict[str, Any] = {
         "binary_found": binary_path is not None,
         "binary_path": binary_path,
-        "authenticated": False,
+        "authenticated": None,
     }
     if not binary_path:
+        status["authenticated"] = False
         return status
     try:
         proc = subprocess.run(
@@ -247,7 +257,7 @@ def claude_code_cli_status() -> Dict[str, Any]:
         )
         payload = json.loads(proc.stdout.decode("utf-8", errors="replace") or "{}")
     except (OSError, subprocess.TimeoutExpired, JSONDecodeError):
-        return status
+        return status  # authenticated stays None: the probe itself was inconclusive
     status["authenticated"] = bool(payload.get("loggedIn"))
     return status
 
@@ -2038,7 +2048,7 @@ def extract_usage(resp) -> dict | None:
     Returns None if unavailable.
     """
     try:
-        usage_obj = getattr(resp, "usage", None)
+        usage_obj = resp.get("usage") if isinstance(resp, dict) else getattr(resp, "usage", None)
         usage_metadata_obj = None
         if not usage_obj:
             usage_metadata_obj = getattr(resp, "usage_metadata", None)
@@ -2087,7 +2097,7 @@ def extract_usage(resp) -> dict | None:
             except (TypeError, ValueError):
                 return None
 
-        model_name = getattr(resp, "model", None)
+        model_name = resp.get("model") if isinstance(resp, dict) else getattr(resp, "model", None)
         # Responses API names these input/output_tokens; Chat Completions
         # (OpenRouter and other compat gateways) names them prompt/completion_tokens.
         prompt_tokens = _as_int(usage_dict.get("input_tokens"))

@@ -2,7 +2,7 @@
 
 Run scanned photos and documents through a vision model and get archival metadata back: a verbatim transcription of whatever is written on the front or back, a scene caption, keywords, and deliberately cautious date/location guesses - as JSON, NDJSON streams, or metadata written straight into the files with ExifTool.
 
-Compatible with OpenAI, Anthropic, Gemini, and OpenRouter API keys — or, if you'd rather use your Claude subscription's usage instead of a billed API key, a locally-installed [Claude Code](https://claude.com/claude-code) CLI (see [Providers](#providers)).
+Compatible with OpenAI, Anthropic, Gemini, and OpenRouter API keys — or, experimentally, a locally-installed [Claude Code](https://claude.com/claude-code) CLI instead of a billed API key (see [Providers](#providers) — whether this draws from a Claude subscription or bills separately as metered usage is currently unconfirmed).
 
 # Why should I use this?
 
@@ -691,9 +691,13 @@ OpenAI, Anthropic, Gemini, and OpenRouter (any vision-capable slug — Kimi, Gro
 
 **Which provider a run uses** is decided in this order: the `--provider` flag, else the `LLM_PROVIDER` environment variable, else the provider whose SDK is installed. With exactly one SDK installed there is nothing to say — installing `photokin[anthropic]` was already the choice. With several installed (or none) and nothing chosen, the run stops with exit 2 before spending anything, and the error says how to choose. OpenRouter is the one provider never picked automatically: it speaks the OpenAI-compatible API through the `openai` SDK, so install the `[openai]` extra, set `OPENROUTER_API_KEY`, and select it explicitly.
 
-### Claude Code CLI (no API key)
+### Claude Code CLI (no API key) — experimental
 
-`--provider claude-code` runs the same Claude models through a locally-installed [Claude Code](https://claude.com/claude-code) CLI instead of the Anthropic API — billed against your Claude Pro/Max/Team subscription's usage instead of a metered API key. Like OpenRouter, it is never auto-selected; it always takes an explicit `--provider claude-code` or `LLM_PROVIDER=claude-code`.
+`--provider claude-code` runs the same Claude models through a locally-installed [Claude Code](https://claude.com/claude-code) CLI instead of the Anthropic API, so it needs no `ANTHROPIC_API_KEY` — just a logged-in `claude` CLI. Like OpenRouter, it is never auto-selected; it always takes an explicit `--provider claude-code` or `LLM_PROVIDER=claude-code`.
+
+**⚠️ Whether this actually bills against your Claude Pro/Max/Team subscription's included usage, or as separate metered API-rate usage credits, is disputed and unconfirmed.** Anthropic's own docs don't call out a difference between interactive and headless (`claude -p`) billing, but multiple issues filed against [anthropics/claude-code](https://github.com/anthropics/claude-code) describe `claude -p` with OAuth billing as API usage instead of subscription usage — including at least one report of over $1,800 in unexpected charges in two days. Claude Code's own local cost estimate (the `total_cost_usd` field this adapter's usage tracking surfaces) doesn't resolve the question either: Anthropic's docs say that figure is shown as an estimate for subscribers too, whether or not it's what actually gets billed.
+
+**Before trusting this for a real batch:** run a handful of photos through it, then check both **[claude.ai/settings/usage](https://claude.ai/settings/usage)** (subscription) and **[platform.claude.com/usage](https://platform.claude.com/usage)** (API/Console) to see where the charge actually lands. Don't assume either dashboard is the answer until you've looked.
 
 Setup:
 
@@ -706,12 +710,12 @@ photokin ./scans/ -rw --provider claude-code
 
 It shares Claude's own model setting (`--claude-model` / `CLAUDE_MODEL` — see [Set your defaults once](#set-your-defaults-once)), so `sonnet`/`haiku`/a full `claude-*` id all work exactly as they do for `--provider anthropic`.
 
-Worth knowing before pointing a big batch at it:
+Other things worth knowing before pointing a big batch at it:
 
-- **Subscription usage limits, not API rate limits.** The CLI enforces its own rolling usage windows tied to your subscription plan, which throttle differently than the Messages API's rate limits — a large batch can hit them well before it would hit an API tier's limits.
-- **Slower per photo.** Each call spawns a fresh `claude` subprocess rather than reusing a persistent streaming client, which adds real overhead across hundreds or thousands of photos.
-- **Best when you already pay for the subscription.** If you're not already a Claude Pro/Max/Team subscriber, a direct `--provider anthropic` API key is usually cheaper and more predictable for a one-off archive — the subscription route pays off when you're using capacity you already have.
-- `claude auth status` (`utils.claude_code_cli_status()` / the `claude_code_cli` block in `--show-config`) reports whether the CLI is installed and logged in, so you can check before committing a run.
+- **Subscription usage limits, not API rate limits — if it does draw from the subscription.** The CLI enforces its own rolling usage windows tied to your subscription plan, which throttle differently than the Messages API's rate limits.
+- **Slower per photo, on two counts.** Each call spawns a fresh `claude` subprocess rather than reusing a persistent streaming client, and each photo also re-checks CLI login status (`claude auth status`) before its analysis call — two subprocess spawns per photo, not one.
+- **Best when you already pay for the subscription** — if the billing question above resolves in the subscription's favor. If you're not already a Claude Pro/Max/Team subscriber, a direct `--provider anthropic` API key is more predictable regardless.
+- `claude auth status` (`utils.claude_code_cli_status()` / the `claude_code_cli` block in `--show-config`, when `claude-code` is the selected provider) reports whether the CLI is installed and logged in, so you can check before committing a run.
 
 ### Set your defaults once
 
