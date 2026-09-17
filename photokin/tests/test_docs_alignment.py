@@ -41,8 +41,22 @@ _DOCS = (
 
 #: Flags the documentation mentions that belong to other programs. The Quick
 #: Start tells a new user to run ``python --version``; that is not a photokin
-#: flag and must not be read as one.
-_FOREIGN_FLAGS = frozenset({"--version"})
+#: flag and must not be read as one. The ``claude-code`` provider section
+#: similarly documents the local ``claude`` CLI's own invocation (what
+#: ``api_claude_code.py`` actually shells out to) -- those are ``claude``'s
+#: flags, not photokin's.
+_FOREIGN_FLAGS = frozenset(
+    {
+        "--version",
+        "--bare",
+        "--system-prompt",
+        "--disallowed-tools",
+        "--input-format",
+        "--output-format",
+        "--model",
+        "--print",
+    }
+)
 
 #: Flags accepted purely so an external caller does not hard-crash on them.
 #: argparse exits 2 on an unrecognized argument, so a retired flag stays

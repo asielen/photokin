@@ -1305,7 +1305,12 @@ def _writes_are_planned(ecfg: ExiftoolConfig, *, changeset_requested: bool) -> b
 #: typo'd env var would fall through ``normalize_provider``'s permissive default
 #: and run OpenAI silently, the exact guess this whole resolution order exists
 #: to avoid.
-_PROVIDER_CHOICES = ("openai", "anthropic", "gemini", "openrouter")
+#:
+#: ``claude-code`` has no SDK to auto-detect (see ``utils.PROVIDER_SDK_MODULES``),
+#: so it never comes back from ``installed_provider_sdks()`` and is never
+#: auto-selected below -- it always takes an explicit ``--provider claude-code``
+#: or ``LLM_PROVIDER=claude-code``.
+_PROVIDER_CHOICES = ("openai", "anthropic", "gemini", "openrouter", "claude-code")
 
 
 def _resolve_provider(flag_value: str | None) -> str:
@@ -1402,12 +1407,20 @@ def _build_show_config(args: argparse.Namespace) -> dict:
                 }
                 for provider, env_var in utils.PROVIDER_API_KEY_ENV.items()
             },
+            # claude-code has no API key -- it authenticates through a locally
+            # logged-in `claude` CLI instead, so it is reported separately
+            # rather than forced into the api_keys shape above.
+            "claude_code_cli": utils.claude_code_cli_status(),
         },
         "models": {
             "openai": args.openai_model,
             "anthropic": args.claude_model,
             "gemini": args.gemini_model,
             "openrouter": args.openrouter_model,
+            # claude-code shares --claude-model/CLAUDE_MODEL with anthropic
+            # (see utils.resolve_model_for_provider) -- it is still Claude,
+            # just reached through the local CLI instead of the API.
+            "claude-code": args.claude_model,
         },
         "image": {
             "jpeg_quality": args.jpeg_quality,

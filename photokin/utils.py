@@ -55,6 +55,8 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import textwrap
 from pathlib import Path
 from dataclasses import dataclass
@@ -206,12 +208,48 @@ PROVIDER_SDK_MODULES: Dict[str, str] = {
 #: Single source of truth for ``core._build_provider_client`` and the CLI's
 #: ``--show-config``, so the two can never name a different variable for the
 #: same provider.
+#:
+#: ``claude-code`` is deliberately absent: it takes no API key at all -- it
+#: authenticates through a locally logged-in ``claude`` CLI (see
+#: ``claude_code_cli_status`` below). Adding it here would force the
+#: ``if not api_key: raise ...`` pattern every other provider's
+#: ``_build_provider_client`` branch uses, which is the wrong check for it.
 PROVIDER_API_KEY_ENV: Dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
+
+
+def claude_code_cli_status() -> Dict[str, Any]:
+    """Probe the local ``claude`` CLI for the ``claude-code`` provider.
+
+    Returns:
+        ``{"binary_found": bool, "binary_path": str | None, "authenticated": bool}``.
+        ``authenticated`` is only meaningful when ``binary_found`` is True; a
+        missing binary, a timeout, or unparsable output all report False
+        rather than raising -- callers decide what a failed probe means.
+    """
+    binary_path = shutil.which("claude")
+    status: Dict[str, Any] = {
+        "binary_found": binary_path is not None,
+        "binary_path": binary_path,
+        "authenticated": False,
+    }
+    if not binary_path:
+        return status
+    try:
+        proc = subprocess.run(
+            [binary_path, "auth", "status"],
+            capture_output=True,
+            timeout=15,
+        )
+        payload = json.loads(proc.stdout.decode("utf-8", errors="replace") or "{}")
+    except (OSError, subprocess.TimeoutExpired, JSONDecodeError):
+        return status
+    status["authenticated"] = bool(payload.get("loggedIn"))
+    return status
 
 
 def installed_provider_sdks() -> list[str]:
@@ -241,6 +279,8 @@ def normalize_provider(provider: str | None) -> str:
     raw = (provider or "").strip().lower()
     if raw in {"claude", "anthropic"}:
         return "anthropic"
+    if raw in {"claude-code", "claude_code"}:
+        return "claude-code"
     if raw in {"gemini", "google"}:
         return "gemini"
     if raw == "openrouter":
@@ -253,6 +293,8 @@ def provider_display_name(provider: str | None) -> str:
     normalized = normalize_provider(provider)
     if normalized == "anthropic":
         return "Claude"
+    if normalized == "claude-code":
+        return "Claude Code"
     if normalized == "gemini":
         return "Gemini"
     if normalized == "openrouter":
@@ -274,7 +316,7 @@ def resolve_claude_model(model_or_alias: str | None, default_alias: str | None =
 def resolve_model_for_provider(config: Config) -> str:
     """Resolve the effective model name sent to the selected provider API."""
     provider = normalize_provider(config.provider)
-    if provider == "anthropic":
+    if provider in ("anthropic", "claude-code"):
         preferred = config.model if config.model.startswith("claude-") else config.claude_model_name
         return resolve_claude_model(preferred)
     if provider == "gemini":

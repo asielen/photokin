@@ -2,7 +2,7 @@
 
 Run scanned photos and documents through a vision model and get archival metadata back: a verbatim transcription of whatever is written on the front or back, a scene caption, keywords, and deliberately cautious date/location guesses - as JSON, NDJSON streams, or metadata written straight into the files with ExifTool.
 
-Compatible with OpenAI, Anthropic, Gemini, and OpenRouter API keys.
+Compatible with OpenAI, Anthropic, Gemini, and OpenRouter API keys — or, if you'd rather use your Claude subscription's usage instead of a billed API key, a locally-installed [Claude Code](https://claude.com/claude-code) CLI (see [Providers](#providers)).
 
 # Why should I use this?
 
@@ -434,6 +434,7 @@ Keys are plain environment variables, one per provider. Photokin reads them when
 | Anthropic | `ANTHROPIC_API_KEY` |
 | Gemini | `GEMINI_API_KEY` |
 | OpenRouter | `OPENROUTER_API_KEY` |
+| Claude Code | _none — authenticates via a locally logged-in `claude` CLI, see [Providers](#providers)_ |
 
 For the current terminal session:
 
@@ -690,6 +691,28 @@ OpenAI, Anthropic, Gemini, and OpenRouter (any vision-capable slug — Kimi, Gro
 
 **Which provider a run uses** is decided in this order: the `--provider` flag, else the `LLM_PROVIDER` environment variable, else the provider whose SDK is installed. With exactly one SDK installed there is nothing to say — installing `photokin[anthropic]` was already the choice. With several installed (or none) and nothing chosen, the run stops with exit 2 before spending anything, and the error says how to choose. OpenRouter is the one provider never picked automatically: it speaks the OpenAI-compatible API through the `openai` SDK, so install the `[openai]` extra, set `OPENROUTER_API_KEY`, and select it explicitly.
 
+### Claude Code CLI (no API key)
+
+`--provider claude-code` runs the same Claude models through a locally-installed [Claude Code](https://claude.com/claude-code) CLI instead of the Anthropic API — billed against your Claude Pro/Max/Team subscription's usage instead of a metered API key. Like OpenRouter, it is never auto-selected; it always takes an explicit `--provider claude-code` or `LLM_PROVIDER=claude-code`.
+
+Setup:
+
+```bash
+pip install photokin                 # no SDK extra needed for this provider
+claude setup-token                   # one-time: mints a long-lived, non-interactive login
+                                      # (or `claude auth login` for an interactive session)
+photokin ./scans/ -rw --provider claude-code
+```
+
+It shares Claude's own model setting (`--claude-model` / `CLAUDE_MODEL` — see [Set your defaults once](#set-your-defaults-once)), so `sonnet`/`haiku`/a full `claude-*` id all work exactly as they do for `--provider anthropic`.
+
+Worth knowing before pointing a big batch at it:
+
+- **Subscription usage limits, not API rate limits.** The CLI enforces its own rolling usage windows tied to your subscription plan, which throttle differently than the Messages API's rate limits — a large batch can hit them well before it would hit an API tier's limits.
+- **Slower per photo.** Each call spawns a fresh `claude` subprocess rather than reusing a persistent streaming client, which adds real overhead across hundreds or thousands of photos.
+- **Best when you already pay for the subscription.** If you're not already a Claude Pro/Max/Team subscriber, a direct `--provider anthropic` API key is usually cheaper and more predictable for a one-off archive — the subscription route pays off when you're using capacity you already have.
+- `claude auth status` (`utils.claude_code_cli_status()` / the `claude_code_cli` block in `--show-config`) reports whether the CLI is installed and logged in, so you can check before committing a run.
+
 ### Set your defaults once
 
 The provider and each provider's model have an environment variable behind the flag, so a machine that always uses the same setup never types either:
@@ -698,7 +721,7 @@ The provider and each provider's model have an environment variable behind the f
 |---|---|---|---|
 | Provider | `--provider` | `LLM_PROVIDER` | the one installed SDK |
 | OpenAI model | `--openai-model` | `OPENAI_MODEL` | `gpt-4o` |
-| Claude model | `--claude-model` | `CLAUDE_MODEL` | `sonnet` |
+| Claude model (also used by `claude-code`) | `--claude-model` | `CLAUDE_MODEL` | `sonnet` |
 | Gemini model | `--gemini-model` | `GEMINI_MODEL` | `gemini-2.5-flash` |
 | OpenRouter model | `--openrouter-model` | `OPENROUTER_MODEL` | `moonshotai/kimi-k3` |
 
@@ -816,7 +839,7 @@ Prints this build's contract as JSON and exits, before any input is required —
     "date_guess": "EXIF:DateTimeOriginal",
     "location_guess": {"country": "IPTC:Country-PrimaryLocationName", "state": "IPTC:Province-State", "city": "IPTC:City", "sublocation": "IPTC:Sub-location"}
   },
-  "providers": ["openai", "anthropic", "gemini", "openrouter"],
+  "providers": ["openai", "anthropic", "gemini", "openrouter", "claude-code"],
   "flags": ["--back", "--batch-id", "..."]
 }
 ```
@@ -841,9 +864,10 @@ Prints this *invocation's* fully resolved settings as JSON and exits, before any
       "anthropic": {"env_var": "ANTHROPIC_API_KEY", "set": false},
       "gemini": {"env_var": "GEMINI_API_KEY", "set": false},
       "openrouter": {"env_var": "OPENROUTER_API_KEY", "set": false}
-    }
+    },
+    "claude_code_cli": {"binary_found": false, "binary_path": null, "authenticated": false}
   },
-  "models": {"openai": "gpt-4o", "anthropic": "sonnet", "gemini": "gemini-2.5-flash", "openrouter": "moonshotai/kimi-k3"},
+  "models": {"openai": "gpt-4o", "anthropic": "sonnet", "gemini": "gemini-2.5-flash", "openrouter": "moonshotai/kimi-k3", "claude-code": "sonnet"},
   "image": {"jpeg_quality": 90, "max_edge": 1024},
   "grouping": {"group_by": "object", "max_images_per_call": 8},
   "confidence_thresholds": {"date": 0.6, "location": 0.7},

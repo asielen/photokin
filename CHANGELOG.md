@@ -3,6 +3,22 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`--provider claude-code`**: runs Claude models through a locally-installed
+  [Claude Code](https://claude.com/claude-code) CLI instead of the Anthropic
+  API, billed against a Claude Pro/Max/Team subscription's usage rather than
+  a metered API key. Authenticates via `claude setup-token`/`claude auth
+  login` — no `ANTHROPIC_API_KEY` needed. Shares Claude's own
+  `--claude-model`/`CLAUDE_MODEL` setting. Like OpenRouter, it is never
+  auto-selected and always takes an explicit `--provider claude-code` or
+  `LLM_PROVIDER=claude-code`. See the "Claude Code CLI" section under
+  [Providers](README.md#providers) for setup and tradeoffs (subscription
+  usage limits instead of API rate limits, slower per-photo due to
+  per-call subprocess overhead).
+
 ## [0.6.2]
 
 ### Added

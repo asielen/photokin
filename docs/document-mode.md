@@ -47,8 +47,10 @@ Verified against the tree at 0.3.2, not from memory of it.
   writes `<stem>.json` beside the image, warns instead of raising, and never takes a
   paid-for analysis down with it. The `.md` writer copies that contract exactly.
 - **All providers, one dispatch.** `api.call_model` is a synchronous request/response
-  dispatch over OpenAI, Anthropic, Gemini and OpenRouter. There is no provider-side
-  agent or fan-out primitive shared across them — see §4 for what that means for
+  dispatch over OpenAI, Anthropic, Gemini, OpenRouter, and the Claude Code CLI
+  (`claude-code`, a subprocess call rather than an SDK request, but the same
+  synchronous one-call-per-image shape). There is no provider-side agent or
+  fan-out primitive shared across them — see §4 for what that means for
   chunking.
 
 ## 2. Decisions

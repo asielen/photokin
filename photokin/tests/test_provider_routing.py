@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import types
@@ -156,6 +157,9 @@ class TestProviderResolution(unittest.TestCase):
         self.assertEqual(utils.normalize_provider("Gemini"), "gemini")
         self.assertEqual(utils.normalize_provider("google"), "gemini")
         self.assertEqual(utils.normalize_provider("OpenRouter"), "openrouter")
+        self.assertEqual(utils.normalize_provider("claude-code"), "claude-code")
+        self.assertEqual(utils.normalize_provider("claude_code"), "claude-code")
+        self.assertEqual(utils.provider_display_name("claude-code"), "Claude Code")
 
     def test_claude_model_resolution_alias_and_default(self):
         self.assertEqual(utils.resolve_claude_model("sonnet"), "claude-sonnet-5")
@@ -168,6 +172,11 @@ class TestProviderResolution(unittest.TestCase):
 
         cfg_openai = utils.Config(provider="openai", model="gpt-4o")
         self.assertEqual(utils.resolve_model_for_provider(cfg_openai), "gpt-4o")
+
+        # claude-code is still Claude, just reached through the local CLI --
+        # it shares the same --claude-model/CLAUDE_MODEL resolution.
+        cfg_claude_code = utils.Config(provider="claude-code", model="gpt-4o", claude_model_name="haiku")
+        self.assertEqual(utils.resolve_model_for_provider(cfg_claude_code), "claude-haiku-4-5-20251001")
 
         cfg_gemini = utils.Config(provider="gemini", model="gpt-4o", gemini_model_name="gemini-2.5-flash")
         self.assertEqual(utils.resolve_model_for_provider(cfg_gemini), "gemini-2.5-flash")
@@ -951,6 +960,200 @@ class TestOpenAIIncompleteDetection(unittest.TestCase):
             status="completed", incomplete_details=None, output_text="hello"
         )
         self.assertEqual(api_openai.extract_openai_output_text(resp), "hello")
+
+
+class TestClaudeCodeProviderClient(unittest.TestCase):
+    """claude-code has no API key -- _build_provider_client instead probes the
+    local `claude` CLI, so its failure modes are binary-not-found and
+    not-logged-in rather than a missing env var."""
+
+    def test_missing_claude_binary_raises_missing_dependency(self):
+        cfg = types.SimpleNamespace(provider="claude-code")
+        status = {"binary_found": False, "binary_path": None, "authenticated": False}
+        with patch.object(utils, "claude_code_cli_status", return_value=status):
+            with self.assertRaises(ProviderApiError) as ctx:
+                core._build_provider_client(cfg)
+        self.assertEqual(ctx.exception.error_type, "missing_dependency")
+        self.assertIn("claude", str(ctx.exception))
+
+    def test_not_logged_in_raises_missing_api_key(self):
+        cfg = types.SimpleNamespace(provider="claude-code")
+        status = {"binary_found": True, "binary_path": "/usr/local/bin/claude", "authenticated": False}
+        with patch.object(utils, "claude_code_cli_status", return_value=status):
+            with self.assertRaises(ProviderApiError) as ctx:
+                core._build_provider_client(cfg)
+        self.assertEqual(ctx.exception.error_type, "missing_api_key")
+        self.assertIn("setup-token", str(ctx.exception))
+
+    def test_logged_in_returns_client_with_binary_path(self):
+        cfg = types.SimpleNamespace(provider="claude-code")
+        status = {"binary_found": True, "binary_path": "/usr/local/bin/claude", "authenticated": True}
+        with patch.object(utils, "claude_code_cli_status", return_value=status):
+            client = core._build_provider_client(cfg)
+        self.assertEqual(client.binary_path, "/usr/local/bin/claude")
+
+
+class TestClaudeCodeCliStatus(unittest.TestCase):
+    """utils.claude_code_cli_status probes `which claude` + `claude auth status`."""
+
+    def test_binary_not_on_path(self):
+        with patch.object(utils.shutil, "which", return_value=None):
+            status = utils.claude_code_cli_status()
+        self.assertFalse(status["binary_found"])
+        self.assertFalse(status["authenticated"])
+
+    def test_binary_found_and_logged_in(self):
+        completed = types.SimpleNamespace(stdout=b'{"loggedIn": true, "authMethod": "oauth_token"}')
+        with patch.object(utils.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
+            utils.subprocess, "run", return_value=completed
+        ):
+            status = utils.claude_code_cli_status()
+        self.assertTrue(status["binary_found"])
+        self.assertTrue(status["authenticated"])
+
+    def test_binary_found_but_logged_out(self):
+        completed = types.SimpleNamespace(stdout=b'{"loggedIn": false}')
+        with patch.object(utils.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
+            utils.subprocess, "run", return_value=completed
+        ):
+            status = utils.claude_code_cli_status()
+        self.assertTrue(status["binary_found"])
+        self.assertFalse(status["authenticated"])
+
+    def test_auth_status_timeout_reports_unauthenticated_not_a_crash(self):
+        import subprocess as subprocess_module
+
+        with patch.object(utils.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
+            utils.subprocess, "run", side_effect=subprocess_module.TimeoutExpired(cmd="claude", timeout=15)
+        ):
+            status = utils.claude_code_cli_status()
+        self.assertTrue(status["binary_found"])
+        self.assertFalse(status["authenticated"])
+
+
+class TestClaudeCodeAdapter(unittest.TestCase):
+    """api_claude_code shells out to `claude -p` and parses its stream-json
+    events back into the same ProviderApiError taxonomy every other adapter
+    uses, per api_claude.call_claude_model's pattern."""
+
+    def _client(self):
+        return types.SimpleNamespace(binary_path="/usr/local/bin/claude")
+
+    def _completed(self, stdout_lines, returncode=0, stderr=b""):
+        stdout = ("\n".join(stdout_lines) + "\n").encode("utf-8")
+        return types.SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+    def test_successful_call_extracts_text(self):
+        from photokin import api_claude_code
+
+        result_line = json.dumps({"type": "result", "is_error": False, "result": "a red barn"})
+        init_line = json.dumps({"type": "system", "subtype": "init", "model": "claude-haiku-4-5-20251001"})
+        completed = self._completed([init_line, result_line])
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed) as mock_run:
+            resp = api_claude_code.call_claude_code_model(
+                self._client(),
+                "haiku",
+                [{"type": "input_text", "text": "Describe this photo."}],
+                [],
+            )
+        self.assertEqual(api_claude_code.extract_claude_code_output_text(resp), "a red barn")
+        self.assertEqual(resp["model"], "claude-haiku-4-5-20251001")
+        # stdin carries the stream-json user message the CLI's --input-format expects.
+        sent = json.loads(mock_run.call_args.kwargs["input"].decode("utf-8"))
+        self.assertEqual(sent["type"], "user")
+        self.assertEqual(sent["message"]["content"][-1]["text"], "Describe this photo.")
+
+    def test_image_content_block_shape(self):
+        from photokin import api_claude_code
+
+        result_line = json.dumps({"type": "result", "is_error": False, "result": "ok"})
+        completed = self._completed([result_line])
+        data_url = "data:image/png;base64,aGVsbG8="
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed) as mock_run:
+            api_claude_code.call_claude_code_model(
+                self._client(), "haiku", [{"type": "input_text", "text": "hi"}], [data_url]
+            )
+        sent = json.loads(mock_run.call_args.kwargs["input"].decode("utf-8"))
+        image_block = sent["message"]["content"][0]
+        self.assertEqual(image_block["type"], "image")
+        self.assertEqual(image_block["source"]["media_type"], "image/png")
+        self.assertEqual(image_block["source"]["data"], "aGVsbG8=")
+
+    def test_authentication_error_maps_to_missing_api_key(self):
+        from photokin import api_claude_code
+
+        result_line = json.dumps(
+            {"type": "result", "is_error": True, "result": "Authentication error · please try again"}
+        )
+        completed = self._completed([result_line], returncode=1)
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed):
+            with self.assertRaises(ProviderApiError) as ctx:
+                api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
+        self.assertEqual(ctx.exception.error_type, "missing_api_key")
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_rate_limit_message_maps_to_rate_limit(self):
+        from photokin import api_claude_code
+
+        result_line = json.dumps({"type": "result", "is_error": True, "result": "usage limit reached"})
+        completed = self._completed([result_line], returncode=1)
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed):
+            with self.assertRaises(ProviderApiError) as ctx:
+                api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
+        self.assertEqual(ctx.exception.error_type, "rate_limit")
+        self.assertEqual(ctx.exception.status_code, 429)
+
+    def test_no_result_event_raises_api_status(self):
+        from photokin import api_claude_code
+
+        completed = self._completed(["not json", ""], returncode=1, stderr=b"boom")
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed):
+            with self.assertRaises(ProviderApiError) as ctx:
+                api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
+        self.assertEqual(ctx.exception.error_type, "api_status")
+        self.assertIn("boom", str(ctx.exception))
+
+    def test_timeout_raises_api_status(self):
+        import subprocess as subprocess_module
+
+        from photokin import api_claude_code
+
+        with patch.object(
+            api_claude_code.subprocess,
+            "run",
+            side_effect=subprocess_module.TimeoutExpired(cmd="claude", timeout=180),
+        ):
+            with self.assertRaises(ProviderApiError) as ctx:
+                api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
+        self.assertEqual(ctx.exception.error_type, "api_status")
+
+    def test_missing_binary_raises_missing_dependency(self):
+        from photokin import api_claude_code
+
+        with patch.object(api_claude_code.subprocess, "run", side_effect=FileNotFoundError()):
+            with self.assertRaises(ProviderApiError) as ctx:
+                api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
+        self.assertEqual(ctx.exception.error_type, "missing_dependency")
+
+    def test_dispatches_through_api_call_model_and_extract_output_text(self):
+        from photokin import api
+
+        result_line = json.dumps({"type": "result", "is_error": False, "result": "dispatched"})
+        completed = self._completed([result_line])
+        with patch("photokin.api_claude_code.subprocess.run", return_value=completed):
+            resp = api.call_model(self._client(), "haiku", [], [], provider="claude-code")
+        self.assertEqual(api.extract_output_text(resp, provider="claude-code"), "dispatched")
+
+
+class TestGetResponseModelDictSupport(unittest.TestCase):
+    """get_response_model must also read a dict-shaped response (claude-code's
+    adapter returns the parsed CLI result event, not an SDK object)."""
+
+    def test_dict_response_reads_model_key(self):
+        from photokin import api
+
+        self.assertEqual(api.get_response_model({"model": "claude-haiku-4-5-20251001"}, "fallback"), "claude-haiku-4-5-20251001")
+        self.assertEqual(api.get_response_model({}, "fallback"), "fallback")
 
 
 if __name__ == "__main__":

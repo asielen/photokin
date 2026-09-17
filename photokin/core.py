@@ -65,6 +65,7 @@ import traceback
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import date
+from types import SimpleNamespace
 from typing import Callable, Dict, Any, List
 from copy import deepcopy
 
@@ -862,6 +863,22 @@ def _build_provider_client(config: utils.Config):
             )
         base_url = (os.getenv("OPENROUTER_BASE_URL") or "").strip() or "https://openrouter.ai/api/v1"
         return OpenAI(api_key=api_key, base_url=base_url)
+    if provider == "claude-code":
+        status = utils.claude_code_cli_status()
+        if not status["binary_found"]:
+            raise ProviderApiError(
+                "missing_dependency",
+                "claude-code provider selected but the `claude` CLI was not found on PATH. "
+                "Install Claude Code (https://claude.com/claude-code) and retry.",
+            )
+        if not status["authenticated"]:
+            raise ProviderApiError(
+                "missing_api_key",
+                "claude-code provider selected but the local `claude` CLI is not logged in. "
+                "Run `claude setup-token` (recommended for unattended/batch use) or "
+                "`claude auth login`, then retry.",
+            )
+        return SimpleNamespace(binary_path=status["binary_path"])
     try:
         from openai import OpenAI
     except ImportError as exc:
