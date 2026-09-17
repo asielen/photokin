@@ -3,6 +3,72 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.2]
+
+### Added
+
+- **`--show-config`**: prints this invocation's fully resolved settings
+  (provider, models, image/grouping/confidence settings, ExifTool config,
+  and which provider API key env vars are set) as JSON and exits, before any
+  input is required — the same timing as `--capabilities`, but answering
+  "what will this exact command line use" rather than "what can this build
+  do." Each API key is reported `set`/not only; the value itself is never
+  read into the output.
+- **A settings-only invocation with no input now says how to make it a
+  standing default.** `photokin --claude-model sonnet` used to just refuse
+  with "no input was given." When every flag on the line has an environment
+  variable equivalent (`--provider`, `--openai-model`, `--claude-model`,
+  `--gemini-model`, `--openrouter-model`, `--exiftool-write`,
+  `--exiftool-fields`, `--exiftool-path`), the refusal now also names it and
+  shows how to set it for the session.
+
+### Changed
+
+- **`CLAUDE_MODELS["sonnet"]` now resolves to `claude-sonnet-5`**, not the
+  previous generation's `claude-sonnet-4-6`. Per Anthropic's own model
+  aliasing on the direct API, `sonnet` means Sonnet 5; the pin had simply
+  never been bumped since Sonnet 5 shipped.
+- **Claude's base output budget is `max_tokens=16384`**, up from `4096`.
+  Even without extended thinking requested, a model can spend part of its
+  budget on internal reasoning before any answer text exists (observed on
+  Sonnet 5) — 4096 was tight enough for a text-dense document to run out
+  mid-reasoning. Gemini now sets the same `max_output_tokens=16384` (it had
+  no cap before); OpenRouter already used it. All three retry once at a 64k
+  ceiling if the base budget still truncates, rather than raising it for
+  every call regardless of whether the content needed it — providers bill
+  for tokens generated, not the ceiling, so this only costs more on the
+  rare call that actually needed the room. OpenAI is intentionally left
+  uncapped, since it never had this problem and a photokin-chosen ceiling
+  there would only add a new way to truncate that doesn't exist today.
+- **Gemini and OpenRouter now retry once without `temperature` if a model
+  rejects it**, matching OpenAI and Claude's existing behavior. Neither
+  provider has a naming pattern to predict it in advance the way
+  `gpt-5`/`claude-opus-4-7` do, so both detect it reactively from the error
+  instead.
+- Removed the `[INFO] Skipping archival upload for provider X (Files API
+  unsupported)` log line, printed on every single file for the three of
+  four providers that don't support it — never new information after the
+  first occurrence, and never actionable.
+
+### Fixed
+
+- **A Claude response that ran out of budget while still "thinking," before
+  any answer text existed, no longer crashes downstream as an opaque
+  `JSONDecodeError`.** `extract_claude_output_text` checked whether any
+  text was found before checking whether the response was truncated,
+  so a text-less truncation fell through to returning the response
+  object's own `repr()`, which then failed JSON parsing with an error
+  pointing nowhere useful. The truncation check now runs first, raising
+  the same clear `length` error a partial-text truncation already got.
+  Gemini and OpenRouter now carry the equivalent check (Gemini had no
+  truncation detection at all before this).
+- Anthropic's SDK has, on at least one observed install, dropped
+  `temperature` from `Messages.stream()`'s accepted parameters entirely —
+  a client-side `TypeError` raised before any request is sent, not the
+  server-side 400 the existing model-name heuristic was written to avoid.
+  `call_claude_model` now retries once with `temperature` omitted when this
+  happens, regardless of model name.
+
 ## [0.6.0]
 
 ### Added
