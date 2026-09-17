@@ -1082,6 +1082,24 @@ class TestClaudeCodeAdapter(unittest.TestCase):
         self.assertEqual(sent["type"], "user")
         self.assertEqual(sent["message"]["content"][-1]["text"], "Describe this photo.")
 
+    def test_truncated_response_raises_length_not_dict_repr(self):
+        """A response truncated by max_tokens has no text yet; falling
+        through to str(resp) would return a dict repr that looks like model
+        output to a JSON-parsing caller and fail as an opaque
+        JSONDecodeError instead of this clear error -- mirrors
+        api_claude.extract_claude_output_text's stop_reason check."""
+        from photokin import api_claude_code
+
+        result_line = json.dumps(
+            {"type": "result", "is_error": False, "stop_reason": "max_tokens", "result": ""}
+        )
+        completed = self._completed([result_line])
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed):
+            resp = api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_claude_code.extract_claude_code_output_text(resp)
+        self.assertEqual(ctx.exception.error_type, "length")
+
     def test_image_content_block_shape(self):
         from photokin import api_claude_code
 

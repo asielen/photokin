@@ -199,6 +199,14 @@ def call_claude_code_model(
 def extract_claude_code_output_text(resp: Any) -> str:
     """Extract plain text from a parsed claude-code CLI result event."""
     if isinstance(resp, dict):
+        # Checked ahead of the "no text" fallback below, mirroring
+        # api_claude.extract_claude_output_text: a response truncated by the
+        # token ceiling has no text yet, and falling through to str(resp)
+        # there returns a dict repr that looks like model output to a
+        # JSON-parsing caller and fails as an opaque JSONDecodeError instead
+        # of this clear error.
+        if resp.get("stop_reason") == "max_tokens":
+            raise ProviderApiError("length", "Model output was truncated by max_tokens.")
         text = resp.get("result")
         if isinstance(text, str) and text.strip():
             return text.strip()
