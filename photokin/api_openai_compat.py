@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 # zero answer text produced. 4096 was too tight for that; this leaves
 # enough room for a long reasoning trace and a full JSON answer.
 MAX_TOKENS = 16384
+# call_openai_compat_model retries once at this ceiling when even MAX_TOKENS
+# still truncates (a text-dense document, say) -- see api_claude's identical
+# MAX_TOKENS/THINKING_MAX_TOKENS pair for the same rationale.
+MAX_TOKENS_RETRY = 64000
 
 
 def call_openai_compat_model(
@@ -69,8 +73,40 @@ def call_openai_compat_model(
         raise ProviderApiError("missing_dependency", "openai package is required for OpenAI-compatible providers.")
 
     tuned = client.with_options(timeout=180.0, max_retries=3)
+
+    def _create(payload: Dict[str, Any]) -> Any:
+        return tuned.chat.completions.create(**payload)
+
+    def _create_with_temperature_retry(payload: Dict[str, Any]) -> Any:
+        try:
+            return _create(payload)
+        except openai.BadRequestError as exc:
+            # Not every model an OpenRouter slug resolves to accepts a
+            # temperature override, and there is no per-slug naming
+            # heuristic worth maintaining across every provider OpenRouter
+            # fronts -- detected reactively instead, the same shape as
+            # api_openai's own temperature retry.
+            if "temperature" not in payload or "temperature" not in str(exc).lower():
+                raise
+            retried = {k: v for k, v in payload.items() if k != "temperature"}
+            if dump_request:
+                dump_request(retried)
+            return _create(retried)
+
     try:
-        return tuned.chat.completions.create(**request_payload)
+        response = _create_with_temperature_retry(request_payload)
+        choices = getattr(response, "choices", None) or []
+        truncated = any(getattr(c, "finish_reason", None) == "length" for c in choices)
+        if truncated and request_payload["max_tokens"] < MAX_TOKENS_RETRY:
+            # Ran out of budget -- possibly mid-reasoning, before any answer
+            # content existed (see extract_openai_compat_output_text). One
+            # retry at a much larger ceiling, since the common case never
+            # reaches here.
+            escalated = {**request_payload, "max_tokens": MAX_TOKENS_RETRY}
+            if dump_request:
+                dump_request(escalated)
+            response = _create_with_temperature_retry(escalated)
+        return response
     except openai.RateLimitError as exc:
         raise ProviderApiError(
             "rate_limit",

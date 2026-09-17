@@ -15,6 +15,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Same rationale as api_claude.MAX_TOKENS/THINKING_MAX_TOKENS: a model can
+# spend part of its output budget on its own reasoning before any answer
+# text exists, and a text-dense document needs more room than a simple
+# photo caption. call_gemini_model retries once at MAX_TOKENS_RETRY when a
+# response truncates at MAX_TOKENS, so the base value only needs to
+# comfortably cover the common case.
+MAX_TOKENS = 16384
+MAX_TOKENS_RETRY = 64000
+
 
 def _normalize_gemini_model(model: str) -> str:
     """Ensure the model name is in the format expected by the google-genai SDK.
@@ -76,7 +85,11 @@ def call_gemini_model(
     combined_prompt = "\n\n".join(chunk.strip() for chunk in text_chunks if chunk.strip())
     parts.append({"text": combined_prompt})
 
-    api_config = {"temperature": 0, "response_mime_type": "application/json"}
+    api_config: Dict[str, Any] = {
+        "temperature": 0,
+        "response_mime_type": "application/json",
+        "max_output_tokens": MAX_TOKENS,
+    }
     request_payload: Dict[str, Any] = {
         "model": model,
         "contents": [{"role": "user", "parts": parts}],
@@ -96,12 +109,45 @@ def call_gemini_model(
 
     logger.info("Starting analysis with model %s...", model)
 
-    try:
+    def _finish_reason(resp: Any) -> str | None:
+        candidates = getattr(resp, "candidates", None) or []
+        if not candidates:
+            return None
+        return getattr(candidates[0], "finish_reason", None)
+
+    def _generate(config: Dict[str, Any]) -> Any:
         return client.models.generate_content(
-            model=model,
-            contents=[{"role": "user", "parts": parts}],
-            config=api_config,
+            model=model, contents=[{"role": "user", "parts": parts}], config=config
         )
+
+    def _generate_with_temperature_retry(config: Dict[str, Any]) -> Any:
+        try:
+            return _generate(config)
+        except Exception as exc:
+            # Not every model behind this call accepts a temperature
+            # override, and unlike OpenAI/Claude there is no per-model
+            # naming heuristic to guess it in advance (Gemini model names
+            # don't signal it the way "gpt-5"/"claude-opus-4-7" do) -- so
+            # this is detected reactively, the same shape as the other three
+            # adapters' own temperature retries.
+            if "temperature" not in config or "temperature" not in str(exc).lower():
+                raise
+            retried = {k: v for k, v in config.items() if k != "temperature"}
+            if dump_request:
+                dump_request({**request_payload, "generation_config": retried})
+            return _generate(retried)
+
+    try:
+        response = _generate_with_temperature_retry(api_config)
+        if _finish_reason(response) == "MAX_TOKENS" and api_config["max_output_tokens"] < MAX_TOKENS_RETRY:
+            # Ran out of budget -- possibly mid-reasoning, before any answer
+            # text existed (see extract_gemini_output_text). One retry at a
+            # much larger ceiling, since the common case never reaches here.
+            escalated_config = {**api_config, "max_output_tokens": MAX_TOKENS_RETRY}
+            if dump_request:
+                dump_request({**request_payload, "generation_config": escalated_config})
+            response = _generate_with_temperature_retry(escalated_config)
+        return response
     except Exception as exc:
         status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
         message = str(exc)
@@ -154,6 +200,15 @@ def call_gemini_model(
 
 def extract_gemini_output_text(resp: Any) -> str:
     """Extract plain text from a Gemini response object."""
+    # Checked ahead of every fallback below, including the `text` shortcut: a
+    # response cut off at max_output_tokens is truncated JSON even when some
+    # text exists, so it is not a valid answer whatever remains of it (and
+    # is possibly no text at all, if the budget went entirely to reasoning
+    # -- see MAX_TOKENS/MAX_TOKENS_RETRY's own comment in call_gemini_model).
+    candidates_for_finish = getattr(resp, "candidates", None) or []
+    if any(getattr(c, "finish_reason", None) == "MAX_TOKENS" for c in candidates_for_finish):
+        raise ProviderApiError("length", "Model output was truncated by max_tokens.")
+
     text = getattr(resp, "text", None)
     if isinstance(text, str) and text.strip():
         return text

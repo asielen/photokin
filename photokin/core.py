@@ -811,9 +811,12 @@ def _build_provider_client(config: utils.Config):
                 "missing_dependency",
                 _missing_sdk_message("Anthropic", "anthropic", "anthropic"),
             ) from exc
-        api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+        api_key = (os.getenv(utils.PROVIDER_API_KEY_ENV["anthropic"]) or "").strip()
         if not api_key:
-            raise ProviderApiError("missing_api_key", _missing_api_key_message("Anthropic", "ANTHROPIC_API_KEY"))
+            raise ProviderApiError(
+                "missing_api_key",
+                _missing_api_key_message("Anthropic", utils.PROVIDER_API_KEY_ENV["anthropic"]),
+            )
         return anthropic.Anthropic(api_key=api_key)
     if provider == "gemini":
         try:
@@ -824,9 +827,12 @@ def _build_provider_client(config: utils.Config):
                 "missing_dependency",
                 _missing_sdk_message("Gemini", "google-genai", "gemini"),
             ) from exc
-        api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+        api_key = (os.getenv(utils.PROVIDER_API_KEY_ENV["gemini"]) or "").strip()
         if not api_key:
-            raise ProviderApiError("missing_api_key", _missing_api_key_message("Gemini", "GEMINI_API_KEY"))
+            raise ProviderApiError(
+                "missing_api_key",
+                _missing_api_key_message("Gemini", utils.PROVIDER_API_KEY_ENV["gemini"]),
+            )
         # Unlike the Anthropic/OpenAI SDKs used here, google-genai has no
         # default request timeout -- observed in practice as a single
         # generate_content() call hanging indefinitely (over an hour, no
@@ -844,13 +850,16 @@ def _build_provider_client(config: utils.Config):
                 "missing_dependency",
                 _missing_sdk_message("OpenRouter", "openai", "openai"),
             ) from exc
-        api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+        api_key = (os.getenv(utils.PROVIDER_API_KEY_ENV["openrouter"]) or "").strip()
         if not api_key:
             # Do NOT pass api_key=None here: the OpenAI SDK would fall back to
             # OPENAI_API_KEY from the environment while still targeting the
             # OpenRouter base_url, leaking the wrong provider's secret to
             # OpenRouter. Require the OpenRouter key explicitly instead.
-            raise ProviderApiError("missing_api_key", _missing_api_key_message("OpenRouter", "OPENROUTER_API_KEY"))
+            raise ProviderApiError(
+                "missing_api_key",
+                _missing_api_key_message("OpenRouter", utils.PROVIDER_API_KEY_ENV["openrouter"]),
+            )
         base_url = (os.getenv("OPENROUTER_BASE_URL") or "").strip() or "https://openrouter.ai/api/v1"
         return OpenAI(api_key=api_key, base_url=base_url)
     try:
@@ -860,9 +869,12 @@ def _build_provider_client(config: utils.Config):
             "missing_dependency",
             _missing_sdk_message("OpenAI", "openai", "openai"),
         ) from exc
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    api_key = (os.getenv(utils.PROVIDER_API_KEY_ENV["openai"]) or "").strip()
     if not api_key:
-        raise ProviderApiError("missing_api_key", _missing_api_key_message("OpenAI", "OPENAI_API_KEY"))
+        raise ProviderApiError(
+            "missing_api_key",
+            _missing_api_key_message("OpenAI", utils.PROVIDER_API_KEY_ENV["openai"]),
+        )
     return OpenAI(api_key=api_key)
 
 
@@ -1005,7 +1017,10 @@ def analyze_photo(
     model_name = utils.resolve_model_for_provider(config)
     today = date.today().isoformat()
 
-    # Archival upload (lossless path; model call uses data URLs below)
+    # Archival upload (lossless path; model call uses data URLs below). Silently
+    # skipped for every provider but OpenAI (_should_run_archival_upload) -- not
+    # supporting it is the normal, unchanging case for three of four providers,
+    # not something worth a line in every single file's log.
     if _should_run_archival_upload(provider):
         for idx, p in enumerate(paths):
             if not p:
@@ -1013,8 +1028,6 @@ def analyze_photo(
             fid = utils.archival_upload(client, p, config.jpeg_quality, purpose="user_data")
             label = "front" if idx == 0 else "back"
             logger.info("Uploaded %s image (file_id=%s)", label, fid)
-    else:
-        logger.info("Skipping archival upload for provider %s (Files API unsupported).", provider)
 
     # Data URLs + sizes (for the multimodal call)
     image_data_urls: List[str] = []
@@ -1726,8 +1739,6 @@ def analyze_group_parts(
             fid = utils.archival_upload(client, p, config.jpeg_quality, purpose="user_data")
             role = path_labels[idx] if idx < len(path_labels) else "part"
             logger.info("Uploaded %s variant image (file_id=%s)", role, fid)
-    else:
-        logger.info("Skipping archival upload for provider %s (Files API unsupported).", provider)
 
     image_data_urls: List[str] = []
     image_byte_sizes: List[int] = []

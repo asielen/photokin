@@ -332,6 +332,46 @@ def _scan_argv_for_output_file(argv: list[str]) -> str | None:
             return token.split("=", 1)[1]
     return None
 
+
+#: Flags whose value also has a standing-default env-var equivalent (see
+#: README's "Config also picks up environment defaults"), rather than being
+#: CLI-only for the one run. ``_resolve_input`` names whichever of these
+#: appear in an invocation that gave no input at all -- ``photokin
+#: --claude-model sonnet`` is very often someone trying to change a default
+#: the way ``-h`` shows it, not a run that forgot its input by accident.
+_SETTINGS_FLAGS_WITH_ENV_VAR: dict[str, str] = {
+    "--provider": "LLM_PROVIDER",
+    "--openai-model": "OPENAI_MODEL",
+    "--claude-model": "CLAUDE_MODEL",
+    "--gemini-model": "GEMINI_MODEL",
+    "--openrouter-model": "OPENROUTER_MODEL",
+    "--exiftool-write": "EXIFTOOL_WRITE_ENABLED",
+    "--exiftool-fields": "EXIFTOOL_FIELDS",
+    "--exiftool-path": "EXIFTOOL_PATH",
+}
+
+
+def _settings_flags_named_in(argv: list[str]) -> tuple[tuple[str, str], ...]:
+    """Return the ``(flag, env_var)`` pairs from :data:`_SETTINGS_FLAGS_WITH_ENV_VAR` named in *argv*.
+
+    A best-effort linear scan, the same shape as
+    :func:`_scan_argv_for_output_file` and for the same reason: called before
+    input is resolved, so it must not raise on anything it cannot make sense
+    of.
+
+    Args:
+        argv: The raw argument list, before ``ap.parse_args`` sees it.
+
+    Returns:
+        Matching pairs, in :data:`_SETTINGS_FLAGS_WITH_ENV_VAR`'s order.
+    """
+    return tuple(
+        (flag, env_var)
+        for flag, env_var in _SETTINGS_FLAGS_WITH_ENV_VAR.items()
+        if any(token == flag or token.startswith(f"{flag}=") for token in argv)
+    )
+
+
 #: What each input kind is called in a message. The plan summary uses the same
 #: words without the article, so "what it was detected as" reads identically
 #: wherever it appears.
@@ -703,7 +743,7 @@ def _resolve_manifest_alias(value: str) -> ResolvedInput:
     return _resolved_input("manifest", path, value)
 
 
-def _resolve_input(args: argparse.Namespace) -> ResolvedInput:
+def _resolve_input(args: argparse.Namespace, argv: list[str] | None = None) -> ResolvedInput:
     """Pick the run's one input and settle what it is.
 
     An alias asserts the type and infers nothing, so ``--manifest ./scans/`` is
@@ -712,6 +752,12 @@ def _resolve_input(args: argparse.Namespace) -> ResolvedInput:
 
     Args:
         args: The parsed namespace.
+        argv: The raw argument list, so the "no input" refusal can point at
+            ``$env:CLAUDE_MODEL``-style defaults when every flag given is one
+            of :data:`_SETTINGS_FLAGS_WITH_ENV_VAR`. Optional and unused
+            otherwise (the rename-mode callers pass none, since none of their
+            flags are in that table): the plain refusal covers them the same
+            as before this existed.
 
     Returns:
         The resolved input.
@@ -737,7 +783,9 @@ def _resolve_input(args: argparse.Namespace) -> ResolvedInput:
             _exit_with_usage_error(
                 *cli_messages.generate_manifest_without_input(args.generate_manifest)
             )
-        _exit_with_usage_error(*cli_messages.no_input_given())
+        _exit_with_usage_error(
+            *cli_messages.no_input_given(_settings_flags_named_in(argv) if argv else ())
+        )
     if len(given) > 1:
         # With all three present the two aliases are reported and the positional
         # is named in neither message: one error per run is the contract.
@@ -1296,6 +1344,91 @@ def _resolve_provider(flag_value: str | None) -> str:
     if not installed:
         _exit_with_usage_error(*cli_messages.no_provider_sdk_installed())
     _exit_with_usage_error(*cli_messages.multiple_provider_sdks_installed(installed))
+
+
+def _build_show_config(args: argparse.Namespace) -> dict:
+    """Describe this invocation's fully resolved settings, before any input is required.
+
+    Answers a different question than :func:`_build_capabilities`: not "what
+    can this build do" but "what will THIS run actually use", after CLI flags
+    and environment variables are layered over every built-in default. Each
+    provider's API key is reported as set/not-set only -- never its value.
+
+    ``-w`` and ``-s`` are expanded the same way ``main`` expands them, since
+    the flags they stand for (``--changeset``, ``--sidecar-md``) are part of
+    "current settings"; ``-v`` is not, since none of the three flags it
+    expands to are surfaced here.
+
+    Args:
+        args: The parsed namespace, read before input resolution -- this
+            only touches flags that need neither an input nor a provider
+            client.
+
+    Returns:
+        A JSON-serializable dict.
+
+    Raises:
+        SystemExit: With code 2 when ``-w`` or ``-s`` contradicts an explicit
+            flag beside it -- the same refusal a real run would give.
+    """
+    selected_provider: str | None
+    try:
+        selected_provider = _resolve_provider(args.provider)
+    except SystemExit:
+        selected_provider = None
+
+    changeset_flag, exiftool_write = _resolve_write_bundle(args)
+    sidecar_md = _resolve_sidecar_bundle(args)
+
+    args.exiftool_write = exiftool_write
+    ecfg = _resolve_exiftool_config(args)
+    resolved_exiftool_path: str | None
+    exiftool_error: str | None
+    try:
+        resolved_exiftool_path = resolve_exiftool_path(ecfg)
+        exiftool_error = None
+    except FileNotFoundError as exc:
+        resolved_exiftool_path = None
+        exiftool_error = str(exc)
+
+    return {
+        "provider": {
+            "selected": selected_provider,
+            "installed_sdks": utils.installed_provider_sdks(),
+            "api_keys": {
+                provider: {
+                    "env_var": env_var,
+                    "set": bool((os.getenv(env_var) or "").strip()),
+                }
+                for provider, env_var in utils.PROVIDER_API_KEY_ENV.items()
+            },
+        },
+        "models": {
+            "openai": args.openai_model,
+            "anthropic": args.claude_model,
+            "gemini": args.gemini_model,
+            "openrouter": args.openrouter_model,
+        },
+        "image": {
+            "jpeg_quality": args.jpeg_quality,
+            "max_edge": None if args.max_edge in (None, 0) else args.max_edge,
+        },
+        "grouping": {"group_by": args.group_by, "max_images_per_call": args.max_images_per_call},
+        "confidence_thresholds": {
+            "date": args.date_confidence_threshold,
+            "location": args.location_confidence_threshold,
+        },
+        "sidecar_md": sidecar_md,
+        "update_vocab": not args.no_update_vocab,
+        "changeset_requested": changeset_flag == "true",
+        "exiftool": {
+            "write_enabled": ecfg.enabled,
+            "fields": list(ecfg.fields),
+            "configured_path": ecfg.path,
+            "resolved_path": resolved_exiftool_path,
+            "resolved_error": exiftool_error,
+        },
+    }
 
 
 def _preflight_exiftool(
@@ -2840,6 +2973,16 @@ def main() -> None:
                  "then exit -- before any input is required. For a caller that "
                  "wants to check compatibility rather than guess at it.",
         )
+        ap.add_argument(
+            "--show-config",
+            action="store_true",
+            help="Print this run's fully resolved settings -- provider, models, "
+                 "image/grouping/confidence settings, ExifTool config, and which "
+                 "provider API key env vars are set -- as JSON, then exit, before "
+                 "any input is required. Reflects CLI flags and environment "
+                 "variables layered over every built-in default; only whether "
+                 "each API key is set is shown, never its value.",
+        )
 
         ap.add_argument("--back", help="Path to the back image (single-photo input only)", default=None)
         ap.add_argument("--meta", help="Path to original metadata JSON (single-photo input only)", default=None)
@@ -3164,6 +3307,13 @@ def main() -> None:
             print(json.dumps(_build_capabilities(ap), indent=2, ensure_ascii=False))
             return
 
+        # Same timing as --capabilities, for the same reason: a caller
+        # inspecting its own settings should not have to point this at a
+        # real photo first.
+        if args.show_config:
+            print(json.dumps(_build_show_config(args), indent=2, ensure_ascii=False))
+            return
+
         # RENAME MODE and its executor commands: each one runs on its own and
         # stops before any provider client can be built or any envelope is
         # opened, the same way --generate-manifest does -- see
@@ -3217,7 +3367,7 @@ def main() -> None:
         if args.jpeg_quality < 1 or args.jpeg_quality > 100:
             ap.error("--jpeg-quality must be between 1 and 100")
 
-        resolved = _resolve_input(args)
+        resolved = _resolve_input(args, argv)
         loaded_manifest: dict | None = None
         if resolved.kind == "folder":
             _validate_folder_input(resolved)

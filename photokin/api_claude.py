@@ -23,14 +23,21 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-MAX_TOKENS = 4096
-# Thinking shares the output budget with the answer, so give it headroom.
-# 8192 was too tight for the judge scoring a large candidate roster in one
-# response (an 8-way group comparison needs a full scored block per
-# candidate plus notes) -- it was hitting this ceiling mid-thinking or
-# mid-answer and either truncating or, worse, returning zero text blocks
-# (extract_claude_output_text then falls back to the raw response repr,
-# which parses as "unparseable" rather than a clear truncation error).
+MAX_TOKENS = 16384
+# Even without an explicit `thinking` request, newer models (observed on
+# Sonnet 5) spend part of this budget on their own internal reasoning before
+# ever writing an answer -- 4096 was too tight for a text-dense document and
+# was hitting this ceiling mid-reasoning, before any text block existed. (It
+# used to also surface as an opaque JSONDecodeError rather than a clear
+# truncation -- extract_claude_output_text had a bug that let a response
+# with zero text blocks skip the stop_reason check entirely; fixed there
+# now.) call_claude_model retries once at THINKING_MAX_TOKENS when even this
+# still truncates, so this only needs to comfortably cover the common case.
+#
+# Thinking shares the same output budget with the answer, so it needs more
+# headroom still: 8192 was too tight for the judge scoring a large candidate
+# roster in one response (an 8-way group comparison needs a full scored
+# block per candidate plus notes).
 THINKING_MAX_TOKENS = 64000
 
 
@@ -68,6 +75,20 @@ def _model_supports_temperature(model: str) -> bool:
     if m.startswith("claude-sonnet-4") or m.startswith("claude-haiku") or m.startswith("claude-3"):
         return True
     return False
+
+
+def _is_unsupported_temperature_typeerror(message: str, payload: Dict[str, Any]) -> bool:
+    """True if a ``TypeError`` from ``messages.stream(**payload)`` is about `temperature`.
+
+    ``_model_supports_temperature``'s naming heuristic guesses from the model
+    string alone, so it cannot know when an installed SDK version's generated
+    client has dropped ``temperature`` from ``stream()``'s signature entirely
+    -- that shows up as a client-side ``TypeError`` before any request is
+    sent, not the server-side 400 the heuristic exists to avoid. Detecting it
+    here lets the caller retry once with the parameter dropped instead of
+    failing every request for that install.
+    """
+    return "temperature" in payload and "unexpected keyword argument 'temperature'" in message
 
 
 def _data_url_to_image_block(data_url: str) -> Dict[str, Any]:
@@ -153,15 +174,43 @@ def call_claude_model(
     if anthropic is None:
         raise ProviderApiError("missing_dependency", "anthropic package is required for Claude provider.")
 
-    try:
+    def _stream_and_finish(payload: Dict[str, Any]) -> Any:
         # Always stream: the SDK refuses a plain create() outright once
         # max_tokens is large enough that it estimates the response could
         # take longer than 10 minutes to generate (independent of which
         # model is called) -- streaming avoids that guard entirely and
         # get_final_message() still returns the same Message shape
         # extract_claude_output_text() and the usage/cost code expect.
-        with client.messages.stream(**request_payload) as stream:
+        with client.messages.stream(**payload) as stream:
             return stream.get_final_message()
+
+    def _call_with_temperature_retry(payload: Dict[str, Any]) -> Any:
+        try:
+            return _stream_and_finish(payload)
+        except TypeError as exc:
+            if not _is_unsupported_temperature_typeerror(str(exc), payload):
+                raise
+            retried = {k: v for k, v in payload.items() if k != "temperature"}
+            if dump_request:
+                dump_request(retried)
+            return _stream_and_finish(retried)
+
+    try:
+        response = _call_with_temperature_retry(request_payload)
+        if (
+            getattr(response, "stop_reason", None) == "max_tokens"
+            and request_payload["max_tokens"] < THINKING_MAX_TOKENS
+        ):
+            # Ran out of budget -- possibly mid-reasoning, before any answer
+            # text existed (see extract_claude_output_text and MAX_TOKENS'
+            # own comment). One retry at the same ceiling the thinking path
+            # already uses, rather than fail a request that likely just
+            # needed more room, since the common case never reaches here.
+            escalated = {**request_payload, "max_tokens": THINKING_MAX_TOKENS}
+            if dump_request:
+                dump_request(escalated)
+            response = _call_with_temperature_retry(escalated)
+        return response
     except anthropic.RateLimitError as exc:
         raise ProviderApiError(
             "rate_limit",
@@ -204,10 +253,14 @@ def extract_claude_output_text(resp: Any) -> str:
             parts.append(text)
 
     joined = "\n".join(parts).strip()
-    if not joined:
-        return str(resp)
-
+    # Checked ahead of the "no text" fallback below, not after it: a response
+    # that ran out of budget while still thinking has no text block at all
+    # yet (joined == "") -- str(resp) then looks like model output to
+    # json.loads() and fails as an opaque JSONDecodeError instead of this
+    # clear one. See MAX_TOKENS's comment above for the first time this bit.
     stop_reason = getattr(resp, "stop_reason", None)
     if stop_reason == "max_tokens":
         raise ProviderApiError("length", "Model output was truncated by max_tokens.")
+    if not joined:
+        return str(resp)
     return joined

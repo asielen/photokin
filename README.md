@@ -805,7 +805,7 @@ Prints this build's contract as JSON and exits, before any input is required —
 
 ```json
 {
-  "version": "0.6.1",
+  "version": "0.6.2",
   "ndjson_schema_version": 3,
   "changeset_schema_version": 2,
   "canonical_tags": {
@@ -822,6 +822,45 @@ Prints this build's contract as JSON and exits, before any input is required —
 ```
 
 Meant to replace an install-time probe (importing some internal symbol and trusting a pip version pin to mean everything else still matches) with a real, versioned answer a launcher can gate a run on instead of discovering a mismatch mid-batch. `canonical_tags` in particular is worth checking before a batch: an earlier photokin release wrote the wrong ExifTool tag spelling entirely (`XMP:dc:Description` instead of the writable `XMP-dc:Description`), which silently dropped every caption it tried to write rather than failing — a `--capabilities` check catches that class of mismatch instead of losing data quietly. `flags` is read live off the argument parser, so it can never drift from what the installed build actually accepts.
+
+### Checking your current settings: `--show-config`
+
+```bash
+photokin --show-config --provider openai --jpeg-quality 90
+```
+
+Prints this *invocation's* fully resolved settings as JSON and exits, before any input is required — the same timing as `--capabilities`, but a different question: not "what can this build do" but "what will this exact command line actually use" once every flag, environment variable (`OPENAI_MODEL`, `LLM_PROVIDER`, `EXIFTOOL_FIELDS`, ...) and built-in default has been resolved down to one value:
+
+```json
+{
+  "provider": {
+    "selected": "openai",
+    "installed_sdks": ["openai", "anthropic"],
+    "api_keys": {
+      "openai": {"env_var": "OPENAI_API_KEY", "set": true},
+      "anthropic": {"env_var": "ANTHROPIC_API_KEY", "set": false},
+      "gemini": {"env_var": "GEMINI_API_KEY", "set": false},
+      "openrouter": {"env_var": "OPENROUTER_API_KEY", "set": false}
+    }
+  },
+  "models": {"openai": "gpt-4o", "anthropic": "sonnet", "gemini": "gemini-2.5-flash", "openrouter": "moonshotai/kimi-k3"},
+  "image": {"jpeg_quality": 90, "max_edge": 1024},
+  "grouping": {"group_by": "object", "max_images_per_call": 8},
+  "confidence_thresholds": {"date": 0.6, "location": 0.7},
+  "sidecar_md": "off",
+  "update_vocab": true,
+  "changeset_requested": false,
+  "exiftool": {
+    "write_enabled": false,
+    "fields": ["EXIF:UserComment", "..."],
+    "configured_path": null,
+    "resolved_path": "C:\\...\\exiftool.exe",
+    "resolved_error": null
+  }
+}
+```
+
+Each provider's API key is reported as `set`/not only — the value itself is never read into the output, so this is safe to paste into a bug report. `provider.selected` is `null` when nothing resolves it (no `--provider`, no `LLM_PROVIDER`, and zero or several SDKs installed) — the same ambiguity a real run would refuse over, printed here to stderr as it is refused rather than left unexplained. `exiftool.resolved_path`/`resolved_error` report whether the ExifTool binary photokin would actually call is findable right now, the same lookup `-r`/`-w` depend on, without needing a real file to run it against.
 
 ### A clean refusal for a headless launcher: empty or malformed argv
 

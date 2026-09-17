@@ -325,13 +325,34 @@ def two_aliases(folder_value: str, manifest_value: str) -> UsageMessage:
     )
 
 
-def no_input_given() -> UsageMessage:
+def no_input_given(settings_flags: tuple[tuple[str, str], ...] = ()) -> UsageMessage:
     """Arguments were passed, but none of them names an input.
+
+    Args:
+        settings_flags: ``(flag, env_var)`` pairs for every settings flag with
+            an environment-variable equivalent (see
+            ``cli._SETTINGS_FLAGS_WITH_ENV_VAR``) that this invocation named.
+            A run built only from these, with no input, is very often someone
+            trying to change a standing default rather than start an
+            analysis -- ``photokin --claude-model sonnet`` looks like it
+            should work the way ``-h`` shows the flag's default, not fail.
+            The remedy says how to do that instead of just repeating the
+            three input examples.
 
     Returns:
         The problem line and the remedy line, in that order.
     """
-    return ("no input was given.", f"name one: {_INPUT_EXAMPLES}")
+    if not settings_flags:
+        return ("no input was given.", f"name one: {_INPUT_EXAMPLES}")
+    flags = ", ".join(f"`{flag}`" for flag, _ in settings_flags)
+    env_vars = ", ".join(env_var for _, env_var in settings_flags)
+    example_var = settings_flags[0][1]
+    return (
+        "no input was given.",
+        f"{flags} only sets this one run -- for a standing default, set {env_vars} instead "
+        f'(PowerShell: $env:{example_var} = "..."; macOS/Linux: export {example_var}=...); '
+        f"to run now, also name an input: {_INPUT_EXAMPLES}",
+    )
 
 
 def no_input_and_not_interactive() -> UsageMessage:

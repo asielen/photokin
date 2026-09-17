@@ -181,7 +181,11 @@ class Config:
 
 
 CLAUDE_MODELS: Dict[str, str] = {
-    "sonnet": "claude-sonnet-4-6",
+    # Undated aliases -- Anthropic's own "track the newest snapshot of this
+    # generation" mechanism (see https://code.claude.com/docs/en/model-config:
+    # on the direct Anthropic API, "sonnet" resolves to Sonnet 5, not 4.6).
+    # A fully bare "claude-sonnet"/"sonnet" is not a model the API accepts.
+    "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5-20251001",
 }
 
@@ -196,6 +200,17 @@ PROVIDER_SDK_MODULES: Dict[str, str] = {
     "openai": "openai",
     "anthropic": "anthropic",
     "gemini": "google.genai",
+}
+
+#: The API key environment variable each provider's client is built from.
+#: Single source of truth for ``core._build_provider_client`` and the CLI's
+#: ``--show-config``, so the two can never name a different variable for the
+#: same provider.
+PROVIDER_API_KEY_ENV: Dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
 }
 
 

@@ -149,7 +149,7 @@ def test_front_back_pair_back_file(tmp_path: Path) -> None:
         'title: "Letter to Mother"\n'
         'category: "Document"\n'
         'keywords: ["Document"]\n'
-        f'analyzed_by: "Claude claude-sonnet-4-6 ({real_date.today().isoformat()})"\n'  # noqa: DTZ011
+        f'analyzed_by: "Claude claude-sonnet-5 ({real_date.today().isoformat()})"\n'  # noqa: DTZ011
         "---\n"
         "\n"
         "# Letter to Mother\n"
@@ -161,7 +161,7 @@ def test_front_back_pair_back_file(tmp_path: Path) -> None:
     assert content == expected
     # _usage carried no model, so analyzed_by fell back to the provider's
     # resolved model, not the (unrelated, OpenAI-shaped) config.model above.
-    assert 'analyzed_by: "Claude claude-sonnet-4-6' in content
+    assert 'analyzed_by: "Claude claude-sonnet-5' in content
 
 
 def test_multipage_page_with_correction(tmp_path: Path) -> None:

@@ -1182,6 +1182,68 @@ class TestABlankInputTokenIsRefused(_CliTestCase):
         self.assertIn("[INFO] Treating `.` as a folder (it is a directory).", stderr)
 
 
+class TestNoInputHintsAtStandingDefaults(_CliTestCase):
+    """A run built only from settings flags -- no input -- is very often
+    someone trying to change a default (``-h`` shows it as one), not a run
+    that forgot its input. The remedy should say how to do that instead of
+    just repeating the three input examples."""
+
+    def test_names_the_matching_env_var(self) -> None:
+        code, _stdout, stderr = self.run_cli(["--claude-model", "sonnet"])
+
+        self.assertEqual(code, 2)
+        lines = self.usage_error(stderr)
+        self.assertEqual(lines[0], "[ERROR] no input was given.")
+        remedy = lines[1]
+        self.assertIn("`--claude-model`", remedy)
+        self.assertIn("CLAUDE_MODEL", remedy)
+        self.assertIn("photokin ./scans/", remedy)
+
+    def test_flag_with_no_env_var_gets_the_plain_message(self) -> None:
+        # --jpeg-quality has no standing-default equivalent to point at, so
+        # the original message is still the right one.
+        code, _stdout, stderr = self.run_cli(["--jpeg-quality", "90"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(
+            self.usage_error(stderr), ["[ERROR] no input was given.", "Try: name one: photokin ./scans/, photokin batch.json, or photokin scan_042.jpg"]
+        )
+
+    def test_multiple_settings_flags_are_all_named(self) -> None:
+        code, _stdout, stderr = self.run_cli(
+            ["--provider", "anthropic", "--claude-model", "sonnet"]
+        )
+
+        self.assertEqual(code, 2)
+        remedy = self.usage_error(stderr)[1]
+        self.assertIn("--provider", remedy)
+        self.assertIn("LLM_PROVIDER", remedy)
+        self.assertIn("--claude-model", remedy)
+        self.assertIn("CLAUDE_MODEL", remedy)
+
+    def test_generate_manifest_without_input_is_unaffected(self) -> None:
+        # --generate-manifest has its own, more specific refusal (naming the
+        # manifest path it would have written); a settings flag beside it
+        # must not steal that message.
+        code, _stdout, stderr = self.run_cli(
+            ["--generate-manifest", "out.json", "--claude-model", "sonnet"]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertNotIn("CLAUDE_MODEL", stderr)
+
+    def test_rename_undo_with_no_folder_is_unaffected(self) -> None:
+        # The rename-mode callers of _resolve_input pass no argv, so a
+        # settings flag beside one of them still gets its own message
+        # (rename-command-needs-folder), not this hint.
+        code, _stdout, stderr = self.run_cli(
+            ["--rename-undo", "--claude-model", "sonnet"]
+        )
+
+        self.assertEqual(code, 2)
+        self.assertNotIn("CLAUDE_MODEL", stderr)
+
+
 class TestThePlanNamesTheResolvedInput(_CliTestCase):
     """The summary answers "which folder", which a relative token cannot.
 
@@ -2357,6 +2419,96 @@ class TestCapabilities(_CliTestCase):
         with patch("photokin.cli.process_manifest_stream", stream):
             self.run_cli(["--capabilities"])
         stream.assert_not_called()
+
+
+class TestShowConfig(_CliTestCase):
+    """``--show-config`` answers "what will this exact command line use",
+    the same timing as ``--capabilities`` but a different question."""
+
+    def test_prints_json_and_exits_without_requiring_input(self):
+        with patch("photokin.cli.resolve_exiftool_path", return_value="/fake/exiftool"):
+            code, stdout, _stderr = self.run_cli(
+                ["--show-config"], env={"OPENAI_API_KEY": "sk-fake"}
+            )
+        self.assertIsNone(code)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["provider"]["selected"], "openai")
+        self.assertEqual(payload["models"]["openai"], "gpt-4o")
+        self.assertEqual(payload["image"], {"jpeg_quality": 80, "max_edge": 1024})
+        self.assertEqual(payload["exiftool"]["resolved_path"], "/fake/exiftool")
+
+    def test_does_not_call_the_model(self):
+        stream = Mock()
+        with patch("photokin.cli.process_manifest_stream", stream):
+            self.run_cli(["--show-config"], env={"OPENAI_API_KEY": "sk-fake"})
+        stream.assert_not_called()
+
+    def test_reports_api_key_presence_without_leaking_the_value(self):
+        with patch("photokin.cli.resolve_exiftool_path", return_value="/fake/exiftool"):
+            code, stdout, _stderr = self.run_cli(
+                ["--show-config"],
+                env={
+                    "OPENAI_API_KEY": "sk-super-secret-value",
+                    "ANTHROPIC_API_KEY": None,
+                },
+            )
+        self.assertIsNone(code)
+        payload = json.loads(stdout)
+        api_keys = payload["provider"]["api_keys"]
+        self.assertEqual(
+            api_keys["openai"], {"env_var": "OPENAI_API_KEY", "set": True}
+        )
+        self.assertEqual(
+            api_keys["anthropic"], {"env_var": "ANTHROPIC_API_KEY", "set": False}
+        )
+        self.assertNotIn("sk-super-secret-value", stdout)
+
+    def test_reflects_cli_flags_over_defaults(self):
+        with patch("photokin.cli.resolve_exiftool_path", return_value="/fake/exiftool"):
+            code, stdout, _stderr = self.run_cli(
+                ["--show-config", "--jpeg-quality", "42", "--openai-model", "gpt-4.1"],
+                env={"OPENAI_API_KEY": "sk-fake"},
+            )
+        self.assertIsNone(code)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["image"]["jpeg_quality"], 42)
+        self.assertEqual(payload["models"]["openai"], "gpt-4.1")
+
+    def test_reflects_w_and_s_shorthand(self):
+        with patch("photokin.cli.resolve_exiftool_path", return_value="/fake/exiftool"):
+            code, stdout, _stderr = self.run_cli(
+                ["--show-config", "-w", "-s"], env={"OPENAI_API_KEY": "sk-fake"}
+            )
+        self.assertIsNone(code)
+        payload = json.loads(stdout)
+        self.assertTrue(payload["changeset_requested"])
+        self.assertTrue(payload["exiftool"]["write_enabled"])
+        self.assertEqual(payload["sidecar_md"], "auto")
+
+    def test_selected_provider_is_null_when_ambiguous(self):
+        with patch(
+            "photokin.utils.installed_provider_sdks",
+            return_value=["openai", "anthropic"],
+        ), patch("photokin.cli.resolve_exiftool_path", return_value="/fake/exiftool"):
+            code, stdout, _stderr = self.run_cli(
+                ["--show-config"], env={"LLM_PROVIDER": None}
+            )
+        self.assertIsNone(code)
+        payload = json.loads(stdout)
+        self.assertIsNone(payload["provider"]["selected"])
+
+    def test_exiftool_resolution_failure_is_reported_not_raised(self):
+        with patch(
+            "photokin.cli.resolve_exiftool_path",
+            side_effect=FileNotFoundError("ExifTool not found."),
+        ):
+            code, stdout, _stderr = self.run_cli(
+                ["--show-config"], env={"OPENAI_API_KEY": "sk-fake"}
+            )
+        self.assertIsNone(code)
+        payload = json.loads(stdout)
+        self.assertIsNone(payload["exiftool"]["resolved_path"])
+        self.assertIn("ExifTool not found", payload["exiftool"]["resolved_error"])
 
 
 if __name__ == "__main__":

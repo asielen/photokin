@@ -158,8 +158,8 @@ class TestProviderResolution(unittest.TestCase):
         self.assertEqual(utils.normalize_provider("OpenRouter"), "openrouter")
 
     def test_claude_model_resolution_alias_and_default(self):
-        self.assertEqual(utils.resolve_claude_model("sonnet"), "claude-sonnet-4-6")
-        self.assertEqual(utils.resolve_claude_model(""), "claude-sonnet-4-6")
+        self.assertEqual(utils.resolve_claude_model("sonnet"), "claude-sonnet-5")
+        self.assertEqual(utils.resolve_claude_model(""), "claude-sonnet-5")
         self.assertEqual(utils.resolve_claude_model("claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001")
 
     def test_resolve_model_for_provider(self):
@@ -376,6 +376,77 @@ class TestModelNotFound(unittest.TestCase):
                 [{"type": "input_text", "text": "describe"}],
                 ["data:image/jpeg;base64,aGk="],
             )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(ctx.exception.error_type, "model_not_found")
+
+    def test_openai_unsupported_temperature_retries_without_it(self):
+        """A model _model_supports_temperature's naming heuristic doesn't
+        recognize as temperature-less (e.g. a new generation's prefix) still
+        succeeds: the first 400 triggers one retry with temperature dropped."""
+        import httpx
+        import openai
+
+        from photokin import api_openai
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        bad_request_exc = openai.BadRequestError(
+            "Unsupported parameter: 'temperature' is not supported with this model.",
+            response=httpx.Response(400, request=request),
+            body=None,
+        )
+        calls: list = []
+
+        class _Responses:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise bad_request_exc
+                return "resp"
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(responses=_Responses())
+        )
+        result = api_openai.call_openai_model(
+            client,
+            "gpt-6-astra",
+            [{"type": "input_text", "text": "describe"}],
+            [],
+        )
+        self.assertEqual(result, "resp")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("temperature", calls[0])
+        self.assertNotIn("temperature", calls[1])
+
+    def test_openai_notfound_on_temperature_fallback_retry_also_maps(self):
+        """If the temperature-dropped retry itself 404s, that must not be
+        swallowed as a generic api_status by the retry's own except clause."""
+        import httpx
+        import openai
+
+        from photokin import api_openai
+        from photokin.errors import ProviderApiError
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        bad_request_exc = openai.BadRequestError(
+            "Unsupported parameter: 'temperature' is not supported with this model.",
+            response=httpx.Response(400, request=request),
+            body=None,
+        )
+        not_found_exc = openai.NotFoundError(
+            "model not found", response=httpx.Response(404, request=request), body=None
+        )
+        calls: list = []
+
+        class _Responses:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                raise bad_request_exc if len(calls) == 1 else not_found_exc
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(responses=_Responses())
+        )
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_openai.call_openai_model(client, "gpt-6-astra", [], [])
         self.assertEqual(len(calls), 2)
         self.assertEqual(ctx.exception.error_type, "model_not_found")
 
@@ -637,6 +708,249 @@ class TestArchivalUploadErrorNormalization(unittest.TestCase):
         self.assertEqual(err.error_type, "invalid_input")
         self.assertEqual(err.status_code, 400)
         self.assertEqual(err.provider_message, "Invalid file format")
+
+
+class _GeminiCandidateStub:
+    def __init__(self, finish_reason):
+        self.finish_reason = finish_reason
+        self.content = None
+
+
+class _GeminiResponseWithFinishReason:
+    def __init__(self, finish_reason):
+        self.candidates = [_GeminiCandidateStub(finish_reason)]
+        self.text = None
+        self.prompt_feedback = None
+
+
+class TestMaxTokensRetryAcrossProviders(unittest.TestCase):
+    """The same escalate-once-then-give-up shape as api_claude's
+    TestMaxTokensRetry, for the other two providers with a photokin-chosen
+    ceiling to retry higher against. api_openai sets no ceiling of its own
+    (see extract_openai_output_text's docstring), so it has nothing to
+    escalate to and is covered separately below by detection alone."""
+
+    def test_gemini_retries_once_and_succeeds(self):
+        from photokin import api_gemini
+
+        calls: list = []
+
+        def generate_content(**kwargs):
+            calls.append(kwargs)
+            max_tokens = kwargs["config"]["max_output_tokens"]
+            finish_reason = "MAX_TOKENS" if max_tokens < api_gemini.MAX_TOKENS_RETRY else "STOP"
+            return _GeminiResponseWithFinishReason(finish_reason)
+
+        client = types.SimpleNamespace(
+            models=types.SimpleNamespace(generate_content=generate_content)
+        )
+        result = api_gemini.call_gemini_model(client, "gemini-2.5-flash", [], [])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["config"]["max_output_tokens"], api_gemini.MAX_TOKENS)
+        self.assertEqual(calls[1]["config"]["max_output_tokens"], api_gemini.MAX_TOKENS_RETRY)
+        self.assertEqual(result.candidates[0].finish_reason, "STOP")
+
+    def test_gemini_gives_up_after_one_retry(self):
+        from photokin import api_gemini
+
+        calls: list = []
+
+        def generate_content(**kwargs):
+            calls.append(kwargs)
+            return _GeminiResponseWithFinishReason("MAX_TOKENS")
+
+        client = types.SimpleNamespace(
+            models=types.SimpleNamespace(generate_content=generate_content)
+        )
+        result = api_gemini.call_gemini_model(client, "gemini-2.5-flash", [], [])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result.candidates[0].finish_reason, "MAX_TOKENS")
+
+    def test_openai_compat_retries_once_and_succeeds(self):
+        from photokin import api_openai_compat
+
+        calls: list = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            if kwargs["max_tokens"] < api_openai_compat.MAX_TOKENS_RETRY:
+                return _ChatCompletionResponseStub(None, finish_reason="length")
+            return _ChatCompletionResponseStub("the answer", finish_reason="stop")
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(
+                chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+            )
+        )
+        result = api_openai_compat.call_openai_compat_model(client, "moonshotai/kimi-k3", [], [])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["max_tokens"], api_openai_compat.MAX_TOKENS)
+        self.assertEqual(calls[1]["max_tokens"], api_openai_compat.MAX_TOKENS_RETRY)
+        self.assertEqual(extract_openai_compat_output_text(result), "the answer")
+
+    def test_openai_compat_gives_up_after_one_retry(self):
+        from photokin import api_openai_compat
+
+        calls: list = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            return _ChatCompletionResponseStub(None, finish_reason="length")
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(
+                chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+            )
+        )
+        result = api_openai_compat.call_openai_compat_model(client, "moonshotai/kimi-k3", [], [])
+        self.assertEqual(len(calls), 2)
+        with self.assertRaises(ProviderApiError) as ctx:
+            extract_openai_compat_output_text(result)
+        self.assertEqual(ctx.exception.error_type, "length")
+
+
+class TestTemperatureRetryForGeminiAndOpenRouter(unittest.TestCase):
+    """Gemini and OpenRouter have no per-model naming heuristic for
+    temperature support (unlike OpenAI/Claude) -- both detect an unsupported
+    override reactively, the same shape as
+    TestModelNotFound.test_openai_unsupported_temperature_retries_without_it."""
+
+    def test_gemini_retries_without_temperature(self):
+        from photokin import api_gemini
+
+        calls: list = []
+
+        def generate_content(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError("400 INVALID_ARGUMENT: temperature is not supported for this model.")
+            return _GeminiResponseWithFinishReason("STOP")
+
+        client = types.SimpleNamespace(
+            models=types.SimpleNamespace(generate_content=generate_content)
+        )
+        result = api_gemini.call_gemini_model(client, "gemini-2.5-flash", [], [])
+        self.assertEqual(result.candidates[0].finish_reason, "STOP")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("temperature", calls[0]["config"])
+        self.assertNotIn("temperature", calls[1]["config"])
+
+    def test_gemini_unrelated_error_is_not_swallowed(self):
+        from photokin import api_gemini
+        from photokin.errors import ProviderApiError
+
+        client = types.SimpleNamespace(
+            models=types.SimpleNamespace(
+                generate_content=lambda **kwargs: (_ for _ in ()).throw(
+                    RuntimeError("400 INVALID_ARGUMENT: request payload too large.")
+                )
+            )
+        )
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_gemini.call_gemini_model(client, "gemini-2.5-flash", [], [])
+        self.assertEqual(ctx.exception.error_type, "invalid_input")
+
+    def test_openai_compat_retries_without_temperature(self):
+        import httpx
+        import openai
+
+        from photokin import api_openai_compat
+
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        bad_request_exc = openai.BadRequestError(
+            "temperature is not supported for this model",
+            response=httpx.Response(400, request=request),
+            body=None,
+        )
+        calls: list = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise bad_request_exc
+            return _ChatCompletionResponseStub("the answer", finish_reason="stop")
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(
+                chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+            )
+        )
+        result = api_openai_compat.call_openai_compat_model(
+            client, "moonshotai/kimi-k3", [{"type": "input_text", "text": "describe"}], []
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertIn("temperature", calls[0])
+        self.assertNotIn("temperature", calls[1])
+        self.assertEqual(extract_openai_compat_output_text(result), "the answer")
+
+    def test_openai_compat_unrelated_bad_request_is_not_swallowed(self):
+        import httpx
+        import openai
+
+        from photokin import api_openai_compat
+
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        bad_request_exc = openai.BadRequestError(
+            "invalid image format",
+            response=httpx.Response(400, request=request),
+            body=None,
+        )
+
+        def create(**kwargs):
+            raise bad_request_exc
+
+        client = types.SimpleNamespace(
+            with_options=lambda **kw: types.SimpleNamespace(
+                chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+            )
+        )
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_openai_compat.call_openai_compat_model(client, "moonshotai/kimi-k3", [], [])
+        self.assertEqual(ctx.exception.error_type, "invalid_input")
+
+
+class TestGeminiMaxTokensDetection(unittest.TestCase):
+    def test_extract_raises_length_on_max_tokens(self):
+        from photokin import api_gemini
+
+        resp = _GeminiResponseWithFinishReason("MAX_TOKENS")
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_gemini.extract_gemini_output_text(resp)
+        self.assertEqual(ctx.exception.error_type, "length")
+
+    def test_extract_unaffected_by_normal_stop(self):
+        from photokin import api_gemini
+
+        resp = _GeminiResponseWithFinishReason("STOP")
+        resp.text = "hello"
+        self.assertEqual(api_gemini.extract_gemini_output_text(resp), "hello")
+
+
+class TestOpenAIIncompleteDetection(unittest.TestCase):
+    """api_openai sets no max_output_tokens ceiling of its own (see
+    extract_openai_output_text's docstring), so there is nothing to retry
+    higher against -- only detection is covered here."""
+
+    def test_incomplete_max_output_tokens_raises_length(self):
+        from photokin import api_openai
+
+        resp = types.SimpleNamespace(
+            status="incomplete",
+            incomplete_details=types.SimpleNamespace(reason="max_output_tokens"),
+            output_text=None,
+            output=None,
+        )
+        with self.assertRaises(ProviderApiError) as ctx:
+            api_openai.extract_openai_output_text(resp)
+        self.assertEqual(ctx.exception.error_type, "length")
+
+    def test_completed_response_unaffected(self):
+        from photokin import api_openai
+
+        resp = types.SimpleNamespace(
+            status="completed", incomplete_details=None, output_text="hello"
+        )
+        self.assertEqual(api_openai.extract_openai_output_text(resp), "hello")
 
 
 if __name__ == "__main__":
