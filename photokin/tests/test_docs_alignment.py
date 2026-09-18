@@ -56,6 +56,7 @@ _FOREIGN_FLAGS = frozenset(
         "--output-format",
         "--model",
         "--print",
+        "--no-session-persistence",
     }
 )
 

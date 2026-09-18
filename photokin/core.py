@@ -4233,8 +4233,12 @@ def process_manifest_stream(
 
             def _tok(u: dict | None, key: str) -> int:
                 return int(u.get(key)) if (u and isinstance(u.get(key), int)) else 0
+            def _cost(u: dict | None) -> float:
+                value = u.get("total_cost_usd") if u else None
+                return float(value) if isinstance(value, (int, float)) else 0.0
             tot_prompt = sum(_tok(rec.get("_usage"), "prompt_tokens") for rec, _, _ in analyses)
             tot_completion = sum(_tok(rec.get("_usage"), "completion_tokens") for rec, _, _ in analyses)
+            tot_cost = sum(_cost(rec.get("_usage")) for rec, _, _ in analyses)
             # analyses has one entry per API call made for this group (usually
             # exactly one); take the resolved model string from it -- this
             # dict otherwise replaces the per-analysis _usage entirely, so
@@ -4250,6 +4254,11 @@ def process_manifest_stream(
                 "total_tokens": (tot_prompt + tot_completion) or None,
                 "model": usage_model,
             }
+            # Omitted entirely rather than set to None/0 when no per-record
+            # _usage carried one (every provider but claude-code), so this
+            # stays a byte-for-byte no-op for every existing consumer.
+            if tot_cost:
+                canonical["_usage"]["total_cost_usd"] = tot_cost
 
             canonical["keywords"] = shared_keywords
 

@@ -1049,6 +1049,67 @@ class TestClaudeCodeCliStatus(unittest.TestCase):
         self.assertTrue(status["binary_found"])
         self.assertIsNone(status["authenticated"])
 
+    def test_missing_logged_in_key_is_inconclusive_not_confirmed_logout(self):
+        """A payload that parses as JSON but lacks a boolean loggedIn (e.g.
+        an error object, or a future CLI version's changed response shape)
+        must not be silently coerced into a confirmed logout -- bool(None)
+        is False, which would incorrectly make _build_provider_client treat
+        it as run-fatal instead of retrying."""
+        completed = types.SimpleNamespace(stdout=b'{"error": "unexpected"}')
+        with patch.object(utils.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
+            utils.subprocess, "run", return_value=completed
+        ):
+            status = utils.claude_code_cli_status()
+        self.assertIsNone(status["authenticated"])
+
+    def test_non_boolean_logged_in_is_inconclusive(self):
+        """A truthy non-boolean loggedIn (e.g. the string "false") must not
+        be accepted at face value -- bool("false") is True in Python, which
+        would silently misreport a logged-out CLI as logged in."""
+        completed = types.SimpleNamespace(stdout=b'{"loggedIn": "false"}')
+        with patch.object(utils.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
+            utils.subprocess, "run", return_value=completed
+        ):
+            status = utils.claude_code_cli_status()
+        self.assertIsNone(status["authenticated"])
+
+    def test_non_object_payload_is_inconclusive(self):
+        completed = types.SimpleNamespace(stdout=b'[1, 2, 3]')
+        with patch.object(utils.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
+            utils.subprocess, "run", return_value=completed
+        ):
+            status = utils.claude_code_cli_status()
+        self.assertIsNone(status["authenticated"])
+
+    def test_probe_strips_anthropic_credentials_from_subprocess_env(self):
+        """Confirmed by direct trial against the real CLI: with
+        ANTHROPIC_API_KEY set, even --safe-mode (not --bare) reports
+        apiKeySource: "ANTHROPIC_API_KEY" instead of using OAuth/subscription
+        login -- so every subprocess this provider spawns must have Anthropic
+        credential env vars stripped, or a key set for --provider anthropic
+        elsewhere silently hijacks claude-code's billing too."""
+        completed = types.SimpleNamespace(stdout=b'{"loggedIn": true}')
+        captured_env = {}
+
+        def _fake_run(*args, **kwargs):
+            captured_env.update(kwargs.get("env") or {})
+            return completed
+
+        with patch.object(utils.shutil, "which", return_value="/usr/local/bin/claude"), patch.object(
+            utils.subprocess, "run", side_effect=_fake_run
+        ), patch.dict(
+            os.environ, {"ANTHROPIC_API_KEY": "sk-ant-should-not-leak", "ANTHROPIC_AUTH_TOKEN": "tok-should-not-leak"}
+        ):
+            utils.claude_code_cli_status()
+        self.assertNotIn("ANTHROPIC_API_KEY", captured_env)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", captured_env)
+
+    def test_sanitized_env_preserves_everything_else(self):
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-secret", "SOME_OTHER_VAR": "keep-me"}):
+            sanitized = utils.sanitized_claude_code_env()
+        self.assertNotIn("ANTHROPIC_API_KEY", sanitized)
+        self.assertEqual(sanitized.get("SOME_OTHER_VAR"), "keep-me")
+
 
 class TestClaudeCodeAdapter(unittest.TestCase):
     """api_claude_code shells out to `claude -p` and parses its stream-json
@@ -1081,6 +1142,29 @@ class TestClaudeCodeAdapter(unittest.TestCase):
         sent = json.loads(mock_run.call_args.kwargs["input"].decode("utf-8"))
         self.assertEqual(sent["type"], "user")
         self.assertEqual(sent["message"]["content"][-1]["text"], "Describe this photo.")
+
+    def test_command_disables_session_persistence(self):
+        """Print mode persists sessions (with the full prompt and any base64
+        image data) to disk by default; a batch run must not leave one such
+        file behind per photo."""
+        from photokin import api_claude_code
+
+        self.assertIn("--no-session-persistence", api_claude_code._build_command("/usr/local/bin/claude", "haiku"))
+
+    def test_call_strips_anthropic_credentials_from_subprocess_env(self):
+        """Confirmed by direct trial: with ANTHROPIC_API_KEY set, even
+        --safe-mode reports using that key instead of OAuth/subscription
+        login -- a key set for --provider anthropic elsewhere must not leak
+        into this provider's subprocess and hijack its billing."""
+        from photokin import api_claude_code
+
+        result_line = json.dumps({"type": "result", "is_error": False, "result": "ok"})
+        completed = self._completed([result_line])
+        with patch.object(api_claude_code.subprocess, "run", return_value=completed) as mock_run, patch.dict(
+            os.environ, {"ANTHROPIC_API_KEY": "sk-ant-should-not-leak"}
+        ):
+            api_claude_code.call_claude_code_model(self._client(), "haiku", [], [])
+        self.assertNotIn("ANTHROPIC_API_KEY", mock_run.call_args.kwargs["env"])
 
     def test_truncated_response_raises_length_not_dict_repr(self):
         """A response truncated by max_tokens has no text yet; falling
@@ -1225,6 +1309,35 @@ class TestGetResponseModelDictSupport(unittest.TestCase):
 
         self.assertEqual(api.get_response_model({"model": "claude-haiku-4-5-20251001"}, "fallback"), "claude-haiku-4-5-20251001")
         self.assertEqual(api.get_response_model({}, "fallback"), "fallback")
+
+
+class TestExtractUsagePropagatesClaudeCodeCost(unittest.TestCase):
+    """claude-code is the only adapter whose response carries a client-side
+    cost estimate (total_cost_usd) -- it must not be silently dropped."""
+
+    def test_total_cost_usd_is_propagated_for_dict_response(self):
+        resp = {
+            "model": "claude-haiku-4-5-20251001",
+            "total_cost_usd": 0.001117,
+            "usage": {"input_tokens": 887, "output_tokens": 46},
+        }
+        usage = utils.extract_usage(resp)
+        self.assertEqual(usage["total_cost_usd"], 0.001117)
+
+    def test_missing_total_cost_usd_is_omitted_not_a_crash(self):
+        """Omitted entirely rather than set to None, so this stays a
+        byte-for-byte no-op for every existing consumer/golden-output test
+        of a provider that never had this field."""
+        resp = {"model": "claude-haiku-4-5-20251001", "usage": {"input_tokens": 1, "output_tokens": 1}}
+        usage = utils.extract_usage(resp)
+        self.assertNotIn("total_cost_usd", usage)
+
+    def test_object_shaped_response_has_no_cost_field_key(self):
+        """Every other provider's response object has no such field --
+        extract_usage must not error, and must not add the key at all."""
+        resp = types.SimpleNamespace(usage=types.SimpleNamespace(input_tokens=1, output_tokens=1), model="gpt-4o")
+        usage = utils.extract_usage(resp)
+        self.assertNotIn("total_cost_usd", usage)
 
 
 if __name__ == "__main__":

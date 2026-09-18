@@ -19,6 +19,13 @@ also strips OAuth/keychain auth (Claude Code then requires
 call would fail authentication) -- confirmed by direct trial. ``--safe-mode``
 disables the same CLAUDE.md/hooks/skills/MCP/plugins auto-discovery while
 leaving auth alone.
+
+Every subprocess this module spawns uses :func:`photokin.utils.sanitized_claude_code_env`,
+not the raw process environment -- confirmed by direct trial that even
+``--safe-mode`` prefers an inherited ``ANTHROPIC_API_KEY`` over OAuth login
+(``apiKeySource`` flips from ``"none"`` to ``"ANTHROPIC_API_KEY"`` the moment
+that variable is set), which would silently switch a user who also has
+``--provider anthropic`` configured over to metered API billing here too.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from typing import Any, Callable, Dict, List
 
 from .api_claude import _data_url_to_image_block as _data_url_to_content_block
 from .errors import ProviderApiError
+from .utils import sanitized_claude_code_env
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +69,12 @@ def _build_command(binary_path: str, model: str) -> List[str]:
         "stream-json",
         # stream-json output is rejected without --verbose in --print mode.
         "--verbose",
+        # Print mode persists sessions to disk by default -- each one holding
+        # the full prompt and base64 image data. A batch of thousands of
+        # photos would otherwise leave that many sensitive-photo-containing
+        # session files behind, contrary to this adapter's side-effect-free
+        # design.
+        "--no-session-persistence",
     ]
 
 
@@ -146,6 +160,7 @@ def call_claude_code_model(
             input=stdin_bytes,
             capture_output=True,
             timeout=CLAUDE_CODE_TIMEOUT_SECONDS,
+            env=sanitized_claude_code_env(),
         )
     except FileNotFoundError as exc:
         raise ProviderApiError(
