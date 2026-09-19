@@ -65,6 +65,7 @@ import traceback
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import date
+from types import SimpleNamespace
 from typing import Callable, Dict, Any, List
 from copy import deepcopy
 
@@ -862,6 +863,34 @@ def _build_provider_client(config: utils.Config):
             )
         base_url = (os.getenv("OPENROUTER_BASE_URL") or "").strip() or "https://openrouter.ai/api/v1"
         return OpenAI(api_key=api_key, base_url=base_url)
+    if provider == "claude-code":
+        status = utils.claude_code_cli_status()
+        if not status["binary_found"]:
+            raise ProviderApiError(
+                "missing_dependency",
+                "claude-code provider selected but the `claude` CLI was not found on PATH. "
+                "Install Claude Code (https://claude.com/claude-code) and retry.",
+            )
+        if status["authenticated"] is False:
+            raise ProviderApiError(
+                "missing_api_key",
+                "claude-code provider selected but the local `claude` CLI is not logged in. "
+                "Run `claude setup-token` (recommended for unattended/batch use) or "
+                "`claude auth login`, then retry.",
+            )
+        if status["authenticated"] is None:
+            # The probe itself didn't complete (timeout / unparsable output) --
+            # distinct from a confirmed logged-out CLI. This is called once per
+            # photo/group, so treating it the same as missing_api_key (which
+            # _is_run_fatal aborts the whole batch on) would let one flaky
+            # `claude auth status` call kill an otherwise healthy run; api_status
+            # is a per-photo failure instead, and the next photo probes again.
+            raise ProviderApiError(
+                "api_status",
+                "Could not confirm the local `claude` CLI's login status "
+                "(the `claude auth status` probe did not complete).",
+            )
+        return SimpleNamespace(binary_path=status["binary_path"])
     try:
         from openai import OpenAI
     except ImportError as exc:
@@ -4204,8 +4233,12 @@ def process_manifest_stream(
 
             def _tok(u: dict | None, key: str) -> int:
                 return int(u.get(key)) if (u and isinstance(u.get(key), int)) else 0
+            def _cost(u: dict | None) -> float:
+                value = u.get("total_cost_usd") if u else None
+                return float(value) if isinstance(value, (int, float)) else 0.0
             tot_prompt = sum(_tok(rec.get("_usage"), "prompt_tokens") for rec, _, _ in analyses)
             tot_completion = sum(_tok(rec.get("_usage"), "completion_tokens") for rec, _, _ in analyses)
+            tot_cost = sum(_cost(rec.get("_usage")) for rec, _, _ in analyses)
             # analyses has one entry per API call made for this group (usually
             # exactly one); take the resolved model string from it -- this
             # dict otherwise replaces the per-analysis _usage entirely, so
@@ -4221,6 +4254,11 @@ def process_manifest_stream(
                 "total_tokens": (tot_prompt + tot_completion) or None,
                 "model": usage_model,
             }
+            # Omitted entirely rather than set to None/0 when no per-record
+            # _usage carried one (every provider but claude-code), so this
+            # stays a byte-for-byte no-op for every existing consumer.
+            if tot_cost:
+                canonical["_usage"]["total_cost_usd"] = tot_cost
 
             canonical["keywords"] = shared_keywords
 

@@ -1,4 +1,4 @@
-"""Provider-dispatched LLM API helpers for OpenAI, Anthropic, Gemini, and OpenRouter."""
+"""Provider-dispatched LLM API helpers for OpenAI, Anthropic, Gemini, OpenRouter, and Claude Code."""
 
 from __future__ import annotations
 
@@ -60,6 +60,17 @@ def call_model(
             image_data_urls,
             dump_request=dump_request,
         )
+    if normalized_provider == "claude-code":
+        from .api_claude_code import call_claude_code_model
+
+        return call_claude_code_model(
+            client,
+            model,
+            content_items,
+            image_data_urls,
+            dump_request=dump_request,
+            thinking=thinking,
+        )
     from .api_openai import call_openai_model
 
     return call_openai_model(
@@ -86,6 +97,10 @@ def extract_output_text(resp: Any, *, provider: str = "openai") -> str:
         from .api_openai_compat import extract_openai_compat_output_text
 
         return extract_openai_compat_output_text(resp)
+    if normalized == "claude-code":
+        from .api_claude_code import extract_claude_code_output_text
+
+        return extract_claude_code_output_text(resp)
     from .api_openai import extract_openai_output_text
 
     return extract_openai_output_text(resp)
@@ -93,7 +108,7 @@ def extract_output_text(resp: Any, *, provider: str = "openai") -> str:
 
 def get_response_model(resp: Any, fallback_model: str) -> str:
     """Return resolved provider model string from response payload when present."""
-    model = getattr(resp, "model", None)
+    model = resp.get("model") if isinstance(resp, dict) else getattr(resp, "model", None)
     if isinstance(model, str) and model.strip():
         return model
     return fallback_model

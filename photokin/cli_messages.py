@@ -695,7 +695,7 @@ def invalid_llm_provider_env(value: str) -> UsageMessage:
     """
     return (
         f"LLM_PROVIDER=`{value}` is not a provider photokin knows.",
-        "set it to one of openai, anthropic, gemini, openrouter, or unset it and pass --provider",
+        "set it to one of openai, anthropic, gemini, openrouter, claude-code, or unset it and pass --provider",
     )
 
 

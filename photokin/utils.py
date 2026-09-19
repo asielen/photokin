@@ -55,6 +55,8 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import textwrap
 from pathlib import Path
 from dataclasses import dataclass
@@ -206,12 +208,90 @@ PROVIDER_SDK_MODULES: Dict[str, str] = {
 #: Single source of truth for ``core._build_provider_client`` and the CLI's
 #: ``--show-config``, so the two can never name a different variable for the
 #: same provider.
+#:
+#: ``claude-code`` is deliberately absent: it takes no API key at all -- it
+#: authenticates through a locally logged-in ``claude`` CLI (see
+#: ``claude_code_cli_status`` below). Adding it here would force the
+#: ``if not api_key: raise ...`` pattern every other provider's
+#: ``_build_provider_client`` branch uses, which is the wrong check for it.
 PROVIDER_API_KEY_ENV: Dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
+
+
+#: Anthropic credential env vars that must NOT reach a ``claude`` subprocess
+#: spawned for the ``claude-code`` provider. Confirmed by direct trial:
+#: even under ``--safe-mode`` (not ``--bare``), the CLI's own
+#: ``system.init`` event reports ``apiKeySource: "ANTHROPIC_API_KEY"``
+#: the moment that variable is present in its environment -- it takes
+#: precedence over OAuth/subscription login. A user who also uses
+#: ``--provider anthropic`` (and so has ``ANTHROPIC_API_KEY`` set for that)
+#: would otherwise have every claude-code call silently authenticate with
+#: that key instead, defeating the entire point of this provider.
+CLAUDE_CODE_CREDENTIAL_ENV_VARS: Tuple[str, ...] = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def sanitized_claude_code_env() -> Dict[str, str]:
+    """A copy of the current environment with Anthropic API credentials removed.
+
+    Used for every subprocess this provider spawns (the ``claude auth
+    status`` probe and the actual ``claude -p`` model call), so an
+    ``ANTHROPIC_API_KEY``/``ANTHROPIC_AUTH_TOKEN`` set for the ``anthropic``
+    provider elsewhere in the same environment can never be inherited by
+    this one. See ``CLAUDE_CODE_CREDENTIAL_ENV_VARS`` for why this matters.
+    """
+    return {key: value for key, value in os.environ.items() if key not in CLAUDE_CODE_CREDENTIAL_ENV_VARS}
+
+
+def claude_code_cli_status() -> Dict[str, Any]:
+    """Probe the local ``claude`` CLI for the ``claude-code`` provider.
+
+    Returns:
+        ``{"binary_found": bool, "binary_path": str | None, "authenticated": bool | None}``.
+        ``authenticated`` is ``True``/``False`` once the probe completes and
+        parses an actual boolean ``loggedIn`` value -- a confirmed, deliberate
+        state. It is ``None`` when the probe itself didn't complete (timeout,
+        launch failure, unparsable output) OR completed with a payload that
+        isn't the expected shape (not an object, or ``loggedIn`` missing/not
+        a boolean -- e.g. an error object from a future CLI version): a
+        one-off hiccup or unrecognized response, not confirmed evidence the
+        CLI is logged out. Callers that treat "logged out" as run-fatal
+        (aborting an entire batch) should NOT treat ``None`` the same way --
+        this is called once per photo/group (see ``core._build_provider_client``),
+        so a transient or malformed probe response must not be
+        indistinguishable from a confirmed missing credential, or one flaky
+        call kills an otherwise healthy run. ``authenticated`` is only
+        meaningful when ``binary_found`` is True; with no binary it is
+        reported ``False`` (a confirmed, non-transient state) rather than
+        ``None``.
+    """
+    binary_path = shutil.which("claude")
+    status: Dict[str, Any] = {
+        "binary_found": binary_path is not None,
+        "binary_path": binary_path,
+        "authenticated": None,
+    }
+    if not binary_path:
+        status["authenticated"] = False
+        return status
+    try:
+        proc = subprocess.run(
+            [binary_path, "auth", "status"],
+            capture_output=True,
+            timeout=15,
+            env=sanitized_claude_code_env(),
+        )
+        payload = json.loads(proc.stdout.decode("utf-8", errors="replace") or "{}")
+    except (OSError, subprocess.TimeoutExpired, JSONDecodeError):
+        return status  # authenticated stays None: the probe itself was inconclusive
+    logged_in = payload.get("loggedIn") if isinstance(payload, dict) else None
+    if isinstance(logged_in, bool):
+        status["authenticated"] = logged_in
+    # else: payload wasn't the expected shape -- authenticated stays None.
+    return status
 
 
 def installed_provider_sdks() -> list[str]:
@@ -241,6 +321,8 @@ def normalize_provider(provider: str | None) -> str:
     raw = (provider or "").strip().lower()
     if raw in {"claude", "anthropic"}:
         return "anthropic"
+    if raw in {"claude-code", "claude_code"}:
+        return "claude-code"
     if raw in {"gemini", "google"}:
         return "gemini"
     if raw == "openrouter":
@@ -253,6 +335,8 @@ def provider_display_name(provider: str | None) -> str:
     normalized = normalize_provider(provider)
     if normalized == "anthropic":
         return "Claude"
+    if normalized == "claude-code":
+        return "Claude Code"
     if normalized == "gemini":
         return "Gemini"
     if normalized == "openrouter":
@@ -274,7 +358,7 @@ def resolve_claude_model(model_or_alias: str | None, default_alias: str | None =
 def resolve_model_for_provider(config: Config) -> str:
     """Resolve the effective model name sent to the selected provider API."""
     provider = normalize_provider(config.provider)
-    if provider == "anthropic":
+    if provider in ("anthropic", "claude-code"):
         preferred = config.model if config.model.startswith("claude-") else config.claude_model_name
         return resolve_claude_model(preferred)
     if provider == "gemini":
@@ -1996,7 +2080,7 @@ def extract_usage(resp) -> dict | None:
     Returns None if unavailable.
     """
     try:
-        usage_obj = getattr(resp, "usage", None)
+        usage_obj = resp.get("usage") if isinstance(resp, dict) else getattr(resp, "usage", None)
         usage_metadata_obj = None
         if not usage_obj:
             usage_metadata_obj = getattr(resp, "usage_metadata", None)
@@ -2045,7 +2129,7 @@ def extract_usage(resp) -> dict | None:
             except (TypeError, ValueError):
                 return None
 
-        model_name = getattr(resp, "model", None)
+        model_name = resp.get("model") if isinstance(resp, dict) else getattr(resp, "model", None)
         # Responses API names these input/output_tokens; Chat Completions
         # (OpenRouter and other compat gateways) names them prompt/completion_tokens.
         prompt_tokens = _as_int(usage_dict.get("input_tokens"))
@@ -2054,7 +2138,7 @@ def extract_usage(resp) -> dict | None:
         completion_tokens = _as_int(usage_dict.get("output_tokens"))
         if completion_tokens is None:
             completion_tokens = _as_int(usage_dict.get("completion_tokens"))
-        return {
+        result = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "input_tokens": prompt_tokens,
@@ -2064,5 +2148,13 @@ def extract_usage(resp) -> dict | None:
             "output_tokens_details": usage_dict.get("output_tokens_details"),
             "model": model_name,
         }
+        # claude-code is the only adapter whose response carries a client-side
+        # cost estimate (the CLI's own total_cost_usd) -- omitted entirely
+        # for every other provider's response shape rather than set to None,
+        # so this stays a byte-for-byte no-op for every existing consumer.
+        total_cost_usd = resp.get("total_cost_usd") if isinstance(resp, dict) else None
+        if isinstance(total_cost_usd, (int, float)):
+            result["total_cost_usd"] = total_cost_usd
+        return result
     except Exception:
         return None
