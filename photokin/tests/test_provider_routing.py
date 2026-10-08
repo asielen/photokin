@@ -176,7 +176,7 @@ class TestProviderResolution(unittest.TestCase):
         # claude-code is still Claude, just reached through the local CLI --
         # it shares the same --claude-model/CLAUDE_MODEL resolution.
         cfg_claude_code = utils.Config(provider="claude-code", model="gpt-4o", claude_model_name="haiku")
-        self.assertEqual(utils.resolve_model_for_provider(cfg_claude_code), "claude-haiku-4-5-20251001")
+        self.assertEqual(utils.resolve_model_for_provider(cfg_claude_code), "claude-haiku-5-5")
 
         cfg_gemini = utils.Config(provider="gemini", model="gpt-4o", gemini_model_name="gemini-2.5-flash")
         self.assertEqual(utils.resolve_model_for_provider(cfg_gemini), "gemini-2.5-flash")

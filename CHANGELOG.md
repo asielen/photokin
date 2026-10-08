@@ -23,10 +23,14 @@ All notable changes to this project are documented here, in the style of
 
 ## [0.6.3]
 
+Released from 0.6.2 plus the changes below only; the `[Unreleased]`
+`--provider claude-code` work above was merged first but is not in 0.6.3.
+
 ### Changed
 
 - **`CLAUDE_MODELS["haiku"]` now resolves to `claude-haiku-5-5`**, not
   Haiku 4.5, matching how `sonnet` tracks the newest Sonnet.
+
 ### Fixed
 
 - **Claude Haiku 5.5 (`claude-haiku-5-5`) no longer fails every request.**
