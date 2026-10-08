@@ -168,7 +168,7 @@ class TestProviderResolution(unittest.TestCase):
 
     def test_resolve_model_for_provider(self):
         cfg = utils.Config(provider="anthropic", model="gpt-4o", claude_model_name="haiku")
-        self.assertEqual(utils.resolve_model_for_provider(cfg), "claude-haiku-4-5-20251001")
+        self.assertEqual(utils.resolve_model_for_provider(cfg), "claude-haiku-5-5")
 
         cfg_openai = utils.Config(provider="openai", model="gpt-4o")
         self.assertEqual(utils.resolve_model_for_provider(cfg_openai), "gpt-4o")

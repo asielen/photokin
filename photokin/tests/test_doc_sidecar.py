@@ -435,7 +435,7 @@ def test_analyzed_by_falls_back_to_resolved_model_when_usage_absent(tmp_path: Pa
         )
     )
 
-    assert 'analyzed_by: "Claude claude-haiku-4-5-20251001' in content
+    assert 'analyzed_by: "Claude claude-haiku-5-5' in content
 
 
 # --- Failure contract ---------------------------------------------------

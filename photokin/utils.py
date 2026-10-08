@@ -188,7 +188,7 @@ CLAUDE_MODELS: Dict[str, str] = {
     # on the direct Anthropic API, "sonnet" resolves to Sonnet 5, not 4.6).
     # A fully bare "claude-sonnet"/"sonnet" is not a model the API accepts.
     "sonnet": "claude-sonnet-5",
-    "haiku": "claude-haiku-4-5-20251001",
+    "haiku": "claude-haiku-5-5",
 }
 
 DEFAULT_CLAUDE_MODEL = "sonnet"
