@@ -21,6 +21,18 @@ All notable changes to this project are documented here, in the style of
   limits if it does draw from the subscription, slower per-photo due to
   two subprocess spawns per call).
 
+## [0.6.3]
+
+### Fixed
+
+- **Claude Haiku 5.5 (`claude-haiku-5-5`) no longer fails every request.**
+  The Haiku special cases in `api_claude.py` were written for Haiku 4.5 and
+  matched any `claude-haiku*` id: requests sent `temperature=0` (Haiku 5.5
+  400s with "`temperature` is deprecated for this model") and, with thinking
+  on, a manual `thinking.type.enabled` budget (Haiku 5.5 accepts only
+  `adaptive`). Both now apply to Haiku 4.x only; Haiku 5.5 is treated like
+  Sonnet 5 -- no temperature, adaptive thinking.
+
 ## [0.6.2]
 
 ### Added

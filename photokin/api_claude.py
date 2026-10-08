@@ -43,9 +43,10 @@ THINKING_MAX_TOKENS = 64000
 
 def _thinking_params(model: str) -> Dict[str, Any]:
     """Request params enabling pre-answer reasoning for the given model."""
-    if model.startswith("claude-haiku"):
-        # Haiku does not support adaptive thinking; use a manual budget
-        # (must be strictly less than max_tokens).
+    if model.startswith("claude-haiku-4"):
+        # Haiku 4.x does not support adaptive thinking; use a manual budget
+        # (must be strictly less than max_tokens). Haiku 5.5 is the reverse:
+        # it 400s on "enabled" and accepts only "adaptive".
         return {"thinking": {"type": "enabled", "budget_tokens": 4096}, "max_tokens": THINKING_MAX_TOKENS}
     return {"thinking": {"type": "adaptive"}, "max_tokens": THINKING_MAX_TOKENS}
 
@@ -54,10 +55,10 @@ def _model_supports_temperature(model: str) -> bool:
     """Return True if the Claude model still accepts a `temperature` override.
 
     Sampling parameters (temperature/top_p/top_k) were removed starting with
-    Opus 4.7, Sonnet 5, and the Fable/Mythos family -- sending temperature to
-    one of those 400s with "`temperature` is deprecated for this model."
-    Opus 4.6 and earlier, Sonnet 4.6 and earlier, Haiku, and legacy Claude 3.x
-    models still accept it. Unrecognized/future model strings default to
+    Opus 4.7, Sonnet 5, Haiku 5.5, and the Fable/Mythos family -- sending
+    temperature to one of those 400s with "`temperature` is deprecated for
+    this model." Opus 4.6 and earlier, Sonnet 4.6 and earlier, Haiku 4.x, and
+    legacy Claude 3.x models still accept it. Unrecognized/future model strings default to
     unsupported (temperature omitted) since the API is trending toward
     removing it everywhere, and a missing override is harmless while a
     rejected one fails the whole request.
@@ -72,7 +73,7 @@ def _model_supports_temperature(model: str) -> bool:
         return False
     if m.startswith("claude-sonnet-5"):
         return False
-    if m.startswith("claude-sonnet-4") or m.startswith("claude-haiku") or m.startswith("claude-3"):
+    if m.startswith("claude-sonnet-4") or m.startswith("claude-haiku-4") or m.startswith("claude-3"):
         return True
     return False
 

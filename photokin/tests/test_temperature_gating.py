@@ -57,6 +57,7 @@ class TestModelSupportsTemperature(unittest.TestCase):
             "claude-opus-4-7",
             "claude-opus-4-8",
             "claude-sonnet-5",
+            "claude-haiku-5-5",
             "claude-fable-5",
             "claude-mythos-5",
         ):

@@ -66,6 +66,11 @@ class TestClaudeThinkingSwitch(unittest.TestCase):
         self.assertLess(payload["thinking"]["budget_tokens"], payload["max_tokens"])
         self.assertNotIn("temperature", payload)
 
+    def test_thinking_adaptive_for_haiku_5_5(self):
+        # Haiku 5.5 rejects a manual budget ("thinking.type.enabled").
+        payload = self._call("claude-haiku-5-5", thinking=True)
+        self.assertEqual(payload["thinking"], {"type": "adaptive"})
+
     def test_dispatch_passes_thinking_through(self):
         from photokin import api
 
