@@ -3,7 +3,18 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.6.4]
+
+### Fixed
+
+- **A new Claude model that rejects `temperature` or a manual thinking
+  budget no longer fails every request.** photokin guesses both from the
+  model id, and a wrong guess used to be fatal (Haiku 5.5 hit both until
+  0.6.3 special-cased it). The Claude backend now does what the OpenAI one
+  already did: on a 400 rejecting `temperature` it retries once without it,
+  and on a 400 rejecting `thinking.type.enabled` it retries once with
+  adaptive thinking. Other 400s still fail immediately, and a retry that
+  hits the same rejection fails rather than looping.
 
 ### Added
 
@@ -23,7 +34,7 @@ All notable changes to this project are documented here, in the style of
 
 ## [0.6.3]
 
-Released from 0.6.2 plus the changes below only; the `[Unreleased]`
+Released from 0.6.2 plus the changes below only; the 0.6.4
 `--provider claude-code` work above was merged first but is not in 0.6.3.
 
 ### Changed

@@ -61,7 +61,8 @@ def _model_supports_temperature(model: str) -> bool:
     legacy Claude 3.x models still accept it. Unrecognized/future model strings default to
     unsupported (temperature omitted) since the API is trending toward
     removing it everywhere, and a missing override is harmless while a
-    rejected one fails the whole request.
+    rejected one costs a wasted round trip (call_claude_model retries without
+    it -- see _payload_without_rejected_param).
     """
     m = model.lower()
     if m.startswith("claude-fable") or m.startswith("claude-mythos"):
@@ -90,6 +91,36 @@ def _is_unsupported_temperature_typeerror(message: str, payload: Dict[str, Any])
     failing every request for that install.
     """
     return "temperature" in payload and "unexpected keyword argument 'temperature'" in message
+
+
+def _payload_without_rejected_param(message: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Return ``payload`` adjusted for a parameter the API's 400 rejected, or None.
+
+    The naming heuristics (``_model_supports_temperature``, ``_thinking_params``)
+    can only guess from the model id, so a new model they misjudge would
+    otherwise fail every request. Two rejections are recoverable, mirroring
+    api_openai's temperature retry:
+
+    - ``temperature`` sent to a model that removed it ("`temperature` is
+      deprecated for this model") -- drop it.
+    - a manual ``thinking.type.enabled`` budget sent to a model that only
+      accepts adaptive thinking -- switch to ``{"type": "adaptive"}``.
+
+    Each fix removes the thing it reacts to, so a repeated rejection returns
+    None and the caller raises instead of looping.
+
+    Args:
+        message: The ``BadRequestError`` text, including the API's error body.
+        payload: The request that was rejected.
+
+    Returns:
+        The adjusted payload, or None when the 400 is about something else.
+    """
+    if "temperature" in payload and "temperature" in message:
+        return {k: v for k, v in payload.items() if k != "temperature"}
+    if payload.get("thinking", {}).get("type") == "enabled" and "thinking.type.enabled" in message:
+        return {**payload, "thinking": {"type": "adaptive"}}
+    return None
 
 
 def _data_url_to_image_block(data_url: str) -> Dict[str, Any]:
@@ -185,32 +216,41 @@ def call_claude_model(
         with client.messages.stream(**payload) as stream:
             return stream.get_final_message()
 
-    def _call_with_temperature_retry(payload: Dict[str, Any]) -> Any:
-        try:
-            return _stream_and_finish(payload)
-        except TypeError as exc:
-            if not _is_unsupported_temperature_typeerror(str(exc), payload):
-                raise
-            retried = {k: v for k, v in payload.items() if k != "temperature"}
+    def _call_with_param_retry(payload: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
+        # Returns the payload that finally succeeded too, so a max_tokens
+        # escalation below doesn't resend a parameter already rejected.
+        while True:
+            try:
+                return _stream_and_finish(payload), payload
+            except TypeError as exc:
+                if not _is_unsupported_temperature_typeerror(str(exc), payload):
+                    raise
+                retried = {k: v for k, v in payload.items() if k != "temperature"}
+            except anthropic.BadRequestError as exc:
+                adjusted = _payload_without_rejected_param(str(exc), payload)
+                if adjusted is None:
+                    raise
+                logger.info("Model %s rejected a request parameter; retrying without it.", model)
+                retried = adjusted
             if dump_request:
                 dump_request(retried)
-            return _stream_and_finish(retried)
+            payload = retried
 
     try:
-        response = _call_with_temperature_retry(request_payload)
+        response, sent_payload = _call_with_param_retry(request_payload)
         if (
             getattr(response, "stop_reason", None) == "max_tokens"
-            and request_payload["max_tokens"] < THINKING_MAX_TOKENS
+            and sent_payload["max_tokens"] < THINKING_MAX_TOKENS
         ):
             # Ran out of budget -- possibly mid-reasoning, before any answer
             # text existed (see extract_claude_output_text and MAX_TOKENS'
             # own comment). One retry at the same ceiling the thinking path
             # already uses, rather than fail a request that likely just
             # needed more room, since the common case never reaches here.
-            escalated = {**request_payload, "max_tokens": THINKING_MAX_TOKENS}
+            escalated = {**sent_payload, "max_tokens": THINKING_MAX_TOKENS}
             if dump_request:
                 dump_request(escalated)
-            response = _call_with_temperature_retry(escalated)
+            response, _ = _call_with_param_retry(escalated)
         return response
     except anthropic.RateLimitError as exc:
         raise ProviderApiError(

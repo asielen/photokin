@@ -1,6 +1,10 @@
 import unittest
 
+import anthropic
+import httpx
+
 from photokin import api_claude
+from photokin.errors import ProviderApiError
 
 
 class _CapturingClient:
@@ -291,6 +295,101 @@ class TestUnsupportedTemperatureTypeErrorRetry(unittest.TestCase):
                 [],
             )
         self.assertEqual(len(client.calls), 1)
+
+
+def _bad_request(message: str) -> anthropic.BadRequestError:
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = {"type": "error", "error": {"type": "invalid_request_error", "message": message}}
+    return anthropic.BadRequestError(
+        f"Error code: 400 - {body}", response=httpx.Response(400, request=request), body=body
+    )
+
+
+class _ServerRejectsClient:
+    """Stands in for the API returning a 400 for any request ``rejects`` flags,
+    the way Haiku 5.5 does for ``temperature`` and manual thinking budgets."""
+
+    def __init__(self, rejects):
+        self.calls: list = []
+        self.messages = self
+        self._rejects = rejects
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        message = self._rejects(kwargs)
+        if message:
+            raise _bad_request(message)
+        return _FinalMessageStreamContext(_FakeMessage("end_turn"))
+
+
+def _rejects_temperature(kwargs):
+    return "`temperature` is deprecated for this model." if "temperature" in kwargs else None
+
+
+def _rejects_manual_thinking(kwargs):
+    if kwargs.get("thinking", {}).get("type") == "enabled":
+        return '"thinking.type.enabled" is not supported for this model.'
+    return None
+
+
+class TestServerRejectedParamRetry(unittest.TestCase):
+    """A 400 for a parameter the naming heuristics wrongly sent gets one
+    retry without it, instead of failing every request for that model."""
+
+    def _call(self, client, model, **kwargs):
+        return api_claude.call_claude_model(
+            client, model, [{"type": "input_text", "text": "prompt"}], [], **kwargs
+        )
+
+    def test_rejected_temperature_is_dropped(self):
+        client = _ServerRejectsClient(_rejects_temperature)
+        result = self._call(client, "claude-sonnet-4-6")
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertEqual(len(client.calls), 2)
+        self.assertNotIn("temperature", client.calls[1])
+
+    def test_rejected_manual_thinking_switches_to_adaptive(self):
+        client = _ServerRejectsClient(_rejects_manual_thinking)
+        result = self._call(client, "claude-haiku-4-5-20251001", thinking=True)
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1]["thinking"], {"type": "adaptive"})
+
+    def test_unrelated_400_is_raised_without_retry(self):
+        client = _ServerRejectsClient(lambda kwargs: "messages: field required")
+        with self.assertRaises(ProviderApiError) as ctx:
+            self._call(client, "claude-sonnet-4-6")
+        self.assertEqual(ctx.exception.error_type, "invalid_input")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_repeated_rejection_is_raised_not_looped(self):
+        # A 400 that names temperature even after it was dropped must surface.
+        client = _ServerRejectsClient(lambda kwargs: "`temperature` is deprecated for this model.")
+        with self.assertRaises(ProviderApiError):
+            self._call(client, "claude-sonnet-4-6")
+        self.assertEqual(len(client.calls), 2)
+
+    def test_max_tokens_escalation_keeps_the_fix(self):
+        calls: list = []
+
+        class _Client:
+            messages = None
+
+            def stream(self, **kwargs):
+                calls.append(kwargs)
+                message = _rejects_temperature(kwargs)
+                if message:
+                    raise _bad_request(message)
+                done = kwargs["max_tokens"] >= api_claude.THINKING_MAX_TOKENS
+                return _FinalMessageStreamContext(_FakeMessage("end_turn" if done else "max_tokens"))
+
+        client = _Client()
+        client.messages = client
+        result = self._call(client, "claude-sonnet-4-6")
+        self.assertEqual(result.stop_reason, "end_turn")
+        # rejected, truncated, then escalated without re-sending temperature
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("temperature", calls[2])
 
 
 if __name__ == "__main__":
