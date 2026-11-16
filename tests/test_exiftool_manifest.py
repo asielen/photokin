@@ -24,7 +24,9 @@ def test_default_fields_include_exif_user_comment() -> None:
     assert "EXIF:UserComment" in DEFAULT_EXIFTOOL_FIELDS
 
 
-def test_maps_instruction_aliases_into_user_comment() -> None:
+def test_maps_instruction_aliases_to_their_own_key_not_user_comment() -> None:
+    # UserComment is also what the AI block is appended to and written back
+    # over, so Instructions folded into it would be copied into the file.
     records = [
         {
             "SourceFile": "/tmp/photo.jpg",
@@ -35,7 +37,26 @@ def test_maps_instruction_aliases_into_user_comment() -> None:
     items = exiftool_records_to_manifest_items(records, ["XMP:Instructions"])
 
     assert len(items) == 1
-    assert items[0]["metadata"]["userComment"] == "Album note"
+    assert items[0]["metadata"]["instructions"] == "Album note"
+    assert "userComment" not in items[0]["metadata"]
+
+
+def test_xmp_location_outranks_iptc_whatever_the_record_order() -> None:
+    records = [
+        {
+            "SourceFile": "/tmp/photo.jpg",
+            "IPTC:City": "San Diego",
+            "XMP-photoshop:City": "Oakland",
+            "IPTC:Province-State": "CA",
+        }
+    ]
+
+    items = exiftool_records_to_manifest_items(
+        records, ["IPTC:City", "XMP-photoshop:City", "IPTC:Province-State"]
+    )
+
+    assert items[0]["metadata"]["city"] == "Oakland"
+    assert items[0]["metadata"]["stateProvince"] == "CA"
 
 
 def test_maps_g1_grouped_tag_names() -> None:

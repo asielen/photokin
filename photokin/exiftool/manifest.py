@@ -56,6 +56,9 @@ from typing import Any, Dict, List, Sequence
 
 DEFAULT_EXIFTOOL_FIELDS: tuple[str, ...] = (
     "EXIF:DateTimeOriginal",
+    # Lightroom's "Date Created", the fallback when the file has no capture
+    # time, so a date set only there still counts as the file's own date.
+    "XMP-photoshop:DateCreated",
     "EXIF:UserComment",
     "XMP:Description",
     "XMP:Title",
@@ -68,6 +71,17 @@ DEFAULT_EXIFTOOL_FIELDS: tuple[str, ...] = (
     # writable family-0 spelling; ExifTool reports it back under ``-G1`` as
     # ``XMP-dc:Subject``, and as a list whenever the file holds more than one.
     "XMP:Subject",
+    # Location, XMP first and IPTC IIM as the fallback: Lightroom keeps its
+    # location in XMP, and once the file's location is read, merge prefers it
+    # over the model's guess, so a curated location is never overwritten.
+    "XMP-photoshop:Country",
+    "IPTC:Country-PrimaryLocationName",
+    "XMP-photoshop:State",
+    "IPTC:Province-State",
+    "XMP-photoshop:City",
+    "IPTC:City",
+    "XMP-iptcCore:Location",
+    "IPTC:Sub-location",
 )
 
 def _split_fields(fields: Sequence[str]) -> List[str]:
@@ -241,16 +255,19 @@ _TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     "EXIF:DateTimeOriginal": "dateTimeOriginal",
     "XMP:DateTimeOriginal": "dateTimeOriginal",
     "XMP-exif:DateTimeOriginal": "dateTimeOriginal",
+    "XMP-photoshop:DateCreated": "dateTimeOriginal",
 
-    # notes/context (canonical source: EXIF UserComment)
+    # notes/context: only the real EXIF UserComment, because it is also the
+    # base the new AI block is appended to and written back over.
     "EXIF:UserComment": "userComment",
 
-    # Lightroom/legacy instruction tags are normalized into userComment
-    "Photoshop:Instructions": "userComment",
-    "XMP:Instructions": "userComment",
-    "XMP-photoshop:Instructions": "userComment",
-    "IPTC:SpecialInstructions": "userComment",
-    "XMP-iptcCore:Instructions": "userComment",
+    # Lightroom/legacy instruction tags reach the model as their own key;
+    # folded into userComment they would be copied into the file's UserComment.
+    "Photoshop:Instructions": "instructions",
+    "XMP:Instructions": "instructions",
+    "XMP-photoshop:Instructions": "instructions",
+    "IPTC:SpecialInstructions": "instructions",
+    "XMP-iptcCore:Instructions": "instructions",
 
     # caption/description
     "XMP:Description": "caption",
@@ -265,7 +282,22 @@ _TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     # keywords (multi-valued; carries the reviewed "DATE:" marker)
     "XMP:Subject": "keywords",
     "XMP-dc:Subject": "keywords",
+
+    # location, XMP before IPTC IIM
+    "XMP-photoshop:Country": "country",
+    "IPTC:Country-PrimaryLocationName": "country",
+    "XMP-photoshop:State": "stateProvince",
+    "IPTC:Province-State": "stateProvince",
+    "XMP-photoshop:City": "city",
+    "IPTC:City": "city",
+    "XMP-iptcCore:Location": "location",
+    "IPTC:Sub-location": "location",
 }
+
+#: Each mapped tag's rank, so that among tags sharing a manifest key the first
+#: non-empty one in this table's order wins, whatever order ExifTool printed
+#: the record in.
+_TAG_PRIORITY: dict[str, int] = {tag: rank for rank, tag in enumerate(_TAG_TO_MANIFEST_KEY)}
 
 #: Manifest keys whose value is a list of strings rather than one string.
 _LIST_MANIFEST_KEYS: frozenset[str] = frozenset({"keywords"})
@@ -276,6 +308,9 @@ _LIST_MANIFEST_KEYS: frozenset[str] = frozenset({"keywords"})
 # succeed regardless of the reported group.
 _BARE_TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     tag.rsplit(":", 1)[-1]: mk for tag, mk in _TAG_TO_MANIFEST_KEY.items()
+}
+_BARE_TAG_PRIORITY: dict[str, int] = {
+    tag.rsplit(":", 1)[-1]: rank for tag, rank in reversed(_TAG_PRIORITY.items())
 }
 
 
@@ -348,7 +383,8 @@ def exiftool_records_to_manifest_items(
 
     - Always stores raw tag/value pairs under metadata["exiftool"].
     - Also maps selected tags into top-level manifest keys (dateTimeOriginal, userComment, etc.).
-    - If multiple tags map to the same manifest key, the first non-empty wins.
+    - If multiple tags map to the same manifest key, the first non-empty in
+      :data:`_TAG_TO_MANIFEST_KEY` order wins (XMP location before IPTC IIM).
     """
     fields_n = _split_fields(requested_fields)
     # Records come back from `-G1`, so a requested "EXIF:UserComment" is keyed as
@@ -372,20 +408,22 @@ def exiftool_records_to_manifest_items(
 
         meta: Dict[str, Any] = {"path": str(src), "exiftool": raw_tags}
 
-        candidates_by_key: Dict[str, List[str | List[str] | None]] = {}
+        candidates_by_key: Dict[str, List[tuple[int, str | List[str] | None]]] = {}
 
         def consider(tag: str, value: Any) -> None:
-            mk = _TAG_TO_MANIFEST_KEY.get(tag) or _BARE_TAG_TO_MANIFEST_KEY.get(_bare_tag(tag))
+            bare = _bare_tag(tag)
+            mk = _TAG_TO_MANIFEST_KEY.get(tag) or _BARE_TAG_TO_MANIFEST_KEY.get(bare)
             if not mk:
                 return
-            candidates_by_key.setdefault(mk, []).append(manifest_value(value, mk))
+            rank = _TAG_PRIORITY.get(tag, _BARE_TAG_PRIORITY.get(bare, len(_TAG_PRIORITY)))
+            candidates_by_key.setdefault(mk, []).append((rank, manifest_value(value, mk)))
 
         source_dict = raw_tags if raw_tags else {k: v for k, v in rec.items() if k != "SourceFile"}
         for tag, value in source_dict.items():
             consider(tag, value)
 
-        for mk, vals in candidates_by_key.items():
-            chosen = _first_non_empty(vals)
+        for mk, ranked in candidates_by_key.items():
+            chosen = _first_non_empty([v for _rank, v in sorted(ranked, key=lambda rv: rv[0])])
             if chosen is not None:
                 meta[mk] = chosen
 

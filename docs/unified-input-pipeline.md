@@ -1630,11 +1630,11 @@ the doubling cannot be observed, and now runs on a labelled pair with the legacy
   maps to `caption`. Archives written by older Lightroom versions may carry notes only there.
   Adding them is a one-line change to the tuple, but it widens what `-r` reads on the plugin's
   path too, so it is left for a follow-up with a real corpus behind it.
-- The changeset's `before_snapshot` never carries the file's existing `UserComment`:
-  `merge_original_sources._pick` does not list it, so every run proposes `EXIF:UserComment`
-  as a change even when the value is unchanged. Pre-existing and unaffected by C3, but more
-  visible now that `-r` puts the existing value in front of the model. Worth settling when
-  the apply step is next opened.
+- ~~The changeset's `before_snapshot` never carries the file's existing `UserComment`.~~
+  **Fixed in 0.7.0.** The before snapshot carries the file's own comment and location, and
+  the proposed comment is that comment plus this run's `[AI Analysis]` block, so an unchanged
+  comment is no longer proposed. Pinned end to end against the real ExifTool in
+  `photokin/tests/test_write_every_field.py`.
 - The scan-order sort is the one mitigation that changes existing manifest-mode output. The
   judgment is that a stable answer beats an arbitrary one, matching B1's slot-occupancy trade.
   If that judgment is wrong, the fallback is to leave the function alone and keep B1's

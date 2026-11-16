@@ -1812,6 +1812,10 @@ class TestTheFileNeverOverwritesWhatTheInputAlreadyCarried(unittest.TestCase):
         "XMP:Description": "Scanned document",
         "XMP:Title": "Scanned Image",
         "XMP:Subject": ["Scans", "Untagged"],
+        "XMP-photoshop:Country": "Canada",
+        "XMP-photoshop:State": "Ontario",
+        "XMP-photoshop:City": "Toronto",
+        "XMP-iptcCore:Location": "Scanner room",
     }
     #: What the caller already supplied, keyed the way an item's metadata is.
     FROM_CALLER = {
@@ -1820,6 +1824,10 @@ class TestTheFileNeverOverwritesWhatTheInputAlreadyCarried(unittest.TestCase):
         "caption": "Ruth and Sam outside the bakery",
         "title": "Mom's graduation, June 1961",
         "keywords": ["Family", "Bakery"],
+        "country": "United States",
+        "stateProvince": "Ohio",
+        "city": "Dayton",
+        "location": "Bakery on Main",
     }
 
     def _hydrate_with(self, metadata: dict) -> dict:

@@ -46,9 +46,9 @@ class TestExiftoolConfig(unittest.TestCase):
         # canonical tag hydration also reads, in the README table's order,
         # plus EXIF:CreateDate. A narrower default silently dropped captions,
         # keywords and titles for every -rw run that did not pass
-        # --exiftool-fields; the IPTC location tags are deliberately absent
-        # because hydration does not read them yet, so a default location
-        # write would overwrite curated location metadata unread.
+        # --exiftool-fields. The IPTC location tags are in it because -r reads
+        # the file's location first, so a curated one is never overwritten
+        # unread.
         self.assertEqual(
             cfg.fields,
             (
@@ -57,6 +57,10 @@ class TestExiftoolConfig(unittest.TestCase):
                 "XMP-dc:Subject",
                 "XMP-dc:Title",
                 "EXIF:DateTimeOriginal",
+                "IPTC:Country-PrimaryLocationName",
+                "IPTC:Province-State",
+                "IPTC:City",
+                "IPTC:Sub-location",
                 "EXIF:CreateDate",
             ),
         )

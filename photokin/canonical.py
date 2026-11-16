@@ -17,6 +17,11 @@ Code map:
 - _location_components_from_metadata     read location parts straight from metadata
 - _location_components_from_guess        read location parts + confidence from a guess
 - _date_from_metadata                    pick a date (explicit wins over guess)
+- _claimed_precision                     how much of a date the model claimed
+- _date_created_value                    the date at the precision the model claimed
+- split_user_comment                     PUBLIC: a comment's user text, AI block dropped
+- merge_user_comment                     PUBLIC: user text + this run's AI block
+- _user_comment_value                    the UserComment to propose, or None
 - canonical_values_from_patch            PUBLIC: extract set-values from a patch
 - canonical_values_from_metadata         PUBLIC: metadata -> flat {tag: value}
 - build_canonical_patch                  PUBLIC: metadata -> (patch, suggestions)
@@ -24,6 +29,7 @@ Code map:
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Tuple
 
 from .utils import Config
@@ -62,6 +68,41 @@ CANONICAL_LOCATION_TAGS = {
     "city": "IPTC:City",
     "sublocation": "IPTC:Sub-location",
 }
+
+# The XMP twin of each IPTC IIM location tag, keyed like CANONICAL_LOCATION_TAGS.
+# Lightroom reads location from XMP and trusts the XMP over the IIM block once
+# ExifTool has rewritten IIM and updated its digest, so an IIM-only write never
+# reaches the catalog. The changeset and the allowlist keep the IIM names; the
+# applier writes the twin alongside whenever it writes the IIM tag.
+CANONICAL_LOCATION_XMP_TAGS = {
+    "country": "XMP-photoshop:Country",
+    "state": "XMP-photoshop:State",
+    "city": "XMP-photoshop:City",
+    "sublocation": "XMP-iptcCore:Location",
+}
+
+# Lightroom's "Date Created". Proposed beside CANONICAL_DATE_TAG ("Capture
+# Time") from the same date, but at the precision the model claimed: XMP takes
+# ``YYYY`` and ``YYYY:MM``, so a year-only inference stays a year here even
+# though EXIF needs a full timestamp. The IIM pair takes only a complete date,
+# so the applier derives it only when the value has one.
+CANONICAL_DATE_CREATED_TAG = "XMP-photoshop:DateCreated"
+CANONICAL_IPTC_DATE_TAG = "IPTC:DateCreated"
+CANONICAL_IPTC_TIME_TAG = "IPTC:TimeCreated"
+
+#: The line that opens an AI analysis block, dated or not: ``inject_analysis_date``
+#: rewrites ``[AI Analysis]:`` to ``[AI Analysis on 1952-06-01]:``. Everything
+#: from the first such line to the end of a caption or UserComment is a previous
+#: run's analysis; everything before it is a person's.
+AI_ANALYSIS_MARKER_RE = re.compile(r"^\s*\[AI Analysis\b[^\]]*\]\s*:?", re.IGNORECASE)
+
+_UNDATED_AI_MARKER = "[AI Analysis]:"
+
+_DATE_PARTS_RE = re.compile(
+    r"^(\d{4})(?:[-:](\d{2})(?:[-:](\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?)?)?(?=$|[ T.Z+-])"
+)
+_DATE_PATTERN_RE = re.compile(r"Y[!?~@](M([!?~@]))?(D([!?~@]))?")
+_ISO_PRECISION_RE = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?")
 
 
 def _clean_str(value: Any) -> str | None:
@@ -145,6 +186,116 @@ def _date_from_metadata(meta: Dict[str, Any]) -> Tuple[str | None, float | None,
     return suggested, confidence, suggested, reason, "guess"
 
 
+def _claimed_precision(date_guess: dict[str, Any]) -> int:
+    """How many of year, month and day the model claimed, from 1 to 3.
+
+    Read from ``pattern`` (``Y~`` -> 1, ``Y!M~`` -> 2, ``Y!M!D!`` -> 3; a ``?``
+    component is unclaimed), else from the shape of ``iso``. Anything else --
+    a decade, a range, nothing -- claims only the year.
+    """
+    pattern = str(date_guess.get("pattern") or "").strip().upper()
+    match = _DATE_PATTERN_RE.fullmatch(pattern)
+    if match:
+        has_month = match.group(1) is not None and match.group(2) != "?"
+        has_day = has_month and match.group(3) is not None and match.group(4) != "?"
+        return 1 + has_month + has_day
+    iso_match = _ISO_PRECISION_RE.fullmatch(str(date_guess.get("iso") or "").strip())
+    if iso_match:
+        return 1 + (iso_match.group(1) is not None) + (iso_match.group(2) is not None)
+    return 1
+
+
+def _date_created_value(date_value: str, meta: dict[str, Any]) -> str | None:
+    """Render ``date_value`` for ``XMP-photoshop:DateCreated`` without inventing precision.
+
+    A date the model inferred is cut to the precision it claimed, so a ``Y~``
+    guess whose ``import_date`` is a mid-year placeholder is written as the
+    year alone. A date the file already held (``date_original``) is kept
+    whole. The result uses ExifTool's colon form (``1952``, ``1952:06``,
+    ``1952:06:01``, ``1952:06:01 12:00:00``).
+
+    Args:
+        date_value: The date chosen for ``EXIF:DateTimeOriginal``.
+        meta: The metadata it came from, read for ``date_guess`` and
+            ``date_original``.
+
+    Returns:
+        The DateCreated value, or ``None`` when ``date_value`` is not a
+        year, year-month, date or timestamp (a decade such as ``1910s``).
+    """
+    match = _DATE_PARTS_RE.match(date_value)
+    if not match:
+        return None
+    parts = [part for part in match.groups()[:3] if part]
+    time = match.group(4)
+    date_guess = meta.get("date_guess")
+    if isinstance(date_guess, dict) and date_value != _clean_str(meta.get("date_original")):
+        precision = _claimed_precision(date_guess)
+        if precision < len(parts):
+            parts, time = parts[:precision], None
+    rendered = ":".join(parts)
+    return f"{rendered} {time}" if time and len(parts) == 3 else rendered
+
+
+def split_user_comment(comment: Any) -> str:
+    """Return the person's part of a UserComment, dropping any earlier AI block.
+
+    The comment is cut at the first line matching :data:`AI_ANALYSIS_MARKER_RE`.
+    Text before it is kept verbatim except for trailing whitespace; a comment
+    with no marker is entirely the person's.
+
+    Args:
+        comment: The file's existing ``EXIF:UserComment``, or ``None``.
+
+    Returns:
+        The user text, or ``""`` when there is none.
+    """
+    kept: list[str] = []
+    for line in str(comment or "").splitlines(keepends=True):
+        if AI_ANALYSIS_MARKER_RE.match(line):
+            break
+        kept.append(line)
+    return "".join(kept).rstrip()
+
+
+def merge_user_comment(existing: Any, ai_block: str) -> str:
+    """Join a file's own comment with this run's AI block, replacing any earlier one.
+
+    Example:
+        >>> merge_user_comment("Note\n\n[AI Analysis]: old", "[AI Analysis]: new")
+        'Note\n\n[AI Analysis]: new'
+
+    Args:
+        existing: The file's current ``EXIF:UserComment``, or ``None``.
+        ai_block: This run's analysis text, non-empty. A block that does not
+            open with the marker gets the undated one, so the next run can
+            recognize and replace it instead of keeping it as user text.
+
+    Returns:
+        ``<user text>\n\n<AI block>``, or the AI block alone when the file
+        holds no user text.
+    """
+    if not AI_ANALYSIS_MARKER_RE.match(ai_block):
+        ai_block = f"{_UNDATED_AI_MARKER} {ai_block}"
+    user_text = split_user_comment(existing)
+    return f"{user_text}\n\n{ai_block}" if user_text.strip() else ai_block
+
+
+def _user_comment_value(meta: dict[str, Any]) -> str | None:
+    """The UserComment for ``meta``: its own comment merged with its AI block.
+
+    ``meta["userComment"]`` is the file's real ``EXIF:UserComment``. With no AI
+    text the comment is returned as it stands, which is what the changeset's
+    before-snapshot needs and what keeps a run without analysis from proposing
+    a change.
+    """
+    existing = _clean_str(meta.get("userComment"))
+    ai_block = _clean_str(meta.get("analysis_notes")) or _clean_str(meta.get("ai_caption"))
+    if ai_block is None:
+        return existing
+    return merge_user_comment(existing, ai_block)
+
+
 def canonical_values_from_patch(patch: Dict[str, Any] | None) -> Dict[str, Any]:
     """Flatten a changeset patch into ``{tag: value}`` for its applied edits.
 
@@ -188,12 +339,7 @@ def canonical_values_from_metadata(meta: Dict[str, Any] | None, config: Config) 
     if description:
         values[CANONICAL_DESCRIPTION_TAG] = description
 
-    user_comment = (
-        _clean_str(meta.get("analysis_notes"))
-        or _clean_str(meta.get("ai_caption"))
-        or _clean_str(meta.get("user_comment"))
-        or _clean_str(meta.get("userComment"))
-    )
+    user_comment = _user_comment_value(meta)
     if user_comment:
         values[CANONICAL_USER_COMMENT_TAG] = user_comment
 
@@ -205,11 +351,13 @@ def canonical_values_from_metadata(meta: Dict[str, Any] | None, config: Config) 
                 values[tag] = value
 
     date_value, confidence, _suggested, _reason, source = _date_from_metadata(meta)
-    if date_value:
-        if source == "metadata":
-            values[CANONICAL_DATE_TAG] = date_value
-        elif confidence is None or confidence >= config.date_confidence_threshold:
-            values[CANONICAL_DATE_TAG] = date_value
+    if date_value and (
+        source == "metadata" or confidence is None or confidence >= config.date_confidence_threshold
+    ):
+        values[CANONICAL_DATE_TAG] = date_value
+        date_created = _date_created_value(date_value, meta)
+        if date_created:
+            values[CANONICAL_DATE_CREATED_TAG] = date_created
 
     return values
 
@@ -244,13 +392,8 @@ def build_canonical_patch(meta: Dict[str, Any] | None, config: Config) -> Tuple[
     if description:
         patch[CANONICAL_DESCRIPTION_TAG] = {"op": "set", "value": description}
 
-    user_comment = (
-        _clean_str(meta.get("analysis_notes"))
-        or _clean_str(meta.get("ai_caption"))
-        or _clean_str(meta.get("user_comment"))
-        or _clean_str(meta.get("userComment"))
-    )
-    if user_comment:
+    user_comment = _user_comment_value(meta)
+    if user_comment and user_comment != _clean_str(meta.get("userComment")):
         patch[CANONICAL_USER_COMMENT_TAG] = {"op": "set", "value": user_comment}
 
     components, confidence, reason = _location_components_from_guess(meta)
@@ -271,10 +414,15 @@ def build_canonical_patch(meta: Dict[str, Any] | None, config: Config) -> Tuple[
 
     date_value, confidence, suggested, reason, source = _date_from_metadata(meta)
     if date_value:
-        if source == "metadata":
+        if (
+            source == "metadata"
+            or confidence is None
+            or confidence >= config.date_confidence_threshold
+        ):
             patch[CANONICAL_DATE_TAG] = {"op": "set", "value": date_value}
-        elif confidence is None or confidence >= config.date_confidence_threshold:
-            patch[CANONICAL_DATE_TAG] = {"op": "set", "value": date_value}
+            date_created = _date_created_value(date_value, meta)
+            if date_created:
+                patch[CANONICAL_DATE_CREATED_TAG] = {"op": "set", "value": date_created}
         else:
             patch_meta[CANONICAL_DATE_TAG] = {
                 "suggested": suggested or date_value,

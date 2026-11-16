@@ -45,6 +45,13 @@ GENERAL RULES FOR ALL BATCH TYPES
   – Example: If one back reads "Dec, 1925" and another reads
     "Dec. 13 1925" and another says "Winter 1925", combine as:
     "Winter / Dec. 13 1925"
+• A part labelled "Cover", "Folder", "Mount", "Envelope", "Note" or "Sleeve"
+  (possibly with "Back" or a number, e.g. "Envelope Back", "Note 2") is an
+  object attached to the same photo, scanned on its own: a studio folder,
+  a card mount, the envelope it was kept in, a clipped note. Transcribe it
+  like any other part, and use what it says (a studio imprint, an address,
+  a postmark) as evidence for the photo's date, place and people. A part
+  labelled "Black and White" is a black-and-white copy of the photo itself.
 
 METADATA SCOPE ACROSS IMAGES
 

@@ -3,6 +3,49 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0]
+
+Every field the Lightroom plug-in asks for can now be written to the file
+through photokin, so Lightroom can re-read the file without losing anything.
+
+### Changed
+
+- **`EXIF:UserComment` keeps your note.** The analysis is appended below the
+  file's own comment instead of replacing it. On a re-run only the previous
+  `[AI Analysis]` block is replaced, so notes are never duplicated or lost.
+  A run with no analysis text proposes no comment change. The merge needs
+  `-r` to see the file's comment.
+- **Location is written to XMP too.** Each IPTC location tag is also written
+  to the XMP tag Lightroom reads (`XMP-photoshop:Country` / `State` / `City`,
+  `XMP-iptcCore:Location`). Without it, Lightroom ignored the new IPTC values.
+- **The date is written to Date Created too.** `EXIF:DateTimeOriginal` is
+  joined by `XMP-photoshop:DateCreated` at the precision the model claimed,
+  so a year-only guess stays a year. A complete date also goes to
+  `IPTC:DateCreated`/`TimeCreated`. The changeset carries
+  `XMP-photoshop:DateCreated` beside every capture-date change; the allowlist
+  still names only `EXIF:DateTimeOriginal`.
+- **`-r` reads location and Date Created.** Location comes from XMP, then
+  IPTC, and a location already in the file beats the model's guess. A date
+  set only in Date Created counts as the file's own date.
+- **The IPTC location tags are in the default write set**, now that `-r`
+  reads them first.
+- **Instruction tags no longer feed `userComment`.** The standalone manifest
+  reader maps them to a new `instructions` key, which is still forwarded to
+  the model.
+- Changeset `schema_version` is now 3.
+
+### Added
+
+- **Scans of things attached to a photo group with it.** A file ending in
+  `-cover`, `-folder`, `-mount`, `-envelope`, `-sleeve`, `-note` or
+  `-note-N` (optionally followed by `-back`, then `-crop`) joins the photo's
+  group, is sent in the same call, and ranks after the back. A studio
+  imprint on a cover now informs the portrait's date and place. Only these
+  words group, so `smith-farm-01400` stays one name. This regroups folders
+  that already hold such files.
+- **`-bw`** marks a black-and-white copy of the same photo, and **`-page-N`**
+  is accepted beside `-pageN`, matching the archive's `fha photoindex`.
+
 ## [0.6.4]
 
 ### Fixed

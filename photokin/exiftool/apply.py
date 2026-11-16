@@ -9,7 +9,9 @@ tags, normalizes values (especially dates), and invokes ExifTool.
 
 Why this exists separately from the Lightroom SDK: a few archival fields (notably
 ``EXIF:UserComment`` and date tags) are either unwritable or awkward via the SDK,
-so the plugin routes them here. Date normalization is the fiddly part — ExifTool
+so the plugin routes its writes here. Each location tag is also written to its
+XMP twin, and a capture date to Date Created, so Lightroom reads back every
+field it is asked to re-read from the file. Date normalization is the fiddly part — ExifTool
 wants ``YYYY:MM:DD HH:MM:SS``, but changesets carry ISO-ish strings, so most of
 the private helpers below exist to coerce values into ExifTool's expected shape.
 
@@ -19,6 +21,7 @@ Code map:
 - _normalize_exif_string      strip/clean a scalar string value
 - _parse_fallback_datetime    last-ditch parse of loose date text
 - _normalize_tag_value        dispatch a tag+value to the right normalizer
+- _companion_tags             the extra tags written beside a location or date write
 - _datfile_name               deterministic ASCII filename for one (file, tag) DATFILE
 - _select_datfile_routing     decide which tag values must move off the command line
 - _build_exiftool_command     assemble the ExifTool argv for one file's writes
@@ -43,7 +46,15 @@ from datetime import date, datetime
 from json import JSONDecodeError
 from typing import Any
 
-from ..canonical import CANONICAL_KEYWORDS_TAG
+from ..canonical import (
+    CANONICAL_DATE_CREATED_TAG,
+    CANONICAL_DATE_TAG,
+    CANONICAL_IPTC_DATE_TAG,
+    CANONICAL_IPTC_TIME_TAG,
+    CANONICAL_KEYWORDS_TAG,
+    CANONICAL_LOCATION_TAGS,
+    CANONICAL_LOCATION_XMP_TAGS,
+)
 from ..changeset import WRITE_SUPPRESSED_KEY
 from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
 from .locate import resolve_exiftool_path
@@ -162,6 +173,49 @@ def _normalize_tag_value(tag: str, value: Any, warnings: list[dict[str, Any]]) -
         return str(value)
     warnings.append({"tag": tag, "warning": f"Unsupported value type: {type(value).__name__}."})
     return None
+
+
+#: IPTC IIM location tag -> the XMP tag Lightroom reads for the same field.
+_LOCATION_XMP_TWIN: dict[str, str] = {
+    CANONICAL_LOCATION_TAGS[part]: xmp_tag for part, xmp_tag in CANONICAL_LOCATION_XMP_TAGS.items()
+}
+
+#: A Date Created value the IIM pair can hold: a complete date, then an
+#: optional time. IIM has no partial-date form, so a year or a year-month is
+#: written to XMP only.
+_FULL_DATE_RE = re.compile(r"^(\d{4}:\d{2}:\d{2})(?: (\d{2}:\d{2}:\d{2}))?$")
+
+
+def _companion_tags(tags: dict[str, str], set_changes: dict[str, Any]) -> dict[str, str]:
+    """Return the tags written beside the allowed ones, so Lightroom sees every write.
+
+    The changeset and the allowlist name only the canonical tags. A location
+    write also goes to its XMP twin, because Lightroom ignores the IIM block in
+    favor of its own XMP once ExifTool has updated the IIM digest. A capture
+    date write also goes to Date Created: ``XMP-photoshop:DateCreated`` from the
+    changeset's value, which keeps the precision the model claimed (or the
+    capture date itself when a changeset from elsewhere has none), and the IIM
+    ``IPTC:DateCreated``/``IPTC:TimeCreated`` pair when that value is a
+    complete date.
+
+    Args:
+        tags: The allowed, normalized tag values about to be written.
+        set_changes: The record's ``proposed_changes.set``.
+
+    Returns:
+        Companion tag values; a tag the caller already writes is left out.
+    """
+    companions = {_LOCATION_XMP_TWIN[tag]: value for tag, value in tags.items() if tag in _LOCATION_XMP_TWIN}
+    if CANONICAL_DATE_TAG in tags:
+        proposed = set_changes.get(CANONICAL_DATE_CREATED_TAG)
+        date_created = str(proposed).strip() if isinstance(proposed, str) else tags[CANONICAL_DATE_TAG]
+        companions[CANONICAL_DATE_CREATED_TAG] = date_created
+        full_date = _FULL_DATE_RE.match(date_created)
+        if full_date:
+            companions[CANONICAL_IPTC_DATE_TAG] = full_date.group(1)
+            if full_date.group(2):
+                companions[CANONICAL_IPTC_TIME_TAG] = full_date.group(2)
+    return {tag: value for tag, value in companions.items() if tag not in tags}
 
 
 _TAG_FILENAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
@@ -597,10 +651,11 @@ def apply_changeset(
 
             if not tags_to_write and not keyword_args:
                 continue
-            write = _FileWrite(tags_to_write, keyword_args)
-            # Computed once so the dry-run preview and the real write can
-            # never count differently.
+            # Computed once, before companions join, so the dry-run preview and
+            # the real write count the same tags: the ones the caller allowed.
             tags_count = len(tags_to_write) + (1 if keyword_args else 0)
+            tags_to_write.update(_companion_tags(tags_to_write, set_changes))
+            write = _FileWrite(tags_to_write, keyword_args)
 
             def _datfile_path_for(tag: str, _line: int = line_number) -> str:
                 if cfg.dry_run:

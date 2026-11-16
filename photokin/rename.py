@@ -480,7 +480,7 @@ _VARIANT_RE = re.compile(
 # than reconstructing one from the parsed page number: parse_media_filename
 # reads that number with int(), which drops leading zeros ("007" -> 7), so a
 # length computed from the integer is wrong for any zero-padded page number.
-_PAGE_SUFFIX_RE = re.compile(r"^(.*?)-page(\d+)$", re.IGNORECASE)
+_PAGE_SUFFIX_RE = utils.PAGE_SUFFIX_RE
 
 
 def _variant_was_dashed(canonical_stem: str, parsed: utils.ParsedName) -> bool:
@@ -512,6 +512,10 @@ def _variant_was_dashed(canonical_stem: str, parsed: utils.ParsedName) -> bool:
         tail = tail[: -len("-front")]
     elif parsed.part_kind == "negative":
         tail = tail[: -len("-negative")]
+    elif parsed.part_kind == "bw":
+        tail = tail[: -len("-bw")]
+    elif parsed.part_kind == "attached" and parsed.attachment:
+        tail = tail[: -len(f"-{parsed.attachment}")]
     elif parsed.part_kind == "page" and parsed.page_num is not None:
         # Re-run the same page regex parse_media_filename used and take its
         # own group(1), rather than slicing by a length rebuilt from the
@@ -650,6 +654,7 @@ def _build_member(item: RenameItem, position: int) -> _Member:
         part_kind=final_part_kind,
         page_num=final_page_num,
         is_crop=parsed.is_crop,
+        attachment=parsed.attachment if final_part_kind == "attached" else None,
     )
 
     photo_date = None

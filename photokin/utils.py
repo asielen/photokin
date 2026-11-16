@@ -376,6 +376,7 @@ DEFAULT_METADATA_FORWARD_FIELDS: tuple[str, ...] = (
     "title",
     "caption",
     "userComment",
+    "instructions",
     "dateTimeOriginal",
     "location",
     "city",
@@ -1483,24 +1484,66 @@ class ParsedName:
 
     ``base_id`` is the shared id that groups variants/sides of the same photo;
     ``variant_id`` distinguishes versions (e.g. a trailing letter); ``part_kind``
-    says whether the file is a front/back/page/negative/none; ``page_num`` is the
-    page index for multipage docs; ``is_crop`` flags derived crop files. The
+    says whether the file is a front/back/page/negative/bw/attached/none;
+    ``page_num`` is the page index for multipage docs; ``is_crop`` flags derived
+    crop files; ``attachment`` is the role of an attached object (``"cover"``,
+    ``"envelope-back"``, ``"note-2"``) when ``part_kind`` is ``"attached"``. The
     manifest bucket loop -- which every input mode now routes through -- keys off
     these fields.
     """
 
     base_id: str
     variant_id: str | None
-    part_kind: str  # "front"|"back"|"page"|"negative"|"none"
+    part_kind: str  # "front"|"back"|"page"|"negative"|"bw"|"attached"|"none"
     page_num: int | None
     is_crop: bool = False
+    attachment: str | None = None
 
 
 #: One canonical ordering over :attr:`ParsedName.part_kind`, from "this is the
 #: object" to "this is a supporting view of it". Every tie-break in the pipeline
 #: that has to rank the files of a group reads it, so the file whose slot is
 #: chosen first and the file whose metadata is taken first are the same file.
-PART_RANK: dict[str, int] = {"front": 0, "none": 1, "page": 2, "back": 3, "negative": 4}
+#: A black-and-white copy ranks with the plain scan it copies, so the path
+#: settles which of the two leads; an attached object ranks after everything
+#: that is the photo itself, so the front or plain scan always stays primary.
+PART_RANK: dict[str, int] = {
+    "front": 0,
+    "none": 1,
+    "bw": 1,
+    "page": 2,
+    "back": 3,
+    "negative": 4,
+    "attached": 5,
+}
+
+#: Things physically attached to a photo and scanned on their own: a studio
+#: folder's or album's cover, the folder itself, the card mount, the envelope
+#: it was kept in, a note clipped to it (``-note``, ``-note-2``), a sleeve. A
+#: closed list on purpose: only these words split off the base id, so
+#: ``smith-farm-01400`` stays photo ``smith-farm-01400`` rather than becoming
+#: photo ``smith`` with a role of ``farm-01400``. Kept in step with the
+#: archive's ``fha photoindex`` grammar so a file groups the same way in both.
+ATTACHED_OBJECT_RE = re.compile(
+    r"^(?P<stem>.+?)-(?P<word>cover|folder|mount|envelope|sleeve|note(?:-\d+)?)$",
+    re.IGNORECASE,
+)
+
+#: ``-pageN`` or ``-page-N``.
+PAGE_SUFFIX_RE = re.compile(r"^(.*?)-page-?(\d+)$", re.IGNORECASE)
+
+
+def attached_role_label(role: str) -> str:
+    """Return the display label for an attached-object role.
+
+    Args:
+        role: The role as parsed, e.g. ``"envelope-back"`` or ``"note-2"``.
+
+    Returns:
+        The label the file travels under and its caption is filed under,
+        e.g. ``"Envelope Back"`` or ``"Note 2"``.
+    """
+    return " ".join(word.capitalize() for word in role.split("-"))
 
 #: Where an entry with no recognized ``part_kind`` sorts: alongside an untagged
 #: file, which is what an unparsed one effectively is.
@@ -1514,15 +1557,21 @@ def parse_media_filename(path: str) -> ParsedName:
     Rules:
     1) Strip extension.
     2) Strip -crop suffix first; it stacks on top of any other tag.
-    3) Detect part suffix in priority order: -negative, -back / -front, -pageN.
-    4) After removing the part suffix, detect a trailing single-letter variant ID.
+    3) Detect part suffix in priority order: -negative, -back / -front, -bw,
+       -pageN / -page-N.
+    4) If what is left ends in an attached-object word
+       (:data:`ATTACHED_OBJECT_RE`), the file is that object, and a -back
+       stripped in step 3 is the object's own back: ``-envelope-back`` is the
+       role ``envelope-back``, never the photo's back.
+    5) After removing the part suffix, detect a trailing single-letter variant ID.
        Variant letters appear before part suffixes (e.g., ...025b-back-crop).
-    5) The remaining stem is the base_id.
+    6) The remaining stem is the base_id.
     """
     stem = os.path.splitext(os.path.basename(path))[0]
     part_kind = "none"
     page_num: int | None = None
     is_crop = False
+    attachment: str | None = None
 
     lowered = stem.lower()
 
@@ -1542,15 +1591,24 @@ def parse_media_filename(path: str) -> ParsedName:
     elif lowered.endswith("-front"):
         part_kind = "front"
         stem = stem[: -len("-front")]
+    elif lowered.endswith("-bw"):
+        part_kind = "bw"
+        stem = stem[: -len("-bw")]
     else:
-        m_page = re.match(r"^(.*?)-page(\d+)$", stem, flags=re.IGNORECASE)
+        m_page = PAGE_SUFFIX_RE.match(stem)
         if m_page:
             part_kind = "page"
             stem = m_page.group(1)
-            try:
-                page_num = int(m_page.group(2))
-            except Exception:
-                page_num = None
+            page_num = int(m_page.group(2))
+
+    if part_kind in ("none", "back"):
+        m_attached = ATTACHED_OBJECT_RE.match(stem)
+        if m_attached:
+            attachment = m_attached.group("word").lower()
+            if part_kind == "back":
+                attachment += "-back"
+            part_kind = "attached"
+            stem = m_attached.group("stem")
     # NOTE: Do not infer missing "-page1" here; grouping decides whether an
     # untagged file should be treated as Page 1 only when the group contains
     # other explicit -pageN files.
@@ -1572,6 +1630,7 @@ def parse_media_filename(path: str) -> ParsedName:
         part_kind=part_kind,
         page_num=page_num,
         is_crop=is_crop,
+        attachment=attachment,
     )
 
 
@@ -1661,7 +1720,8 @@ def render_media_filename(
     Raises:
         ValueError: If *prefix* is empty once its trailing ``-`` is trimmed,
             or *parsed* claims ``part_kind == "page"`` without a
-            ``page_num`` to render.
+            ``page_num`` to render, or ``"attached"`` without an
+            ``attachment``.
     """
     prefix = prefix.rstrip("-")
     if not prefix:
@@ -1679,6 +1739,12 @@ def render_media_filename(
         if parsed.page_num is None:
             raise ValueError("part_kind is 'page' but page_num is None")
         part = f"-page{parsed.page_num}"
+    elif parsed.part_kind == "bw":
+        part = "-bw"
+    elif parsed.part_kind == "attached":
+        if not parsed.attachment:
+            raise ValueError("part_kind is 'attached' but attachment is None")
+        part = f"-{parsed.attachment}"
     else:
         part = ""
 
@@ -1948,8 +2014,9 @@ def combine_group_metadata(items_in_group: list[dict]) -> dict:
             p,
         )
 
-    keywords = []
+    keywords: list[str] = []
     title = caption = date = location = state = city = country = user_comment = None
+    instructions = None
 
     # if any preferred has values, pluck them first
     preferred = sorted((it for it in items_in_group if it.get("preferred")), key=_scan_key)
@@ -1970,10 +2037,12 @@ def combine_group_metadata(items_in_group: list[dict]) -> dict:
         if not country:       country = (meta.get("country") or "").strip() or None
         if not user_comment:
             user_comment = (meta.get("userComment") or "").strip() or None
+        if not instructions:
+            instructions = (meta.get("instructions") or "").strip() or None
 
     # dedupe keywords
     keywords = _norm_str_set(keywords)
-    out = {}
+    out: dict[str, str | list[str]] = {}
     if keywords: out["keywords"] = keywords
     if title:    out["title"] = title
     if caption:  out["caption"] = caption
@@ -1991,6 +2060,7 @@ def combine_group_metadata(items_in_group: list[dict]) -> dict:
     if city:     out["city"] = city
     if country:  out["country"] = country
     if user_comment: out["userComment"] = user_comment
+    if instructions: out["instructions"] = instructions
     return out
 
 # === Metadata merge helpers ===
@@ -2020,6 +2090,7 @@ def merge_original_sources(primary: dict | None, fallback: dict | None) -> dict:
     ``combine_group_metadata`` produces the ``date`` spelling. Without the alias
     no file's own date ever reaches its own record, and every file in a group
     would inherit whichever sibling the group scan happened to read first.
+    ``state`` reads ``stateProvince`` for the same reason.
     """
     primary = primary or {}
     fallback = fallback or {}
@@ -2035,16 +2106,15 @@ def merge_original_sources(primary: dict | None, fallback: dict | None) -> dict:
     fk = _norm_list(fallback.get("keywords") or fallback.get("tags"))
     keywords = union_keywords(pk, fk)
 
+    aliases = {"date": "dateTimeOriginal", "state": "stateProvince"}
+
     def _pick(field: str):
-        v1 = (primary.get(field) or "").strip()
-        if not v1 and field == "date":
-            v1 = (primary.get("dateTimeOriginal") or "").strip()
-        if v1:
-            return v1
-        v2 = (fallback.get(field) or "").strip()
-        if not v2 and field == "date":
-            v2 = (fallback.get("dateTimeOriginal") or "").strip()
-        return v2 or None
+        alias = aliases.get(field, field)
+        for source in (primary, fallback):
+            value = (source.get(field) or source.get(alias) or "").strip()
+            if value:
+                return value
+        return None
 
     merged: dict[str, str | list[str]] = {}
     if keywords:

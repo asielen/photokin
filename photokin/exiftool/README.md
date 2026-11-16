@@ -5,10 +5,13 @@ Lightroom SDK cannot reliably read or write some fields — most importantly
 `EXIF:UserComment` — so the pipeline uses ExifTool for exactly those gaps:
 
 - **Read (hydration)**: before analysis, and only when the CLI was given `-r`,
-  fill each item's metadata from the file itself — `EXIF:DateTimeOriginal`,
-  `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject`, the set
-  `DEFAULT_EXIFTOOL_FIELDS` declares — for every input type, filling only the
-  keys the item does not already carry. `XMP:Subject` is read because
+  fill each item's metadata from the file itself — `EXIF:DateTimeOriginal`
+  (else `XMP-photoshop:DateCreated`), `EXIF:UserComment`, `XMP:Description`,
+  `XMP:Title`, `XMP:Subject` and the four location fields (XMP, else IPTC),
+  the set `DEFAULT_EXIFTOOL_FIELDS` declares — for every input type, filling
+  only the keys the item does not already carry. Instruction tags map to
+  their own `instructions` key, never to `userComment`, because UserComment is
+  also the base the new analysis is appended to. `XMP:Subject` is read because
   `merge.py`'s date-correction heuristic treats a `DATE:` keyword as a human
   "hands off the date" signal, and reading the date without its interlock would
   re-date a print an archivist has already dated by hand. A file list too long
@@ -16,7 +19,10 @@ Lightroom SDK cannot reliably read or write some fields — most importantly
   failing as a unit.
 - **Write (apply)**: after analysis, write selected changeset fields directly
   into the files (or sidecars), so they survive even where Lightroom can't
-  write them.
+  write them. Each IPTC location tag is also written to its XMP twin, and
+  `EXIF:DateTimeOriginal` to `XMP-photoshop:DateCreated` (plus the IIM
+  `IPTC:DateCreated`/`TimeCreated` pair for a complete date), so Lightroom
+  sees every write when it re-reads the file.
 
 The core never imports this package; the CLI composes the two
 (**hydrate → analyze → apply**). Anything embedding the core can skip this
@@ -45,11 +51,9 @@ layer entirely.
 `ExiftoolConfig.from_env()` builds the pipeline config from environment
 variables — `EXIFTOOL_WRITE_ENABLED` (default false), `EXIFTOOL_PATH`,
 `EXIFTOOL_FIELDS` (comma-separated, default: every canonical tag photokin both
-produces and reads back, `DEFAULT_PIPELINE_FIELDS` in `config.py` — the IPTC
-location tags are excluded until hydration reads them; a caller that writes
-some tags itself, the way the Lightroom plug-in does, narrows it explicitly) —
-with
-explicit keyword overrides winning. The main CLI's `--exiftool-write`,
+produces and reads back, `DEFAULT_PIPELINE_FIELDS` in `config.py`; a caller
+that writes some tags itself narrows it explicitly) — with explicit keyword
+overrides winning. The main CLI's `--exiftool-write`,
 `--exiftool-fields` and `--exiftool-path` flags layer on top
 (flag > env > default), and `-w` is the shorthand that turns writing on.
 

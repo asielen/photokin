@@ -12,7 +12,9 @@ record and a report of what it overrode/unioned, so callers can log decisions.
 
 Key domain rules encoded here:
 - Keywords union (original first), case-insensitive de-dup, spelling preserved.
-- Original caption/location win when present; an original title wins only where
+- Original caption/location win when present (a structured ``locationShown``,
+  else the flat ``country``/``stateProvince``/``city``/``location`` keys); an
+  original title wins only where
   the model returned none, since a title the model returns was read off the
   print while a file's own title is as likely to be scanner boilerplate.
 - The original date is evidence, not truth: it drives the correction heuristic
@@ -143,24 +145,10 @@ def _structured_location_from_original(original: Dict[str, Any]) -> Dict[str, st
             "sublocation": _normalize_location_component(obj.get("subLocation") or obj.get("location")),
         }
 
-    if loc_obj:
-        return _from_obj(loc_obj)
-
-    loc_text = _normalize_location_component(original.get("location"))
-    if loc_text:
-        return {
-            "country": None,
-            "state": None,
-            "city": None,
-            "sublocation": loc_text,
-        }
-
-    return {
-        "country": None,
-        "state": None,
-        "city": None,
-        "sublocation": None,
-    }
+    # Without a structured object, the flat keys -- what -r hydrates from the
+    # file's XMP/IPTC location, and what a manifest may carry -- are read the
+    # same way, a bare "location" string standing for the sublocation.
+    return _from_obj(loc_obj or original)
 
 
 def _render_location_string(parts: Dict[str, str | None]) -> str | None:

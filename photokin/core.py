@@ -74,6 +74,7 @@ from .api import call_model, extract_output_text, get_response_model
 from .errors import ProviderApiError, SELF_EXPLANATORY_ERROR_TYPES
 from .merge import merge_record_with_original as merge_metadata
 from .canonical import (
+    AI_ANALYSIS_MARKER_RE,
     build_canonical_patch,
     canonical_values_from_metadata,
     canonical_values_from_patch,
@@ -256,21 +257,25 @@ def _strip_empty_caption_sections(caption: str) -> str:
 
 #: A caption an older photokin release wrote may still carry an "[AI Analysis]"
 #: tail glued on from a previous run -- that release's own interpretation, not a
-#: human's words. ``_split_caption_sections`` matches on this to drop that tail
-#: when reading an existing caption back in, so an already-contaminated file is
-#: cleaned up the next time it is read rather than having the stale analysis
-#: treated as a caption section and merged forward forever.
-#:
-#: Matched loosely: ``inject_analysis_date`` rewrites the marker to
-#: "[AI Analysis on 1952-06-01]:" in ``ai_caption``, so both spellings have to be
-#: recognized.
-_CAPTION_AI_MARKER_RE = re.compile(r"^\s*\[AI Analysis\b[^\]]*\]\s*:?", re.IGNORECASE)
+#: human's words. ``_split_caption_sections`` matches on
+#: ``canonical.AI_ANALYSIS_MARKER_RE`` to drop that tail when reading an existing
+#: caption back in, so an already-contaminated file is cleaned up the next time
+#: it is read rather than having the stale analysis treated as a caption section
+#: and merged forward forever. The same marker splits a UserComment into the
+#: person's text and the previous run's analysis.
 
 #: A caption line that already carries one of our own section labels. ``Front``
 #: is read but never written: it is what photokin wrote before the wording
 #: became ``Photo``, and an archive enriched by an older release must keep those
 #: lines as they are rather than have them attributed a second time.
-_CAPTION_LABEL_RE = re.compile(r"^\s*\[(Photo|Front|Back)(\s+[^\]]+)?\]\s*:?\s*", re.IGNORECASE)
+#: The black-and-white copy and the attached objects (``utils.ATTACHED_OBJECT_RE``)
+#: carry labels of their own, "[Cover]" or "[Envelope Back]", read back here so
+#: a re-run files them under the same section instead of attributing them again.
+_CAPTION_LABEL_RE = re.compile(
+    r"^\s*\[(Photo|Front|Back|Black and White|Cover|Folder|Mount|Envelope|Note|Sleeve)"
+    r"(\s+[^\]]+)?\]\s*:?\s*",
+    re.IGNORECASE,
+)
 
 #: The bare prefix a model sometimes puts on a caption of its own accord, and
 #: which an older tool may have written into a file. Stripped only when it names
@@ -459,7 +464,7 @@ def _split_caption_sections(caption: str, label: str) -> list[tuple[str, list[st
     """
     kept: list[str] = []
     for raw in (caption or "").strip().splitlines():
-        if _CAPTION_AI_MARKER_RE.match(raw):
+        if AI_ANALYSIS_MARKER_RE.match(raw):
             break
         kept.append(raw.rstrip())
 
@@ -2761,6 +2766,7 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
         "version": version,
         "part_kind": part_kind,
         "page_num": page_num,
+        "attachment": parsed.attachment if part_kind == "attached" else None,
         "is_crop": is_crop,
         "group_key": group_key,
         "preferred": bool(raw.get("preferred")),
@@ -2997,8 +3003,12 @@ def _manifest_part_key(entry: dict) -> str:
         # '-page0' is a legal name whose slot must stay distinct from page 1's.
         page_num = entry["page_num"]
         return f"page:{1 if page_num is None else page_num}"
-    if part_kind in ("front", "back", "negative"):
+    if part_kind in ("front", "back", "negative", "bw"):
         return part_kind
+    if part_kind == "attached":
+        # Each attached role is its own slot: a cover and an envelope are two
+        # objects, and an envelope's back is not the envelope.
+        return f"attached:{entry['attachment']}"
     return "none"
 
 
@@ -3031,7 +3041,8 @@ def resolve_part_label(
 
     Returns:
         The part label the entry's file was sent under: ``"Front"``,
-        ``"Back"``, ``"Negative"`` or ``"Page N"``.
+        ``"Back"``, ``"Negative"``, ``"Page N"``, ``"Black and White"`` or an
+        attached object's label such as ``"Envelope Back"``.
     """
     part_key = _manifest_part_key(entry)
     if part_key == "none" and multipage_present and entry["version"] in relabelled_versions:
@@ -3053,11 +3064,21 @@ def part_label_for_slot(part_key: str) -> str:
             ``"page:N"`` after the page-1 relabel.
 
     Returns:
-        ``"Front"``, ``"Back"``, ``"Negative"`` or ``"Page N"``.
+        ``"Front"``, ``"Back"``, ``"Negative"``, ``"Page N"``, ``"Black and
+        White"`` or an attached object's label such as ``"Note 2"``.
     """
-    if part_key.startswith("page:"):
-        return f"Page {part_key.split(':', 1)[1]}"
-    return {"front": "Front", "back": "Back", "negative": "Negative", "none": "Front"}[part_key]
+    kind, _, detail = part_key.partition(":")
+    if kind == "page":
+        return f"Page {detail}"
+    if kind == "attached":
+        return utils.attached_role_label(detail)
+    return {
+        "front": "Front",
+        "back": "Back",
+        "negative": "Negative",
+        "bw": "Black and White",
+        "none": "Front",
+    }[part_key]
 
 
 def _slot_address_rank(version: str | None, part_key: str) -> tuple[int, int, int, str]:
@@ -3074,10 +3095,8 @@ def _slot_address_rank(version: str | None, part_key: str) -> tuple[int, int, in
     Returns:
         A sort key placing the address a path should keep first.
     """
-    if part_key.startswith("page:"):
-        kind, page_num = "page", int(part_key.split(":", 1)[1])
-    else:
-        kind, page_num = part_key, 0
+    kind, _, detail = part_key.partition(":")
+    page_num = int(detail) if kind == "page" else 0
     return (_PART_RANK[kind], page_num, 0 if version is None else 1, version or "")
 
 
@@ -3524,11 +3543,33 @@ def process_manifest_stream(
                                 continue
                 page_nums_all = sorted(page_set)
 
-            all_negatives: list[str] = []
-            for ver in variant_list_sorted:
-                neg = variant_parts.get(ver, {}).get("negative")
-                if neg and neg not in all_negatives:
-                    all_negatives.append(neg)
+            def _slot_paths(key: str) -> list[str]:
+                """Every variant's file in the ``key`` slot, once each, in variant order."""
+                paths: list[str] = []
+                for ver in variant_list_sorted:
+                    pth = variant_parts.get(ver, {}).get(key)
+                    if pth and pth not in paths:
+                        paths.append(pth)
+                return paths
+
+            all_negatives = _slot_paths("negative")
+
+            # Parts that are neither a side of the photo nor a page: its
+            # black-and-white copy and the objects attached to it, each role
+            # its own part, after everything that is the photo itself. They
+            # travel in the group's one call so a studio imprint on a cover
+            # informs the portrait's date and place, and the cover's own
+            # analysis sees the portrait.
+            extra_keys = sorted(
+                {
+                    key
+                    for parts in variant_parts.values()
+                    for key in parts
+                    if key == "bw" or key.startswith("attached:")
+                },
+                key=lambda key: (_slot_address_rank(None, key), key),
+            )
+            extra_parts = [(part_label_for_slot(key), _slot_paths(key)) for key in extra_keys]
 
             # Primary selection reads the slot map rather than the arrival order,
             # so the analyzed file is always one the payload actually carries.
@@ -3629,6 +3670,7 @@ def process_manifest_stream(
             group_payload = (
                 multipage_present
                 or bool(all_negatives)
+                or bool(extra_parts)
                 or len(all_fronts) > 1
                 or len(all_backs) > 1
             )
@@ -3716,20 +3758,18 @@ def process_manifest_stream(
                         if part_paths:
                             parts_for_analysis.append((f"Page {num}", part_paths))
 
-                    def _collect_part(key: str, label: str):
-                        # Preserve supplemental sides (front/back) after pages, since
-                        # multipage mode prioritizes ordered pages first.
-                        part_paths: list[str] = []
-                        for ver in variant_list_sorted:
-                            pth = variant_parts.get(ver, {}).get(key)
-                            if pth and pth not in part_paths:
-                                part_paths.append(pth)
-                        if part_paths:
-                            parts_for_analysis.append((label, part_paths))
-
-                    _collect_part("front", "Front")
-                    _collect_part("back", "Back")
-                    _collect_part("negative", "Negative")
+                    # Supplemental sides follow the pages, since multipage
+                    # mode prioritizes ordered pages first.
+                    parts_for_analysis.extend(
+                        (label, paths)
+                        for label, paths in (
+                            ("Front", _slot_paths("front")),
+                            ("Back", _slot_paths("back")),
+                            ("Negative", all_negatives),
+                            *extra_parts,
+                        )
+                        if paths
+                    )
 
                     if not parts_for_analysis:
                         raise ValueError(f"No parts collected for multipage group {stem}")
@@ -3740,10 +3780,11 @@ def process_manifest_stream(
                         original_meta=combined_meta,
                         write_sidecar=write_sidecars,
                     )
-                elif all_negatives:
-                    # A negative is neither a front nor a back, so it needs the
-                    # generic part form. The ordinary front/back call site is
-                    # left exactly as it was.
+                elif all_negatives or extra_parts:
+                    # A negative, a black-and-white copy or an attached object
+                    # is neither a front nor a back, so it needs the generic
+                    # part form. The ordinary front/back call site is left
+                    # exactly as it was.
                     data_group = analyze_group_parts(
                         parts=[
                             (label, paths)
@@ -3751,6 +3792,7 @@ def process_manifest_stream(
                                 ("Front", all_fronts),
                                 ("Back", all_backs),
                                 ("Negative", all_negatives),
+                                *extra_parts,
                             )
                             if paths
                         ],
@@ -3796,7 +3838,18 @@ def process_manifest_stream(
                 canonical = data_primary["result"][primary_front]
                 analyses.append((canonical, primary_front, primary_version))
 
-            multiple_fronts = len([it for it in group if not it["is_back"]]) > 1
+            # Each of these carries a caption label of its own ("[Cover]",
+            # "[Black and White]"), so none of them makes the photo's own
+            # scans "multiple".
+            labelled_apart = {
+                it["path"]: part_label_for_slot(_manifest_part_key(it))
+                for it in group
+                if it["part_kind"] in ("bw", "attached")
+            }
+            multiple_fronts = (
+                len([it for it in group if not it["is_back"] and it["path"] not in labelled_apart])
+                > 1
+            )
             multiple_backs = len([it for it in group if it["is_back"]]) > 1
 
             # Variant merge rules:
@@ -3920,7 +3973,9 @@ def process_manifest_stream(
 
             # --- Which label each file's caption is filed under -----------------
 
-            has_front_side = any(not it["is_back"] for it in group)
+            has_front_side = any(
+                not it["is_back"] and it["path"] not in labelled_apart for it in group
+            )
             has_back_side = any(it["is_back"] for it in group)
             # "[Back]" only says anything opposite a "[Photo]", and a lone file
             # has nothing to be told apart from, so the overwhelmingly common
@@ -3954,8 +4009,14 @@ def process_manifest_stream(
                 # own wording to leave alone.
                 return letter.upper() if len(letter) == 1 else letter
 
-            def _label_for(is_back: bool, ver: str | None, page_num: int | None = None) -> str:
+            def _label_for(entry: dict) -> str:
                 """Return the label a file's own caption is filed under, or ""."""
+                is_back, ver, page_num = entry["is_back"], entry["version"], entry.get("page_num")
+                apart = labelled_apart.get(entry["path"])
+                if apart is not None:
+                    # An attached object or a black-and-white copy is named for
+                    # what it is whenever anything else shares the block.
+                    return f"[{apart}]" if len({it["path"] for it in group}) > 1 else ""
                 # The letter appears only where it disambiguates, decided per
                 # role independently -- which is exactly what multiple_fronts and
                 # multiple_backs already answer, so they answer it here. Two
@@ -3995,7 +4056,7 @@ def process_manifest_stream(
             group_intake = [
                 (
                     (entry_meta.get("caption") or "").strip(),
-                    _label_for(entry["is_back"], entry["version"], entry.get("page_num")),
+                    _label_for(entry),
                 )
                 for entry, entry_meta in sorted(
                     zip(group, own_metadata), key=lambda pair: _slot_rank_key(pair[0])
@@ -4186,7 +4247,7 @@ def process_manifest_stream(
                 fallback_intake = [
                     (
                         (entry_meta.get("caption") or "").strip(),
-                        _label_for(entry["is_back"], entry["version"], entry.get("page_num")),
+                        _label_for(entry),
                     )
                     for entry, entry_meta, part_text in sorted(
                         zip(group, own_metadata, attributed),
@@ -4491,7 +4552,12 @@ def process_manifest_stream(
                             )
 
                 merged["_merge"] = report
-                patch, patch_meta = build_canonical_patch(merged, cfg)
+                # The UserComment is merged against this file's own comment,
+                # not the group's: variants share one AI block, but each keeps
+                # its own user text.
+                patch, patch_meta = build_canonical_patch(
+                    {**merged, "userComment": own_meta.get("userComment")}, cfg
+                )
                 # One decision for both write vehicles and the record flag --
                 # see the helper's docstring for why a gate must never touch
                 # just one of them.

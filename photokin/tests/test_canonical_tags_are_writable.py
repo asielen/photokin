@@ -55,6 +55,9 @@ _MINIMAL_JPEG_B64 = (
 _SAMPLE_VALUES = {
     "EXIF:DateTimeOriginal": "1975:06:01 12:00:00",
     "EXIF:CreateDate": "1975:06:01 12:00:00",
+    "XMP-photoshop:DateCreated": "1975:06:01 12:00:00",
+    "IPTC:DateCreated": "1975:06:01",
+    "IPTC:TimeCreated": "12:00:00+00:00",
 }
 _DEFAULT_SAMPLE = "photokin writability probe"
 

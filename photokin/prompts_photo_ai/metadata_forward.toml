@@ -6,6 +6,7 @@ forward_fields = [
   "title",
   "caption",
   "userComment",
+  "instructions",
   "dateTimeOriginal",
   "location",
   "city",
