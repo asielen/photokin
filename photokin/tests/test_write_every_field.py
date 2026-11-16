@@ -47,6 +47,7 @@ from photokin.canonical import (
 from photokin.changeset import diff_canonical_metadata
 from photokin.exiftool.apply import apply_changeset
 from photokin.exiftool.config import ExiftoolConfig
+from photokin.exiftool.manifest import utf8_argfile
 
 #: The plug-in's ``--exiftool-fields`` after this change, verbatim.
 _PLUGIN_FIELDS = (
@@ -585,6 +586,40 @@ class TestNonAsciiTextSurvivesTheRoundTrip(_RealExiftoolCase):
 
                 self.assertEqual(summary["errors"], [])
                 self.assertEqual(self.read_back(path)["XMP-photoshop:City"], "Kraków")
+
+
+class TestALineBreakNeverSplitsAnArgument(_RealExiftoolCase):
+    """A keyword carrying a line break stays one keyword and touches nothing else."""
+
+    def test_the_argfile_is_not_used_for_an_argument_with_a_line_break(self) -> None:
+        cmd = ["exiftool", "-XMP-dc:Subject+=Łódź\n-XMP-dc:Title=", "photo.jpg"]
+
+        self.assertEqual(utf8_argfile(cmd), (cmd, None))
+
+    def test_a_keyword_line_break_cannot_clear_another_tag(self) -> None:
+        for extension in _FORMATS:
+            with self.subTest(format=extension):
+                path = self.image(extension, {"XMP-dc:Title": "Aunt May's porch"})
+                changeset = os.path.join(self.work, f"{extension}-kw.ndjson")
+                proposed = {
+                    "set": {"XMP-dc:Description": "Café on the corner"},
+                    "keywords_add": ["Łódź trip\n-XMP-dc:Title="],
+                }
+                with open(changeset, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"path": path, "proposed_changes": proposed}) + "\n")
+
+                summary = apply_changeset(
+                    changeset,
+                    ExiftoolConfig(enabled=True, path=self.exiftool),
+                    fields=("XMP-dc:Description", "XMP-dc:Subject"),
+                )
+
+                self.assertEqual(summary["errors"], [])
+                record = json.loads(
+                    self.exiftool_run("-j", "-G1", "-XMP-dc:Title", "-XMP-dc:Subject", path)
+                )[0]
+                self.assertEqual(record["XMP-dc:Title"], "Aunt May's porch")
+                self.assertEqual(record["XMP-dc:Subject"], "Łódź trip -XMP-dc:Title=")
 
 
 class TestAnAccentedFolderIsReadAndWritten(_RealExiftoolCase):

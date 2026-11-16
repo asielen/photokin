@@ -220,6 +220,7 @@ def _companion_tags(tags: dict[str, str], set_changes: dict[str, Any]) -> dict[s
 
 
 _TAG_FILENAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
+_LINE_BREAKS_RE = re.compile(r"[\r\n]+")
 
 
 def _datfile_name(file_index: int, tag: str) -> str:
@@ -400,7 +401,9 @@ def _keyword_delta_args(
                     {"path": path, "warning": f"Skipping a non-string or empty {key} entry."}
                 )
                 continue
-            keyword = value.strip()
+            # A keyword is one line: a break inside one ("Family\nReunion")
+            # folds to a space rather than reaching ExifTool as two tokens.
+            keyword = _LINE_BREAKS_RE.sub(" ", value).strip()
             if len(keyword) > _INLINE_VALUE_MAX:
                 # A "keyword" this long is malformed output, and unlike a set
                 # value it cannot be routed to a DATFILE, so it is dropped by

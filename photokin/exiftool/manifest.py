@@ -169,14 +169,17 @@ def utf8_argfile(cmd: list[str]) -> tuple[list[str], str | None]:
     arrives intact. An all-ASCII command is returned unchanged.
 
     Args:
-        cmd: The argv: the ExifTool binary, then its arguments. No argument
-            may contain a line break, since an argument file holds one per line.
+        cmd: The argv: the ExifTool binary, then its arguments.
 
     Returns:
         ``(argv, stdin)``: the command to run and the text to feed it, or the
-        command unchanged and ``None``.
+        command unchanged and ``None``. A command whose arguments hold a line
+        break also stays on the command line: an argument file holds one
+        argument per line, so the break would split one argument into two,
+        and the second half would be read as a file name or an option.
     """
-    if all(arg.isascii() for arg in cmd[1:]):
+    args = cmd[1:]
+    if all(arg.isascii() for arg in args) or any("\n" in arg or "\r" in arg for arg in args):
         return cmd, None
     return [cmd[0], "-@", "-"], "\n".join(["-charset", "filename=utf8", *cmd[1:]]) + "\n"
 
