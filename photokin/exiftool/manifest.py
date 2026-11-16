@@ -34,6 +34,7 @@ This module is also imported (not just run) by the ExifTool hydration path
 Code map:
 - _split_fields                       expand comma-separated --field values
 - _normalize_paths                    absolutize/clean input file paths
+- utf8_argfile                        PUBLIC: move non-ASCII arguments onto stdin as UTF-8
 - run_exiftool_json                   PUBLIC: run exiftool -j and parse the JSON
 - manifest_value                      PUBLIC: one tag value -> the shape its key expects
 - _first_non_empty                    pick the first present value across tag aliases
@@ -158,6 +159,28 @@ def _batch_files(files: List[str], prefix_cost: int) -> List[List[str]]:
     return batches
 
 
+def utf8_argfile(cmd: list[str]) -> tuple[list[str], str | None]:
+    """Move a command's arguments onto stdin when any of them is not ASCII.
+
+    On Windows ExifTool reads its command line in the ANSI code page, so a
+    path such as ``D:\\Photos\\Grand-mère`` or a value such as ``Łódź`` reaches
+    it mangled, and with ``-charset filename=utf8`` an accented path is not
+    found at all. An argument file read from stdin (``-@ -``) is UTF-8 and
+    arrives intact. An all-ASCII command is returned unchanged.
+
+    Args:
+        cmd: The argv: the ExifTool binary, then its arguments. No argument
+            may contain a line break, since an argument file holds one per line.
+
+    Returns:
+        ``(argv, stdin)``: the command to run and the text to feed it, or the
+        command unchanged and ``None``.
+    """
+    if all(arg.isascii() for arg in cmd[1:]):
+        return cmd, None
+    return [cmd[0], "-@", "-"], "\n".join(["-charset", "filename=utf8", *cmd[1:]]) + "\n"
+
+
 def _run_exiftool_batch(
     exiftool_path: str, cmd: List[str], timeout_sec: int
 ) -> List[Dict[str, Any]]:
@@ -169,9 +192,11 @@ def _run_exiftool_batch(
     into mojibake, and a value such as ``Łódź`` failed to decode at all. A
     record that is not valid UTF-8 is a failed read, raised as one.
     """
+    argv, stdin = utf8_argfile(cmd)
     try:
         proc = subprocess.run(
-            cmd,
+            argv,
+            input=None if stdin is None else stdin.encode("utf-8"),
             capture_output=True,
             timeout=timeout_sec,
             check=False,

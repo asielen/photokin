@@ -249,13 +249,16 @@ class _RealExiftoolCase(unittest.TestCase):
                     logger.removeHandler(handler)
                     handler.close()
 
-    def image(self, extension: str, tags: dict[str, str] | None = None) -> str:
+    def image(
+        self, extension: str, tags: dict[str, str] | None = None, folder_prefix: str = "tmp"
+    ) -> str:
         """Create a real image in its own folder, seeded with ``tags``.
 
         Each value is seeded from a UTF-8 file (``-TAG<=file``), because an
-        inline non-ASCII value reaches ExifTool on Windows as ``?``.
+        inline non-ASCII value reaches ExifTool on Windows as ``?``. The
+        folder's name starts with ``folder_prefix``.
         """
-        folder = tempfile.mkdtemp(dir=self.work)
+        folder = tempfile.mkdtemp(prefix=folder_prefix, dir=self.work)
         path = os.path.join(folder, f"photo.{extension}")
         Image.new("RGB", (4, 4), "white").save(path)
         args = []
@@ -269,14 +272,18 @@ class _RealExiftoolCase(unittest.TestCase):
         return path
 
     def exiftool_run(self, *args: str) -> str:
-        """Run the real ExifTool and return its stdout."""
+        """Run the real ExifTool and return its stdout.
+
+        The arguments travel as a UTF-8 argument file on stdin, so an
+        accented folder or value reaches ExifTool intact on Windows.
+        """
+        stdin = "\n".join(["-charset", "filename=utf8", *args]) + "\n"
         result = subprocess.run(
-            [self.exiftool, *args],
+            [self.exiftool, "-@", "-"],
+            input=stdin,
             capture_output=True,
-            text=True,
             encoding="utf-8",
             check=True,
-            stdin=subprocess.DEVNULL,
         )
         return result.stdout
 
@@ -578,6 +585,39 @@ class TestNonAsciiTextSurvivesTheRoundTrip(_RealExiftoolCase):
 
                 self.assertEqual(summary["errors"], [])
                 self.assertEqual(self.read_back(path)["XMP-photoshop:City"], "Kraków")
+
+
+class TestAnAccentedFolderIsReadAndWritten(_RealExiftoolCase):
+    """A photo under ``Grand-mère Łódź`` is found, read and written."""
+
+    def test_the_plugin_call_reads_and_writes_in_an_accented_folder(self) -> None:
+        for extension in _FORMATS:
+            with self.subTest(format=extension):
+                path = self.image(
+                    extension,
+                    {"EXIF:UserComment": "Café note", "XMP-photoshop:City": "Kraków"},
+                    folder_prefix="Grand-mère Łódź ",
+                )
+                reply = {
+                    **TestUserCommentInTheFile.REPLY,
+                    "caption": "Café on the corner\nsecond line",
+                    "keywords": ["Łódź trip"],
+                }
+
+                record = self.run_plugin_call(path, reply)
+
+                self.assertNotIn("suppressed", record["proposed_changes"])
+                self.assertEqual(record["original_data"]["file_metadata"]["IPTC:City"], "Kraków")
+                record_back = json.loads(
+                    self.exiftool_run("-j", "-G1", "-XMP-dc:Description", "-XMP-dc:Subject", path)
+                )[0]
+                self.assertEqual(
+                    record_back["XMP-dc:Description"], "Café on the corner\nsecond line"
+                )
+                self.assertIn("Łódź trip", json.dumps(record_back, ensure_ascii=False))
+                self.assertTrue(
+                    self.read_back(path)["EXIF:UserComment"].startswith("Café note\n\n")
+                )
 
 
 class TestTheBeforeSnapshotShowsTheFilesOwnDateCreated(_RealExiftoolCase):

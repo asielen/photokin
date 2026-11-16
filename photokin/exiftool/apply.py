@@ -58,6 +58,7 @@ from ..canonical import (
 from ..changeset import WRITE_SUPPRESSED_KEY
 from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
 from .locate import resolve_exiftool_path
+from .manifest import utf8_argfile
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,10 @@ class _FileWrite:
 
     tags: dict[str, str]
     keyword_args: list[str] = field(default_factory=list)
+    #: Whether the command will travel as a UTF-8 argument file on stdin
+    #: (``manifest.utf8_argfile``), which holds one argument per line, so a
+    #: multi-line value has to move to a DATFILE.
+    via_argfile: bool = False
 
 
 def _command_length_units(cmd: list[str]) -> int:
@@ -304,8 +309,8 @@ def _select_datfile_routing(
     """Decide which of one file's tag values must route through a DATFILE.
 
     Two passes, per decision E3 in docs/per-page-captions.md: first, any value
-    longer than ``_INLINE_VALUE_MAX``, or holding any non-ASCII character,
-    always routes. Then the whole command is
+    longer than ``_INLINE_VALUE_MAX`` always routes, and so does a multi-line
+    value when the command travels as an argument file. Then the whole command is
     assembled and measured, and -- because the OS limit is on the whole
     command line, not on any single value -- the next-longest still-inline
     value is routed and the command re-measured, repeating until it fits
@@ -330,11 +335,11 @@ def _select_datfile_routing(
         DATFILE and rendered as ``-TAG<=path`` rather than inlined.
     """
     tags = write.tags
-    # Non-ASCII routes too: on Windows ExifTool reads its command line in the
-    # ANSI code page, so an inline "Grand-mère" or "Łódź" lands as
-    # "Grand-m?re" / "L?dz". A DATFILE is read as UTF-8 and arrives intact.
     routed = {
-        tag for tag, value in tags.items() if len(value) > _INLINE_VALUE_MAX or not value.isascii()
+        tag
+        for tag, value in tags.items()
+        if len(value) > _INLINE_VALUE_MAX
+        or (write.via_argfile and ("\n" in value or "\r" in value))
     }
     resolved: dict[str, str] = {}
 
@@ -661,7 +666,14 @@ def apply_changeset(
             # the real write count the same tags: the ones the caller allowed.
             tags_count = len(tags_to_write) + (1 if keyword_args else 0)
             tags_to_write.update(_companion_tags(tags_to_write, set_changes))
-            write = _FileWrite(tags_to_write, keyword_args)
+            # Decided before routing, because an argument file cannot carry a
+            # multi-line value inline. The temporary root counts: a DATFILE
+            # path under it is an argument too.
+            via_argfile = not all(
+                text.isascii()
+                for text in (path, tempfile.gettempdir(), *tags_to_write.values(), *keyword_args)
+            )
+            write = _FileWrite(tags_to_write, keyword_args, via_argfile)
 
             def _datfile_path_for(tag: str, _line: int = line_number) -> str:
                 if cfg.dry_run:
@@ -741,8 +753,19 @@ def apply_changeset(
             try:
                 # stderr names files, so decode it as UTF-8 and never let a
                 # stray byte fail the decode and with it the whole batch.
+                argv, stdin = utf8_argfile(cmd)
+                if stdin is not None:
+                    # Strict, unlike the stderr decode: a value UTF-8 cannot
+                    # carry (a lone surrogate from a JSON escape) fails this
+                    # file here, rather than reaching the photo as "?".
+                    stdin.encode("utf-8")
                 result = subprocess.run(
-                    cmd, capture_output=True, encoding="utf-8", errors="replace", check=False
+                    argv,
+                    input=stdin,
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
                 )
             except (OSError, ValueError) as exc:
                 # OSError covers FileNotFoundError (binary went missing

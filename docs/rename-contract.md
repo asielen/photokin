@@ -192,7 +192,7 @@ the last three rows below.
 | `prefix` | string \| `null` | The group's fully rendered prefix (template resolved, leading and trailing `-` trimmed), e.g. `"520601-bag-woodbury"`. Every member of a group shares this. `null` under the same condition as `target`. |
 | `number` | int \| `null` | The 1-based position within `prefix`'s numbering bucket (section 4.5) -- **not** zero-padded; `digits` plus this value is what `target` was rendered from. `null` under the same condition as `target`. |
 | `variant` | string \| `null` | The single-letter variant (`"b"`, ...), or `null` when the name carries none. |
-| `part` | `"front"` \| `"back"` \| `"negative"` \| `"page"` \| `"bw"` \| `"attached"` \| `null` | Which part of the object this file is, after any `is_back`/`version` override is applied. `null` means "no part suffix" (an ordinary front), not "unknown". For `"attached"`, the target name carries the role (`-cover`, `-envelope-back`, `-note-2`). |
+| `part` | `"front"` \| `"back"` \| `"negative"` \| `"page"` \| `"attached"` \| `null` | Which part of the object this file is, after any `is_back`/`version` override is applied. `null` means "no part suffix" (an ordinary front), not "unknown". For `"attached"`, the target name carries the role (`-cover`, `-envelope-back`, `-note-2`, or `-bw` for a black-and-white copy). |
 | `page` | int \| `null` | The page number when `part == "page"`; `null` otherwise. |
 | `crop` | bool | Whether the name carries `-crop`. |
 | `changed` | bool | Whether `target` differs from the file's current basename. `false` for an already-clean file *and* for an unplannable entry (`target: null`) -- check `target is not None` first if you need to tell those apart. |

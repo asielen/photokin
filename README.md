@@ -317,7 +317,7 @@ The printed result has one entry per file — backs, variants, pages, negatives 
 
 ## Naming conventions
 
-Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-front|-back|-negative|-bw|-pageN][-crop]`, or `name[letter]-<attached>[-back][-crop]` for something attached to the photo, case-insensitive, applied right to left:
+Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-front|-back|-negative|-pageN][-crop]`, or `name[letter]-<attached>[-back][-crop]` for something attached to the photo or a black-and-white copy (`-bw`), case-insensitive, applied right to left:
 
 | Example | Meaning |
 |---|---|

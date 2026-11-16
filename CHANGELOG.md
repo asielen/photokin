@@ -34,11 +34,13 @@ through photokin, so Lightroom can re-read the file without losing anything.
 
 ### Fixed
 
-- **Accented and non-Latin text survives a write.** On Windows, ExifTool read
-  an inline value in the system code page, so `Grand-mère` or `Łódź` was
-  written as `Grand-m?re` / `L?dz`. Any non-ASCII value now goes through a
-  UTF-8 file. `-r` also decodes ExifTool's output as UTF-8, so such a value
-  is read correctly instead of failing the run.
+- **Accented and non-Latin text survives, and so do accented folders.** On
+  Windows, ExifTool read its command line in the system code page: a value
+  like `Grand-mère` or `Łódź` (caption, note, keyword, place) was written as
+  `Grand-m?re` / `L?dz`, and a photo under a folder like `Grand-mère` could
+  not be read or written at all. A command holding any non-ASCII text now
+  reaches ExifTool as a UTF-8 argument file, and `-r` decodes ExifTool's
+  output as UTF-8.
 - **A rename prefix ending in `-page` or `-note`** is refused instead of
   producing names that would regroup as pages or notes.
 
