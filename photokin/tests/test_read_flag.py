@@ -129,11 +129,15 @@ def _batch_paths(cmd: Sequence[str]) -> list[str]:
 
 
 class _CompletedProcess(NamedTuple):
-    """The three fields ``run_exiftool_json`` reads off a finished process."""
+    """The three fields ``run_exiftool_json`` reads off a finished process.
+
+    Bytes, as the real call returns them: the reader decodes ExifTool's UTF-8
+    itself rather than letting a text-mode pipe guess the code page.
+    """
 
     returncode: int
-    stdout: str
-    stderr: str
+    stdout: bytes
+    stderr: bytes
 
 
 class _ExifToolStub:
@@ -178,7 +182,7 @@ class _ExifToolStub:
         if self.failure is not None:
             raise self.failure
         if self.raw_stdout is not None:
-            return _CompletedProcess(0, self.raw_stdout, "")
+            return _CompletedProcess(0, self.raw_stdout.encode("utf-8"), b"")
         # ExifTool reports SourceFile with forward slashes even on Windows,
         # which is the mismatch the hydrator normalizes away.
         records = [
@@ -188,7 +192,7 @@ class _ExifToolStub:
             }
             for path in paths
         ]
-        return _CompletedProcess(0, json.dumps(records), "")
+        return _CompletedProcess(0, json.dumps(records).encode("utf-8"), b"")
 
     def _resolve(self, _cfg: object = None) -> str:
         """Stand in for ``resolve_exiftool_path``."""

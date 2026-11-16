@@ -355,7 +355,11 @@ def canonical_values_from_metadata(meta: Dict[str, Any] | None, config: Config) 
         source == "metadata" or confidence is None or confidence >= config.date_confidence_threshold
     ):
         values[CANONICAL_DATE_TAG] = date_value
-        date_created = _date_created_value(date_value, meta)
+        # A file's own Date Created, when it was read, is what it holds there;
+        # only a date with none of its own is rendered from the capture date.
+        date_created = _clean_str(meta.get("dateCreated")) or _date_created_value(
+            date_value, meta
+        )
         if date_created:
             values[CANONICAL_DATE_CREATED_TAG] = date_created
 

@@ -161,12 +161,18 @@ def _batch_files(files: List[str], prefix_cost: int) -> List[List[str]]:
 def _run_exiftool_batch(
     exiftool_path: str, cmd: List[str], timeout_sec: int
 ) -> List[Dict[str, Any]]:
-    """Run one prepared ExifTool command line and return its parsed JSON list."""
+    """Run one prepared ExifTool command line and return its parsed JSON list.
+
+    The output is read as bytes and decoded as UTF-8 here, because ``-charset
+    utf8`` makes ExifTool write UTF-8 and a text-mode pipe would decode it in
+    the platform's code page instead: on Windows that turned ``Grand-mère``
+    into mojibake, and a value such as ``Łódź`` failed to decode at all. A
+    record that is not valid UTF-8 is a failed read, raised as one.
+    """
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
             timeout=timeout_sec,
             check=False,
         )
@@ -176,15 +182,20 @@ def _run_exiftool_batch(
             f"Provide --exiftool-path or ensure it's on PATH."
         ) from e
 
-    if proc.returncode != 0 and not proc.stdout.strip():
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    try:
+        raw = proc.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"ExifTool output is not valid UTF-8.\nstderr:\n{stderr}") from e
+
+    if proc.returncode != 0 and not raw:
         raise RuntimeError(
             "ExifTool failed.\n"
             f"cmd: {' '.join(cmd)}\n"
             f"exit: {proc.returncode}\n"
-            f"stderr:\n{proc.stderr}"
+            f"stderr:\n{stderr}"
         )
 
-    raw = proc.stdout.strip()
     if not raw:
         return []
 
@@ -194,7 +205,7 @@ def _run_exiftool_batch(
         raise RuntimeError(
             "Failed to parse ExifTool JSON output.\n"
             f"cmd: {' '.join(cmd)}\n"
-            f"stderr:\n{proc.stderr}\n"
+            f"stderr:\n{stderr}\n"
             f"stdout (first 1000 chars):\n{raw[:1000]}"
         ) from e
 

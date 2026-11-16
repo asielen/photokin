@@ -20,10 +20,12 @@ logger = logging.getLogger(__name__)
 #: hydrated ``metadata`` object has a stable key order and a generated manifest
 #: is byte-identical across runs. Where several tags fill one key (location:
 #: XMP, then IPTC IIM; date: capture time, then Date Created), the earlier tag
-#: wins.
+#: wins. Date Created is also kept as itself, under ``dateCreated``, so the
+#: changeset's before-snapshot shows what the file really holds there rather
+#: than a value derived from the capture date.
 _HYDRATED_TAGS: tuple[tuple[str, str], ...] = tuple(
     (tag, _TAG_TO_MANIFEST_KEY[tag]) for tag in DEFAULT_EXIFTOOL_FIELDS
-)
+) + (("XMP-photoshop:DateCreated", "dateCreated"),)
 
 
 def _has_date_marker(keywords: list[str]) -> bool:

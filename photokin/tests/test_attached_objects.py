@@ -53,10 +53,22 @@ class TestTheGrammar(unittest.TestCase):
 
     def test_bw_and_dashed_pages(self) -> None:
         bw = utils.parse_media_filename("box3_025-bw.jpg")
+        bw_back = utils.parse_media_filename("box3_025-bw-back.jpg")
         page = utils.parse_media_filename("album-page-2.jpg")
 
-        self.assertEqual((bw.base_id, bw.part_kind), ("box3_025", "bw"))
+        self.assertEqual((bw.base_id, bw.part_kind, bw.attachment), ("box3_025", "attached", "bw"))
+        # The copy's back stays with the copy, in the photo's group.
+        self.assertEqual(
+            (bw_back.base_id, bw_back.part_kind, bw_back.attachment),
+            ("box3_025", "attached", "bw-back"),
+        )
         self.assertEqual((page.base_id, page.part_kind, page.page_num), ("album", "page", 2))
+
+    def test_a_prefix_ending_in_a_part_word_is_refused_not_misread(self) -> None:
+        plain = utils.parse_media_filename("x.jpg")
+        for prefix in ("scrapbook-page", "aunt-may-note"):
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                utils.render_media_filename(prefix, 1, 3, plain, ".jpg")
 
     def test_attached_objects_rank_after_the_back(self) -> None:
         self.assertGreater(utils.PART_RANK["attached"], utils.PART_RANK["back"])
@@ -188,6 +200,66 @@ class TestTheGroupSeesItsAttachedObjects(unittest.TestCase):
         self.assertIn("[Cover] Bachrach, Boston", block)
         self.assertNotIn("[Photo]", block.split("[Cover]")[1])
         self.assertEqual(second["results"][os.path.join(self.work, "044.jpg")]["caption"], block)
+
+
+class TestTheBlackAndWhiteCopyNeverLeads(unittest.TestCase):
+    """The plain scan stays the photo; its B&W copy rides along, labelled apart.
+
+    ``047-bw.jpg`` sorts before ``047.jpg`` by path (``-`` < ``.``), so any
+    tie in rank hands the copy the lead.
+    """
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.work = scratch.name
+        self.stream = TestTheGroupSeesItsAttachedObjects.run_stream.__get__(self)
+
+    def test_the_copys_back_travels_with_the_group(self) -> None:
+        recorder, _out = self.stream(
+            {"047.jpg": None, "047-bw.jpg": None, "047-bw-back.jpg": None},
+            {"caption": "", "keywords": []},
+        )
+
+        self.assertEqual(
+            recorder.calls,
+            [
+                (
+                    "parts",
+                    [
+                        ("Front", ["047.jpg"]),
+                        ("Black and White", ["047-bw.jpg"]),
+                        ("Black and White Back", ["047-bw-back.jpg"]),
+                    ],
+                )
+            ],
+        )
+
+    def test_the_photos_caption_stays_the_photos_across_runs(self) -> None:
+        reply = {"caption": "", "keywords": []}
+        front = os.path.join(self.work, "047.jpg")
+        _rec, first = self.stream(
+            {"047.jpg": "Aunt May at Coney Island", "047-bw.jpg": None}, reply
+        )
+        block = first["results"][front]["caption"]
+
+        _rec, second = self.stream({"047.jpg": block, "047-bw.jpg": block}, reply)
+
+        self.assertEqual(block, "Aunt May at Coney Island")
+        self.assertEqual(second["results"][front]["caption"], block)
+
+    def test_the_photos_own_title_is_what_the_model_is_told(self) -> None:
+        titles = {"047.jpg": "Aunt May", "047-bw.jpg": "bw copy scan"}
+        entries = [
+            {
+                "path": os.path.join(self.work, name),
+                "part_kind": utils.parse_media_filename(name).part_kind,
+                "metadata": {"title": title},
+            }
+            for name, title in titles.items()
+        ]
+
+        self.assertEqual(utils.combine_group_metadata(entries)["title"], "Aunt May")
 
 
 if __name__ == "__main__":

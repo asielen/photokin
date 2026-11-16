@@ -3003,7 +3003,7 @@ def _manifest_part_key(entry: dict) -> str:
         # '-page0' is a legal name whose slot must stay distinct from page 1's.
         page_num = entry["page_num"]
         return f"page:{1 if page_num is None else page_num}"
-    if part_kind in ("front", "back", "negative", "bw"):
+    if part_kind in ("front", "back", "negative"):
         return part_kind
     if part_kind == "attached":
         # Each attached role is its own slot: a cover and an envelope are two
@@ -3076,7 +3076,6 @@ def part_label_for_slot(part_key: str) -> str:
         "front": "Front",
         "back": "Back",
         "negative": "Negative",
-        "bw": "Black and White",
         "none": "Front",
     }[part_key]
 
@@ -3565,7 +3564,7 @@ def process_manifest_stream(
                     key
                     for parts in variant_parts.values()
                     for key in parts
-                    if key == "bw" or key.startswith("attached:")
+                    if key.startswith("attached:")
                 },
                 key=lambda key: (_slot_address_rank(None, key), key),
             )
@@ -3844,7 +3843,7 @@ def process_manifest_stream(
             labelled_apart = {
                 it["path"]: part_label_for_slot(_manifest_part_key(it))
                 for it in group
-                if it["part_kind"] in ("bw", "attached")
+                if it["part_kind"] == "attached"
             }
             multiple_fronts = (
                 len([it for it in group if not it["is_back"] and it["path"] not in labelled_apart])

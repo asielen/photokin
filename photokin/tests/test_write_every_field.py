@@ -250,12 +250,22 @@ class _RealExiftoolCase(unittest.TestCase):
                     handler.close()
 
     def image(self, extension: str, tags: dict[str, str] | None = None) -> str:
-        """Create a real image in its own folder, seeded with ``tags``."""
+        """Create a real image in its own folder, seeded with ``tags``.
+
+        Each value is seeded from a UTF-8 file (``-TAG<=file``), because an
+        inline non-ASCII value reaches ExifTool on Windows as ``?``.
+        """
         folder = tempfile.mkdtemp(dir=self.work)
         path = os.path.join(folder, f"photo.{extension}")
         Image.new("RGB", (4, 4), "white").save(path)
-        if tags:
-            self.exiftool_run("-overwrite_original", *(f"-{t}={v}" for t, v in tags.items()), path)
+        args = []
+        for index, (tag, value) in enumerate((tags or {}).items()):
+            value_path = os.path.join(self.work, f"{os.path.basename(folder)}-{index}.txt")
+            with open(value_path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(value)
+            args.append(f"-{tag}<={value_path}")
+        if args:
+            self.exiftool_run("-overwrite_original", *args, path)
         return path
 
     def exiftool_run(self, *args: str) -> str:
@@ -523,6 +533,67 @@ class TestDateInTheFile(_RealExiftoolCase):
                 self.assertEqual(read["XMP-photoshop:DateCreated"], "1952:06:01 10:30:00")
                 self.assertEqual(read["IPTC:DateCreated"], "1952:06:01")
                 self.assertTrue(read["IPTC:TimeCreated"].startswith("10:30:00"))
+
+
+class TestNonAsciiTextSurvivesTheRoundTrip(_RealExiftoolCase):
+    """Accents and non-Latin-1 letters are read and written back exactly."""
+
+    def test_a_city_outside_cp1252_does_not_fail_the_run(self) -> None:
+        for extension in _FORMATS:
+            with self.subTest(format=extension):
+                path = self.image(extension, {"XMP-photoshop:City": "Łódź"})
+
+                record = self.run_plugin_call(path, TestUserCommentInTheFile.REPLY)
+
+                self.assertEqual(record["original_data"]["file_metadata"]["IPTC:City"], "Łódź")
+                self.assertEqual(self.read_back(path)["XMP-photoshop:City"], "Łódź")
+
+    def test_an_accented_note_is_kept_exactly(self) -> None:
+        note = "Grand-mère’s note, Łódź"
+        for extension in _FORMATS:
+            with self.subTest(format=extension):
+                path = self.image(extension, {"EXIF:UserComment": note})
+
+                record = self.run_plugin_call(path, TestUserCommentInTheFile.REPLY)
+
+                self.assertEqual(record["original_data"]["file_metadata"]["EXIF:UserComment"], note)
+                self.assertTrue(
+                    self.read_back(path)["EXIF:UserComment"].startswith(f"{note}\n\n[AI Analysis")
+                )
+
+    def test_a_non_ascii_location_is_written_exactly(self) -> None:
+        for extension in _FORMATS:
+            with self.subTest(format=extension):
+                path = self.image(extension)
+                changeset = os.path.join(self.work, f"{extension}-city.ndjson")
+                record = {"path": path, "proposed_changes": {"set": {"IPTC:City": "Kraków"}}}
+                with open(changeset, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record) + "\n")
+
+                summary = apply_changeset(
+                    changeset,
+                    ExiftoolConfig(enabled=True, path=self.exiftool),
+                    fields=("IPTC:City",),
+                )
+
+                self.assertEqual(summary["errors"], [])
+                self.assertEqual(self.read_back(path)["XMP-photoshop:City"], "Kraków")
+
+
+class TestTheBeforeSnapshotShowsTheFilesOwnDateCreated(_RealExiftoolCase):
+    """A hand-typed Date Created is shown as itself, not rebuilt from the scan date."""
+
+    def test_date_created_is_read_as_the_file_holds_it(self) -> None:
+        path = self.image(
+            "jpg",
+            {"EXIF:DateTimeOriginal": "2021:04:09 10:00:00", "XMP-photoshop:DateCreated": "1948"},
+        )
+
+        record = self.run_plugin_call(path, TestUserCommentInTheFile.REPLY)
+
+        self.assertEqual(
+            record["original_data"]["file_metadata"]["XMP-photoshop:DateCreated"], "1948"
+        )
 
 
 if __name__ == "__main__":

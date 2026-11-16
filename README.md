@@ -324,7 +324,7 @@ Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-
 | `box3_025.jpg` | the photo itself (the print's front, no variant letter) |
 | `box3_025-b.jpg` or `box3_025b.jpg` | another scan of the same object (variant letter, with or without dash after a digit) |
 | `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
-| `box3_025-bw.jpg` | a black-and-white copy of the same photo |
+| `box3_025-bw.jpg`, `box3_025-bw-back.jpg` | a black-and-white copy of the same photo, and that copy's back |
 | `album-page1.jpg`, `album-page-2.jpg` | ordered pages of one document |
 | `box3_025-cover.jpg`, `box3_025-envelope-back.jpg` | something attached to the photo, scanned on its own: `-cover`, `-folder`, `-mount`, `-envelope`, `-sleeve`, `-note` or `-note-N`, optionally followed by `-back` for that object's own back. Only these words group; any other trailing word stays part of the name, so `smith-farm-01400.jpg` is photo `smith-farm-01400` |
 | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but not analyzed as its own object while its parent is present — a crop with no parent fills the missing slot, and `--group-by none` analyzes every crop alone |
@@ -359,7 +359,7 @@ ExifTool reads the metadata a file already holds (`-r`) and writes the analysis 
 | `keywords` | `XMP-dc:Subject` |
 | `title` | `XMP-dc:Title` |
 | `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` (Lightroom's Capture Time), and with it `XMP-photoshop:DateCreated` (Date Created) at the precision the model claimed — a year-only guess is written as just the year. A complete date also goes to `IPTC:DateCreated`/`TimeCreated` |
-| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location`, each also written to the XMP tag Lightroom reads (`XMP-photoshop:Country` / `State` / `City`, `XMP-iptcCore:Location`) |
+| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location`, each also written to the XMP tag Lightroom reads (`XMP-photoshop:Country` / `State` / `City`, `XMP-iptcCore:Location`). Not written by default, because a `-w` run without `-r` would overwrite a location already in the file unread; opt in by naming them in `--exiftool-fields`, alongside `-r` |
 
 ### Why read first
 
@@ -660,7 +660,7 @@ spent on anything else.
 | `-r`, `--read`                  | Before analysis, read the date, `EXIF:UserComment`, `XMP:Description`, `XMP:Title`, `XMP:Subject` and the location out of the files and send them to the model, for every input type (see [Why read first](#why-read-first)). Only fills what the input does not already carry; nothing is written. Mirrors `-w` |
 | `-w`, `--write`                 | Shorthand for `--changeset true --exiftool-write true`: record the proposed writes and apply them. An explicit flag that contradicts it is an error rather than a guess |
 | `--exiftool-write {true,false}` | Apply changeset fields to the files after analysis (default `false`; nothing is written without an explicit opt-in) |
-| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write. The default is every tag in the [What gets written where](#what-gets-written-where) table. The flag **replaces** the default list rather than adding to it, so name every tag you want written. Name the IPTC location tags and `EXIF:DateTimeOriginal`; their XMP and Date Created companions are written with them. A launcher that writes some tags itself should narrow this explicitly, e.g. `--exiftool-fields EXIF:UserComment` |
+| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write. The default is every tag in the [What gets written where](#what-gets-written-where) table except the location tags, which are an explicit opt-in so a curated location is never overwritten unread. The flag **replaces** the default list rather than adding to it, so name every tag you want written. Name the IPTC location tags and `EXIF:DateTimeOriginal`; their XMP and Date Created companions are written with them. A launcher that writes some tags itself should narrow this explicitly, e.g. `--exiftool-fields EXIF:UserComment` |
 | `--exiftool-path PATH`          | ExifTool binary to use (default: auto-detect) |
 
 `-r` is the read half and `-w` the write half; the short letters are deliberately symmetrical, and they combine as `-rw` (or `-wr`) exactly like any other pair of short flags — that combined form is the one to reach for, for the reason given above. `-R` is **reserved** for the recursive-folder flag that is still deferred (it changes grouping semantics across directories and interacts with write safety, so it gets its own change), and must not be spent on anything else.

@@ -1484,17 +1484,18 @@ class ParsedName:
 
     ``base_id`` is the shared id that groups variants/sides of the same photo;
     ``variant_id`` distinguishes versions (e.g. a trailing letter); ``part_kind``
-    says whether the file is a front/back/page/negative/bw/attached/none;
+    says whether the file is a front/back/page/negative/attached/none;
     ``page_num`` is the page index for multipage docs; ``is_crop`` flags derived
-    crop files; ``attachment`` is the role of an attached object (``"cover"``,
-    ``"envelope-back"``, ``"note-2"``) when ``part_kind`` is ``"attached"``. The
+    crop files; ``attachment`` is the role of an attached object or a
+    black-and-white copy (``"cover"``, ``"envelope-back"``, ``"note-2"``,
+    ``"bw"``) when ``part_kind`` is ``"attached"``. The
     manifest bucket loop -- which every input mode now routes through -- keys off
     these fields.
     """
 
     base_id: str
     variant_id: str | None
-    part_kind: str  # "front"|"back"|"page"|"negative"|"bw"|"attached"|"none"
+    part_kind: str  # "front"|"back"|"page"|"negative"|"attached"|"none"
     page_num: int | None
     is_crop: bool = False
     attachment: str | None = None
@@ -1504,13 +1505,11 @@ class ParsedName:
 #: object" to "this is a supporting view of it". Every tie-break in the pipeline
 #: that has to rank the files of a group reads it, so the file whose slot is
 #: chosen first and the file whose metadata is taken first are the same file.
-#: A black-and-white copy ranks with the plain scan it copies, so the path
-#: settles which of the two leads; an attached object ranks after everything
-#: that is the photo itself, so the front or plain scan always stays primary.
+#: An attached object or a black-and-white copy ranks after everything that is
+#: the photo itself, so the front or plain scan always stays primary.
 PART_RANK: dict[str, int] = {
     "front": 0,
     "none": 1,
-    "bw": 1,
     "page": 2,
     "back": 3,
     "negative": 4,
@@ -1524,8 +1523,10 @@ PART_RANK: dict[str, int] = {
 #: ``smith-farm-01400`` stays photo ``smith-farm-01400`` rather than becoming
 #: photo ``smith`` with a role of ``farm-01400``. Kept in step with the
 #: archive's ``fha photoindex`` grammar so a file groups the same way in both.
+#: A black-and-white copy (``-bw``) is read the same way: a separate print of
+#: the photo that groups with it, labelled apart, with a back of its own.
 ATTACHED_OBJECT_RE = re.compile(
-    r"^(?P<stem>.+?)-(?P<word>cover|folder|mount|envelope|sleeve|note(?:-\d+)?)$",
+    r"^(?P<stem>.+?)-(?P<word>bw|cover|folder|mount|envelope|sleeve|note(?:-\d+)?)$",
     re.IGNORECASE,
 )
 
@@ -1541,9 +1542,11 @@ def attached_role_label(role: str) -> str:
 
     Returns:
         The label the file travels under and its caption is filed under,
-        e.g. ``"Envelope Back"`` or ``"Note 2"``.
+        e.g. ``"Envelope Back"``, ``"Note 2"`` or ``"Black and White Back"``.
     """
-    return " ".join(word.capitalize() for word in role.split("-"))
+    return " ".join(
+        "Black and White" if word == "bw" else word.capitalize() for word in role.split("-")
+    )
 
 #: Where an entry with no recognized ``part_kind`` sorts: alongside an untagged
 #: file, which is what an unparsed one effectively is.
@@ -1557,7 +1560,7 @@ def parse_media_filename(path: str) -> ParsedName:
     Rules:
     1) Strip extension.
     2) Strip -crop suffix first; it stacks on top of any other tag.
-    3) Detect part suffix in priority order: -negative, -back / -front, -bw,
+    3) Detect part suffix in priority order: -negative, -back / -front,
        -pageN / -page-N.
     4) If what is left ends in an attached-object word
        (:data:`ATTACHED_OBJECT_RE`), the file is that object, and a -back
@@ -1591,9 +1594,6 @@ def parse_media_filename(path: str) -> ParsedName:
     elif lowered.endswith("-front"):
         part_kind = "front"
         stem = stem[: -len("-front")]
-    elif lowered.endswith("-bw"):
-        part_kind = "bw"
-        stem = stem[: -len("-bw")]
     else:
         m_page = PAGE_SUFFIX_RE.match(stem)
         if m_page:
@@ -1721,7 +1721,8 @@ def render_media_filename(
         ValueError: If *prefix* is empty once its trailing ``-`` is trimmed,
             or *parsed* claims ``part_kind == "page"`` without a
             ``page_num`` to render, or ``"attached"`` without an
-            ``attachment``.
+            ``attachment``, or the rendered name would not parse back to the
+            same parts (a prefix ending in ``-page`` or ``-note``).
     """
     prefix = prefix.rstrip("-")
     if not prefix:
@@ -1739,8 +1740,6 @@ def render_media_filename(
         if parsed.page_num is None:
             raise ValueError("part_kind is 'page' but page_num is None")
         part = f"-page{parsed.page_num}"
-    elif parsed.part_kind == "bw":
-        part = "-bw"
     elif parsed.part_kind == "attached":
         if not parsed.attachment:
             raise ValueError("part_kind is 'attached' but attachment is None")
@@ -1750,7 +1749,22 @@ def render_media_filename(
 
     crop = "-crop" if parsed.is_crop else ""
 
-    return f"{prefix}-{number:0{digits}d}{variant}{part}{crop}{ext}"
+    rendered = f"{prefix}-{number:0{digits}d}{variant}{part}{crop}{ext}"
+    reparsed = parse_media_filename(rendered)
+    if (reparsed.variant_id, reparsed.part_kind, reparsed.page_num, reparsed.attachment) != (
+        parsed.variant_id,
+        parsed.part_kind,
+        parsed.page_num,
+        parsed.attachment,
+    ):
+        # A prefix ending in a part word ("scrapbook-page", "aunt-may-note")
+        # turns "-001" into a page or note number, so the renamed file would
+        # no longer group as the photo it is.
+        raise ValueError(
+            f"prefix {prefix!r} ends in a word photokin reads as part of the photo "
+            f"({rendered!r}); choose a prefix that does not end in it"
+        )
+    return rendered
 
 
 def casefold_filename(name: str) -> str:

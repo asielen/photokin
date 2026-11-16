@@ -304,7 +304,8 @@ def _select_datfile_routing(
     """Decide which of one file's tag values must route through a DATFILE.
 
     Two passes, per decision E3 in docs/per-page-captions.md: first, any value
-    longer than ``_INLINE_VALUE_MAX`` always routes. Then the whole command is
+    longer than ``_INLINE_VALUE_MAX``, or holding any non-ASCII character,
+    always routes. Then the whole command is
     assembled and measured, and -- because the OS limit is on the whole
     command line, not on any single value -- the next-longest still-inline
     value is routed and the command re-measured, repeating until it fits
@@ -329,7 +330,12 @@ def _select_datfile_routing(
         DATFILE and rendered as ``-TAG<=path`` rather than inlined.
     """
     tags = write.tags
-    routed = {tag for tag, value in tags.items() if len(value) > _INLINE_VALUE_MAX}
+    # Non-ASCII routes too: on Windows ExifTool reads its command line in the
+    # ANSI code page, so an inline "Grand-mère" or "Łódź" lands as
+    # "Grand-m?re" / "L?dz". A DATFILE is read as UTF-8 and arrives intact.
+    routed = {
+        tag for tag, value in tags.items() if len(value) > _INLINE_VALUE_MAX or not value.isascii()
+    }
     resolved: dict[str, str] = {}
 
     def _paths_for(tags_routed: set[str]) -> dict[str, str]:
@@ -733,7 +739,11 @@ def apply_changeset(
                 continue
 
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                # stderr names files, so decode it as UTF-8 and never let a
+                # stray byte fail the decode and with it the whole batch.
+                result = subprocess.run(
+                    cmd, capture_output=True, encoding="utf-8", errors="replace", check=False
+                )
             except (OSError, ValueError) as exc:
                 # OSError covers FileNotFoundError (binary went missing
                 # mid-batch) and PermissionError (an unexecutable binary, a

@@ -11,7 +11,6 @@ from ..canonical import (
     CANONICAL_DATE_TAG,
     CANONICAL_DESCRIPTION_TAG,
     CANONICAL_KEYWORDS_TAG,
-    CANONICAL_LOCATION_TAGS,
     CANONICAL_TITLE_TAG,
     CANONICAL_USER_COMMENT_TAG,
 )
@@ -26,21 +25,21 @@ from ..canonical import (
 # narrow default here cannot serve both callers, and the CLI is the one that
 # has no other way to say what it wants.
 #
-# The IPTC location tags are here because hydration (exiftool/manifest.py's
-# DEFAULT_EXIFTOOL_FIELDS) reads the file's location first and merge prefers
-# it over the model's guess, so a curated location is never overwritten
-# unread. Their XMP twins and Date Created are not listed: the applier writes
-# them alongside the IPTC location tags and EXIF:DateTimeOriginal.
-# EXIF:CreateDate is not a canonical output tag, but changesets from other
-# producers may carry it and the applier knows how to normalize it, so it
-# stays allowed.
+# The IPTC location tags (CANONICAL_LOCATION_TAGS) are deliberately NOT here.
+# -r reads the file's location first, but -w is allowed without -r, and a
+# default location write would then overwrite a location someone curated in
+# the file, unread -- in the XMP tag Lightroom shows, too. Writing them is an
+# explicit --exiftool-fields opt-in, which the Lightroom plug-in makes
+# alongside -r. Date Created is not listed either: the applier writes it with
+# EXIF:DateTimeOriginal. EXIF:CreateDate is not a canonical output tag, but
+# changesets from other producers may carry it and the applier knows how to
+# normalize it, so it stays allowed.
 DEFAULT_PIPELINE_FIELDS: tuple[str, ...] = (
     CANONICAL_USER_COMMENT_TAG,
     CANONICAL_DESCRIPTION_TAG,
     CANONICAL_KEYWORDS_TAG,
     CANONICAL_TITLE_TAG,
     CANONICAL_DATE_TAG,
-    *CANONICAL_LOCATION_TAGS.values(),
     "EXIF:CreateDate",
 )
 

@@ -512,8 +512,6 @@ def _variant_was_dashed(canonical_stem: str, parsed: utils.ParsedName) -> bool:
         tail = tail[: -len("-front")]
     elif parsed.part_kind == "negative":
         tail = tail[: -len("-negative")]
-    elif parsed.part_kind == "bw":
-        tail = tail[: -len("-bw")]
     elif parsed.part_kind == "attached" and parsed.attachment:
         tail = tail[: -len(f"-{parsed.attachment}")]
     elif parsed.part_kind == "page" and parsed.page_num is not None:

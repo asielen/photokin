@@ -27,12 +27,20 @@ through photokin, so Lightroom can re-read the file without losing anything.
 - **`-r` reads location and Date Created.** Location comes from XMP, then
   IPTC, and a location already in the file beats the model's guess. A date
   set only in Date Created counts as the file's own date.
-- **The IPTC location tags are in the default write set**, now that `-r`
-  reads them first.
 - **Instruction tags no longer feed `userComment`.** The standalone manifest
   reader maps them to a new `instructions` key, which is still forwarded to
   the model.
 - Changeset `schema_version` is now 3.
+
+### Fixed
+
+- **Accented and non-Latin text survives a write.** On Windows, ExifTool read
+  an inline value in the system code page, so `Grand-mère` or `Łódź` was
+  written as `Grand-m?re` / `L?dz`. Any non-ASCII value now goes through a
+  UTF-8 file. `-r` also decodes ExifTool's output as UTF-8, so such a value
+  is read correctly instead of failing the run.
+- **A rename prefix ending in `-page` or `-note`** is refused instead of
+  producing names that would regroup as pages or notes.
 
 ### Added
 
@@ -43,7 +51,8 @@ through photokin, so Lightroom can re-read the file without losing anything.
   imprint on a cover now informs the portrait's date and place. Only these
   words group, so `smith-farm-01400` stays one name. This regroups folders
   that already hold such files.
-- **`-bw`** marks a black-and-white copy of the same photo, and **`-page-N`**
+- **`-bw`** marks a black-and-white copy of the same photo (`-bw-back` is
+  that copy's back); it groups with the photo and never leads it. **`-page-N`**
   is accepted beside `-pageN`, matching the archive's `fha photoindex`.
 
 ## [0.6.4]
