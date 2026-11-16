@@ -317,18 +317,20 @@ The printed result has one entry per file — backs, variants, pages, negatives 
 
 ## Naming conventions
 
-Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-front|-back|-negative|-pageN][-crop]`, case-insensitive, applied right to left:
+Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-front|-back|-negative|-pageN][-crop]`, or `name[letter]-<attached>[-back][-crop]` for something attached to the photo or a black-and-white copy (`-bw`), case-insensitive, applied right to left:
 
 | Example | Meaning |
 |---|---|
 | `box3_025.jpg` | the photo itself (the print's front, no variant letter) |
 | `box3_025-b.jpg` or `box3_025b.jpg` | another scan of the same object (variant letter, with or without dash after a digit) |
 | `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
-| `album-page1.jpg`, `album-page2.jpg` | ordered pages of one document |
+| `box3_025-bw.jpg`, `box3_025-bw-back.jpg` | a black-and-white copy of the same photo, and that copy's back |
+| `album-page1.jpg`, `album-page-2.jpg` | ordered pages of one document |
+| `box3_025-cover.jpg`, `box3_025-envelope-back.jpg` | something attached to the photo, scanned on its own: `-cover`, `-folder`, `-mount`, `-envelope`, `-sleeve`, `-note` or `-note-N`, optionally followed by `-back` for that object's own back. Only these words group; any other trailing word stays part of the name, so `smith-farm-01400.jpg` is photo `smith-farm-01400` |
 | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but not analyzed as its own object while its parent is present — a crop with no parent fills the missing slot, and `--group-by none` analyzes every crop alone |
 | `box3_025.tif` beside `box3_025.jpg` | the same scan in two formats — one object, not two photos |
 
-The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other numbered pages.
+The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other numbered pages. Attached objects are analyzed in the same call as the photo, so a studio imprint on a cover counts as evidence for the portrait's date and place. The front or plain scan always stays the group's primary file.
 
 Every file also gets at most one keyword naming its part — `back` on a reverse side, `negative` on a negative, nothing on a front — so you can always tell which file is which afterwards. A `back` or `Negative` keyword you applied yourself is left exactly where it is.
 
@@ -352,18 +354,20 @@ ExifTool reads the metadata a file already holds (`-r`) and writes the analysis 
 
 | Result field | Tag |
 |---|---|
-| `ai_caption` (the AI analysis) | `EXIF:UserComment` |
+| `ai_caption` (the AI analysis) | `EXIF:UserComment`, below any note already there — a re-run replaces only its own earlier `[AI Analysis]` block |
 | `caption` (the verbatim transcription) | `XMP-dc:Description` |
 | `keywords` | `XMP-dc:Subject` |
 | `title` | `XMP-dc:Title` |
-| `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` |
-| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location` — not written by default: `-r` doesn't read these tags yet, so a location already in the file would be overwritten unread; opt in by naming them in `--exiftool-fields` — which replaces the whole list, so include the default tags you still want alongside them |
+| `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` (Lightroom's Capture Time), and with it `XMP-photoshop:DateCreated` (Date Created) at the precision the model claimed — a year-only guess is written as just the year. A complete date also goes to `IPTC:DateCreated`/`TimeCreated` |
+| `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location`, each also written to the XMP tag Lightroom reads (`XMP-photoshop:Country` / `State` / `City`, `XMP-iptcCore:Location`). Not written by default, because a `-w` run without `-r` would overwrite a location already in the file unread; opt in by naming them in `--exiftool-fields`, alongside `-r` |
 
 ### Why read first
 
-With `-r`, photokin reads `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` before analysis, so a note, caption, title, date or keyword already living in an image rides along to the model as context. Two of those fields get special treatment:
+With `-r`, photokin reads `EXIF:DateTimeOriginal` (or, failing that, `XMP-photoshop:DateCreated`), `EXIF:UserComment`, `XMP:Description`, `XMP:Title`, `XMP:Subject` and the location (the XMP tags first, then IPTC) before analysis, so a note, caption, title, date, keyword or place already living in an image rides along to the model as context. Some of those fields get special treatment:
 
 * **Dates.** The file's own date is treated as evidence, not truth: on a flatbed scan `DateTimeOriginal` is the day you scanned the print, not the day the photograph was taken, so it never overwrites the model's `date_guess` — but it is what the date-correction heuristic compares that guess against before writing anything.
+* **Notes.** Your text in `EXIF:UserComment` is kept; the new analysis goes below it, replacing the previous run's `[AI Analysis]` block. Without `-r` photokin cannot see your note, so the comment is written as the analysis alone.
+* **Locations.** A location already in the file beats the model's guess, so a place you set by hand is never overwritten.
 * **Titles.** Scanner software routinely writes "Scanned Image" or the bare filename into `XMP:Title`, so a title read out of a file does not beat the model. A title you supplied yourself, in a manifest or `--meta`, always wins.
 
 A file `-r` asked for but could not read gets **no proposed writes at all**, with a warning naming it — unread is not empty, and writing against a before-snapshot that was never seen could overwrite metadata the file really holds. Fix whatever blocked the read (a locked or corrupt file) and re-run.
@@ -653,10 +657,10 @@ spent on anything else.
 
 | Flag                            | What it does |
 |---------------------------------|---|
-| `-r`, `--read`                  | Before analysis, read `EXIF:DateTimeOriginal`, `EXIF:UserComment`, `XMP:Description`, `XMP:Title` and `XMP:Subject` out of the files and send them to the model, for every input type. Only fills what the input does not already carry; nothing is written. Mirrors `-w` |
+| `-r`, `--read`                  | Before analysis, read the date, `EXIF:UserComment`, `XMP:Description`, `XMP:Title`, `XMP:Subject` and the location out of the files and send them to the model, for every input type (see [Why read first](#why-read-first)). Only fills what the input does not already carry; nothing is written. Mirrors `-w` |
 | `-w`, `--write`                 | Shorthand for `--changeset true --exiftool-write true`: record the proposed writes and apply them. An explicit flag that contradicts it is an error rather than a guess |
 | `--exiftool-write {true,false}` | Apply changeset fields to the files after analysis (default `false`; nothing is written without an explicit opt-in) |
-| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write. The default is every tag in the [What gets written where](#what-gets-written-where) table except the location tags — those are an explicit opt-in until `-r` learns to read them, so a curated location is never overwritten unread. The flag **replaces** the default list rather than adding to it, so name every tag you want written. A launcher that writes some tags itself (the Lightroom plug-in writes the XMP tags through the catalog SDK) should narrow this explicitly, e.g. `--exiftool-fields EXIF:UserComment` |
+| `--exiftool-fields TAGS`        | Comma-separated tags ExifTool may write. The default is every tag in the [What gets written where](#what-gets-written-where) table except the location tags, which are an explicit opt-in so a curated location is never overwritten unread. The flag **replaces** the default list rather than adding to it, so name every tag you want written. Name the IPTC location tags and `EXIF:DateTimeOriginal`; their XMP and Date Created companions are written with them. A launcher that writes some tags itself should narrow this explicitly, e.g. `--exiftool-fields EXIF:UserComment` |
 | `--exiftool-path PATH`          | ExifTool binary to use (default: auto-detect) |
 
 `-r` is the read half and `-w` the write half; the short letters are deliberately symmetrical, and they combine as `-rw` (or `-wr`) exactly like any other pair of short flags — that combined form is the one to reach for, for the reason given above. `-R` is **reserved** for the recursive-folder flag that is still deferred (it changes grouping semantics across directories and interacts with write safety, so it gets its own change), and must not be spent on anything else.
@@ -832,9 +836,9 @@ Prints this build's contract as JSON and exits, before any input is required —
 
 ```json
 {
-  "version": "0.6.2",
+  "version": "0.7.0",
   "ndjson_schema_version": 3,
-  "changeset_schema_version": 2,
+  "changeset_schema_version": 3,
   "canonical_tags": {
     "ai_caption": "EXIF:UserComment",
     "caption": "XMP-dc:Description",

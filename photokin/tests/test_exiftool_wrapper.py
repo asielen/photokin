@@ -46,9 +46,9 @@ class TestExiftoolConfig(unittest.TestCase):
         # canonical tag hydration also reads, in the README table's order,
         # plus EXIF:CreateDate. A narrower default silently dropped captions,
         # keywords and titles for every -rw run that did not pass
-        # --exiftool-fields; the IPTC location tags are deliberately absent
-        # because hydration does not read them yet, so a default location
-        # write would overwrite curated location metadata unread.
+        # --exiftool-fields. The IPTC location tags are deliberately absent:
+        # -w may run without -r, and a default location write would then
+        # overwrite a curated location unread.
         self.assertEqual(
             cfg.fields,
             (
@@ -987,7 +987,10 @@ class TestAShortLoneSurrogateDoesNotAbortTheWholeBatch(_ChangesetFileMixin, unit
     """
 
     def test_a_short_lone_surrogate_value_still_lets_the_next_record_write(self) -> None:
-        surrogate_value = "\ud800" * 10  # far under _INLINE_VALUE_MAX: must not route
+        # Far under _INLINE_VALUE_MAX, but non-ASCII, so it routes to a DATFILE
+        # (inline, Windows would write it as "?"): the command is still
+        # measured first, and the value's UTF-8 encode then fails per file.
+        surrogate_value = "\ud800" * 10
         self.assertLess(len(surrogate_value), _INLINE_VALUE_MAX)
         changeset = self._write_changeset(
             [
@@ -1014,8 +1017,8 @@ class TestAShortLoneSurrogateDoesNotAbortTheWholeBatch(_ChangesetFileMixin, unit
             summary = apply_changeset(changeset, cfg)
 
         self.assertEqual(summary["files_seen"], 2)
-        self.assertEqual(summary["errors"], [])
-        self.assertEqual(summary["files_written"], 2, "the second record must still be written")
+        self.assertEqual([e["path"] for e in summary["errors"]], ["/photos/a.jpg"])
+        self.assertEqual(summary["files_written"], 1, "the second record must still be written")
 
 
 class TestDatfileNamesDoNotCollideAcrossTagSpellings(_ChangesetFileMixin, unittest.TestCase):

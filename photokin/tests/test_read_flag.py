@@ -129,11 +129,15 @@ def _batch_paths(cmd: Sequence[str]) -> list[str]:
 
 
 class _CompletedProcess(NamedTuple):
-    """The three fields ``run_exiftool_json`` reads off a finished process."""
+    """The three fields ``run_exiftool_json`` reads off a finished process.
+
+    Bytes, as the real call returns them: the reader decodes ExifTool's UTF-8
+    itself rather than letting a text-mode pipe guess the code page.
+    """
 
     returncode: int
-    stdout: str
-    stderr: str
+    stdout: bytes
+    stderr: bytes
 
 
 class _ExifToolStub:
@@ -178,7 +182,7 @@ class _ExifToolStub:
         if self.failure is not None:
             raise self.failure
         if self.raw_stdout is not None:
-            return _CompletedProcess(0, self.raw_stdout, "")
+            return _CompletedProcess(0, self.raw_stdout.encode("utf-8"), b"")
         # ExifTool reports SourceFile with forward slashes even on Windows,
         # which is the mismatch the hydrator normalizes away.
         records = [
@@ -188,7 +192,7 @@ class _ExifToolStub:
             }
             for path in paths
         ]
-        return _CompletedProcess(0, json.dumps(records), "")
+        return _CompletedProcess(0, json.dumps(records).encode("utf-8"), b"")
 
     def _resolve(self, _cfg: object = None) -> str:
         """Stand in for ``resolve_exiftool_path``."""
@@ -1150,33 +1154,44 @@ class TestTheChangesetDiffIsNeutralExceptWhereTheReadLands(_ReadFlagTestCase):
     #: The model's whole answer as canonical writes, which is what every row
     #: proposes before the file gets a say. Spelled once so each row below reads
     #: as "the model's answer, minus what the file already settles".
+    #: The analysis notes carry no marker of their own, so the UserComment
+    #: opens with the undated one -- what lets the next run find and replace
+    #: this block. Date Created travels with the capture date at the precision
+    #: the model claimed: ``Y~`` is a year, not the ``import_date`` placeholder.
     _MODEL_PROPOSES: ClassVar[dict[str, Any]] = {
         "EXIF:DateTimeOriginal": "1952-01-01",
-        "EXIF:UserComment": "print, deckled edge",
+        "EXIF:UserComment": "[AI Analysis]: print, deckled edge",
         "IPTC:Country-PrimaryLocationName": "United States",
         "IPTC:Province-State": "Ohio",
         "XMP-dc:Description": "Two men beside a car",
         "XMP-dc:Title": "Wedding Day 1952",
+        "XMP-photoshop:DateCreated": "1952",
     }
+
+    #: The two keys one date change proposes together, and never one alone.
+    _DATE_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"EXIF:DateTimeOriginal", "XMP-photoshop:DateCreated"}
+    )
 
     #: The canonical tags a read can move, and the ExifTool tag each comes from:
     #:
     #:   EXIF:DateTimeOriginal <- EXIF:DateTimeOriginal (feeds the gap rule)
+    #:   XMP-photoshop:DateCreated  moves with EXIF:DateTimeOriginal
     #:   XMP-dc:Title          <- XMP:Title
     #:   XMP-dc:Description    <- XMP:Description       (the caption join)
     #:   XMP-dc:Subject        <- XMP:Subject           (as keywords_add/remove)
     #:
     #: Named rather than derived by diffing the two runs, because a loose diff
-    #: would absorb a regression instead of reporting it. ``EXIF:UserComment`` is
-    #: deliberately *not* here even though ``-r`` reads it: the before snapshot
-    #: is built from ``merge_original_sources`` output, which does not forward
-    #: ``userComment``, so the value never reaches the diff. That is a documented
-    #: pre-existing gap (see the C3 open risks in docs/unified-input-pipeline.md)
-    #: and it makes ``EXIF:UserComment`` one of the keys neutrality is measured
-    #: on below -- if the read ever starts moving it, this class says so.
+    #: would absorb a regression instead of reporting it. ``EXIF:UserComment``
+    #: and the location tags are deliberately *not* here even though ``-r``
+    #: reads them: no file in this table holds one, so a read that moved them
+    #: here would be inventing a value, and neutrality is measured on them
+    #: below. What a read of a real comment or location does is pinned in
+    #: ``test_write_every_field.py``.
     READ_REACHES: ClassVar[frozenset[str]] = frozenset(
         {
             "EXIF:DateTimeOriginal",
+            "XMP-photoshop:DateCreated",
             "XMP-dc:Title",
             "XMP-dc:Description",
             "XMP-dc:Subject",
@@ -1221,7 +1236,7 @@ class TestTheChangesetDiffIsNeutralExceptWhereTheReadLands(_ReadFlagTestCase):
                 "set": {
                     key: value
                     for key, value in _MODEL_PROPOSES.items()
-                    if key != "EXIF:DateTimeOriginal"
+                    if key not in ("EXIF:DateTimeOriginal", "XMP-photoshop:DateCreated")
                 },
                 "keywords_add": ["family"],
                 "keywords_remove": [],
@@ -1348,16 +1363,18 @@ class TestTheChangesetDiffIsNeutralExceptWhereTheReadLands(_ReadFlagTestCase):
         rewritten = records["box3_020.jpg"]["proposed_changes"]
         declined = records["box3_021.jpg"]["proposed_changes"]
         self.assertEqual(rewritten["set"]["EXIF:DateTimeOriginal"], "1952-01-01")
-        self.assertNotIn(
-            "EXIF:DateTimeOriginal",
-            declined["set"],
-            "a date the heuristic declined to rewrite was still proposed as a "
-            "write. before and after both hold the file's own date, so the "
-            "correct diff names no date at all",
-        )
+        self.assertEqual(rewritten["set"]["XMP-photoshop:DateCreated"], "1952")
+        for key in self._DATE_KEYS:
+            self.assertNotIn(
+                key,
+                declined["set"],
+                "a date the heuristic declined to rewrite was still proposed as a "
+                "write. before and after both hold the file's own date, so the "
+                "correct diff names no date at all",
+            )
         self.assertEqual(
-            {k: v for k, v in rewritten["set"].items() if k != "EXIF:DateTimeOriginal"},
-            {k: v for k, v in declined["set"].items() if k != "EXIF:DateTimeOriginal"},
+            {k: v for k, v in rewritten["set"].items() if k not in self._DATE_KEYS},
+            {k: v for k, v in declined["set"].items() if k not in self._DATE_KEYS},
         )
         # The rewrite is the only one of the two that marks itself.
         self.assertEqual(rewritten["keywords_add"], ["family", "DATE: Y~"])

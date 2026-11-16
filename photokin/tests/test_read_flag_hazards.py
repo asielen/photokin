@@ -221,14 +221,14 @@ class TestTheReadIsBatchedForLargeFolders(unittest.TestCase):
 
         class _Proc:
             returncode = 0
-            stderr = ""
+            stderr = b""
 
             def __init__(self, cmd):
                 paths = [a for a in cmd if not a.startswith("-") and a.endswith(".jpg")]
                 seen.append(paths)
                 self.stdout = json.dumps(
                     [{"SourceFile": p.replace("\\", "/"), "XMP:Title": "T"} for p in paths]
-                )
+                ).encode("utf-8")
 
         with patch(
             "photokin.exiftool.manifest.subprocess.run",
@@ -1812,6 +1812,11 @@ class TestTheFileNeverOverwritesWhatTheInputAlreadyCarried(unittest.TestCase):
         "XMP:Description": "Scanned document",
         "XMP:Title": "Scanned Image",
         "XMP:Subject": ["Scans", "Untagged"],
+        "XMP-photoshop:Country": "Canada",
+        "XMP-photoshop:State": "Ontario",
+        "XMP-photoshop:City": "Toronto",
+        "XMP-iptcCore:Location": "Scanner room",
+        "XMP-photoshop:DateCreated": "2019:04:11",
     }
     #: What the caller already supplied, keyed the way an item's metadata is.
     FROM_CALLER = {
@@ -1820,6 +1825,11 @@ class TestTheFileNeverOverwritesWhatTheInputAlreadyCarried(unittest.TestCase):
         "caption": "Ruth and Sam outside the bakery",
         "title": "Mom's graduation, June 1961",
         "keywords": ["Family", "Bakery"],
+        "country": "United States",
+        "stateProvince": "Ohio",
+        "city": "Dayton",
+        "location": "Bakery on Main",
+        "dateCreated": "1952",
     }
 
     def _hydrate_with(self, metadata: dict) -> dict:

@@ -18,10 +18,14 @@ logger = logging.getLogger(__name__)
 #: mapping, and every one is in ``utils.DEFAULT_METADATA_FORWARD_FIELDS`` so
 #: every one can actually reach the model. Iteration order is the tuple's, so a
 #: hydrated ``metadata`` object has a stable key order and a generated manifest
-#: is byte-identical across runs.
+#: is byte-identical across runs. Where several tags fill one key (location:
+#: XMP, then IPTC IIM; date: capture time, then Date Created), the earlier tag
+#: wins. Date Created is also kept as itself, under ``dateCreated``, so the
+#: changeset's before-snapshot shows what the file really holds there rather
+#: than a value derived from the capture date.
 _HYDRATED_TAGS: tuple[tuple[str, str], ...] = tuple(
     (tag, _TAG_TO_MANIFEST_KEY[tag]) for tag in DEFAULT_EXIFTOOL_FIELDS
-)
+) + (("XMP-photoshop:DateCreated", "dateCreated"),)
 
 
 def _has_date_marker(keywords: list[str]) -> bool:
@@ -42,9 +46,9 @@ def hydrate_item_metadata(
 ) -> None:
     """Best-effort: read each file's own metadata via ExifTool into its item.
 
-    Reads the tags in :data:`_HYDRATED_TAGS` -- ``EXIF:DateTimeOriginal``,
-    ``EXIF:UserComment``, ``XMP:Description``, ``XMP:Title`` and ``XMP:Subject``
-    -- and fills only the keys an item's metadata is missing or holds empty, so a
+    Reads the tags in :data:`_HYDRATED_TAGS` -- the capture date (falling
+    back to Date Created), ``EXIF:UserComment``, ``XMP:Description``,
+    ``XMP:Title``, ``XMP:Subject`` and the four location fields -- and fills only the keys an item's metadata is missing or holds empty, so a
     Lightroom- or ``--meta``-supplied value is never overridden. Values are
     stored verbatim: ``dateTimeOriginal`` stays in EXIF colon form, which is what
     ``merge`` and ``canonical`` both read, and ``keywords`` stays a list.
@@ -175,8 +179,9 @@ def hydrate_item_metadata(
             continue
         unseen.discard(src_key)
         for raw, wanted, rescue_date_marker in wanted_by_path.get(src_key, []):
+            filled: set[str] = set()
             for tag, key in _HYDRATED_TAGS:
-                if key not in wanted:
+                if key not in wanted or key in filled:
                     continue
                 # run_exiftool_json requests -G1, so EXIF:UserComment comes back
                 # keyed as ExifIFD:UserComment; _find_tag_value matches on the
@@ -201,6 +206,7 @@ def hydrate_item_metadata(
                 if not isinstance(target, dict):
                     target = raw["metadata"] = {}
                 target[key] = value
+                filled.add(key)
                 if key == "title" and title_from_file is not None:
                     title_from_file.add(id(target))
 

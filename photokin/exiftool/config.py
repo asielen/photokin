@@ -20,21 +20,20 @@ from ..canonical import (
 # default write set for every caller: the point of a plain -rw run is that it
 # writes what the analysis produced, and a default narrower than the changeset
 # silently dropped captions, keywords and titles for anyone who did not also
-# pass --exiftool-fields. A launcher that writes some of these tags itself --
-# the Lightroom plug-in routes only EXIF:UserComment through photokin and
-# writes the XMP tags via the catalog SDK -- must narrow the set explicitly
-# with --exiftool-fields or EXIFTOOL_FIELDS; a narrow default here cannot
-# serve both callers, and the CLI is the one that has no other way to say
-# what it wants.
+# pass --exiftool-fields. A launcher that writes some of these tags itself
+# must narrow the set explicitly with --exiftool-fields or EXIFTOOL_FIELDS; a
+# narrow default here cannot serve both callers, and the CLI is the one that
+# has no other way to say what it wants.
 #
-# The IPTC location tags (CANONICAL_LOCATION_TAGS) are deliberately NOT here:
-# hydration (exiftool/manifest.py's DEFAULT_EXIFTOOL_FIELDS) does not read
-# them, so a confident model guess would be diffed against an empty
-# before-snapshot and overwrite a location someone already curated in the
-# file, unread. Until the read side learns those tags, writing them is an
-# explicit --exiftool-fields opt-in. EXIF:CreateDate is not a canonical
-# output tag, but changesets from other producers may carry it and the
-# applier knows how to normalize it, so it stays allowed.
+# The IPTC location tags (CANONICAL_LOCATION_TAGS) are deliberately NOT here.
+# -r reads the file's location first, but -w is allowed without -r, and a
+# default location write would then overwrite a location someone curated in
+# the file, unread -- in the XMP tag Lightroom shows, too. Writing them is an
+# explicit --exiftool-fields opt-in, which the Lightroom plug-in makes
+# alongside -r. Date Created is not listed either: the applier writes it with
+# EXIF:DateTimeOriginal. EXIF:CreateDate is not a canonical output tag, but
+# changesets from other producers may carry it and the applier knows how to
+# normalize it, so it stays allowed.
 DEFAULT_PIPELINE_FIELDS: tuple[str, ...] = (
     CANONICAL_USER_COMMENT_TAG,
     CANONICAL_DESCRIPTION_TAG,

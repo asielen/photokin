@@ -59,7 +59,7 @@ if no text is visible.
 
 transcriptions (OPTIONAL): a per-part transcription map. Each key MUST be
 EXACTLY one of the part labels this prompt assigned ("Front", "Back",
-"Page 1", "Page 2", ..., "Negative") — copy each label character for
+"Page 1", "Page 2", ..., "Negative", "Cover", "Envelope Back", ...) — copy each label character for
 character, including the capital letter and the single space in "Page 1".
 A key spelled any other way is not matched to its file: its text still
 reaches the caption, but under that wrong heading, and the file it

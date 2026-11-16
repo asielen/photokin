@@ -34,6 +34,7 @@ This module is also imported (not just run) by the ExifTool hydration path
 Code map:
 - _split_fields                       expand comma-separated --field values
 - _normalize_paths                    absolutize/clean input file paths
+- utf8_argfile                        PUBLIC: move non-ASCII arguments onto stdin as UTF-8
 - run_exiftool_json                   PUBLIC: run exiftool -j and parse the JSON
 - manifest_value                      PUBLIC: one tag value -> the shape its key expects
 - _first_non_empty                    pick the first present value across tag aliases
@@ -56,6 +57,9 @@ from typing import Any, Dict, List, Sequence
 
 DEFAULT_EXIFTOOL_FIELDS: tuple[str, ...] = (
     "EXIF:DateTimeOriginal",
+    # Lightroom's "Date Created", the fallback when the file has no capture
+    # time, so a date set only there still counts as the file's own date.
+    "XMP-photoshop:DateCreated",
     "EXIF:UserComment",
     "XMP:Description",
     "XMP:Title",
@@ -68,6 +72,17 @@ DEFAULT_EXIFTOOL_FIELDS: tuple[str, ...] = (
     # writable family-0 spelling; ExifTool reports it back under ``-G1`` as
     # ``XMP-dc:Subject``, and as a list whenever the file holds more than one.
     "XMP:Subject",
+    # Location, XMP first and IPTC IIM as the fallback: Lightroom keeps its
+    # location in XMP, and once the file's location is read, merge prefers it
+    # over the model's guess, so a curated location is never overwritten.
+    "XMP-photoshop:Country",
+    "IPTC:Country-PrimaryLocationName",
+    "XMP-photoshop:State",
+    "IPTC:Province-State",
+    "XMP-photoshop:City",
+    "IPTC:City",
+    "XMP-iptcCore:Location",
+    "IPTC:Sub-location",
 )
 
 def _split_fields(fields: Sequence[str]) -> List[str]:
@@ -144,15 +159,48 @@ def _batch_files(files: List[str], prefix_cost: int) -> List[List[str]]:
     return batches
 
 
+def utf8_argfile(cmd: list[str]) -> tuple[list[str], str | None]:
+    """Move a command's arguments onto stdin when any of them is not ASCII.
+
+    On Windows ExifTool reads its command line in the ANSI code page, so a
+    path such as ``D:\\Photos\\Grand-mère`` or a value such as ``Łódź`` reaches
+    it mangled, and with ``-charset filename=utf8`` an accented path is not
+    found at all. An argument file read from stdin (``-@ -``) is UTF-8 and
+    arrives intact. An all-ASCII command is returned unchanged.
+
+    Args:
+        cmd: The argv: the ExifTool binary, then its arguments.
+
+    Returns:
+        ``(argv, stdin)``: the command to run and the text to feed it, or the
+        command unchanged and ``None``. A command whose arguments hold a line
+        break also stays on the command line: an argument file holds one
+        argument per line, so the break would split one argument into two,
+        and the second half would be read as a file name or an option.
+    """
+    args = cmd[1:]
+    if all(arg.isascii() for arg in args) or any("\n" in arg or "\r" in arg for arg in args):
+        return cmd, None
+    return [cmd[0], "-@", "-"], "\n".join(["-charset", "filename=utf8", *cmd[1:]]) + "\n"
+
+
 def _run_exiftool_batch(
     exiftool_path: str, cmd: List[str], timeout_sec: int
 ) -> List[Dict[str, Any]]:
-    """Run one prepared ExifTool command line and return its parsed JSON list."""
+    """Run one prepared ExifTool command line and return its parsed JSON list.
+
+    The output is read as bytes and decoded as UTF-8 here, because ``-charset
+    utf8`` makes ExifTool write UTF-8 and a text-mode pipe would decode it in
+    the platform's code page instead: on Windows that turned ``Grand-mère``
+    into mojibake, and a value such as ``Łódź`` failed to decode at all. A
+    record that is not valid UTF-8 is a failed read, raised as one.
+    """
+    argv, stdin = utf8_argfile(cmd)
     try:
         proc = subprocess.run(
-            cmd,
+            argv,
+            input=None if stdin is None else stdin.encode("utf-8"),
             capture_output=True,
-            text=True,
             timeout=timeout_sec,
             check=False,
         )
@@ -162,15 +210,20 @@ def _run_exiftool_batch(
             f"Provide --exiftool-path or ensure it's on PATH."
         ) from e
 
-    if proc.returncode != 0 and not proc.stdout.strip():
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    try:
+        raw = proc.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"ExifTool output is not valid UTF-8.\nstderr:\n{stderr}") from e
+
+    if proc.returncode != 0 and not raw:
         raise RuntimeError(
             "ExifTool failed.\n"
             f"cmd: {' '.join(cmd)}\n"
             f"exit: {proc.returncode}\n"
-            f"stderr:\n{proc.stderr}"
+            f"stderr:\n{stderr}"
         )
 
-    raw = proc.stdout.strip()
     if not raw:
         return []
 
@@ -180,7 +233,7 @@ def _run_exiftool_batch(
         raise RuntimeError(
             "Failed to parse ExifTool JSON output.\n"
             f"cmd: {' '.join(cmd)}\n"
-            f"stderr:\n{proc.stderr}\n"
+            f"stderr:\n{stderr}\n"
             f"stdout (first 1000 chars):\n{raw[:1000]}"
         ) from e
 
@@ -241,16 +294,19 @@ _TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     "EXIF:DateTimeOriginal": "dateTimeOriginal",
     "XMP:DateTimeOriginal": "dateTimeOriginal",
     "XMP-exif:DateTimeOriginal": "dateTimeOriginal",
+    "XMP-photoshop:DateCreated": "dateTimeOriginal",
 
-    # notes/context (canonical source: EXIF UserComment)
+    # notes/context: only the real EXIF UserComment, because it is also the
+    # base the new AI block is appended to and written back over.
     "EXIF:UserComment": "userComment",
 
-    # Lightroom/legacy instruction tags are normalized into userComment
-    "Photoshop:Instructions": "userComment",
-    "XMP:Instructions": "userComment",
-    "XMP-photoshop:Instructions": "userComment",
-    "IPTC:SpecialInstructions": "userComment",
-    "XMP-iptcCore:Instructions": "userComment",
+    # Lightroom/legacy instruction tags reach the model as their own key;
+    # folded into userComment they would be copied into the file's UserComment.
+    "Photoshop:Instructions": "instructions",
+    "XMP:Instructions": "instructions",
+    "XMP-photoshop:Instructions": "instructions",
+    "IPTC:SpecialInstructions": "instructions",
+    "XMP-iptcCore:Instructions": "instructions",
 
     # caption/description
     "XMP:Description": "caption",
@@ -265,7 +321,22 @@ _TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     # keywords (multi-valued; carries the reviewed "DATE:" marker)
     "XMP:Subject": "keywords",
     "XMP-dc:Subject": "keywords",
+
+    # location, XMP before IPTC IIM
+    "XMP-photoshop:Country": "country",
+    "IPTC:Country-PrimaryLocationName": "country",
+    "XMP-photoshop:State": "stateProvince",
+    "IPTC:Province-State": "stateProvince",
+    "XMP-photoshop:City": "city",
+    "IPTC:City": "city",
+    "XMP-iptcCore:Location": "location",
+    "IPTC:Sub-location": "location",
 }
+
+#: Each mapped tag's rank, so that among tags sharing a manifest key the first
+#: non-empty one in this table's order wins, whatever order ExifTool printed
+#: the record in.
+_TAG_PRIORITY: dict[str, int] = {tag: rank for rank, tag in enumerate(_TAG_TO_MANIFEST_KEY)}
 
 #: Manifest keys whose value is a list of strings rather than one string.
 _LIST_MANIFEST_KEYS: frozenset[str] = frozenset({"keywords"})
@@ -276,6 +347,9 @@ _LIST_MANIFEST_KEYS: frozenset[str] = frozenset({"keywords"})
 # succeed regardless of the reported group.
 _BARE_TAG_TO_MANIFEST_KEY: Dict[str, str] = {
     tag.rsplit(":", 1)[-1]: mk for tag, mk in _TAG_TO_MANIFEST_KEY.items()
+}
+_BARE_TAG_PRIORITY: dict[str, int] = {
+    tag.rsplit(":", 1)[-1]: rank for tag, rank in reversed(_TAG_PRIORITY.items())
 }
 
 
@@ -348,7 +422,8 @@ def exiftool_records_to_manifest_items(
 
     - Always stores raw tag/value pairs under metadata["exiftool"].
     - Also maps selected tags into top-level manifest keys (dateTimeOriginal, userComment, etc.).
-    - If multiple tags map to the same manifest key, the first non-empty wins.
+    - If multiple tags map to the same manifest key, the first non-empty in
+      :data:`_TAG_TO_MANIFEST_KEY` order wins (XMP location before IPTC IIM).
     """
     fields_n = _split_fields(requested_fields)
     # Records come back from `-G1`, so a requested "EXIF:UserComment" is keyed as
@@ -372,20 +447,22 @@ def exiftool_records_to_manifest_items(
 
         meta: Dict[str, Any] = {"path": str(src), "exiftool": raw_tags}
 
-        candidates_by_key: Dict[str, List[str | List[str] | None]] = {}
+        candidates_by_key: Dict[str, List[tuple[int, str | List[str] | None]]] = {}
 
         def consider(tag: str, value: Any) -> None:
-            mk = _TAG_TO_MANIFEST_KEY.get(tag) or _BARE_TAG_TO_MANIFEST_KEY.get(_bare_tag(tag))
+            bare = _bare_tag(tag)
+            mk = _TAG_TO_MANIFEST_KEY.get(tag) or _BARE_TAG_TO_MANIFEST_KEY.get(bare)
             if not mk:
                 return
-            candidates_by_key.setdefault(mk, []).append(manifest_value(value, mk))
+            rank = _TAG_PRIORITY.get(tag, _BARE_TAG_PRIORITY.get(bare, len(_TAG_PRIORITY)))
+            candidates_by_key.setdefault(mk, []).append((rank, manifest_value(value, mk)))
 
         source_dict = raw_tags if raw_tags else {k: v for k, v in rec.items() if k != "SourceFile"}
         for tag, value in source_dict.items():
             consider(tag, value)
 
-        for mk, vals in candidates_by_key.items():
-            chosen = _first_non_empty(vals)
+        for mk, ranked in candidates_by_key.items():
+            chosen = _first_non_empty([v for _rank, v in sorted(ranked, key=lambda rv: rv[0])])
             if chosen is not None:
                 meta[mk] = chosen
 

@@ -32,7 +32,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
-from .canonical import CANONICAL_KEYWORDS_TAG
+from .canonical import CANONICAL_DATE_CREATED_TAG, CANONICAL_DATE_TAG, CANONICAL_KEYWORDS_TAG
 from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywords
 
 # Bumped whenever a record's shape changes in a way a consumer could care
@@ -49,7 +49,11 @@ from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywor
 #        compared or deduped that value across a group's files would have
 #        gotten a different answer with no shape change to detect it by. See
 #        docs/per-page-captions.md, decision E11.
-SCHEMA_VERSION = 2
+#   3 -- ``EXIF:UserComment`` became the file's own comment plus this run's AI
+#        block instead of the AI block alone; ``XMP-photoshop:DateCreated``
+#        joined ``proposed_changes.set`` beside every capture-date change; and
+#        the before-snapshot carries the file's location and Date Created.
+SCHEMA_VERSION = 3
 
 
 def make_run_id() -> str:
@@ -117,7 +121,20 @@ WRITE_SUPPRESSED_KEY = "suppressed"
 
 
 def diff_canonical_metadata(before: dict, after: dict) -> dict:
-    """Compute a compact diff in canonical tag space (set/keywords_add/keywords_remove)."""
+    """Compute a compact diff in canonical tag space (set/keywords_add/keywords_remove).
+
+    ``XMP-photoshop:DateCreated`` is not diffed on its own: it travels with
+    ``EXIF:DateTimeOriginal``. It is proposed whenever the capture date is,
+    even if its own rendering happens to match, and never without it, so the
+    two only ever change together and only when the date itself changes.
+
+    Args:
+        before: The file's own canonical values.
+        after: The canonical values this run would write.
+
+    Returns:
+        ``{"set": {...}, "keywords_add": [...], "keywords_remove": [...]}``.
+    """
     before_keywords = _normalize_keyword_list(before.get(CANONICAL_KEYWORDS_TAG))
     after_keywords = _normalize_keyword_list(after.get(CANONICAL_KEYWORDS_TAG))
 
@@ -136,6 +153,10 @@ def diff_canonical_metadata(before: dict, after: dict) -> dict:
         before_val = before.get(key)
         if before_val != after_val:
             set_changes[key] = deepcopy(after_val)
+
+    set_changes.pop(CANONICAL_DATE_CREATED_TAG, None)
+    if CANONICAL_DATE_TAG in set_changes and CANONICAL_DATE_CREATED_TAG in after:
+        set_changes[CANONICAL_DATE_CREATED_TAG] = after[CANONICAL_DATE_CREATED_TAG]
 
     return {
         "set": set_changes,

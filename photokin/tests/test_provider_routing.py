@@ -5,6 +5,12 @@ import types
 import unittest
 from unittest.mock import patch
 
+try:
+    # anthropic 2 and openai 3 build their errors on httpx2 rather than httpx.
+    import httpx2 as httpx
+except ModuleNotFoundError:
+    import httpx
+
 from photokin import core, errors, utils
 from photokin.api_claude import _data_url_to_image_block
 from photokin.api_openai import ProviderApiError
@@ -264,7 +270,6 @@ class TestModelNotFound(unittest.TestCase):
 
     def test_claude_404_maps_to_model_not_found(self):
         import anthropic
-        import httpx
 
         from photokin import api_claude
         from photokin.errors import ProviderApiError
@@ -321,7 +326,6 @@ class TestModelNotFound(unittest.TestCase):
         self.assertIn("OPENROUTER_MODEL", str(err))
 
     def test_openai_404_maps_to_model_not_found(self):
-        import httpx
         import openai
 
         from photokin import api_openai
@@ -352,7 +356,6 @@ class TestModelNotFound(unittest.TestCase):
         """A BadRequestError about the image_url shape triggers a reformatted
         retry; if that retry ALSO 404s, it must not be swallowed as a generic
         api_status by the retry's own narrower except clauses."""
-        import httpx
         import openai
 
         from photokin import api_openai
@@ -392,7 +395,6 @@ class TestModelNotFound(unittest.TestCase):
         """A model _model_supports_temperature's naming heuristic doesn't
         recognize as temperature-less (e.g. a new generation's prefix) still
         succeeds: the first 400 triggers one retry with temperature dropped."""
-        import httpx
         import openai
 
         from photokin import api_openai
@@ -429,7 +431,6 @@ class TestModelNotFound(unittest.TestCase):
     def test_openai_notfound_on_temperature_fallback_retry_also_maps(self):
         """If the temperature-dropped retry itself 404s, that must not be
         swallowed as a generic api_status by the retry's own except clause."""
-        import httpx
         import openai
 
         from photokin import api_openai
@@ -647,7 +648,6 @@ class TestArchivalUploadErrorNormalization(unittest.TestCase):
     itself -- not leak a raw SDK exception into the NDJSON error record."""
 
     def test_rejected_key_maps_to_api_status_with_provider_message(self):
-        import httpx
         import openai
 
         request = httpx.Request("POST", "https://api.openai.com/v1/files")
@@ -670,7 +670,6 @@ class TestArchivalUploadErrorNormalization(unittest.TestCase):
         self.assertEqual(err.provider_message, "Incorrect API key provided")
 
     def test_rate_limit_maps_to_rate_limit_with_retry_after(self):
-        import httpx
         import openai
 
         request = httpx.Request("POST", "https://api.openai.com/v1/files")
@@ -696,7 +695,6 @@ class TestArchivalUploadErrorNormalization(unittest.TestCase):
         (wrong extension, empty file, oversized upload) reads as the generic
         ``api_status`` bucket instead of the ``invalid_input`` every other
         per-request validation failure in the codebase uses."""
-        import httpx
         import openai
 
         request = httpx.Request("POST", "https://api.openai.com/v1/files")
@@ -860,7 +858,6 @@ class TestTemperatureRetryForGeminiAndOpenRouter(unittest.TestCase):
         self.assertEqual(ctx.exception.error_type, "invalid_input")
 
     def test_openai_compat_retries_without_temperature(self):
-        import httpx
         import openai
 
         from photokin import api_openai_compat
@@ -893,7 +890,6 @@ class TestTemperatureRetryForGeminiAndOpenRouter(unittest.TestCase):
         self.assertEqual(extract_openai_compat_output_text(result), "the answer")
 
     def test_openai_compat_unrelated_bad_request_is_not_swallowed(self):
-        import httpx
         import openai
 
         from photokin import api_openai_compat
