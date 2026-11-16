@@ -1,7 +1,12 @@
 import unittest
 
 import anthropic
-import httpx
+
+try:
+    # anthropic 2 and openai 3 build their errors on httpx2 rather than httpx.
+    import httpx2 as httpx
+except ModuleNotFoundError:
+    import httpx
 
 from photokin import api_claude
 from photokin.errors import ProviderApiError
