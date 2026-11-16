@@ -41,6 +41,7 @@ from photokin.canonical import (
     _date_created_value,
     build_canonical_patch,
     canonical_values_from_metadata,
+    canonical_values_from_patch,
     merge_user_comment,
     split_user_comment,
 )
@@ -173,6 +174,19 @@ class TestDateCreatedPrecision(unittest.TestCase):
 
         self.assertEqual(patch_["EXIF:DateTimeOriginal"]["value"], "1952-06-15")
         self.assertEqual(patch_["XMP-photoshop:DateCreated"]["value"], "1952")
+
+
+class TestAKeywordLineBreakSettlesOnTheFirstRun(unittest.TestCase):
+    """The diff folds a keyword's line break the way the write does."""
+
+    def test_a_rerun_proposes_nothing_for_a_keyword_already_written(self) -> None:
+        cfg = utils.Config()
+        before = canonical_values_from_metadata({"keywords": ["family", "Family Reunion"]}, cfg)
+        patch_, _meta = build_canonical_patch({"keywords": ["family", "Family\nReunion"]}, cfg)
+
+        proposed = diff_canonical_metadata(before, canonical_values_from_patch(patch_))
+
+        self.assertEqual((proposed["keywords_add"], proposed["keywords_remove"]), ([], []))
 
 
 class TestDateCreatedTravelsWithTheCaptureDate(unittest.TestCase):

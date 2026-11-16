@@ -98,6 +98,10 @@ AI_ANALYSIS_MARKER_RE = re.compile(r"^\s*\[AI Analysis\b[^\]]*\]\s*:?", re.IGNOR
 
 _UNDATED_AI_MARKER = "[AI Analysis]:"
 
+#: A run of line breaks inside a keyword, folded to one space: ExifTool takes
+#: arguments one per line once they travel as an argument file.
+LINE_BREAKS_RE = re.compile(r"[\r\n]+")
+
 _DATE_PARTS_RE = re.compile(
     r"^(\d{4})(?:[-:](\d{2})(?:[-:](\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?)?)?(?=$|[ T.Z+-])"
 )
@@ -122,7 +126,9 @@ def _clean_str_list(values: Any) -> list[str]:
     for item in values or []:
         if not isinstance(item, str):
             continue
-        trimmed = item.strip()
+        # A keyword is one line. Folded here, where both sides of the
+        # changeset diff are built, so the diff and the write agree.
+        trimmed = LINE_BREAKS_RE.sub(" ", item).strip()
         lowered = trimmed.lower()
         if trimmed and lowered not in seen:
             seen.add(lowered)

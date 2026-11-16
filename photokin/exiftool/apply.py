@@ -54,6 +54,7 @@ from ..canonical import (
     CANONICAL_KEYWORDS_TAG,
     CANONICAL_LOCATION_TAGS,
     CANONICAL_LOCATION_XMP_TAGS,
+    LINE_BREAKS_RE,
 )
 from ..changeset import WRITE_SUPPRESSED_KEY
 from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
@@ -220,7 +221,6 @@ def _companion_tags(tags: dict[str, str], set_changes: dict[str, Any]) -> dict[s
 
 
 _TAG_FILENAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
-_LINE_BREAKS_RE = re.compile(r"[\r\n]+")
 
 
 def _datfile_name(file_index: int, tag: str) -> str:
@@ -403,7 +403,8 @@ def _keyword_delta_args(
                 continue
             # A keyword is one line: a break inside one ("Family\nReunion")
             # folds to a space rather than reaching ExifTool as two tokens.
-            keyword = _LINE_BREAKS_RE.sub(" ", value).strip()
+            # photokin's own changesets are already folded; others may not be.
+            keyword = LINE_BREAKS_RE.sub(" ", value).strip()
             if len(keyword) > _INLINE_VALUE_MAX:
                 # A "keyword" this long is malformed output, and unlike a set
                 # value it cannot be routed to a DATFILE, so it is dropped by
