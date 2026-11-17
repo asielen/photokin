@@ -51,10 +51,15 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, NamedTuple, Sequence
 
-from ..canonical import CANONICAL_KEYWORD_MIRROR_TAGS, CANONICAL_KEYWORDS_TAG, iim_holds_keyword
-from ..utils import UNMIRRORED_KEYWORDS_KEY
+from ..canonical import (
+    CANONICAL_KEYWORD_MIRROR_TAGS,
+    CANONICAL_KEYWORDS_TAG,
+    hierarchy_levels,
+    iim_holds_keyword,
+)
+from ..utils import HIERARCHICAL_KEYWORDS_KEY, UNMIRRORED_KEYWORDS_KEY
 
 
 
@@ -420,50 +425,65 @@ def manifest_value(value: Any, manifest_key: str) -> str | List[str] | None:
 KEYWORD_TAGS: tuple[str, ...] = (CANONICAL_KEYWORDS_TAG, *CANONICAL_KEYWORD_MIRROR_TAGS)
 
 
-def record_keywords(rec: dict[str, Any]) -> tuple[list[str] | None, list[str]]:
+class FileKeywords(NamedTuple):
+    """A file's keywords as :func:`record_keywords` reads them."""
+
+    #: The flat keywords of every keyword tag, or ``None`` when there are none.
+    keywords: list[str] | None
+    #: The flat keywords missing from at least one of :data:`KEYWORD_TAGS`.
+    unmirrored: list[str]
+    #: The hierarchical entries (``People|Ruth``) in ``XMP-lr:HierarchicalSubject``.
+    hierarchy: list[str]
+
+
+def record_keywords(rec: dict[str, Any]) -> FileKeywords:
     """Union a record's keyword tags, and name the keywords some tag lacks.
 
     A hierarchical entry (``People|Ruth``) is not a flat keyword and stays out
     of the union: written back as one, its leaf would become a second,
-    top-level ``Ruth`` in Lightroom. It stays as written in the file, and each
-    of its levels counts as present in ``XMP-lr:HierarchicalSubject``. A keyword IIM cannot hold
-    (:func:`~photokin.canonical.iim_holds_keyword`) is never written to
-    ``IPTC:Keywords``, so it is not missing from there.
+    top-level ``Ruth`` in Lightroom. It is returned on its own, and each of its
+    levels counts as present in ``XMP-lr:HierarchicalSubject``. A keyword IIM
+    cannot hold (:func:`~photokin.canonical.iim_holds_keyword`) is never
+    written to ``IPTC:Keywords``, so it is not missing from there.
 
     Example:
         >>> record_keywords({"XMP-dc:Subject": ["Ruth", "beach"],
         ...                  "XMP-lr:HierarchicalSubject": ["People|Ruth", "beach"],
         ...                  "IPTC:Keywords": ["Ruth"]})
-        (['Ruth', 'beach'], ['beach'])
+        FileKeywords(keywords=['Ruth', 'beach'], unmirrored=['beach'], hierarchy=['People|Ruth'])
 
     Args:
         rec: One ExifTool JSON record.
 
     Returns:
-        ``(keywords, unmirrored)``: the case-insensitive, order-preserving
-        union, or ``None`` when no tag holds a keyword, and the keywords
-        missing from at least one of :data:`KEYWORD_TAGS`.
+        The union, case-insensitive and order-preserving, with the unmirrored
+        keywords and the hierarchical entries.
     """
-    subject, hierarchy, iptc = (
+    subject, hierarchical, iptc = (
         manifest_value(_find_tag_value(rec, tag), "keywords") or [] for tag in KEYWORD_TAGS
     )
+    flat_hierarchical = [entry for entry in hierarchical if "|" not in entry]
+    hierarchy = [entry for entry in hierarchical if "|" in entry]
     union: dict[str, str] = {}
-    for keyword in (*subject, *(entry for entry in hierarchy if "|" not in entry), *iptc):
-        if keyword:
-            union.setdefault(keyword.lower(), keyword)
-    if not union:
-        return None, []
+    for keyword in (*subject, *flat_hierarchical, *iptc):
+        union.setdefault(keyword.lower(), keyword)
     in_subject = {kw.lower() for kw in subject}
-    in_hierarchy = {part.strip().lower() for entry in hierarchy for part in entry.split("|")}
+    in_hierarchical = {kw.lower() for kw in flat_hierarchical} | hierarchy_levels(hierarchy)
     in_iptc = {kw.lower() for kw in iptc}
     unmirrored = [
         kw
         for key, kw in union.items()
         if key not in in_subject
-        or key not in in_hierarchy
+        or key not in in_hierarchical
         or (key not in in_iptc and iim_holds_keyword(kw))
     ]
-    return list(union.values()), unmirrored
+    return FileKeywords(list(union.values()) or None, unmirrored, hierarchy)
+
+
+def _keyword_extras(read: FileKeywords) -> dict[str, list[str]]:
+    """The manifest keys a full keyword read adds beside ``keywords``, when non-empty."""
+    extras = {UNMIRRORED_KEYWORDS_KEY: read.unmirrored, HIERARCHICAL_KEYWORDS_KEY: read.hierarchy}
+    return {key: value for key, value in extras.items() if value}
 
 
 def _first_non_empty(
@@ -526,11 +546,11 @@ def exiftool_records_to_manifest_items(
             if chosen is not None:
                 meta[mk] = chosen
         if "keywords" in meta:
-            meta["keywords"], unmirrored = record_keywords(source_dict)
+            read = record_keywords(source_dict)
+            meta["keywords"] = read.keywords
             # A tag that was not read is not known to lack anything.
-            read_all = not fields_n or all(_bare_tag(t) in requested_bare for t in KEYWORD_TAGS)
-            if unmirrored and read_all:
-                meta[UNMIRRORED_KEYWORDS_KEY] = unmirrored
+            if not fields_n or all(_bare_tag(t) in requested_bare for t in KEYWORD_TAGS):
+                meta.update(_keyword_extras(read))
 
         items.append({"path": str(src), "metadata": meta})
 

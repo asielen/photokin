@@ -22,7 +22,7 @@ import unittest
 from typing import Any, ClassVar
 from unittest.mock import patch
 
-from photokin import utils
+from photokin import core, utils
 from photokin.canonical import build_canonical_patch, iim_holds_keyword
 from photokin.changeset import diff_canonical_metadata
 from photokin.exiftool.apply import _keyword_delta_args
@@ -30,7 +30,7 @@ from photokin.exiftool.config import ExiftoolConfig
 from photokin.exiftool.hydrate import hydrate_item_metadata
 from photokin.exiftool.manifest import exiftool_records_to_manifest_items, record_keywords
 from photokin.merge import merge_record_with_original
-from photokin.tests.test_write_every_field import _RealExiftoolCase
+from photokin.tests.test_write_every_field import _RealExiftoolCase, _stubbed_model
 
 _KEYWORD_TAGS = ("XMP-dc:Subject", "XMP-lr:HierarchicalSubject", "IPTC:Keywords")
 
@@ -156,7 +156,7 @@ class TestReadingEveryKeywordTag(unittest.TestCase):
     """``record_keywords`` and the two readers built on it."""
 
     def test_a_hierarchy_counts_as_present_but_never_becomes_flat(self) -> None:
-        keywords, unmirrored = record_keywords(
+        keywords, unmirrored, hierarchy = record_keywords(
             {
                 "XMP-dc:Subject": ["family", "Ruth"],
                 "XMP-lr:HierarchicalSubject": ["family", "People|Ruth", "Places|Ohio|Akron"],
@@ -166,15 +166,16 @@ class TestReadingEveryKeywordTag(unittest.TestCase):
 
         self.assertEqual(keywords, ["family", "Ruth", "scan"])
         self.assertEqual(unmirrored, ["scan"])
+        self.assertEqual(hierarchy, ["People|Ruth", "Places|Ohio|Akron"])
 
     def test_a_keyword_iim_cannot_hold_is_not_missing_from_it(self) -> None:
         long_keyword = "x" * 65
-        _keywords, unmirrored = record_keywords(
+        unmirrored = record_keywords(
             {
                 "XMP-dc:Subject": ["北京", long_keyword, "Grand-mère"],
                 "XMP-lr:HierarchicalSubject": ["北京", long_keyword, "Grand-mère"],
             }
-        )
+        ).unmirrored
 
         self.assertEqual(unmirrored, ["Grand-mère"])
         self.assertFalse(iim_holds_keyword("北京"))
@@ -182,7 +183,7 @@ class TestReadingEveryKeywordTag(unittest.TestCase):
         self.assertTrue(iim_holds_keyword("Grand-mère"))
 
     def test_no_keyword_anywhere_is_none(self) -> None:
-        self.assertEqual(record_keywords({"XMP-dc:Title": "x"}), (None, []))
+        self.assertEqual(record_keywords({"XMP-dc:Title": "x"}), (None, [], []))
 
     def test_the_manifest_reader_unions_and_marks(self) -> None:
         record = {
@@ -278,6 +279,55 @@ class TestTheKeywordWrite(unittest.TestCase):
         )
 
 
+class TestAuditFindings(unittest.TestCase):
+    """What the first review of this change found, each pinned where it was found."""
+
+    def test_a_backs_inferred_date_does_not_reopen_the_fronts_sign_off(self) -> None:
+        with tempfile.TemporaryDirectory() as work:
+            front = os.path.join(work, "florence-032.jpg")
+            back = os.path.join(work, "florence-032-back.jpg")
+            for path in (front, back):
+                open(path, "wb").close()
+            items = [
+                {
+                    "path": front,
+                    "metadata": {"keywords": ["family", "DATE: Y~"], "dateTimeOriginal": "1940:07:01"},
+                },
+                {
+                    "path": back,
+                    "metadata": {
+                        "keywords": ["family", "DATE: Y~", utils.AI_INFERRED_DATE_KEYWORD],
+                        "dateTimeOriginal": "1915:07:01",
+                    },
+                },
+            ]
+            with _stubbed_model(_guess(0.45, "1915-07-01")):
+                results = core.process_manifest_stream(
+                    manifest={"items": items}, cfg=utils.Config()
+                )["results"]
+
+        self.assertEqual(results[front]["dateTimeOriginal"], "1940:07:01")
+        self.assertNotIn(utils.AI_INFERRED_DATE_KEYWORD, results[front]["keywords"])
+        self.assertIn(utils.AI_INFERRED_DATE_KEYWORD, results[back]["keywords"])
+
+    def test_a_hierarchy_level_is_never_added_to_the_hierarchy_flat(self) -> None:
+        before = {"XMP-dc:Subject": ["family"]}
+        after = {"XMP-dc:Subject": ["family", "Ruth", "beach"]}
+
+        proposed = diff_canonical_metadata(before, after, None, ["People|Ruth"])
+        args = _keyword_delta_args(proposed, "a.jpg", [])
+
+        self.assertEqual(proposed["keywords_in_hierarchy"], ["Ruth"])
+        self.assertNotIn("-XMP-lr:HierarchicalSubject+=Ruth", args)
+        self.assertIn("-XMP-dc:Subject+=Ruth", args)
+        self.assertIn("-IPTC:Keywords+=Ruth", args)
+        self.assertIn("-XMP-lr:HierarchicalSubject+=beach", args)
+
+    def test_iim_fits_a_keyword_in_64_bytes_of_utf8_too(self) -> None:
+        self.assertFalse(iim_holds_keyword("é" * 40))
+        self.assertTrue(iim_holds_keyword("é" * 32))
+
+
 class TestTheIssuesBatchInTheFile(_RealExiftoolCase):
     """The first 0.7.0 run, replayed: an undated scan Lightroom had keyworded."""
 
@@ -325,6 +375,18 @@ class TestTheIssuesBatchInTheFile(_RealExiftoolCase):
         again = self.run_plugin_call(path, reply)["proposed_changes"]
 
         self.assertEqual((again["keywords_add"], again["keywords_remove"]), ([], []))
+
+    def test_a_hierarchy_leaf_missing_from_iim_gets_no_flat_copy(self) -> None:
+        path = self.image("jpg")
+        args = [f"-XMP-dc:Subject={kw}" for kw in ("Ruth", "People", "family")]
+        args += [f"-XMP-lr:HierarchicalSubject={kw}" for kw in ("People|Ruth", "family")]
+        self.exiftool_run("-overwrite_original", *args, path)
+
+        self.run_plugin_call(path, {"keywords": ["family"]})
+
+        tags = self.keyword_tags(path)
+        self.assertEqual(sorted(tags["XMP-lr:HierarchicalSubject"]), ["People|Ruth", "family"])
+        self.assertEqual(sorted(tags["IPTC:Keywords"]), ["People", "Ruth", "family"])
 
     def test_a_stale_mirror_is_repaired(self) -> None:
         path = self.seeded(self.LIGHTROOM)

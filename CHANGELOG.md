@@ -30,8 +30,17 @@ gets the model's date even when the model is unsure of it.
   describing a date it does not hold. A date written below the usual bar
   (0.6 for a file with no date, 0.7 to replace one) also gets the keyword
   `AI Inferred Date`. While that keyword is there, the `DATE:` keyword beside
-  it does not lock the date, so a later run can still correct it; remove
-  `AI Inferred Date` once you have checked the date.
+  it does not lock the date: a later run can replace it on the same terms as
+  any date in the file. Remove `AI Inferred Date` once you have checked the
+  date. Date keywords are per file; a group's scans no longer share them.
+- **Files from earlier versions.** photokin 0.7 and earlier kept the model's
+  `DATE:` keyword even when no date was written. That keyword now counts as
+  reviewed and locks the date; remove it from an undated file to let
+  photokin date it.
+- Changeset `schema_version` is now 4: `proposed_changes` may carry
+  `keywords_in_hierarchy`, the added keywords already present as a level of
+  a hierarchical keyword, which are not added to
+  `XMP-lr:HierarchicalSubject`.
 
 ## [0.7.0]
 

@@ -7,7 +7,6 @@ from typing import Callable
 
 from ..utils import (
     HYDRATION_FAILED_KEY,
-    UNMIRRORED_KEYWORDS_KEY,
     is_date_keyword,
     is_date_marker,
     normalize_path,
@@ -86,6 +85,7 @@ def hydrate_item_metadata(
     # patches onto photokin.exiftool.manifest is the one this call reaches.
     from photokin.exiftool.manifest import (
         _find_tag_value,
+        _keyword_extras,
         manifest_value,
         record_keywords,
         run_exiftool_json,
@@ -185,13 +185,14 @@ def hydrate_item_metadata(
                 # run_exiftool_json requests -G1, so EXIF:UserComment comes back
                 # keyed as ExifIFD:UserComment; _find_tag_value matches on the
                 # bare tag name.
-                unmirrored: list[str] = []
+                extras: dict[str, list[str]] = {}
                 value: str | list[str] | None
                 if key == "keywords":
                     # One union of every keyword tag, so the three tags that
                     # map here are read once, by the first of them.
                     filled.add(key)
-                    value, unmirrored = record_keywords(rec)
+                    read = record_keywords(rec)
+                    value, extras = read.keywords, _keyword_extras(read)
                 else:
                     value = manifest_value(_find_tag_value(rec, tag), key)
                 if value is None:
@@ -215,8 +216,7 @@ def hydrate_item_metadata(
                 if not isinstance(target, dict):
                     target = raw["metadata"] = {}
                 target[key] = value
-                if unmirrored:
-                    target[UNMIRRORED_KEYWORDS_KEY] = unmirrored
+                target.update(extras)
                 filled.add(key)
                 if key == "title" and title_from_file is not None:
                     title_from_file.add(id(target))

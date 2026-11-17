@@ -356,7 +356,7 @@ ExifTool reads the metadata a file already holds (`-r`) and writes the analysis 
 |---|---|
 | `ai_caption` (the AI analysis) | `EXIF:UserComment`, below any note already there — a re-run replaces only its own earlier `[AI Analysis]` block |
 | `caption` (the verbatim transcription) | `XMP-dc:Description` |
-| `keywords` | `XMP-dc:Subject`, with each change also made to `XMP-lr:HierarchicalSubject` (which Lightroom reads first) and `IPTC:Keywords`. A hierarchical entry such as `People|Ruth` is kept as it is. A keyword IIM cannot store exactly — characters outside Latin, or longer than 64 bytes — goes to the two XMP tags only |
+| `keywords` | `XMP-dc:Subject`, with each change also made to `XMP-lr:HierarchicalSubject` (which Lightroom reads first) and `IPTC:Keywords`. A hierarchical entry such as `People|Ruth` is kept as it is, and `Ruth` or `People` is never added beside it as a flat entry. A keyword IIM cannot store exactly — characters outside Latin, or longer than 64 bytes — goes to the two XMP tags only |
 | `title` | `XMP-dc:Title` |
 | `date_guess` (see [Dates](#why-read-first)) | `EXIF:DateTimeOriginal` (Lightroom's Capture Time), and with it `XMP-photoshop:DateCreated` (Date Created) at the precision the model claimed — a year-only guess is written as just the year. A complete date also goes to `IPTC:DateCreated`/`TimeCreated` |
 | `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location`, each also written to the XMP tag Lightroom reads (`XMP-photoshop:Country` / `State` / `City`, `XMP-iptcCore:Location`). Not written by default, because a `-w` run without `-r` would overwrite a location already in the file unread; opt in by naming them in `--exiftool-fields`, alongside `-r` |
@@ -374,7 +374,7 @@ With `-r`, photokin reads `EXIF:DateTimeOriginal` (or, failing that, `XMP-photos
   | closer | at least 0.8, for a guess down to the month or day (`Y!M!`, `Y!M!D!`) more than 5 years away |
   | any, with a reviewed `DATE:` keyword | never |
 
-  A written date gets a `DATE: <pattern>` keyword (such as `DATE: Y~`); a guess that is not written gets none, and is offered as a suggestion instead. A date written below the usual bar (0.6 for a file with no date, 0.7 to replace one) also gets the keyword `AI Inferred Date`. While that keyword is there a later run may still correct the date; remove it once you have checked the date, and the `DATE:` keyword then locks it.
+  A written date gets a `DATE: <pattern>` keyword (such as `DATE: Y~`); a guess that is not written gets none, and is offered as a suggestion instead. A date written below the usual bar (0.6 for a file with no date, 0.7 to replace one) also gets the keyword `AI Inferred Date`. While that keyword is there the date is not locked: a later run can replace it on the same terms as any date in the file (a guess more than 20 years away, or a confident month- or day-precise one more than 5 years away). Remove it once you have checked the date, and the `DATE:` keyword then locks it. Each file's date keywords are its own: removing `AI Inferred Date` from a front does not depend on its back. Files analyzed by photokin 0.7 or earlier may carry a `DATE:` keyword for a date that was never written; it counts as reviewed, so remove it to let photokin date the file.
 * **Keywords.** The file's keywords are read from all three keyword tags, so a keyword Lightroom saved to only one of them is kept, and a keyword missing from any of them is written to it again.
 * **Notes.** Your text in `EXIF:UserComment` is kept; the new analysis goes below it, replacing the previous run's `[AI Analysis]` block. Without `-r` photokin cannot see your note, so the comment is written as the analysis alone.
 * **Locations.** A location already in the file beats the model's guess, so a place you set by hand is never overwritten.
@@ -849,7 +849,7 @@ Prints this build's contract as JSON and exits, before any input is required —
 {
   "version": "0.7.0",
   "ndjson_schema_version": 3,
-  "changeset_schema_version": 3,
+  "changeset_schema_version": 4,
   "canonical_tags": {
     "ai_caption": "EXIF:UserComment",
     "caption": "XMP-dc:Description",

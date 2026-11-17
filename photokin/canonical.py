@@ -72,28 +72,45 @@ CANONICAL_HIERARCHICAL_KEYWORDS_TAG = "XMP-lr:HierarchicalSubject"
 CANONICAL_IPTC_KEYWORDS_TAG = "IPTC:Keywords"
 CANONICAL_KEYWORD_MIRROR_TAGS = (CANONICAL_HIERARCHICAL_KEYWORDS_TAG, CANONICAL_IPTC_KEYWORDS_TAG)
 
-#: IPTC:Keywords' limit, in bytes of ExifTool's default IIM encoding.
+#: IPTC:Keywords' limit, in bytes.
 _IIM_KEYWORD_MAX_BYTES = 64
+
+
+def hierarchy_levels(entries: list[str] | None) -> set[str]:
+    """Every level of the hierarchical keywords in ``entries``, lowercased.
+
+    Example:
+        >>> sorted(hierarchy_levels(["People|Ruth", "family"]))
+        ['people', 'ruth']
+    """
+    return {
+        level.strip().lower()
+        for entry in entries or []
+        if "|" in entry
+        for level in entry.split("|")
+    }
 
 
 def iim_holds_keyword(keyword: str) -> bool:
     """Whether ``IPTC:Keywords`` stores ``keyword`` exactly as written.
 
-    ExifTool encodes IIM text as Latin (cp1252) unless the file says
-    otherwise, writing ``?`` for any other character, and cuts a keyword at
-    64 bytes; either way the stored keyword is no longer the one written, and
-    a later removal no longer matches it. Such a keyword is kept in XMP only.
+    ExifTool encodes IIM text as Latin (cp1252), writing ``?`` for any other
+    character, unless the file declares UTF-8, and cuts a keyword at 64 bytes
+    of whichever encoding it uses; either way the stored keyword is no longer
+    the one written, and a later removal no longer matches it. Such a keyword
+    is kept in XMP only.
 
     Args:
         keyword: One flat keyword.
 
     Returns:
-        True when the keyword encodes to cp1252 within 64 bytes.
+        True when the keyword is Latin and fits 64 bytes in either encoding.
     """
     try:
-        return len(keyword.encode("cp1252")) <= _IIM_KEYWORD_MAX_BYTES
+        keyword.encode("cp1252")
     except UnicodeEncodeError:
         return False
+    return len(keyword.encode("utf-8")) <= _IIM_KEYWORD_MAX_BYTES
 
 CANONICAL_LOCATION_TAGS = {
     "country": "IPTC:Country-PrimaryLocationName",

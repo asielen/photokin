@@ -384,7 +384,10 @@ def _keyword_delta_args(
     and to ``XMP-lr:HierarchicalSubject``, and to ``IPTC:Keywords`` when IIM
     can hold the keyword (:func:`~photokin.canonical.iim_holds_keyword`). A
     hierarchical entry (``People|Ruth``) is a different value from the flat
-    keyword, so it is never removed by one.
+    keyword, so it is never removed by one; and a keyword the record lists in
+    ``keywords_in_hierarchy``, already a level of one, is left out of
+    HierarchicalSubject, where a flat copy would be a second, top-level
+    keyword in Lightroom.
 
     Args:
         proposed: The record's ``proposed_changes`` payload.
@@ -396,6 +399,11 @@ def _keyword_delta_args(
         carries no usable deltas.
     """
     args: list[str] = []
+    in_hierarchy = {
+        kw.strip().lower()
+        for kw in proposed.get("keywords_in_hierarchy") or []
+        if isinstance(kw, str)
+    }
     for key in ("keywords_remove", "keywords_add"):
         values = proposed.get(key) or []
         if not isinstance(values, list):
@@ -424,8 +432,12 @@ def _keyword_delta_args(
                     }
                 )
                 continue
-            iim = (CANONICAL_IPTC_KEYWORDS_TAG,) if iim_holds_keyword(keyword) else ()
-            for tag in (CANONICAL_KEYWORDS_TAG, CANONICAL_HIERARCHICAL_KEYWORDS_TAG, *iim):
+            tags = (
+                CANONICAL_KEYWORDS_TAG,
+                *(() if keyword.lower() in in_hierarchy else (CANONICAL_HIERARCHICAL_KEYWORDS_TAG,)),
+                *((CANONICAL_IPTC_KEYWORDS_TAG,) if iim_holds_keyword(keyword) else ()),
+            )
+            for tag in tags:
                 args.append(f"-{tag}-={keyword}")
                 if key == "keywords_add":
                     args.append(f"-{tag}+={keyword}")

@@ -2878,6 +2878,7 @@ def _file_write_instructions(
         before_snapshot,
         canonical_values_from_patch(patch),
         own_meta.get(utils.UNMIRRORED_KEYWORDS_KEY),
+        own_meta.get(utils.HIERARCHICAL_KEYWORDS_KEY),
     )
     return _WriteDecision(patch, False, before_snapshot, proposed)
 
@@ -4425,6 +4426,18 @@ def process_manifest_stream(
                 )
                 sidecar_page_count = len(page_nums_all) if multipage_present else None
 
+            # A date marker describes the date of the file it is on, so a
+            # sibling's never reaches another file: a back's AI Inferred Date
+            # would reopen the front's signed-off date.
+            group_meta_for_files = {
+                **combined_meta,
+                "keywords": [
+                    kw
+                    for kw in combined_meta.get("keywords") or []
+                    if not utils.is_date_marker(kw)
+                ],
+            }
+
             # emit per-file (merged with per-file metadata)
             for it, own_meta, (file_caption, caption_scope) in zip(
                 group, own_metadata, captions_for_files
@@ -4436,7 +4449,7 @@ def process_manifest_stream(
                 own_markers = utils.part_markers_in(
                     own_meta.get("keywords") or own_meta.get("tags")
                 )
-                per_meta = utils.merge_original_sources(own_meta, combined_meta)
+                per_meta = utils.merge_original_sources(own_meta, group_meta_for_files)
 
                 # The one keyword that is a property of this file rather than of
                 # the object.

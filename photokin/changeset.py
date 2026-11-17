@@ -32,7 +32,12 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
-from .canonical import CANONICAL_DATE_CREATED_TAG, CANONICAL_DATE_TAG, CANONICAL_KEYWORDS_TAG
+from .canonical import (
+    CANONICAL_DATE_CREATED_TAG,
+    CANONICAL_DATE_TAG,
+    CANONICAL_KEYWORDS_TAG,
+    hierarchy_levels,
+)
 from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywords
 
 # Bumped whenever a record's shape changes in a way a consumer could care
@@ -53,7 +58,12 @@ from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywor
 #        block instead of the AI block alone; ``XMP-photoshop:DateCreated``
 #        joined ``proposed_changes.set`` beside every capture-date change; and
 #        the before-snapshot carries the file's location and Date Created.
-SCHEMA_VERSION = 3
+#   4 -- keyword additions and removals reach XMP-lr:HierarchicalSubject and
+#        IPTC:Keywords as well, and ``proposed_changes`` may carry
+#        ``keywords_in_hierarchy``: the added keywords the file's hierarchy
+#        already holds as a level, which an applier must not add to
+#        HierarchicalSubject as flat entries.
+SCHEMA_VERSION = 4
 
 
 def make_run_id() -> str:
@@ -121,7 +131,10 @@ WRITE_SUPPRESSED_KEY = "suppressed"
 
 
 def diff_canonical_metadata(
-    before: dict, after: dict, unmirrored: list[str] | None = None
+    before: dict,
+    after: dict,
+    unmirrored: list[str] | None = None,
+    hierarchy: list[str] | None = None,
 ) -> dict:
     """Compute a compact diff in canonical tag space (set/keywords_add/keywords_remove).
 
@@ -139,9 +152,12 @@ def diff_canonical_metadata(
         after: The canonical values this run would write.
         unmirrored: Keywords the file holds in some of its keyword tags but
             not all of them.
+        hierarchy: The file's hierarchical keywords (``People|Ruth``).
 
     Returns:
-        ``{"set": {...}, "keywords_add": [...], "keywords_remove": [...]}``.
+        ``{"set": {...}, "keywords_add": [...], "keywords_remove": [...]}``,
+        plus ``keywords_in_hierarchy`` when an added keyword is already a
+        level of ``hierarchy``.
     """
     before_keywords = _normalize_keyword_list(before.get(CANONICAL_KEYWORDS_TAG))
     after_keywords = _normalize_keyword_list(after.get(CANONICAL_KEYWORDS_TAG))
@@ -168,10 +184,13 @@ def diff_canonical_metadata(
     if CANONICAL_DATE_TAG in set_changes and CANONICAL_DATE_CREATED_TAG in after:
         set_changes[CANONICAL_DATE_CREATED_TAG] = after[CANONICAL_DATE_CREATED_TAG]
 
+    levels = hierarchy_levels(hierarchy)
+    in_hierarchy = [kw for kw in keywords_add if kw.lower() in levels]
     return {
         "set": set_changes,
         "keywords_add": keywords_add,
         "keywords_remove": keywords_remove,
+        **({"keywords_in_hierarchy": in_hierarchy} if in_hierarchy else {}),
     }
 
 

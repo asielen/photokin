@@ -127,6 +127,12 @@ UNMIRRORED_KEYWORDS_KEY = "unmirroredKeywords"
 #: correct the date; a person signs the date off by removing it.
 AI_INFERRED_DATE_KEYWORD = "AI Inferred Date"
 
+#: Manifest key for a file's hierarchical keywords (``People|Ruth``), read from
+#: ``XMP-lr:HierarchicalSubject``. A keyword that is a level of one is never
+#: added to that tag as a flat entry, which Lightroom would read as a second,
+#: top-level keyword.
+HIERARCHICAL_KEYWORDS_KEY = "hierarchicalKeywords"
+
 
 def is_date_keyword(keyword: object) -> bool:
     """Whether ``keyword`` is a ``DATE: <pattern>`` marker."""
