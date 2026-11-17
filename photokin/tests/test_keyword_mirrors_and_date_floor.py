@@ -310,6 +310,28 @@ class TestAuditFindings(unittest.TestCase):
         self.assertNotIn(utils.AI_INFERRED_DATE_KEYWORD, results[front]["keywords"])
         self.assertIn(utils.AI_INFERRED_DATE_KEYWORD, results[back]["keywords"])
 
+    def test_a_fronts_sign_off_still_locks_its_bare_back(self) -> None:
+        with tempfile.TemporaryDirectory() as work:
+            front = os.path.join(work, "florence-037.jpg")
+            back = os.path.join(work, "florence-037-back.jpg")
+            for path in (front, back):
+                open(path, "wb").close()
+            items = [
+                {
+                    "path": front,
+                    "metadata": {"keywords": ["family", "DATE: Y!"], "dateTimeOriginal": "1940:07:01"},
+                },
+                {"path": back},
+            ]
+            with _stubbed_model(_guess(0.45, "1915-07-01")):
+                results = core.process_manifest_stream(
+                    manifest={"items": items}, cfg=utils.Config()
+                )["results"]
+
+        self.assertEqual(results[back]["dateTimeOriginal"], "1940:07:01")
+        self.assertIn("DATE: Y!", results[back]["keywords"])
+        self.assertNotIn(utils.AI_INFERRED_DATE_KEYWORD, results[back]["keywords"])
+
     def test_a_hierarchy_level_is_never_added_to_the_hierarchy_flat(self) -> None:
         before = {"XMP-dc:Subject": ["family"]}
         after = {"XMP-dc:Subject": ["family", "Ruth", "beach"]}

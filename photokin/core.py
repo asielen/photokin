@@ -4426,15 +4426,22 @@ def process_manifest_stream(
                 )
                 sidecar_page_count = len(page_nums_all) if multipage_present else None
 
-            # A date marker describes the date of the file it is on, so a
-            # sibling's never reaches another file: a back's AI Inferred Date
-            # would reopen the front's signed-off date.
+            # A sibling's date markers reach the other files only as a
+            # sign-off: a reviewed DATE: keyword locks the whole print's date,
+            # while a back's AI Inferred Date would reopen the front's.
+            signed_off = {
+                kw.strip().lower()
+                for kws in (meta.get("keywords") or meta.get("tags") for meta in own_metadata)
+                if isinstance(kws, list) and utils.has_reviewed_date_keyword(kws)
+                for kw in kws
+                if utils.is_date_keyword(kw)
+            }
             group_meta_for_files = {
                 **combined_meta,
                 "keywords": [
                     kw
                     for kw in combined_meta.get("keywords") or []
-                    if not utils.is_date_marker(kw)
+                    if not utils.is_date_marker(kw) or kw.strip().lower() in signed_off
                 ],
             }
 
