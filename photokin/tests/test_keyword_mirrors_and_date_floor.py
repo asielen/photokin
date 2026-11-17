@@ -332,6 +332,43 @@ class TestAuditFindings(unittest.TestCase):
         self.assertIn("DATE: Y!", results[back]["keywords"])
         self.assertNotIn(utils.AI_INFERRED_DATE_KEYWORD, results[back]["keywords"])
 
+    def run_print(self, front_meta: dict, back_meta: dict, reply: dict) -> dict[str, dict]:
+        """Run a front and back with their own metadata; return results by basename."""
+        with tempfile.TemporaryDirectory() as work:
+            items = []
+            for name, meta in (("florence-041.jpg", front_meta), ("florence-041-back.jpg", back_meta)):
+                path = os.path.join(work, name)
+                open(path, "wb").close()
+                items.append({"path": path, "metadata": meta})
+            with _stubbed_model(reply):
+                results = core.process_manifest_stream(
+                    manifest={"items": items}, cfg=utils.Config()
+                )["results"]
+        return {os.path.basename(path): record for path, record in results.items()}
+
+    def test_a_back_with_its_own_inferred_date_keeps_its_own_markers(self) -> None:
+        results = self.run_print(
+            {"keywords": ["family", "DATE: Y!"], "dateTimeOriginal": "1940:07:01"},
+            {
+                "keywords": ["family", "DATE: Y~", utils.AI_INFERRED_DATE_KEYWORD],
+                "dateTimeOriginal": "1915:07:01",
+            },
+            _guess(0.45, "1915-07-01"),
+        )
+
+        self.assertEqual(
+            [kw for kw in results["florence-041-back.jpg"]["keywords"] if utils.is_date_marker(kw)],
+            ["DATE: Y~", utils.AI_INFERRED_DATE_KEYWORD],
+        )
+
+    def test_a_front_signed_off_in_a_single_string_locks_its_back(self) -> None:
+        results = self.run_print(
+            {"keywords": "DATE: Y!", "dateTimeOriginal": "1940:07:01"}, {}, _guess(0.45, "1915-07-01")
+        )
+
+        self.assertEqual(results["florence-041-back.jpg"]["dateTimeOriginal"], "1940:07:01")
+        self.assertIn("DATE: Y!", results["florence-041-back.jpg"]["keywords"])
+
     def test_a_hierarchy_level_is_never_added_to_the_hierarchy_flat(self) -> None:
         before = {"XMP-dc:Subject": ["family"]}
         after = {"XMP-dc:Subject": ["family", "Ruth", "beach"]}
