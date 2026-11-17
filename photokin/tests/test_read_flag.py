@@ -701,8 +701,10 @@ class TestTheScanDateIsEvidenceNotTruth(_ReadFlagTestCase):
 
         merged = self.stream([{"path": path}], None, reply=reply)["results"][path]
 
+        # Unread, the file has no date to compare with, so the guess fills it
+        # as it would an empty one.
         self.assertNotIn("date_original", merged)
-        self.assertNotIn("dateTimeOriginal", merged)
+        self.assertEqual(merged["dateTimeOriginal"], self.MODEL_DATE["import_date"])
         self.assertEqual(merged["date_guess"], self.MODEL_DATE)
 
 
@@ -995,6 +997,8 @@ class TestGeneratedManifestRoundTripsWhatWasRead(_ReadFlagTestCase):
                     "caption": "Grandma on the porch",
                     "title": "Scanned Image",
                     "keywords": ["family", "ohio"],
+                    # Held in XMP:Subject alone, so missing from both mirrors.
+                    "unmirroredKeywords": ["family", "ohio"],
                 },
                 "box3_025b.jpg": None,
                 "box3_026.jpg": {"title": "Untitled Scan"},
@@ -1249,26 +1253,36 @@ class TestTheChangesetDiffIsNeutralExceptWhereTheReadLands(_ReadFlagTestCase):
             # The whole model answer, title included: had the boilerplate won
             # the merge, before and after would both read "Scanned Image" and
             # the title would vanish from the diff instead of being written.
-            {"set": dict(_MODEL_PROPOSES), "keywords_add": ["family"], "keywords_remove": []},
+            # The file has no date, so the model's is written and marked.
+            {
+                "set": dict(_MODEL_PROPOSES),
+                "keywords_add": ["family", "DATE: Y~"],
+                "keywords_remove": [],
+            },
         ),
         _Shape(
             "the file already holds the answer",
             "box3_023.jpg",
             {
                 "XMP:Title": "Wedding Day 1952",
+                # In every keyword tag, so the keyword is settled everywhere;
+                # held in one tag alone it would be proposed to the others.
                 "XMP:Subject": ["family"],
+                "XMP-lr:HierarchicalSubject": ["family"],
+                "IPTC:Keywords": ["family"],
                 "XMP:Description": JOINED_CAPTION,
             },
-            # Three keys settled by the file drop out; the two the file says
+            # Three keys settled by the file drop out; the ones the file says
             # nothing about stay, which is what keeps this from being an
-            # assertion about an empty record.
+            # assertion about an empty record. The date is written to a file
+            # with none, so its DATE: marker is the one keyword added.
             {
                 "set": {
                     key: value
                     for key, value in _MODEL_PROPOSES.items()
                     if key not in ("XMP-dc:Title", "XMP-dc:Description")
                 },
-                "keywords_add": [],
+                "keywords_add": ["DATE: Y~"],
                 "keywords_remove": [],
             },
         ),
@@ -1276,7 +1290,11 @@ class TestTheChangesetDiffIsNeutralExceptWhereTheReadLands(_ReadFlagTestCase):
             "the file holds nothing",
             "box3_024.jpg",
             {},
-            {"set": dict(_MODEL_PROPOSES), "keywords_add": ["family"], "keywords_remove": []},
+            {
+                "set": dict(_MODEL_PROPOSES),
+                "keywords_add": ["family", "DATE: Y~"],
+                "keywords_remove": [],
+            },
         ),
     )
 
@@ -1389,7 +1407,7 @@ class TestTheChangesetDiffIsNeutralExceptWhereTheReadLands(_ReadFlagTestCase):
 
         for key in ("XMP-dc:Title", "XMP-dc:Description"):
             self.assertNotIn(key, proposed["set"], f"{key} was proposed at its current value")
-        self.assertEqual(proposed["keywords_add"], [])
+        self.assertEqual(proposed["keywords_add"], ["DATE: Y~"])
         self.assertEqual(
             proposed["keywords_remove"],
             [],

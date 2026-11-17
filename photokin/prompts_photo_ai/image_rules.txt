@@ -69,7 +69,8 @@ MANDATORY KEYWORDS
 Always include:
 • The chosen photo category (exact label)
 • "{{PROVIDER_NAME}} {{MODEL_NAME}} Analyzed"
-• "DATE: <date_guess.pattern>" — this must exactly match the value in date_guess.pattern
+Do NOT include a "DATE: ..." keyword; the calling program adds it from
+date_guess.pattern when it writes the date.
 
 PET & ANIMAL TAGGING
 • Family pet clearly shown → use both "Pets" and "Animals"

@@ -2816,6 +2816,24 @@ class _WriteDecision:
     proposed_changes: Dict[str, Any] | None
 
 
+def _own_keywords(meta: dict[str, Any]) -> list[str]:
+    """A file's own keywords as a list; a manifest may give a single string."""
+    keywords = meta.get("keywords") or meta.get("tags") or []
+    return [keywords] if isinstance(keywords, str) else list(keywords)
+
+
+def _group_meta_with_date_markers(combined_meta: dict[str, Any], kept: set[str]) -> dict[str, Any]:
+    """``combined_meta`` without the group's date markers, except those in ``kept`` (lowercased)."""
+    return {
+        **combined_meta,
+        "keywords": [
+            kw
+            for kw in combined_meta.get("keywords") or []
+            if not utils.is_date_marker(kw) or kw.strip().lower() in kept
+        ],
+    }
+
+
 def _file_write_instructions(
     patch: Dict[str, Any],
     own_meta: Dict[str, Any],
@@ -2874,7 +2892,12 @@ def _file_write_instructions(
             WRITE_SUPPRESSED_KEY: "hydration_failed",
         }
         return _WriteDecision({}, True, before_snapshot, proposed)
-    proposed = diff_canonical_metadata(before_snapshot, canonical_values_from_patch(patch))
+    proposed = diff_canonical_metadata(
+        before_snapshot,
+        canonical_values_from_patch(patch),
+        own_meta.get(utils.UNMIRRORED_KEYWORDS_KEY),
+        own_meta.get(utils.HIERARCHICAL_KEYWORDS_KEY),
+    )
     return _WriteDecision(patch, False, before_snapshot, proposed)
 
 
@@ -4421,6 +4444,20 @@ def process_manifest_stream(
                 )
                 sidecar_page_count = len(page_nums_all) if multipage_present else None
 
+            # Date markers describe one file's date. A file carrying its own
+            # keeps exactly those; a file with none takes a sibling's only as
+            # a sign-off, so a bare back is locked by its front's reviewed
+            # date, and a back's AI Inferred Date never reopens the front's.
+            signed_off = {
+                kw.strip().lower()
+                for kws in map(_own_keywords, own_metadata)
+                if utils.has_reviewed_date_keyword(kws)
+                for kw in kws
+                if utils.is_date_keyword(kw)
+            }
+            group_meta_signed_off = _group_meta_with_date_markers(combined_meta, signed_off)
+            group_meta_unmarked = _group_meta_with_date_markers(combined_meta, set())
+
             # emit per-file (merged with per-file metadata)
             for it, own_meta, (file_caption, caption_scope) in zip(
                 group, own_metadata, captions_for_files
@@ -4432,7 +4469,12 @@ def process_manifest_stream(
                 own_markers = utils.part_markers_in(
                     own_meta.get("keywords") or own_meta.get("tags")
                 )
-                per_meta = utils.merge_original_sources(own_meta, combined_meta)
+                per_meta = utils.merge_original_sources(
+                    own_meta,
+                    group_meta_unmarked
+                    if any(map(utils.is_date_marker, _own_keywords(own_meta)))
+                    else group_meta_signed_off,
+                )
 
                 # The one keyword that is a property of this file rather than of
                 # the object.

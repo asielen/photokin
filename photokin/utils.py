@@ -116,6 +116,54 @@ SIDECAR_AUTO_CATEGORIES: frozenset[str] = frozenset({"Document", "Postcard"})
 #: never imports the wrapper.
 HYDRATION_FAILED_KEY = "hydration_failed"
 
+#: Manifest key for the keywords a file holds in some of its keyword tags but
+#: not all of them (see ``exiftool.manifest.record_keywords``). The changeset
+#: proposes them again so the write puts each one in every tag.
+UNMIRRORED_KEYWORDS_KEY = "unmirroredKeywords"
+
+#: Keyword photokin adds beside ``DATE: <pattern>`` when it wrote a date only
+#: because of the ``date_min_confidence`` floor. While it is present the
+#: ``DATE:`` keyword is photokin's, not a person's, so a later run may still
+#: correct the date; a person signs the date off by removing it.
+AI_INFERRED_DATE_KEYWORD = "AI Inferred Date"
+
+#: Manifest key for a file's hierarchical keywords (``People|Ruth``), read from
+#: ``XMP-lr:HierarchicalSubject``. A keyword that is a level of one is never
+#: added to that tag as a flat entry, which Lightroom would read as a second,
+#: top-level keyword.
+HIERARCHICAL_KEYWORDS_KEY = "hierarchicalKeywords"
+
+
+def is_date_keyword(keyword: object) -> bool:
+    """Whether ``keyword`` is a ``DATE: <pattern>`` marker."""
+    return isinstance(keyword, str) and keyword.strip().upper().startswith("DATE:")
+
+
+def is_date_marker(keyword: object) -> bool:
+    """Whether ``keyword`` is a ``DATE:`` marker or :data:`AI_INFERRED_DATE_KEYWORD`."""
+    return is_date_keyword(keyword) or (
+        isinstance(keyword, str) and keyword.strip().lower() == AI_INFERRED_DATE_KEYWORD.lower()
+    )
+
+
+def has_reviewed_date_keyword(keywords: list[str] | None) -> bool:
+    """Whether ``keywords`` carry a ``DATE:`` marker a person has signed off.
+
+    A ``DATE:`` keyword beside :data:`AI_INFERRED_DATE_KEYWORD` is photokin's
+    own low-confidence date and does not count.
+
+    Args:
+        keywords: A file's keywords, or ``None``.
+
+    Returns:
+        True when a ``DATE:`` keyword is present and the AI marker is not.
+    """
+    listed = [kw for kw in keywords or [] if isinstance(kw, str)]
+    inferred = AI_INFERRED_DATE_KEYWORD.lower()
+    return any(map(is_date_keyword, listed)) and all(
+        kw.strip().lower() != inferred for kw in listed
+    )
+
 @dataclass
 class Config:
     """Runtime configuration for an analysis run, with environment-variable defaults.
@@ -161,6 +209,11 @@ class Config:
     # produce that; the two knobs were set in different modules for different
     # reasons and never compared.
     date_confidence_threshold: float = 0.6
+    # The floor under both gates. A guess at or above it is written when the
+    # file has no date, or when the file's date is further from it than
+    # date_override_year_gap (on an old print that date is a scan or import
+    # date); below the normal gate it is written tagged AI_INFERRED_DATE_KEYWORD.
+    date_min_confidence: float = 0.4
     location_confidence_threshold: float = 0.7
     # date_guess override policy (merge.py). The precise variant below stays
     # above this one: a tighter year gap buys less evidence of a real mismatch,

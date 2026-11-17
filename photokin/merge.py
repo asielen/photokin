@@ -21,14 +21,19 @@ Key domain rules encoded here:
   and fills ``dateTimeOriginal`` when that heuristic declines, but it no longer
   overwrites the model's ``date_guess`` at confidence 1.0 -- on a scan it is the
   scan date, not the capture date.
-- A reviewed ``DATE:`` keyword is a human "hands off the date" signal that
-  suppresses the date-correction heuristic.
+- One rule decides whether the model's date is written (:func:`_date_to_write`),
+  and the ``DATE: <pattern>`` keyword follows the write: it is added when a
+  date is written and never taken from the model. A date written only because
+  of the ``date_min_confidence`` floor also gets ``AI Inferred Date``.
+- A reviewed ``DATE:`` keyword (one without ``AI Inferred Date``) is a human
+  "hands off the date" signal: no date is written over it.
 
 Code map:
 - _norm_str_set                       order-preserving, case-insensitive de-dup
 - _extract_year                       pull a plausible 4-digit year from free text
-- _has_date_keyword                   detect a human-reviewed ``DATE:`` marker
 - _valid_pattern                      sanity-check a model date pattern (Y!M!D!)
+- _date_to_write                      the date rule: which model date is written
+- _date_keywords                      the keywords that follow a written date
 - _normalize_location_component       trim/empty-to-None a single location field
 - _structured_location_from_original  read location parts from original metadata
 - _render_location_string             join location parts into a display string
@@ -37,13 +42,14 @@ Code map:
 """
 
 from typing import Dict, Any, Tuple, List
-import logging
-import os
 import re
 
-from .utils import Config
-
-logger = logging.getLogger(__name__)
+from .utils import (
+    AI_INFERRED_DATE_KEYWORD,
+    Config,
+    has_reviewed_date_keyword,
+    is_date_marker,
+)
 
 
 def _norm_str_set(seq) -> List[str]:
@@ -84,22 +90,6 @@ def _extract_year(value: str) -> int | None:
     if 1800 <= year <= 2100:
         return year
     return None
-
-
-def _has_date_keyword(keywords: List[str]) -> bool:
-    """
-    Return True if any keyword looks like a reviewed DATE: ... marker.
-
-    This is your "human has already looked at this date" signal. When present,
-    we avoid auto-correcting dateTimeOriginal and avoid injecting new DATE:
-    keywords from AI heuristics.
-    """
-    for kw in keywords or []:
-        if not isinstance(kw, str):
-            continue
-        if kw.strip().upper().startswith("DATE:"):
-            return True
-    return False
 
 
 def _valid_pattern(pattern: str) -> bool:
@@ -168,6 +158,93 @@ def _standardize_location_guess(loc_guess: Dict[str, Any] | None) -> Dict[str, A
     }
 
 
+_IMPORT_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_PRECISE_PATTERNS = frozenset({"Y!M!D!", "Y!M!"})
+
+
+def _date_to_write(
+    date_guess: dict[str, Any], existing: str, config: Config
+) -> tuple[str, bool] | None:
+    """Decide whether the model's date is written over the file's date.
+
+    ===================================  ==========================================
+    The file's date                      The model's date is written when
+    ===================================  ==========================================
+    none                                 confidence >= ``date_min_confidence``
+    more than ``date_override_year_gap`` confidence >= ``date_min_confidence``
+    years away
+    closer                               a ``Y!M!D!``/``Y!M!`` pattern, confidence
+                                         >= ``date_override_precise_confidence_
+                                         threshold`` and a gap over
+                                         ``date_override_precise_year_gap``
+    ===================================  ==========================================
+
+    A large gap is evidence the file's date is a scan or import date, so it
+    needs no confident guess to be replaced. A reviewed ``DATE:`` keyword is
+    checked by the caller.
+
+    Args:
+        date_guess: The model's ``date_guess``.
+        existing: The file's own date, or ``""``.
+        config: Supplies the thresholds.
+
+    Returns:
+        ``(value, inferred)``: the date to write, keeping the existing date's
+        time-of-day suffix, and whether it is written only because of the
+        floor (its confidence is under the normal gate for its case). ``None``
+        when nothing is written.
+    """
+    confidence = date_guess.get("confidence")
+    import_date = str(date_guess.get("import_date") or "").strip()
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or confidence < config.date_min_confidence
+        or not _IMPORT_DATE_RE.fullmatch(import_date)
+    ):
+        return None
+    if not existing:
+        return import_date, confidence < config.date_confidence_threshold
+    existing_year = _extract_year(existing)
+    if existing_year is None:
+        return None
+    gap = abs(int(import_date[:4]) - existing_year)
+    if gap > config.date_override_year_gap:
+        inferred = confidence < config.date_override_confidence_threshold
+    elif (
+        str(date_guess.get("pattern") or "").strip() in _PRECISE_PATTERNS
+        and confidence >= config.date_override_precise_confidence_threshold
+        and gap > config.date_override_precise_year_gap
+    ):
+        inferred = False
+    else:
+        return None
+    time_suffix = existing[existing.index("T") :] if "T" in existing else ""
+    return import_date + time_suffix, inferred
+
+
+def _date_keywords(keywords: list[str], pattern: str, inferred: bool) -> list[str]:
+    """Replace the date keywords in ``keywords`` with the ones for a written date.
+
+    Called only when a date is written, so any date keyword already present is
+    an earlier run's unreviewed one: a reviewed date is never written over.
+
+    Args:
+        keywords: The merged keywords.
+        pattern: The model's ``date_guess.pattern``; an implausible one adds
+            no ``DATE:`` keyword.
+        inferred: Whether the date is written only because of the floor.
+
+    Returns:
+        The keywords with ``DATE: <pattern>`` and, for an inferred date,
+        ``AI Inferred Date`` in place of any earlier date keywords.
+    """
+    added = ([f"DATE: {pattern}"] if _valid_pattern(pattern) else []) + (
+        [AI_INFERRED_DATE_KEYWORD] if inferred else []
+    )
+    return _norm_str_set([kw for kw in keywords if not is_date_marker(kw)] + added)
+
+
 def merge_record_with_original(
     record: Dict[str, Any],
     original: Dict[str, Any],
@@ -205,23 +282,13 @@ def merge_record_with_original(
       model's "date_guess". It is the file's EXIF:DateTimeOriginal, which on a
       scan is the day the print was scanned; treating that as the capture date
       at confidence 1.0 destroyed the inference the model was paid for. What
-      reaches the file is unchanged: the fix-up below still decides that.
-    - DateTimeOriginal fix-up (config-driven):
-        * If there is NO existing DATE: keyword,
-        * and AI has a high-confidence date_guess,
-        * and AI year vs original year differ by the configured year gap,
-        * and date_guess.import_date is a valid YYYY-MM-DD,
-          then we:
-            - update merged["dateTimeOriginal"] to that import_date
-              (preserving any time-of-day suffix), and
-            - add a DATE: <pattern> keyword, using date_guess.pattern
-              if it looks valid.
-
-        If the model gives a precise Y!M!D! or Y!M! pattern with higher confidence,
-        we allow a smaller year gap. This helps newer photos where metadata is
-        usually accurate within a decade, while still allowing large gaps for
-        older scanned photos.
-
+      reaches the file is decided by :func:`_date_to_write`.
+    - Written date: unless the keywords carry a reviewed ``DATE:`` marker,
+      ``_date_to_write`` may set "dateTimeOriginal" to the model's
+      ``import_date``; the date keywords are then replaced to match
+      (:func:`_date_keywords`). With no date written, the model's own
+      ``DATE:`` keyword is dropped, so the keyword never names a date the
+      file does not hold.
 
     This keeps the "should we trust this?" logic here, while leaving the
     nuanced "what do we know about the date?" reasoning to the model.
@@ -235,107 +302,27 @@ def merge_record_with_original(
         orig_k = [orig_k]
     ai_k = merged.get("keywords") or []
 
-    combo = _norm_str_set(list(orig_k) + list(ai_k))
+    # The model's date keywords are dropped: whether the file gets a date, and
+    # so a DATE: keyword, is decided below.
+    combo = _norm_str_set(list(orig_k) + [kw for kw in ai_k if not is_date_marker(kw)])
     if combo != ai_k:
         merged["keywords"] = combo
         report["unions"].append("keywords")
 
-    has_reviewed_date_kw = _has_date_keyword(combo)
-
-    # --- High-confidence date sanity check vs. dateTimeOriginal ------------
-    #
-    # We look at:
-    #   - record["date_guess"] (iso, import_date, confidence, pattern)
-    #   - original["dateTimeOriginal"]
-    #
-    # If:
-    #   * There is no DATE: keyword yet (no human-reviewed date),
-    #   * confidence meets the configured threshold (or the precise threshold
-    #     for Y!M!D!/Y!M! patterns),
-    #   * AI year vs EXIF year differ by the configured year gap,
-    #   * import_date is a valid YYYY-MM-DD,
-    # then we:
-    #   * update dateTimeOriginal to import_date (+ time-of-day suffix), and
-    #   * add a DATE: <pattern> keyword if we don't already have one and the
-    #     pattern looks sane.
-    #
-    try:
-        ai_date = record.get("date_guess") or {}
-        if not isinstance(ai_date, dict):
-            ai_date = {}
-
-        ai_iso = (ai_date.get("iso") or "").strip()
-        ai_import = (ai_date.get("import_date") or "").strip()
-        ai_conf = ai_date.get("confidence")
-        ai_pattern = (ai_date.get("pattern") or "").strip()
-
-        dt_orig_raw = (original.get("date") or "").strip()
-
-        # Prefer a year derived from import_date, fall back to iso.
-        ai_year = _extract_year(ai_import) or _extract_year(ai_iso)
-        dt_year = _extract_year(dt_orig_raw)
-
-        # import_date should be a strict YYYY-MM-DD when present.
-        is_valid_import_date = bool(
-            re.fullmatch(r"\d{4}-\d{2}-\d{2}", ai_import or "")
+    # --- Date: one rule, and the date keywords follow the write -----------
+    ai_date = record.get("date_guess")
+    date_guess = ai_date if isinstance(ai_date, dict) else {}
+    written = (
+        None
+        if has_reviewed_date_keyword(combo)
+        else _date_to_write(date_guess, (original.get("date") or "").strip(), config)
+    )
+    if written is not None:
+        merged["dateTimeOriginal"], inferred = written
+        report["overrides"].append("dateTimeOriginal")
+        merged["keywords"] = _date_keywords(
+            combo, str(date_guess.get("pattern") or "").strip(), inferred
         )
-
-        min_year_gap = config.date_override_year_gap
-        if (
-            ai_pattern in {"Y!M!D!", "Y!M!"}
-            and isinstance(ai_conf, (int, float))
-            and ai_conf >= config.date_override_precise_confidence_threshold
-        ):
-            min_year_gap = config.date_override_precise_year_gap
-        # Diagnostic for the date-override decision. Kept behind a debug flag and
-        # routed to the logger so it never pollutes the NDJSON result stream.
-        if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
-            logger.debug(
-                "[DATE-OVERRIDE-CHECK] path=%s dt_orig_raw=%r dt_year=%s ai_year=%s "
-                "ai_conf=%s import_date=%r min_gap=%s abs_gap=%s has_DATE_keyword=%s",
-                original.get("path"),
-                dt_orig_raw,
-                dt_year,
-                ai_year,
-                ai_conf,
-                ai_import,
-                min_year_gap,
-                abs(ai_year - dt_year) if ai_year and dt_year else None,
-                "DATE:" in " ".join(original.get("keywords", [])),
-            )
-        if (
-            not has_reviewed_date_kw
-            and isinstance(ai_conf, (int, float))
-            and ai_conf >= config.date_override_confidence_threshold
-            and ai_year is not None
-            and dt_year is not None
-            and abs(ai_year - dt_year) > min_year_gap
-            and is_valid_import_date
-        ):
-            # Use import_date as the canonical replacement date. If the original
-            # had a time-of-day suffix (e.g., "T12:34:56Z"), preserve it.
-            time_suffix = ""
-            if "T" in dt_orig_raw:
-                time_suffix = dt_orig_raw[dt_orig_raw.index("T") :]
-            new_dt = ai_import + time_suffix
-            merged["dateTimeOriginal"] = new_dt
-            report["overrides"].append("dateTimeOriginal")
-
-            # Add DATE: keyword when:
-            #   - we still don't have any DATE: keyword, and
-            #   - the model gave us a plausible pattern (Y~/Y!/Y!M~/Y!M!D!/etc).
-            if not _has_date_keyword(merged.get("keywords") or []):
-                if _valid_pattern(ai_pattern):
-                    new_keywords = _norm_str_set(
-                        (merged.get("keywords") or []) + [f"DATE: {ai_pattern}"]
-                    )
-                    merged["keywords"] = new_keywords
-                    report["unions"].append("keywords")
-    except (KeyError, TypeError, ValueError) as exc:
-        # Never allow heuristics to break the merge step.
-        # If anything goes sideways, we skip the date fix-up.
-        if os.getenv("MEL_VERBOSE") or os.getenv("MEL_DEBUG"):
-            logger.warning("Skipping date override heuristics: %s", exc)
 
     # --- Title: the original wins, unless it may be the file's own ---------
     #

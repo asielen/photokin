@@ -1812,6 +1812,9 @@ class TestTheFileNeverOverwritesWhatTheInputAlreadyCarried(unittest.TestCase):
         "XMP:Description": "Scanned document",
         "XMP:Title": "Scanned Image",
         "XMP:Subject": ["Scans", "Untagged"],
+        # Mirrored in full, so the read fills keywords and nothing beside them.
+        "XMP-lr:HierarchicalSubject": ["Scans", "Untagged"],
+        "IPTC:Keywords": ["Scans", "Untagged"],
         "XMP-photoshop:Country": "Canada",
         "XMP-photoshop:State": "Ontario",
         "XMP-photoshop:City": "Toronto",

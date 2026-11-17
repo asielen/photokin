@@ -10,8 +10,9 @@ tags, normalizes values (especially dates), and invokes ExifTool.
 Why this exists separately from the Lightroom SDK: a few archival fields (notably
 ``EXIF:UserComment`` and date tags) are either unwritable or awkward via the SDK,
 so the plugin routes its writes here. Each location tag is also written to its
-XMP twin, and a capture date to Date Created, so Lightroom reads back every
-field it is asked to re-read from the file. Date normalization is the fiddly part — ExifTool
+XMP twin, a capture date to Date Created, and every keyword change to
+``XMP-lr:HierarchicalSubject`` and ``IPTC:Keywords``, so Lightroom reads back
+every field it is asked to re-read from the file. Date normalization is the fiddly part — ExifTool
 wants ``YYYY:MM:DD HH:MM:SS``, but changesets carry ISO-ish strings, so most of
 the private helpers below exist to coerce values into ExifTool's expected shape.
 
@@ -49,12 +50,15 @@ from typing import Any
 from ..canonical import (
     CANONICAL_DATE_CREATED_TAG,
     CANONICAL_DATE_TAG,
+    CANONICAL_HIERARCHICAL_KEYWORDS_TAG,
     CANONICAL_IPTC_DATE_TAG,
+    CANONICAL_IPTC_KEYWORDS_TAG,
     CANONICAL_IPTC_TIME_TAG,
     CANONICAL_KEYWORDS_TAG,
     CANONICAL_LOCATION_TAGS,
     CANONICAL_LOCATION_XMP_TAGS,
     LINE_BREAKS_RE,
+    iim_holds_keyword,
 )
 from ..changeset import WRITE_SUPPRESSED_KEY
 from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
@@ -376,7 +380,14 @@ def _keyword_delta_args(
     therefore writes them as ExifTool list operations rather than an
     assignment: ``-TAG-=kw`` removes one entry, and an add is the dupe-safe
     ``-TAG-=kw`` ``-TAG+=kw`` pair, which leaves exactly one copy whether or
-    not the file already held it.
+    not the file already held it. Each operation is applied to the keyword tag
+    and to ``XMP-lr:HierarchicalSubject``, and to ``IPTC:Keywords`` when IIM
+    can hold the keyword (:func:`~photokin.canonical.iim_holds_keyword`). A
+    hierarchical entry (``People|Ruth``) is a different value from the flat
+    keyword, so it is never removed by one; and a keyword the record lists in
+    ``keywords_in_hierarchy``, already a level of one, is left out of
+    HierarchicalSubject, where a flat copy would be a second, top-level
+    keyword in Lightroom.
 
     Args:
         proposed: The record's ``proposed_changes`` payload.
@@ -388,6 +399,11 @@ def _keyword_delta_args(
         carries no usable deltas.
     """
     args: list[str] = []
+    in_hierarchy = {
+        kw.strip().lower()
+        for kw in proposed.get("keywords_in_hierarchy") or []
+        if isinstance(kw, str)
+    }
     for key in ("keywords_remove", "keywords_add"):
         values = proposed.get(key) or []
         if not isinstance(values, list):
@@ -416,9 +432,15 @@ def _keyword_delta_args(
                     }
                 )
                 continue
-            args.append(f"-{CANONICAL_KEYWORDS_TAG}-={keyword}")
-            if key == "keywords_add":
-                args.append(f"-{CANONICAL_KEYWORDS_TAG}+={keyword}")
+            tags = (
+                CANONICAL_KEYWORDS_TAG,
+                *(() if keyword.lower() in in_hierarchy else (CANONICAL_HIERARCHICAL_KEYWORDS_TAG,)),
+                *((CANONICAL_IPTC_KEYWORDS_TAG,) if iim_holds_keyword(keyword) else ()),
+            )
+            for tag in tags:
+                args.append(f"-{tag}-={keyword}")
+                if key == "keywords_add":
+                    args.append(f"-{tag}+={keyword}")
     return args
 
 

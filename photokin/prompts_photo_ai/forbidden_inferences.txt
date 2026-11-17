@@ -29,7 +29,7 @@ FORBIDDEN INFERENCES — READ CAREFULLY AND COMPLY
 
 10) Do NOT add narrative or speculative context. Captions and AI analysis must remain factual, neutral, and concise.
 
-11) Do NOT remove required keywords. Always include: (a) the selected category label, (b) "{{PROVIDER_NAME}} {{MODEL_NAME}} Analyzed", and (c) "DATE: <date_guess.pattern>".
+11) Do NOT remove required keywords. Always include: (a) the selected category label and (b) "{{PROVIDER_NAME}} {{MODEL_NAME}} Analyzed". Do NOT add a "DATE: ..." keyword: the calling program adds it when it writes the date.
 
 12) Do NOT invent the analysis date in the ai_caption header. Use the required header format from instructions_front_back/output_format (the calling program may inject a real analysis date later).
 

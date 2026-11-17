@@ -3,6 +3,45 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0]
+
+Lightroom now reads back the keywords photokin writes, and an undated scan
+gets the model's date even when the model is unsure of it.
+
+### Changed
+
+- **Keywords go to every tag Lightroom reads.** Each keyword added or removed
+  in `XMP-dc:Subject` is added or removed in `XMP-lr:HierarchicalSubject`
+  (which Lightroom prefers) and `IPTC:Keywords` as well. A hierarchical entry
+  such as `People|Ruth` is left as it is. A keyword IIM cannot store exactly
+  (characters outside Latin, or longer than 64 bytes) goes to the XMP tags
+  only. The allowlist still names only `XMP-dc:Subject`.
+- **`-r` reads all three keyword tags.** A keyword held in only some of them
+  is kept, and the next write puts it in the others, which repairs a file
+  whose Lightroom keywords had gone stale.
+- **One rule decides whether a date is written.** A guess is written from a
+  confidence of 0.4 (`--date-min-confidence`) when the file has no date, or
+  when the file's date is more than 20 years from the guess, since that is
+  most likely a scan date. A date closer than that is replaced only on the
+  old terms (0.8, for a guess down to the month or day, more than 5 years
+  away). A reviewed `DATE:` keyword still locks the date.
+- **`DATE: <pattern>` is added only when a date is written.** The model no
+  longer adds it; a file whose date was not written no longer gets a keyword
+  describing a date it does not hold. A date written below the usual bar
+  (0.6 for a file with no date, 0.7 to replace one) also gets the keyword
+  `AI Inferred Date`. While that keyword is there, the `DATE:` keyword beside
+  it does not lock the date: a later run can replace it on the same terms as
+  any date in the file. Remove `AI Inferred Date` once you have checked the
+  date. Date keywords are per file; a group's scans no longer share them.
+- **Files from earlier versions.** photokin 0.7 and earlier kept the model's
+  `DATE:` keyword even when no date was written. That keyword now counts as
+  reviewed and locks the date; remove it from an undated file to let
+  photokin date it.
+- Changeset `schema_version` is now 4: `proposed_changes` may carry
+  `keywords_in_hierarchy`, the added keywords already present as a level of
+  a hierarchical keyword, which are not added to
+  `XMP-lr:HierarchicalSubject`.
+
 ## [0.7.0]
 
 Every field the Lightroom plug-in asks for can now be written to the file

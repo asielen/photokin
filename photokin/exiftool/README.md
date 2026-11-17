@@ -7,7 +7,8 @@ Lightroom SDK cannot reliably read or write some fields — most importantly
 - **Read (hydration)**: before analysis, and only when the CLI was given `-r`,
   fill each item's metadata from the file itself — `EXIF:DateTimeOriginal`
   (else `XMP-photoshop:DateCreated`), `EXIF:UserComment`, `XMP:Description`,
-  `XMP:Title`, `XMP:Subject` and the four location fields (XMP, else IPTC),
+  `XMP:Title`, the keywords (`XMP:Subject`, `XMP-lr:HierarchicalSubject` and
+  `IPTC:Keywords`, unioned) and the four location fields (XMP, else IPTC),
   the set `DEFAULT_EXIFTOOL_FIELDS` declares — for every input type, filling
   only the keys the item does not already carry. Instruction tags map to
   their own `instructions` key, never to `userComment`, because UserComment is
@@ -22,7 +23,9 @@ Lightroom SDK cannot reliably read or write some fields — most importantly
   write them. Each IPTC location tag is also written to its XMP twin, and
   `EXIF:DateTimeOriginal` to `XMP-photoshop:DateCreated` (plus the IIM
   `IPTC:DateCreated`/`TimeCreated` pair for a complete date), so Lightroom
-  sees every write when it re-reads the file.
+  sees every write when it re-reads the file. Every keyword addition and
+  removal is made to `XMP-lr:HierarchicalSubject` and `IPTC:Keywords` as well
+  as `XMP-dc:Subject` (to IIM only when it can store the keyword exactly).
 
 The core never imports this package; the CLI composes the two
 (**hydrate → analyze → apply**). Anything embedding the core can skip this

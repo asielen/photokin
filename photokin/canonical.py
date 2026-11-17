@@ -4,8 +4,9 @@ The rest of the pipeline speaks in fuzzy, model-friendly field names (``caption`
 ``keywords``, ``location_guess``, ``date_guess``). Writers (ExifTool, the
 changeset emitter) need stable industry-standard tag keys (XMP/IPTC/EXIF). This
 module is the single place that maps the former onto the latter, applying the
-confidence thresholds in :class:`~photokin.utils.Config` so low-confidence
-guesses are surfaced as *suggestions* rather than written.
+location threshold in :class:`~photokin.utils.Config` so a low-confidence
+guess is surfaced as a *suggestion* rather than written. A date is decided
+upstream, in ``merge``: one it did not write is a suggestion here.
 
 Two output shapes share that mapping logic:
 - a flat ``{tag: value}`` dict (``canonical_values_*``), and
@@ -16,7 +17,7 @@ Code map:
 - _clean_str / _clean_str_list           trim/de-dup scalars and string lists
 - _location_components_from_metadata     read location parts straight from metadata
 - _location_components_from_guess        read location parts + confidence from a guess
-- _date_from_metadata                    pick a date (explicit wins over guess)
+- _written_date                          the capture date merge decided to write
 - _claimed_precision                     how much of a date the model claimed
 - _date_created_value                    the date at the precision the model claimed
 - split_user_comment                     PUBLIC: a comment's user text, AI block dropped
@@ -61,6 +62,55 @@ CANONICAL_TITLE_TAG = "XMP-dc:Title"
 CANONICAL_DESCRIPTION_TAG = "XMP-dc:Description"
 CANONICAL_USER_COMMENT_TAG = "EXIF:UserComment"
 CANONICAL_DATE_TAG = "EXIF:DateTimeOriginal"
+
+# Where the keyword list is mirrored. Lightroom reads lr:HierarchicalSubject
+# in preference to dc:Subject once a file has it, and IIM readers read
+# IPTC:Keywords, so a list written to CANONICAL_KEYWORDS_TAG alone is read back
+# stale. The changeset and the allowlist name only CANONICAL_KEYWORDS_TAG; the
+# applier applies the same additions and removals to each of these.
+CANONICAL_HIERARCHICAL_KEYWORDS_TAG = "XMP-lr:HierarchicalSubject"
+CANONICAL_IPTC_KEYWORDS_TAG = "IPTC:Keywords"
+CANONICAL_KEYWORD_MIRROR_TAGS = (CANONICAL_HIERARCHICAL_KEYWORDS_TAG, CANONICAL_IPTC_KEYWORDS_TAG)
+
+#: IPTC:Keywords' limit, in bytes.
+_IIM_KEYWORD_MAX_BYTES = 64
+
+
+def hierarchy_levels(entries: list[str] | None) -> set[str]:
+    """Every level of the hierarchical keywords in ``entries``, lowercased.
+
+    Example:
+        >>> sorted(hierarchy_levels(["People|Ruth", "family"]))
+        ['people', 'ruth']
+    """
+    return {
+        level.strip().lower()
+        for entry in entries or []
+        if "|" in entry
+        for level in entry.split("|")
+    }
+
+
+def iim_holds_keyword(keyword: str) -> bool:
+    """Whether ``IPTC:Keywords`` stores ``keyword`` exactly as written.
+
+    ExifTool encodes IIM text as Latin (cp1252), writing ``?`` for any other
+    character, unless the file declares UTF-8, and cuts a keyword at 64 bytes
+    of whichever encoding it uses; either way the stored keyword is no longer
+    the one written, and a later removal no longer matches it. Such a keyword
+    is kept in XMP only.
+
+    Args:
+        keyword: One flat keyword.
+
+    Returns:
+        True when the keyword is Latin and fits 64 bytes in either encoding.
+    """
+    try:
+        keyword.encode("cp1252")
+    except UnicodeEncodeError:
+        return False
+    return len(keyword.encode("utf-8")) <= _IIM_KEYWORD_MAX_BYTES
 
 CANONICAL_LOCATION_TAGS = {
     "country": "IPTC:Country-PrimaryLocationName",
@@ -175,21 +225,14 @@ def _location_components_from_guess(meta: Dict[str, Any]) -> Tuple[Dict[str, str
     return components, confidence, reason
 
 
-def _date_from_metadata(meta: Dict[str, Any]) -> Tuple[str | None, float | None, str | None, str | None, str]:
-    date_value = _clean_str(meta.get("dateTimeOriginal")) or _clean_str(meta.get("date"))
-    if date_value:
-        return date_value, 1.0, None, None, "metadata"
+def _written_date(meta: Dict[str, Any]) -> str | None:
+    """The capture date to write: the record's own, never a bare guess.
 
-    date_guess = meta.get("date_guess") if isinstance(meta.get("date_guess"), dict) else None
-    suggested = None
-    confidence = None
-    reason = None
-    if date_guess:
-        suggested = _clean_str(date_guess.get("import_date")) or _clean_str(date_guess.get("iso"))
-        confidence = date_guess.get("confidence")
-        reason = date_guess.get("reason") if isinstance(date_guess.get("reason"), str) else None
-
-    return suggested, confidence, suggested, reason, "guess"
+    ``merge`` decides whether the model's date is written and, when it is,
+    puts it in ``dateTimeOriginal``; a ``date_guess`` left beside no date is
+    only a suggestion.
+    """
+    return _clean_str(meta.get("dateTimeOriginal")) or _clean_str(meta.get("date"))
 
 
 def _claimed_precision(date_guess: dict[str, Any]) -> int:
@@ -323,12 +366,12 @@ def canonical_values_from_patch(patch: Dict[str, Any] | None) -> Dict[str, Any]:
 def canonical_values_from_metadata(meta: Dict[str, Any] | None, config: Config) -> Dict[str, Any]:
     """Map a metadata dict to a flat ``{canonical_tag: value}`` dict.
 
-    Applies the same precedence and confidence gating as
-    :func:`build_canonical_patch` (explicit dates/locations always win;
-    guesses are only included when at or above the configured threshold), but
-    returns plain values rather than changeset ops. Below-threshold guesses are
-    simply omitted here — use ``build_canonical_patch`` when you also need the
-    rejected suggestions.
+    Applies the same precedence and gating as :func:`build_canonical_patch`
+    (explicit dates/locations always win; a location guess is included only at
+    or above its threshold, a date only once ``merge`` has written it), but
+    returns plain values rather than changeset ops. Guesses that are not
+    written are simply omitted here — use ``build_canonical_patch`` when you
+    also need the rejected suggestions.
     """
     meta = meta or {}
     values: Dict[str, Any] = {}
@@ -356,10 +399,8 @@ def canonical_values_from_metadata(meta: Dict[str, Any] | None, config: Config) 
             if value:
                 values[tag] = value
 
-    date_value, confidence, _suggested, _reason, source = _date_from_metadata(meta)
-    if date_value and (
-        source == "metadata" or confidence is None or confidence >= config.date_confidence_threshold
-    ):
+    date_value = _written_date(meta)
+    if date_value:
         values[CANONICAL_DATE_TAG] = date_value
         # A file's own Date Created, when it was read, is what it holds there;
         # only a date with none of its own is rendered from the capture date.
@@ -377,9 +418,9 @@ def build_canonical_patch(meta: Dict[str, Any] | None, config: Config) -> Tuple[
 
     Returns ``(patch, patch_meta)`` where:
     - ``patch`` maps canonical tags to ``{"op": "set", "value": ...}`` for edits
-      confident enough to write (explicit metadata, or guesses at/above the
-      relevant ``Config`` threshold).
-    - ``patch_meta`` holds below-threshold location/date guesses as
+      confident enough to write (explicit metadata, a location guess at or
+      above its ``Config`` threshold, a date ``merge`` decided to write).
+    - ``patch_meta`` holds the location and date guesses not written, as
       ``{"suggested", "confidence", "reason"}`` so the UI can offer them without
       the writer applying them.
 
@@ -422,22 +463,20 @@ def build_canonical_patch(meta: Dict[str, Any] | None, config: Config) -> Tuple[
                     "reason": reason,
                 }
 
-    date_value, confidence, suggested, reason, source = _date_from_metadata(meta)
+    date_value = _written_date(meta)
+    date_guess = meta.get("date_guess")
     if date_value:
-        if (
-            source == "metadata"
-            or confidence is None
-            or confidence >= config.date_confidence_threshold
-        ):
-            patch[CANONICAL_DATE_TAG] = {"op": "set", "value": date_value}
-            date_created = _date_created_value(date_value, meta)
-            if date_created:
-                patch[CANONICAL_DATE_CREATED_TAG] = {"op": "set", "value": date_created}
-        else:
+        patch[CANONICAL_DATE_TAG] = {"op": "set", "value": date_value}
+        date_created = _date_created_value(date_value, meta)
+        if date_created:
+            patch[CANONICAL_DATE_CREATED_TAG] = {"op": "set", "value": date_created}
+    elif isinstance(date_guess, dict):
+        suggested = _clean_str(date_guess.get("import_date")) or _clean_str(date_guess.get("iso"))
+        if suggested:
             patch_meta[CANONICAL_DATE_TAG] = {
-                "suggested": suggested or date_value,
-                "confidence": confidence,
-                "reason": reason,
+                "suggested": suggested,
+                "confidence": date_guess.get("confidence"),
+                "reason": date_guess.get("reason") if isinstance(date_guess.get("reason"), str) else None,
             }
 
     return patch, patch_meta

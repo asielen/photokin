@@ -162,6 +162,7 @@ class TestDateCreatedPrecision(unittest.TestCase):
 
     def test_the_patch_carries_both_date_tags(self) -> None:
         meta = {
+            "dateTimeOriginal": "1952-06-15",
             "date_guess": {
                 "iso": "1952",
                 "import_date": "1952-06-15",

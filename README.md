@@ -356,16 +356,26 @@ ExifTool reads the metadata a file already holds (`-r`) and writes the analysis 
 |---|---|
 | `ai_caption` (the AI analysis) | `EXIF:UserComment`, below any note already there — a re-run replaces only its own earlier `[AI Analysis]` block |
 | `caption` (the verbatim transcription) | `XMP-dc:Description` |
-| `keywords` | `XMP-dc:Subject` |
+| `keywords` | `XMP-dc:Subject`, with each change also made to `XMP-lr:HierarchicalSubject` (which Lightroom reads first) and `IPTC:Keywords`. A hierarchical entry such as `People|Ruth` is kept as it is, and `Ruth` or `People` is never added beside it as a flat entry. A keyword IIM cannot store exactly — characters outside Latin, or longer than 64 bytes — goes to the two XMP tags only |
 | `title` | `XMP-dc:Title` |
-| `date_guess` (when confident enough) | `EXIF:DateTimeOriginal` (Lightroom's Capture Time), and with it `XMP-photoshop:DateCreated` (Date Created) at the precision the model claimed — a year-only guess is written as just the year. A complete date also goes to `IPTC:DateCreated`/`TimeCreated` |
+| `date_guess` (see [Dates](#why-read-first)) | `EXIF:DateTimeOriginal` (Lightroom's Capture Time), and with it `XMP-photoshop:DateCreated` (Date Created) at the precision the model claimed — a year-only guess is written as just the year. A complete date also goes to `IPTC:DateCreated`/`TimeCreated` |
 | `location_guess` (when confident enough) | `IPTC:Country-PrimaryLocationName` / `Province-State` / `City` / `Sub-location`, each also written to the XMP tag Lightroom reads (`XMP-photoshop:Country` / `State` / `City`, `XMP-iptcCore:Location`). Not written by default, because a `-w` run without `-r` would overwrite a location already in the file unread; opt in by naming them in `--exiftool-fields`, alongside `-r` |
 
 ### Why read first
 
-With `-r`, photokin reads `EXIF:DateTimeOriginal` (or, failing that, `XMP-photoshop:DateCreated`), `EXIF:UserComment`, `XMP:Description`, `XMP:Title`, `XMP:Subject` and the location (the XMP tags first, then IPTC) before analysis, so a note, caption, title, date, keyword or place already living in an image rides along to the model as context. Some of those fields get special treatment:
+With `-r`, photokin reads `EXIF:DateTimeOriginal` (or, failing that, `XMP-photoshop:DateCreated`), `EXIF:UserComment`, `XMP:Description`, `XMP:Title`, the keywords (`XMP:Subject`, `XMP-lr:HierarchicalSubject`, `IPTC:Keywords`) and the location (the XMP tags first, then IPTC) before analysis, so a note, caption, title, date, keyword or place already living in an image rides along to the model as context. Some of those fields get special treatment:
 
-* **Dates.** The file's own date is treated as evidence, not truth: on a flatbed scan `DateTimeOriginal` is the day you scanned the print, not the day the photograph was taken, so it never overwrites the model's `date_guess` — but it is what the date-correction heuristic compares that guess against before writing anything.
+* **Dates.** The file's own date is treated as evidence, not truth: on a flatbed scan `DateTimeOriginal` is the day you scanned the print, not the day the photograph was taken, so it never overwrites the model's `date_guess` — but it decides whether that guess is written:
+
+  | The file's date | The guess is written when its confidence is |
+  |---|---|
+  | none | at least 0.4 |
+  | more than 20 years from the guess (likely a scan date) | at least 0.4 |
+  | closer | at least 0.8, for a guess down to the month or day (`Y!M!`, `Y!M!D!`) more than 5 years away |
+  | any, with a reviewed `DATE:` keyword | never |
+
+  A written date gets a `DATE: <pattern>` keyword (such as `DATE: Y~`); a guess that is not written gets none, and is offered as a suggestion instead. A date written below the usual bar (0.6 for a file with no date, 0.7 to replace one) also gets the keyword `AI Inferred Date`. While that keyword is there the date is not locked: a later run can replace it on the same terms as any date in the file (a guess more than 20 years away, or a confident month- or day-precise one more than 5 years away). Remove it once you have checked the date, and the `DATE:` keyword then locks it. Each file's date keywords are its own: removing `AI Inferred Date` from a front does not depend on its back. Files analyzed by photokin 0.7 or earlier may carry a `DATE:` keyword for a date that was never written; it counts as reviewed, so remove it to let photokin date the file.
+* **Keywords.** The file's keywords are read from all three keyword tags, so a keyword Lightroom saved to only one of them is kept, and a keyword missing from any of them is written to it again.
 * **Notes.** Your text in `EXIF:UserComment` is kept; the new analysis goes below it, replacing the previous run's `[AI Analysis]` block. Without `-r` photokin cannot see your note, so the comment is written as the analysis alone.
 * **Locations.** A location already in the file beats the model's guess, so a place you set by hand is never overwritten.
 * **Titles.** Scanner software routinely writes "Scanned Image" or the bare filename into `XMP:Title`, so a title read out of a file does not beat the model. A title you supplied yourself, in a manifest or `--meta`, always wins.
@@ -628,7 +638,8 @@ If you are processing a large number of photos related to a single event, you ca
 | Flag                                               | What it does |
 |----------------------------------------------------|---|
 | `--group-by {object,pair,none}`                    | Grouping granularity, the one axis (default `object`). `object`: every scan of one print is one object and shares a single analysis. `pair`: each rescan — print plus variant letter — is analyzed on its own. `none`: every file alone. See below |
-| `--date-confidence-threshold X`                    | Minimum model confidence before a date guess is written into a file that has no date, 0-1 (default 0.6). Replacing a date the file already holds is governed separately and costs more; see below |
+| `--date-confidence-threshold X`                    | Confidence at which a date guess fills a file that has no date without the `AI Inferred Date` keyword, 0-1 (default 0.6). See [Dates](#why-read-first) |
+| `--date-min-confidence X`                          | Lowest confidence at which a date guess is written at all, 0-1 (default 0.4); below it the guess is only a suggestion |
 | `--location-confidence-threshold X`                | Same, for location guesses (default 0.7) |
 | `--no-update-vocab`                                | Don't append newly proposed keywords to the vocabulary file |
 
@@ -836,9 +847,9 @@ Prints this build's contract as JSON and exits, before any input is required —
 
 ```json
 {
-  "version": "0.7.0",
+  "version": "0.8.0",
   "ndjson_schema_version": 3,
-  "changeset_schema_version": 3,
+  "changeset_schema_version": 4,
   "canonical_tags": {
     "ai_caption": "EXIF:UserComment",
     "caption": "XMP-dc:Description",
@@ -878,7 +889,7 @@ Prints this *invocation's* fully resolved settings as JSON and exits, before any
   "models": {"openai": "gpt-4o", "anthropic": "sonnet", "gemini": "gemini-2.5-flash", "openrouter": "moonshotai/kimi-k3", "claude-code": "sonnet"},
   "image": {"jpeg_quality": 90, "max_edge": 1024},
   "grouping": {"group_by": "object", "max_images_per_call": 8},
-  "confidence_thresholds": {"date": 0.6, "location": 0.7},
+  "confidence_thresholds": {"date": 0.6, "date_min": 0.4, "location": 0.7},
   "sidecar_md": "off",
   "update_vocab": true,
   "changeset_requested": false,
