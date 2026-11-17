@@ -1435,6 +1435,7 @@ def _build_show_config(args: argparse.Namespace) -> dict:
         "grouping": {"group_by": args.group_by, "max_images_per_call": args.max_images_per_call},
         "confidence_thresholds": {
             "date": args.date_confidence_threshold,
+            "date_min": args.date_min_confidence,
             "location": args.location_confidence_threshold,
         },
         "sidecar_md": sidecar_md,
@@ -3081,7 +3082,12 @@ def main() -> None:
                         help="Downscale longest edge before model (e.g., 1024). 0/None = keep size")
         ap.add_argument("--process-all-variants", action="store_true", help=argparse.SUPPRESS)
         ap.add_argument("--date-confidence-threshold", type=float, default=defaults.date_confidence_threshold,
-                        help="Minimum confidence required to apply dates to the patch (default: %(default)s)")
+                        help="Confidence at which a date fills a file with none without the "
+                             "'AI Inferred Date' keyword (default: %(default)s)")
+        ap.add_argument("--date-min-confidence", type=float, default=defaults.date_min_confidence,
+                        help="Lowest confidence at which a date is written at all; below the usual "
+                             "threshold it is written with the 'AI Inferred Date' keyword "
+                             "(default: %(default)s)")
         ap.add_argument("--location-confidence-threshold", type=float, default=defaults.location_confidence_threshold,
                         help="Minimum confidence required to apply locations to the patch (default: %(default)s)")
         ap.add_argument("--no-update-vocab", action="store_true", help="Do not append new keywords to TOML")
@@ -3493,6 +3499,7 @@ def main() -> None:
             sidecar_md=args.sidecar_md,
             max_images_per_call=args.max_images_per_call,
             date_confidence_threshold=args.date_confidence_threshold,
+            date_min_confidence=args.date_min_confidence,
             location_confidence_threshold=args.location_confidence_threshold,
         )
         _apply_common_cfg(cfg, args, manifest=loaded_manifest)

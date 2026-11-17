@@ -82,10 +82,8 @@ statements, and correct inaccuracies if needed.
 KEYWORDS REQUIREMENTS
 • Must include the chosen category label (exact).
 • Must include: "{{PROVIDER_NAME}} {{MODEL_NAME}} Analyzed".
-• Must include: "DATE: <date_guess.pattern>" (exact match to date_guess.pattern).
-• CRITICAL: The "DATE: ..." keyword string must EXACTLY match the
-  date_guess.pattern value. If date_guess.pattern is "Y~", the keyword
-  must be "DATE: Y~", not "DATE: Y!". Verify this before outputting.
+• Do NOT include a "DATE: ..." keyword. The calling program adds it from
+  date_guess.pattern when it writes the date.
 
 ai_caption REQUIREMENTS
 • Must start with "[AI Analysis]:" exactly once.

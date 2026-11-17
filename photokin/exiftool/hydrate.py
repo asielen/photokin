@@ -5,7 +5,13 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from ..utils import HYDRATION_FAILED_KEY, normalize_path
+from ..utils import (
+    HYDRATION_FAILED_KEY,
+    UNMIRRORED_KEYWORDS_KEY,
+    is_date_keyword,
+    is_date_marker,
+    normalize_path,
+)
 from .config import ExiftoolConfig
 from .locate import resolve_exiftool_path
 from .manifest import _TAG_TO_MANIFEST_KEY, DEFAULT_EXIFTOOL_FIELDS
@@ -28,16 +34,6 @@ _HYDRATED_TAGS: tuple[tuple[str, str], ...] = tuple(
 ) + (("XMP-photoshop:DateCreated", "dateCreated"),)
 
 
-def _has_date_marker(keywords: list[str]) -> bool:
-    """Whether any keyword looks like a reviewed ``DATE:`` marker.
-
-    Mirrors :func:`photokin.merge._has_date_keyword`'s predicate exactly; kept
-    local rather than imported so this read-side module does not reach into
-    the merge step's internals for one line of string matching.
-    """
-    return any(kw.strip().upper().startswith("DATE:") for kw in keywords if isinstance(kw, str))
-
-
 def hydrate_item_metadata(
     items: list[dict],
     cfg: ExiftoolConfig,
@@ -48,7 +44,9 @@ def hydrate_item_metadata(
 
     Reads the tags in :data:`_HYDRATED_TAGS` -- the capture date (falling
     back to Date Created), ``EXIF:UserComment``, ``XMP:Description``,
-    ``XMP:Title``, ``XMP:Subject`` and the four location fields -- and fills only the keys an item's metadata is missing or holds empty, so a
+    ``XMP:Title``, the keywords (``XMP:Subject`` unioned with its two mirrors,
+    see :func:`~photokin.exiftool.manifest.record_keywords`) and the four
+    location fields -- and fills only the keys an item's metadata is missing or holds empty, so a
     Lightroom- or ``--meta``-supplied value is never overridden. Values are
     stored verbatim: ``dateTimeOriginal`` stays in EXIF colon form, which is what
     ``merge`` and ``canonical`` both read, and ``keywords`` stays a list.
@@ -89,6 +87,7 @@ def hydrate_item_metadata(
     from photokin.exiftool.manifest import (
         _find_tag_value,
         manifest_value,
+        record_keywords,
         run_exiftool_json,
     )
 
@@ -186,26 +185,38 @@ def hydrate_item_metadata(
                 # run_exiftool_json requests -G1, so EXIF:UserComment comes back
                 # keyed as ExifIFD:UserComment; _find_tag_value matches on the
                 # bare tag name.
-                value = manifest_value(_find_tag_value(rec, tag), key)
+                unmirrored: list[str] = []
+                value: str | list[str] | None
+                if key == "keywords":
+                    # One union of every keyword tag, so the three tags that
+                    # map here are read once, by the first of them.
+                    filled.add(key)
+                    value, unmirrored = record_keywords(rec)
+                else:
+                    value = manifest_value(_find_tag_value(rec, tag), key)
                 if value is None:
                     continue
                 if key == "keywords" and rescue_date_marker:
                     # The item already has its own keyword list -- this is not
-                    # a fill, so that list is never replaced. Only a DATE:
-                    # marker found on the file is rescued, and only if the
-                    # item doesn't already carry one of its own.
+                    # a fill, so that list is never replaced. Only the file's
+                    # date markers are rescued, and only if the item doesn't
+                    # already carry a DATE: marker of its own. AI Inferred Date
+                    # travels with its DATE: keyword: rescued alone, that
+                    # keyword would read as a person's sign-off.
                     existing = raw.get("metadata", {}).get("keywords") or []
-                    if _has_date_marker(existing):
+                    markers = [kw for kw in value if is_date_marker(kw)]
+                    if not any(map(is_date_keyword, markers)) or any(
+                        map(is_date_keyword, existing)
+                    ):
                         continue
-                    marker = next((kw for kw in value if _has_date_marker([kw])), None)
-                    if marker is None:
-                        continue
-                    raw["metadata"]["keywords"] = [*existing, marker]
+                    raw["metadata"]["keywords"] = [*existing, *markers]
                     continue
                 target = raw.get("metadata")
                 if not isinstance(target, dict):
                     target = raw["metadata"] = {}
                 target[key] = value
+                if unmirrored:
+                    target[UNMIRRORED_KEYWORDS_KEY] = unmirrored
                 filled.add(key)
                 if key == "title" and title_from_file is not None:
                     title_from_file.add(id(target))

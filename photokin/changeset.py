@@ -120,7 +120,9 @@ def _normalize_keyword_list(values: Any) -> list[str]:
 WRITE_SUPPRESSED_KEY = "suppressed"
 
 
-def diff_canonical_metadata(before: dict, after: dict) -> dict:
+def diff_canonical_metadata(
+    before: dict, after: dict, unmirrored: list[str] | None = None
+) -> dict:
     """Compute a compact diff in canonical tag space (set/keywords_add/keywords_remove).
 
     ``XMP-photoshop:DateCreated`` is not diffed on its own: it travels with
@@ -128,9 +130,15 @@ def diff_canonical_metadata(before: dict, after: dict) -> dict:
     even if its own rendering happens to match, and never without it, so the
     two only ever change together and only when the date itself changes.
 
+    A keyword the file already holds is added again when it is in
+    ``unmirrored``: the applier's additions reach every keyword tag, so the
+    write repairs a list Lightroom would otherwise read back stale.
+
     Args:
         before: The file's own canonical values.
         after: The canonical values this run would write.
+        unmirrored: Keywords the file holds in some of its keyword tags but
+            not all of them.
 
     Returns:
         ``{"set": {...}, "keywords_add": [...], "keywords_remove": [...]}``.
@@ -138,7 +146,9 @@ def diff_canonical_metadata(before: dict, after: dict) -> dict:
     before_keywords = _normalize_keyword_list(before.get(CANONICAL_KEYWORDS_TAG))
     after_keywords = _normalize_keyword_list(after.get(CANONICAL_KEYWORDS_TAG))
 
-    before_set = {kw.lower() for kw in before_keywords}
+    before_set = {kw.lower() for kw in before_keywords} - {
+        kw.lower() for kw in _normalize_keyword_list(unmirrored)
+    }
     after_set = {kw.lower() for kw in after_keywords}
 
     keywords_add = [kw for kw in after_keywords if kw.lower() not in before_set]

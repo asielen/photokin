@@ -73,7 +73,8 @@ def _canonical_tags() -> dict[str, str]:
 
     Returns a ``{attribute_name: tag}`` mapping so a failure can name the
     constant that is wrong, not just the tag string. Covers both shapes the
-    module uses: ``CANONICAL_*_TAG`` scalars and ``CANONICAL_*_TAGS`` mappings.
+    module uses: ``CANONICAL_*_TAG`` scalars and ``CANONICAL_*_TAGS`` mappings
+    and tuples.
     """
     tags: dict[str, str] = {}
     for name, value in vars(canonical).items():
@@ -85,6 +86,10 @@ def _canonical_tags() -> dict[str, str]:
             for key, tag in value.items():
                 if isinstance(tag, str):
                     tags[f"{name}[{key!r}]"] = tag
+        elif isinstance(value, tuple):
+            for index, tag in enumerate(value):
+                if isinstance(tag, str):
+                    tags[f"{name}[{index}]"] = tag
     return tags
 
 

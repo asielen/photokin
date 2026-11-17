@@ -2874,7 +2874,11 @@ def _file_write_instructions(
             WRITE_SUPPRESSED_KEY: "hydration_failed",
         }
         return _WriteDecision({}, True, before_snapshot, proposed)
-    proposed = diff_canonical_metadata(before_snapshot, canonical_values_from_patch(patch))
+    proposed = diff_canonical_metadata(
+        before_snapshot,
+        canonical_values_from_patch(patch),
+        own_meta.get(utils.UNMIRRORED_KEYWORDS_KEY),
+    )
     return _WriteDecision(patch, False, before_snapshot, proposed)
 
 
