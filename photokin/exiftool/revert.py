@@ -209,7 +209,8 @@ def _plan_file(record: dict, entries: int) -> _FilePlan:
     proposed = record.get("proposed_changes") or {}
     if not isinstance(proposed, dict) or proposed.get(WRITE_SUPPRESSED_KEY):
         return plan
-    snapshot = (record.get("original_data") or {}).get("written_tags")
+    original = record.get("original_data") or {}
+    snapshot = original.get("written_tags")
     if not isinstance(snapshot, dict):
         # From schema 5 the applier records a snapshot for every file it
         # writes, so a newer record without one is a file it never wrote
@@ -217,7 +218,7 @@ def _plan_file(record: dict, entries: int) -> _FilePlan:
         # leaves the question open.
         version = record.get("schema_version")
         predates = not isinstance(version, int) or version < _FIRST_SNAPSHOT_SCHEMA
-        plan.no_snapshot = predates and bool(
+        plan.no_snapshot = (predates or bool(original.get("written_tags_missing"))) and bool(
             proposed.get("set") or proposed.get("keywords_add") or proposed.get("keywords_remove")
         )
         return plan

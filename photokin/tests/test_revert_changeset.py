@@ -488,3 +488,22 @@ def test_a_current_record_the_apply_never_wrote_is_unchanged(tmp_path: Path) -> 
     # Assert
     assert records[0]["status"] == "unchanged"
     write.assert_not_called()
+
+
+def test_a_file_written_without_its_snapshot_is_no_snapshot(tmp_path: Path) -> None:
+    # Arrange: the before-read failed, and the apply wrote the file anyway.
+    photo = _photo(tmp_path)
+    record = {
+        "schema_version": 6,
+        "path": photo,
+        "original_data": {"file_metadata": {}, "written_tags_missing": True},
+        "proposed_changes": _PROPOSED,
+    }
+    changeset = _changeset(tmp_path, record)
+
+    # Act
+    records, write = _revert(changeset, [{"SourceFile": photo, **_AFTER_RUN}])
+
+    # Assert
+    assert records[0]["status"] == "no_snapshot"
+    write.assert_not_called()
