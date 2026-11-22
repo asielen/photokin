@@ -86,6 +86,13 @@ rename mode hydrates `EXIF:DateTimeOriginal` for the folder itself
 in one ExifTool call. Reading is not writing, so this needs no flag; `-r` is
 accepted and redundant.
 
+A manifest with `managed_by` is planned item for item, whatever each item's
+extension: the catalog tracks every one as a photo (PSD, DNG and other raw
+files, HEIC, video) and renames all of them. Without `managed_by`, an item is
+planned when its extension is a photo, raw or video type
+(`utils.RENAMABLE_EXTS`); any other item, such as a hand-listed
+`document.pdf`, is left out and reported in `left_behind`.
+
 The planner always lists the folder on disk, in manifest mode too, because two
 things live there that a manifest does not describe: companions (non-image
 files sharing a stem) and bystanders (images not in the manifest, whose names

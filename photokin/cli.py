@@ -2389,7 +2389,9 @@ def _manifest_bool(value: Any) -> bool | None:
     return None
 
 
-def _build_rename_items_from_manifest(document: dict[str, Any]) -> list[RenameItem]:
+def _build_rename_items_from_manifest(
+    document: dict[str, Any],
+) -> tuple[list[RenameItem], list[str]]:
     """Build the planner's items from a manifest's ``items`` list (4.1, 6.1).
 
     Args:
@@ -2400,17 +2402,22 @@ def _build_rename_items_from_manifest(document: dict[str, Any]) -> list[RenameIt
     Returns:
         One :class:`RenameItem` per item, carrying its own ``metadata``,
         ``order``, ``is_back``, ``version`` and ``preferred`` overrides
-        exactly as section 4.1 describes them.
+        exactly as section 4.1 describes them; and the paths left out. A
+        manifest a catalog manages (any non-null ``managed_by``) keeps every
+        item, since the catalog renames all of them. Any other manifest keeps
+        the photo and video types of :data:`utils.RENAMABLE_EXTS`, so a
+        ``document.pdf`` listed by hand is not renamed as a photo.
     """
+    managed = document.get("managed_by") is not None
     items: list[RenameItem] = []
+    left_out: list[str] = []
     for raw in document.get("items") or []:
         if not isinstance(raw, dict):
             continue
         path = normalize_path(raw.get("path") or "") or ""
-        if os.path.splitext(path)[1].lower() not in utils.VALID_EXTS:
-            # Rename mode renames images; anything else in a manifest is at
-            # most a companion, which the planner finds on disk by stem.
-            logger.warning("Not an image, so not renamed: %s", path)
+        if not managed and os.path.splitext(path)[1].lower() not in utils.RENAMABLE_EXTS:
+            logger.warning("Not a photo or video, so not renamed: %s", path)
+            left_out.append(path)
             continue
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None
         order = raw.get("order")
@@ -2430,7 +2437,7 @@ def _build_rename_items_from_manifest(document: dict[str, Any]) -> list[RenameIt
                 mtime=mtime,
             )
         )
-    return items
+    return items, left_out
 
 
 #: Matches ``{date}``/``{date:FORMAT}`` in a raw prefix template, case
@@ -2724,10 +2731,11 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         _validate_folder_input(resolved)
         folder = resolved.path
         items = _build_rename_items_from_folder(folder)
+        left_out: list[str] = []
     else:
         loaded_manifest = _load_manifest_input(resolved)
         managed_by = loaded_manifest.get("managed_by")
-        items = _build_rename_items_from_manifest(loaded_manifest)
+        items, left_out = _build_rename_items_from_manifest(loaded_manifest)
         folder = _rename_folder_from_items(items, resolved)
 
     changeset_flag, apply_requested = _resolve_rename_write_bundle(args)
@@ -2772,6 +2780,9 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         managed_by=managed_by,
         photokin_version=_photokin_version(),
         disk_file_stats={path: _stat_for_rename(path) for path in disk_files},
+    )
+    plan["left_behind"].extend(
+        {"path": path, "reason": utils.NOT_RENAMABLE_REASON} for path in left_out
     )
 
     # Every destination this run has, checked here: the plan is the first

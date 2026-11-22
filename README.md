@@ -866,7 +866,7 @@ Prints this build's contract as JSON and exits, before any input is required —
 
 ```json
 {
-  "version": "0.9.0",
+  "version": "0.9.1",
   "ndjson_schema_version": 3,
   "changeset_schema_version": 6,
   "canonical_tags": {
