@@ -97,3 +97,10 @@ class TestRenameTypes(_CliTestCase):
             ],
         )
         self.assertIn("memo.pdf: not a photo or video type", plan["warnings"])
+
+    def test_a_managed_plan_reserves_names_in_every_type_it_renames(self) -> None:
+        # Act: page.pdf would be renamed onto an uncatalogued bw-001.pdf.
+        plan = self._plan(["page.pdf"], {"app": "lightroom"}, extra=("bw-001.pdf",))
+
+        # Assert
+        self.assertTrue(any("bw-001.pdf" in e for e in plan["errors"]), plan["errors"])

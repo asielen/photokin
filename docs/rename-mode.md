@@ -95,7 +95,7 @@ planned when its extension is a photo, raw or video type
 
 The planner always lists the folder on disk, in manifest mode too, because two
 things live there that a manifest does not describe: companions (non-image
-files sharing a stem) and bystanders (images not in the manifest, whose names
+files sharing a stem) and bystanders (photos and videos not in the manifest, and files of any type the plan renames, whose names
 are reserved).
 
 ### 4.2 Parsing and rendering the grammar
