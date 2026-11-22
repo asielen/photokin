@@ -73,8 +73,14 @@ SCHEMA_VERSION = 6
 
 
 def make_run_id() -> str:
-    """Generate a run id from a UTC timestamp plus a short random token."""
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Generate a run id from a UTC timestamp plus a short random token.
+
+    The timestamp carries microseconds, so two runs started in the same
+    second still sort by age: a folder's rename journals are ordered by run
+    id, and with whole seconds the random token decided which of two
+    same-second runs an undo picked.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     token = secrets.token_hex(4)
     return f"{stamp}_{token}"
 

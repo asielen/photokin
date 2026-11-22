@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from photokin import rename_apply
+from photokin.changeset import make_run_id
 from photokin.rename_apply import (
     RenameOp,
     RenamePreflightError,
@@ -226,3 +227,12 @@ def test_a_linked_transcripts_real_folder_is_synced(
     assert warning is None
     assert real.read_bytes() == b"new"
     assert synced == [str(outside)]
+
+
+def test_run_ids_from_one_second_sort_by_age() -> None:
+    # Act
+    ids = [make_run_id() for _ in range(50)]
+
+    # Assert
+    assert sorted(ids, key=lambda i: i.split("_")[0]) == ids
+    assert len({i.split("_")[0] for i in ids}) > 1

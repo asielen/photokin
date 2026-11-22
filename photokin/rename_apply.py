@@ -1024,9 +1024,10 @@ def _journal_candidates(folder: str) -> list[str]:
     guard that stops a second run trampling a half-finished one, with the
     journal sitting right there.
 
-    A run id starts with a UTC ISO timestamp, so the token after the marker
-    sorts by age on its own; the whole name is the tie-break, which only
-    matters for two runs that started in the same second.
+    A run id starts with a UTC ISO timestamp to the microsecond, so the token
+    after the marker sorts by age on its own; the whole name is the
+    tie-break, which only matters for two runs started in the same
+    microsecond.
 
     Args:
         folder: The folder to look in.
