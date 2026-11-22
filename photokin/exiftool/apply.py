@@ -28,6 +28,7 @@ Code map:
 - _build_exiftool_command     assemble the ExifTool argv for one file's writes
 - _snapshot_value / _read_before_values / _fold_snapshots_into_changeset
                               record each file's pre-write values in the changeset
+- _run_file_write             route, measure and run one file's write
 - apply_changeset             PUBLIC: read a changeset NDJSON and write via ExifTool
 - main                        PUBLIC: CLI entry (python -m photokin.exiftool)
 """
@@ -609,6 +610,133 @@ def _build_exiftool_command(
     return cmd
 
 
+def _run_file_write(
+    exiftool: str,
+    cfg: ExiftoolConfig,
+    write: _FileWrite,
+    path: str,
+    datfile_path_for: Callable[[str], str],
+) -> dict[str, Any] | None:
+    """Route, measure and run one file's ExifTool write.
+
+    Shared by :func:`apply_changeset` and the revert, so both write long and
+    non-ASCII values the same way. A dry run stops after the measurement.
+
+    Args:
+        exiftool: Path to the ExifTool executable.
+        cfg: Wrapper config.
+        write: The file's assembled write.
+        path: The file the command targets.
+        datfile_path_for: As for :func:`_select_datfile_routing`.
+
+    Returns:
+        ``None`` when the write succeeded (or would, on a dry run), else the
+        error record for the summary.
+    """
+    try:
+        datfile_paths = _select_datfile_routing(
+            exiftool, cfg, write, path, datfile_path_for
+        )
+    except OSError as exc:
+        # Only reachable when a value needed a DATFILE and the
+        # temporary directory could not be created; a run with nothing
+        # to route never asks for one.
+        return {"path": path, "error": f"Could not create a DATFILE directory: {exc}"}
+
+    cmd = _build_exiftool_command(exiftool, cfg, write, path, datfile_paths)
+    if _command_length_units(cmd) > _COMMAND_LENGTH_BUDGET:
+        # Only reachable when the keyword operations alone exceed the
+        # budget: every routable ``set`` value has already moved to a
+        # DATFILE, and keyword args cannot. Failing here is a named
+        # per-file error instead of ExifTool failing to start with an
+        # error that looks like a missing binary -- and it is checked
+        # before the dry-run branch below, so a preview errors exactly
+        # where the real run would rather than counting the file as
+        # writable.
+        return {
+            "path": path,
+            "error": "Keyword operations exceed the command-line length "
+            "budget; nothing on this file was written.",
+        }
+
+    if cfg.dry_run:
+        return None
+
+    try:
+        for tag, datfile_path in datfile_paths.items():
+            # newline="" is load-bearing: Python's text-mode write
+            # translates a bare "\n" to "\r\n" on Windows, which
+            # would corrupt every transcription's line breaks
+            # before ExifTool ever reads the file. No BOM either --
+            # ExifTool's default value charset is already UTF-8.
+            with open(datfile_path, "w", encoding="utf-8", newline="") as datfile:
+                datfile.write(write.tags[tag])
+    except (OSError, UnicodeError) as exc:
+        # ``UnicodeError`` beside ``OSError`` because the value being
+        # written is model-authored text: a lone surrogate reaching
+        # here from a valid JSON ``\ud800`` escape raises
+        # UnicodeEncodeError, which is a ValueError and would sail past
+        # an OSError-only guard and out of ``apply_changeset``
+        # entirely, aborting every remaining file in the batch. The
+        # same value written inline is caught as a ValueError around
+        # ``subprocess.run`` below, so routing it must not be the thing
+        # that turns a per-file failure into a whole-batch one.
+        return {"path": path, "error": f"Failed to write DATFILE for ExifTool: {exc}"}
+
+    try:
+        # stderr names files, so decode it as UTF-8 and never let a
+        # stray byte fail the decode and with it the whole batch.
+        argv, stdin = utf8_argfile(cmd)
+        if stdin is not None:
+            # Strict, unlike the stderr decode: a value UTF-8 cannot
+            # carry (a lone surrogate from a JSON escape) fails this
+            # file here, rather than reaching the photo as "?".
+            stdin.encode("utf-8")
+        result = subprocess.run(
+            argv,
+            input=stdin,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except (OSError, ValueError) as exc:
+        # OSError covers FileNotFoundError (binary went missing
+        # mid-batch) and PermissionError (an unexecutable binary, a
+        # locked file) alike; ValueError covers subprocess's own
+        # argument validation (an embedded NUL byte in a bad path).
+        # Per-file, like every other failure in this loop: a batch of
+        # 500 does not abort on file 3, and the files already written
+        # before it stay written and stay reported.
+        return {"path": path, "error": f"ExifTool failed to start: {exc}"}
+
+    if result.returncode != 0:
+        return {
+            "path": path,
+            "error": f"ExifTool failed with code {result.returncode}.",
+            "stderr": result.stderr.strip(),
+        }
+
+    if datfile_paths and _DATFILE_READ_FAILURE_MARKER in result.stderr:
+        # E5: a corrupted or dropped write must never pass as
+        # success just because the process exited 0. Measured
+        # against the real binary -- when one DATFILE among
+        # several tag writes cannot be opened (e.g. it vanished
+        # mid-batch), ExifTool still reports "N image files
+        # updated" and exits 0, because the *other* tags on that
+        # same command did get written; only stderr names the
+        # miss. Trusting the exit code alone would let that file's
+        # skipped tag pass silently as written.
+        return {
+            "path": path,
+            "error": "ExifTool could not read a DATFILE for this write; nothing on this "
+            "file was confirmed written.",
+            "stderr": result.stderr.strip(),
+        }
+
+    return None
+
+
 def apply_changeset(
     changeset_path: str,
     cfg: ExiftoolConfig,
@@ -853,67 +981,6 @@ def apply_changeset(
                     )
                 return os.path.join(_datfile_dir(tmp_stack), _datfile_name(_line, tag))
 
-            try:
-                datfile_paths = _select_datfile_routing(
-                    exiftool, cfg, write, path, _datfile_path_for
-                )
-            except OSError as exc:
-                # Only reachable when a value needed a DATFILE and the
-                # temporary directory could not be created; a run with nothing
-                # to route never asks for one.
-                summary["errors"].append(
-                    {"path": path, "error": f"Could not create a DATFILE directory: {exc}"}
-                )
-                continue
-
-            cmd = _build_exiftool_command(exiftool, cfg, write, path, datfile_paths)
-            if _command_length_units(cmd) > _COMMAND_LENGTH_BUDGET:
-                # Only reachable when the keyword operations alone exceed the
-                # budget: every routable ``set`` value has already moved to a
-                # DATFILE, and keyword args cannot. Failing here is a named
-                # per-file error instead of ExifTool failing to start with an
-                # error that looks like a missing binary -- and it is checked
-                # before the dry-run branch below, so a preview errors exactly
-                # where the real run would rather than counting the file as
-                # writable.
-                summary["errors"].append(
-                    {
-                        "path": path,
-                        "error": "Keyword operations exceed the command-line length "
-                        "budget; nothing on this file was written.",
-                    }
-                )
-                continue
-
-            if cfg.dry_run:
-                summary["files_written"] += 1
-                summary["tags_written"] += tags_count
-                continue
-
-            try:
-                for tag, datfile_path in datfile_paths.items():
-                    # newline="" is load-bearing: Python's text-mode write
-                    # translates a bare "\n" to "\r\n" on Windows, which
-                    # would corrupt every transcription's line breaks
-                    # before ExifTool ever reads the file. No BOM either --
-                    # ExifTool's default value charset is already UTF-8.
-                    with open(datfile_path, "w", encoding="utf-8", newline="") as datfile:
-                        datfile.write(tags_to_write[tag])
-            except (OSError, UnicodeError) as exc:
-                # ``UnicodeError`` beside ``OSError`` because the value being
-                # written is model-authored text: a lone surrogate reaching
-                # here from a valid JSON ``\ud800`` escape raises
-                # UnicodeEncodeError, which is a ValueError and would sail past
-                # an OSError-only guard and out of ``apply_changeset``
-                # entirely, aborting every remaining file in the batch. The
-                # same value written inline is caught as a ValueError around
-                # ``subprocess.run`` below, so routing it must not be the thing
-                # that turns a per-file failure into a whole-batch one.
-                summary["errors"].append(
-                    {"path": path, "error": f"Failed to write DATFILE for ExifTool: {exc}"}
-                )
-                continue
-
             if before_values is not None:
                 file_values = before_values.get(_path_key(path))
                 if file_values is not None:
@@ -922,64 +989,10 @@ def apply_changeset(
                         tag: _snapshot_value(file_values, tag) for tag in touched
                     }
 
-            try:
-                # stderr names files, so decode it as UTF-8 and never let a
-                # stray byte fail the decode and with it the whole batch.
-                argv, stdin = utf8_argfile(cmd)
-                if stdin is not None:
-                    # Strict, unlike the stderr decode: a value UTF-8 cannot
-                    # carry (a lone surrogate from a JSON escape) fails this
-                    # file here, rather than reaching the photo as "?".
-                    stdin.encode("utf-8")
-                result = subprocess.run(
-                    argv,
-                    input=stdin,
-                    capture_output=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-            except (OSError, ValueError) as exc:
-                # OSError covers FileNotFoundError (binary went missing
-                # mid-batch) and PermissionError (an unexecutable binary, a
-                # locked file) alike; ValueError covers subprocess's own
-                # argument validation (an embedded NUL byte in a bad path).
-                # Per-file, like every other failure in this loop: a batch of
-                # 500 does not abort on file 3, and the files already written
-                # before it stay written and stay reported.
-                summary["errors"].append({"path": path, "error": f"ExifTool failed to start: {exc}"})
+            error = _run_file_write(exiftool, cfg, write, path, _datfile_path_for)
+            if error is not None:
+                summary["errors"].append(error)
                 continue
-
-            if result.returncode != 0:
-                summary["errors"].append(
-                    {
-                        "path": path,
-                        "error": f"ExifTool failed with code {result.returncode}.",
-                        "stderr": result.stderr.strip(),
-                    }
-                )
-                continue
-
-            if datfile_paths and _DATFILE_READ_FAILURE_MARKER in result.stderr:
-                # E5: a corrupted or dropped write must never pass as
-                # success just because the process exited 0. Measured
-                # against the real binary -- when one DATFILE among
-                # several tag writes cannot be opened (e.g. it vanished
-                # mid-batch), ExifTool still reports "N image files
-                # updated" and exits 0, because the *other* tags on that
-                # same command did get written; only stderr names the
-                # miss. Trusting the exit code alone would let that file's
-                # skipped tag pass silently as written.
-                summary["errors"].append(
-                    {
-                        "path": path,
-                        "error": "ExifTool could not read a DATFILE for this write; nothing on this "
-                        "file was confirmed written.",
-                        "stderr": result.stderr.strip(),
-                    }
-                )
-                continue
-
             summary["files_written"] += 1
             summary["tags_written"] += tags_count
 
