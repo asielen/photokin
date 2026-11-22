@@ -3,6 +3,40 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+An album's pages are no longer read as one document, and a run's
+changeset now records enough to undo it.
+
+### Changed
+
+- **Each page of a photo album is its own object.** A `-pageN` set reads
+  as an album when the name before `-pageN` holds the word `album`, or
+  any page has the keyword `album`. Each page then groups with its own
+  `-back` and crops. `--page-grouping {auto,document,album}` decides for
+  every set instead, a manifest `group` always wins, and the plan lists
+  each set it read as an album.
+- **A document page keeps its own fields.** A page's title, date,
+  location and keywords no longer spread to the other pages. The scans
+  of one print still share theirs, so a back still gets its front's title.
+- **`_back`, `_front`, `_negative`, `_crop` and `_pageN` pair like the
+  hyphen forms**, and a variant letter may follow a digit after an
+  underscore (`013_b`).
+- **Variant letters count only in order.** `c` is a variant only when
+  the group also has a `b` scan; `a` is never required. A lone
+  `013_z.tif` is its own photo, and the run says so. This also applies
+  to `-b` and `5b`.
+- **A run refuses to start when one document holds more than 50 pages.**
+  `--max-group-pages N` raises the cap, and `0` lifts it.
+- **`-w` saves each file's values from before the write** into the
+  changeset as `original_data.written_tags` (changeset `schema_version`
+  5), so a revert can restore exactly what was there.
+- **The `complete` and `cancelled` records carry `items_recorded`**
+  beside `files_recorded`, since items that share a path (Lightroom
+  virtual copies) count once as files.
+- **Packaging:** the license is declared as an SPDX string, and the vocab
+  backup goes to `~/.photokin/backups` instead of the package folder.
+
 ## [0.8.0]
 
 Lightroom now reads back the keywords photokin writes, and an undated scan
