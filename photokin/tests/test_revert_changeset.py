@@ -74,7 +74,10 @@ def _revert(
     restored = read_back
     if restored is None:
         restored = [
-            {"SourceFile": rec["SourceFile"], **{k: v for k, v in _SNAPSHOT.items() if v is not None}}
+            {
+                "SourceFile": rec["SourceFile"],
+                **{k: v for k, v in _SNAPSHOT.items() if v is not None},
+            }
             for rec in current
         ]
     read = MagicMock(side_effect=[current, restored])
@@ -83,9 +86,7 @@ def _revert(
         patch("photokin.exiftool.revert.run_exiftool_json", read),
         patch("photokin.exiftool.revert._run_file_write", write),
     ):
-        records = revert_changeset(
-            changeset, ExiftoolConfig(), options or RevertOptions()
-        )
+        records = revert_changeset(changeset, ExiftoolConfig(), options or RevertOptions())
     return records, write
 
 
@@ -127,7 +128,14 @@ def test_a_written_file_is_put_back(tmp_path: Path) -> None:
         "-IPTC:Keywords=",
     ]
     assert records[-1] == {
-        "summary": {"reverted": 1, "unchanged": 0, "conflict": 0, "missing": 0, "error": 0},
+        "summary": {
+            "reverted": 1,
+            "unchanged": 0,
+            "conflict": 0,
+            "missing": 0,
+            "no_snapshot": 0,
+            "error": 0,
+        },
         "dry_run": False,
     }
 
@@ -153,7 +161,11 @@ def test_a_file_already_back_is_unchanged(tmp_path: Path) -> None:
     # Arrange
     photo = _photo(tmp_path)
     changeset = _changeset(tmp_path, _record(photo))
-    restored = {"SourceFile": photo, "XMP-dc:Description": "Old caption", "XMP-dc:Subject": "Church"}
+    restored = {
+        "SourceFile": photo,
+        "XMP-dc:Description": "Old caption",
+        "XMP-dc:Subject": "Church",
+    }
 
     # Act
     records, write = _revert(changeset, [restored])
@@ -178,9 +190,7 @@ def test_first_record_per_path_and_write_false_skipped(tmp_path: Path) -> None:
     # Arrange
     photo = _photo(tmp_path)
     crop = _photo(tmp_path, "crop.jpg")
-    changeset = _changeset(
-        tmp_path, _record(photo), _record(photo), _record(crop, write=False)
-    )
+    changeset = _changeset(tmp_path, _record(photo), _record(photo), _record(crop, write=False))
 
     # Act
     records, _write = _revert(changeset, [{"SourceFile": photo, **_AFTER_RUN}])
@@ -205,7 +215,7 @@ def test_filters_choose_the_files(tmp_path: Path) -> None:
     assert [os.path.basename(r["path"]) for r in picked_by_glob[:-1]] == ["a.jpg"]
 
 
-def test_an_old_changeset_restores_what_it_knows_and_deletes_nothing(tmp_path: Path) -> None:
+def test_an_old_changeset_without_a_snapshot_is_left_alone(tmp_path: Path) -> None:
     # Arrange
     photo = _photo(tmp_path)
     old = {
@@ -216,38 +226,12 @@ def test_an_old_changeset_restores_what_it_knows_and_deletes_nothing(tmp_path: P
     changeset = _changeset(tmp_path, old)
 
     # Act
-    records, write = _revert(
-        changeset,
-        [{"SourceFile": photo, **_AFTER_RUN}],
-        read_back=[{"SourceFile": photo, "XMP-dc:Description": "Old caption"}],
-    )
+    records, write = _revert(changeset, [{"SourceFile": photo, **_AFTER_RUN}])
 
     # Assert
-    assert records[0]["not_restored"] == ["XMP-dc:Title"]
-    restore = write.call_args.args[2]
-    assert restore.tags == {"XMP-dc:Description": "Old caption"}
-    assert "-XMP-dc:Subject-=Page 1" in restore.keyword_args
-    assert "-XMP-dc:Subject+=Church" in restore.keyword_args
-
-
-def test_an_old_changeset_does_not_flatten_a_hierarchy_keyword(tmp_path: Path) -> None:
-    # Arrange: the run removed "Church"; Lightroom still holds it as Places|Church.
-    photo = _photo(tmp_path)
-    old = {
-        "path": photo,
-        "original_data": {"file_metadata": {"XMP-dc:Subject": ["Church"]}},
-        "proposed_changes": {"set": {}, "keywords_add": [], "keywords_remove": ["Church"]},
-    }
-    changeset = _changeset(tmp_path, old)
-    current = [{"SourceFile": photo, "XMP-lr:HierarchicalSubject": "Places|Church"}]
-
-    # Act
-    _records, write = _revert(changeset, current, read_back=current)
-
-    # Assert
-    args = write.call_args.args[2].keyword_args
-    assert "-XMP-dc:Subject+=Church" in args
-    assert not [a for a in args if a.startswith("-XMP-lr:HierarchicalSubject")]
+    assert records[0]["status"] == "no_snapshot"
+    write.assert_not_called()
+    assert records[-1]["summary"]["no_snapshot"] == 1
 
 
 def test_a_restore_exiftool_skipped_is_an_error_not_reverted(tmp_path: Path) -> None:
@@ -283,7 +267,9 @@ def test_keywords_the_run_did_not_write_are_not_a_conflict(tmp_path: Path) -> No
     record = _record(photo)
     record["original_data"]["written_tags"] = {"XMP-dc:Description": "Old caption"}
     changeset = _changeset(tmp_path, record)
-    current = [{"SourceFile": photo, "XMP-dc:Description": "New caption", "XMP-dc:Subject": "Church"}]
+    current = [
+        {"SourceFile": photo, "XMP-dc:Description": "New caption", "XMP-dc:Subject": "Church"}
+    ]
 
     # Act
     records, _write = _revert(
@@ -315,13 +301,25 @@ class TestTheRevertCommand(_CliTestCase):
         # Arrange
         changeset = os.path.join(self.scratch(), "c.ndjson")
         Path(changeset).write_text("", encoding="utf-8")
-        summary = {"summary": {"reverted": 0, "unchanged": 0, "conflict": 0, "missing": 0, "error": 0}}
+        summary = {
+            "summary": {
+                "reverted": 0,
+                "unchanged": 0,
+                "conflict": 0,
+                "missing": 0,
+                "no_snapshot": 0,
+                "error": 0,
+            }
+        }
 
         # Act
-        with self.assertLogs("photokin", level="WARNING") as logs, patch(
-            "photokin.cli.revert_changeset", return_value=[summary]
-        ) as revert:
-            self.run_cli(["--revert-changeset", changeset, "--revert-paths", "Smith, John 1950.jpg"])
+        with (
+            self.assertLogs("photokin", level="WARNING") as logs,
+            patch("photokin.cli.revert_changeset", return_value=[summary]) as revert,
+        ):
+            self.run_cli(
+                ["--revert-changeset", changeset, "--revert-paths", "Smith, John 1950.jpg"]
+            )
 
         # Assert
         only = revert.call_args.args[2].only_paths
@@ -350,7 +348,16 @@ class TestTheRevertCommand(_CliTestCase):
         out = os.path.join(folder, "revert.ndjson")
         records = [
             {"path": "a.jpg", "status": "conflict", "tags": []},
-            {"summary": {"reverted": 0, "unchanged": 0, "conflict": 1, "missing": 0, "error": 0}},
+            {
+                "summary": {
+                    "reverted": 0,
+                    "unchanged": 0,
+                    "conflict": 1,
+                    "missing": 0,
+                    "no_snapshot": 0,
+                    "error": 0,
+                }
+            },
         ]
         changeset = os.path.join(folder, "c.ndjson")
         Path(changeset).write_text("", encoding="utf-8")
@@ -378,16 +385,33 @@ def test_round_trip_with_the_real_exiftool(tmp_path: Path) -> None:
     photo = tmp_path / "real.jpg"
     photo.write_bytes(base64.b64decode(_MINIMAL_JPEG_B64))
     subprocess.run(
-        [exiftool, "-q", "-overwrite_original", "-XMP-dc:Description=Old caption",
-         "-XMP-dc:Subject=Church", "-EXIF:DateTimeOriginal=1950:01:01 00:00:00", str(photo)],
+        [
+            exiftool,
+            "-q",
+            "-overwrite_original",
+            "-XMP-dc:Description=Old caption",
+            "-XMP-dc:Subject=Church",
+            "-EXIF:DateTimeOriginal=1950:01:01 00:00:00",
+            str(photo),
+        ],
         check=True,
     )
 
     def read() -> dict:
         out = subprocess.run(
-            [exiftool, "-json", "-G1", "-XMP:all", "-EXIF:DateTimeOriginal", "-IPTC:all",
-             "-Photoshop:all", str(photo)],
-            capture_output=True, text=True, check=True,
+            [
+                exiftool,
+                "-json",
+                "-G1",
+                "-XMP:all",
+                "-EXIF:DateTimeOriginal",
+                "-IPTC:all",
+                "-Photoshop:all",
+                str(photo),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout
         return {k: v for k, v in json.loads(out)[0].items() if k != "SourceFile"}
 
@@ -419,7 +443,9 @@ def test_round_trip_with_the_real_exiftool(tmp_path: Path) -> None:
     assert again[0]["status"] == "unchanged"
 
 
-def test_a_dry_run_creates_no_temporary_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_dry_run_creates_no_temporary_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Arrange: a value long enough to need a DATFILE.
     photo = _photo(tmp_path)
     record = _record(photo)

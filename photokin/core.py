@@ -4640,12 +4640,16 @@ def process_manifest_stream(
             # In a document each page is its own file, but the scans of one
             # page (a rescan, a crop) are still one page: they share that
             # page's fields, and only that page's.
-            # An untagged file in a document is its page 1, so it shares a
-            # slot with a "-page1" rescan. Date markers follow the print rule
-            # within a page: a reviewed sign-off reaches a bare rescan.
+            # A file's page is the label it was sent under, so an untagged
+            # file that became page 1 shares that slot with a "-page1" rescan,
+            # while one displaced by an explicit page 1 keeps its own. Date
+            # markers follow the print rule within a page.
             def _page_slot(entry: dict) -> str:
-                slot = _manifest_part_key(entry)
-                return "page:1" if slot == "none" else slot
+                return resolve_part_label(
+                    entry,
+                    multipage_present=multipage_present,
+                    relabelled_versions=relabelled_versions_frozen,
+                )
 
             page_meta: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
             if multipage_present:
