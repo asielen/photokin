@@ -4070,20 +4070,27 @@ def process_manifest_stream(
                     base.append(kw)
                 return base, pc_only
 
-            keyword_bases: list[list[str]] = []
+            analysis_keyword_bases: list[list[str]] = []
             pc_codes: list[str] = []
             combined_base, _ = _split_keywords_for_merge(combined_meta.get("keywords"))
-            if combined_base:
-                keyword_bases.append(combined_base)
             for rec, _, _ver in analyses:
                 base_kw, pc_kw = _split_keywords_for_merge(rec.get("keywords"))
                 if base_kw:
-                    keyword_bases.append(base_kw)
+                    analysis_keyword_bases.append(base_kw)
                 if pc_kw:
                     pc_codes.extend(pc_kw)
+            model_keywords = utils.union_keywords(*analysis_keyword_bases)
             # Rule 1: union all shared keywords; "back" only applies when we later
-            # emit a back record.
-            shared_keywords = utils.union_keywords(*keyword_bases)
+            # emit a back record. The pages of a document are different files with
+            # their own originals, so a page's keywords, title, date and location
+            # never reach another page; each page gets its own plus the model's.
+            # The scans of one print share everything, which is how a back gets
+            # the title typed on its front.
+            shared_keywords = (
+                model_keywords
+                if multipage_present
+                else utils.union_keywords(combined_base, model_keywords)
+            )
             # A PC* code is a short identifier the model transcribes off the object
             # itself (image_rules.txt:97), so it describes the physical print rather
             # than the one scan that happened to be legible. Every variant in a group
@@ -4638,7 +4645,9 @@ def process_manifest_stream(
                 )
                 per_meta = utils.merge_original_sources(
                     own_meta,
-                    group_meta_unmarked
+                    None
+                    if multipage_present
+                    else group_meta_unmarked
                     if any(map(utils.is_date_marker, _own_keywords(own_meta)))
                     else group_meta_signed_off,
                 )
