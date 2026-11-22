@@ -76,11 +76,12 @@ def test_a_non_image_manifest_entry_is_left_out(
 
     # Act
     with caplog.at_level(logging.WARNING):
-        items = cli._build_rename_items_from_manifest(document)
+        items, left_out = cli._build_rename_items_from_manifest(document)
 
     # Assert
     assert [os.path.basename(item.path) for item in items] == ["scan.tif"]
-    assert "Not an image, so not renamed" in caplog.text
+    assert [os.path.basename(path) for path in left_out] == ["document.pdf"]
+    assert "Not a photo or video, so not renamed" in caplog.text
 
 
 def test_a_case_twin_is_a_companion_only_where_case_folds(tmp_path: Path) -> None:

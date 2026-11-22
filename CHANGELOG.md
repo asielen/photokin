@@ -3,6 +3,22 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.1]
+
+### Fixed
+
+- **A Lightroom rename plan covers every catalogued photo again.** 0.9.0
+  left any manifest item outside `.tif`/`.jpg`/`.png` out of the plan, so
+  PSD, DNG and other raw files, HEIC and video dropped out and the
+  Lightroom plug-in refused the whole folder. A manifest with `managed_by`
+  now plans every item. Another manifest plans every photo, raw and video
+  type, and still leaves out a hand-listed `document.pdf`, which the plan
+  now reports in `left_behind` (with a plan warning) instead of only
+  logging it.
+- **An uncatalogued PSD, raw or video file holds its name.** A plan that
+  would rename onto one is refused like a plan that would rename onto an
+  uncatalogued TIFF, so Lightroom is never handed a target that is taken.
+
 ## [0.9.0]
 
 An album's pages are no longer read as one document, and a run's

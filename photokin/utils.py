@@ -1632,6 +1632,23 @@ def parse_with_retry(
 # Accept common image extensions (case-insensitive)
 VALID_EXTS = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 
+#: What rename mode renames from a manifest no catalog manages: every photo
+#: and video type an archive holds, which is wider than :data:`VALID_EXTS`
+#: (the set photokin can send to a model). A manifest a catalog manages is
+#: not filtered at all, since the catalog renames every photo it tracks.
+RENAMABLE_EXTS: frozenset[str] = frozenset(
+    {
+        *VALID_EXTS,
+        ".psd", ".psb", ".webp", ".heic", ".heif", ".gif", ".bmp", ".jp2",
+        ".dng", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2",
+        ".orf", ".rw2", ".raf", ".pef", ".srw", ".x3f", ".3fr", ".iiq", ".rwl",
+        ".mp4", ".mov", ".avi", ".m4v", ".mts", ".m2ts", ".3gp", ".mpg", ".mpeg", ".wmv",
+    }
+)
+
+#: The ``left_behind`` reason for a manifest item rename mode does not rename.
+NOT_RENAMABLE_REASON = "not a photo or video type"
+
 @dataclass
 class ParsedName:
     """Structured result of parsing a media filename into its grouping parts.

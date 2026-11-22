@@ -1273,6 +1273,11 @@ def _attach_companions_and_bystanders(
         stem = utils.casefold_filename(os.path.splitext(os.path.basename(entry["path"]))[0])
         entry_indices_by_stem.setdefault(stem, []).append(idx)
 
+    # A managed plan renames any extension, so whatever it renames is also a
+    # type whose uncatalogued files keep their names.
+    reserved_exts = utils.RENAMABLE_EXTS | {
+        os.path.splitext(entry["path"])[1].lower() for entry in entries
+    }
     known_exact = set(known_image_paths)
     known_by_casefold: dict[str, list[str]] = {}
     for known in known_image_paths:
@@ -1292,13 +1297,18 @@ def _attach_companions_and_bystanders(
             continue
         name = os.path.basename(norm_disk_path)
         stem, ext = os.path.splitext(name)
-        if ext.lower() in utils.VALID_EXTS:
+        # Any photo or video the plan does not rename holds its name, as does
+        # a file of any type the plan renames: a catalog would rename onto an
+        # uncatalogued one. Only the analysis types stop here; the others are
+        # still matched by stem below, as they always were.
+        if ext.lower() in reserved_exts:
             candidates = known_by_casefold.get(utils.casefold_filename(abs_disk_path), ())
             is_known = abs_disk_path in known_exact or any(
                 utils.paths_are_same_file(abs_disk_path, candidate) for candidate in candidates
             )
             if not is_known:
                 bystander_names.add(utils.casefold_filename(name))
+        if ext.lower() in utils.VALID_EXTS:
             continue
         matches = [
             i

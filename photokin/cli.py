@@ -2389,7 +2389,36 @@ def _manifest_bool(value: Any) -> bool | None:
     return None
 
 
-def _build_rename_items_from_manifest(document: dict[str, Any]) -> list[RenameItem]:
+def _report_left_out(plan: dict[str, Any], left_out: list[str]) -> None:
+    """Add the manifest items rename mode did not plan to *plan*'s report.
+
+    An item the planner already placed -- carried as a companion of a planned
+    image, or reported left behind by stem -- keeps that one record, so a
+    file is never both renamed and left behind, nor counted twice.
+
+    Args:
+        plan: The plan :func:`plan_rename` built; updated in place.
+        left_out: The manifest paths :func:`_build_rename_items_from_manifest`
+            did not plan.
+    """
+
+    def _key(path: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+    placed = {_key(record["path"]) for record in plan["left_behind"]}
+    placed.update(
+        _key(companion["path"]) for entry in plan["entries"] for companion in entry["companions"]
+    )
+    for path in left_out:
+        if _key(path) in placed:
+            continue
+        plan["left_behind"].append({"path": path, "reason": utils.NOT_RENAMABLE_REASON})
+        plan["warnings"].append(f"{os.path.basename(path)}: {utils.NOT_RENAMABLE_REASON}")
+
+
+def _build_rename_items_from_manifest(
+    document: dict[str, Any],
+) -> tuple[list[RenameItem], list[str]]:
     """Build the planner's items from a manifest's ``items`` list (4.1, 6.1).
 
     Args:
@@ -2400,17 +2429,22 @@ def _build_rename_items_from_manifest(document: dict[str, Any]) -> list[RenameIt
     Returns:
         One :class:`RenameItem` per item, carrying its own ``metadata``,
         ``order``, ``is_back``, ``version`` and ``preferred`` overrides
-        exactly as section 4.1 describes them.
+        exactly as section 4.1 describes them; and the paths left out. A
+        manifest a catalog manages (any non-null ``managed_by``) keeps every
+        item, since the catalog renames all of them. Any other manifest keeps
+        the photo and video types of :data:`utils.RENAMABLE_EXTS`, so a
+        ``document.pdf`` listed by hand is not renamed as a photo.
     """
+    managed = document.get("managed_by") is not None
     items: list[RenameItem] = []
+    left_out: list[str] = []
     for raw in document.get("items") or []:
         if not isinstance(raw, dict):
             continue
         path = normalize_path(raw.get("path") or "") or ""
-        if os.path.splitext(path)[1].lower() not in utils.VALID_EXTS:
-            # Rename mode renames images; anything else in a manifest is at
-            # most a companion, which the planner finds on disk by stem.
-            logger.warning("Not an image, so not renamed: %s", path)
+        if not managed and os.path.splitext(path)[1].lower() not in utils.RENAMABLE_EXTS:
+            logger.warning("Not a photo or video, so not renamed: %s", path)
+            left_out.append(path)
             continue
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None
         order = raw.get("order")
@@ -2430,7 +2464,7 @@ def _build_rename_items_from_manifest(document: dict[str, Any]) -> list[RenameIt
                 mtime=mtime,
             )
         )
-    return items
+    return items, left_out
 
 
 #: Matches ``{date}``/``{date:FORMAT}`` in a raw prefix template, case
@@ -2617,7 +2651,7 @@ def _rename_protected_paths(
     protected.extend(
         _ProtectedPath(path, "a photo in this folder this run did not plan")
         for path in disk_files
-        if os.path.splitext(path)[1].lower() in utils.VALID_EXTS
+        if os.path.splitext(path)[1].lower() in utils.RENAMABLE_EXTS
         and os.path.normpath(os.path.abspath(path)) not in planned
     )
     protected.extend(
@@ -2724,10 +2758,11 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         _validate_folder_input(resolved)
         folder = resolved.path
         items = _build_rename_items_from_folder(folder)
+        left_out: list[str] = []
     else:
         loaded_manifest = _load_manifest_input(resolved)
         managed_by = loaded_manifest.get("managed_by")
-        items = _build_rename_items_from_manifest(loaded_manifest)
+        items, left_out = _build_rename_items_from_manifest(loaded_manifest)
         folder = _rename_folder_from_items(items, resolved)
 
     changeset_flag, apply_requested = _resolve_rename_write_bundle(args)
@@ -2773,6 +2808,7 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         photokin_version=_photokin_version(),
         disk_file_stats={path: _stat_for_rename(path) for path in disk_files},
     )
+    _report_left_out(plan, left_out)
 
     # Every destination this run has, checked here: the plan is the first
     # point the run knows what it touches, and nothing has been written yet
