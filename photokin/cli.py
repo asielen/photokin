@@ -88,7 +88,7 @@ from .core import (
     build_single_photo_manifest,
     process_manifest_stream,
 )
-from .doc_sidecar import sidecar_path_for
+from .doc_sidecar import sidecar_destination
 from .errors import ProviderApiError, SELF_EXPLANATORY_ERROR_TYPES
 from .exiftool import (
     ExiftoolConfig,
@@ -1720,11 +1720,15 @@ def _analysis_protected_paths(
             for path in images
         )
     if args.sidecar_md != utils.SIDECAR_MD_OFF:
+        sidecar_items = (
+            [item for item in items if item.get("path")]
+            if resolved.kind == "manifest"
+            else [{"path": path} for path in images]
+        )
         protected.extend(
-            _ProtectedPath(
-                sidecar_path_for(path), "a transcript this run writes (--sidecar-md)"
-            )
-            for path in images
+            _ProtectedPath(destination, "a transcript this run writes (--sidecar-md)")
+            for item in sidecar_items
+            if (destination := sidecar_destination(item)) is not None
         )
     return protected
 

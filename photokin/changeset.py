@@ -67,7 +67,9 @@ from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywor
 #        each tag its write touched held just before the write, ``null`` where
 #        the file had none. The applier adds it, so it is absent from a
 #        changeset that was never applied.
-SCHEMA_VERSION = 5
+#   6 -- a record may carry the manifest item's ``id`` and ``source_path``,
+#        and ``write: false``, which an applier must honor by not writing it.
+SCHEMA_VERSION = 6
 
 
 def make_run_id() -> str:
@@ -213,8 +215,14 @@ def emit_changeset_record(
     sent_to_model: dict,
     file_metadata: dict,
     proposed_changes: dict,
+    item_fields: dict | None = None,
 ) -> None:
-    """Emit a single changeset NDJSON record for a photo file."""
+    """Emit a single changeset NDJSON record for a photo file.
+
+    ``item_fields`` are top-level keys the manifest item asked to see again:
+    its ``id`` and ``source_path``, and ``write: false``, which tells the
+    applier to leave the file alone.
+    """
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     sent_block = {
         "metadata": deepcopy(sent_to_model),
@@ -233,6 +241,7 @@ def emit_changeset_record(
             "sent_to_model": sent_block,
         },
         "proposed_changes": deepcopy(proposed_changes),
+        **deepcopy(item_fields or {}),
     }
 
     writer(json.dumps(record, ensure_ascii=False))

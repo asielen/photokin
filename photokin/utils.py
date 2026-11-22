@@ -129,6 +129,65 @@ SIDECAR_AUTO_CATEGORIES: frozenset[str] = frozenset({"Document", "Postcard"})
 #: never imports the wrapper.
 HYDRATION_FAILED_KEY = "hydration_failed"
 
+#: Manifest item keys a run hands back unchanged on the item's result and
+#: changeset records: the caller's own id for the item, and the file a crop or
+#: export was made from.
+ITEM_ECHO_KEYS: tuple[str, ...] = ("id", "source_path")
+
+# The plug-in writes manifests from Lua, which passes literal true/false strings.
+_MANIFEST_TRUE = frozenset({"true", "1", "yes"})
+_MANIFEST_FALSE = frozenset({"false", "0", "no"})
+
+
+def item_echo(raw: dict) -> dict[str, Any]:
+    """Return the :data:`ITEM_ECHO_KEYS` a manifest item sets, verbatim.
+
+    Args:
+        raw: One entry of the manifest's ``items`` array.
+
+    Returns:
+        ``{key: value}`` for each echo key present and not null.
+    """
+    return {key: raw[key] for key in ITEM_ECHO_KEYS if raw.get(key) is not None}
+
+
+def coerce_manifest_bool(
+    raw: dict, key: str, path: str, report_to: logging.Logger | None
+) -> bool | None:
+    """Read a tri-state boolean flag from a manifest item.
+
+    Args:
+        raw: One entry of the manifest's ``items`` array.
+        key: Flag name to read.
+        path: Normalized item path, used only for the warning message.
+        report_to: The logger an unreadable value is reported on, the
+            caller's own; ``None`` for a caller resolving the same items a
+            second time purely to count them.
+
+    Returns:
+        The flag value, or ``None`` when it is absent, null or unreadable -- all
+        of which mean "no override". Note that ``False`` is an override and must
+        therefore never be tested for truthiness by the caller.
+    """
+    value = raw.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _MANIFEST_TRUE:
+            return True
+        if token in _MANIFEST_FALSE:
+            return False
+    if report_to is not None:
+        report_to.warning("Manifest item %s: ignoring unrecognized %s value %r", path, key, value)
+    return None
+
+
+
 #: Manifest key for the keywords a file holds in some of its keyword tags but
 #: not all of them (see ``exiftool.manifest.record_keywords``). The changeset
 #: proposes them again so the write puts each one in every tag.

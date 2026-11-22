@@ -636,7 +636,8 @@ def apply_changeset(
     ``files_with_proposals`` (records that proposed any write at all, before
     allow-list filtering -- what the strict verdict measures "attempted"
     against), ``files_suppressed`` (records the emitter marked
-    write-suppressed), ``tags_written``, ``errors``, ``warnings``,
+    write-suppressed), ``files_left_to_caller`` (records marked ``write:
+    false``, never written), ``tags_written``, ``errors``, ``warnings``,
     ``dry_run``.
     """
     summary: dict[str, Any] = {
@@ -644,6 +645,7 @@ def apply_changeset(
         "files_written": 0,
         "files_with_proposals": 0,
         "files_suppressed": 0,
+        "files_left_to_caller": 0,
         "tags_written": 0,
         "errors": [],
         "warnings": [],
@@ -770,6 +772,12 @@ def apply_changeset(
             path = record.get("path")
             if not isinstance(path, str) or not path:
                 summary["warnings"].append({"line": line_number, "warning": "Missing path in record."})
+                continue
+
+            if record.get("write") is False:
+                # The caller applies this one itself; counted apart so the
+                # strict verdict never reads it as a failed write.
+                summary["files_left_to_caller"] += 1
                 continue
 
             proposed = record.get("proposed_changes") or {}

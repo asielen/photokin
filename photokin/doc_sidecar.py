@@ -116,6 +116,28 @@ def sidecar_path_for(image_path: str) -> str:
     return os.path.join(img_dir, f"{img_base}.md")
 
 
+def sidecar_destination(item: dict[str, Any]) -> str | None:
+    """Return where one manifest item's markdown sidecar goes, or ``None`` for nowhere.
+
+    An item's own ``sidecar_path`` wins. Without one, an item marked
+    ``write: false`` gets no sidecar, since its image is a temporary export
+    about to be deleted; anything else gets :func:`sidecar_path_for`.
+
+    Args:
+        item: A grouping entry or a raw manifest item; ``path``,
+            ``sidecar_path`` and ``write`` are read.
+
+    Returns:
+        The absolute destination, or ``None``.
+    """
+    explicit = item.get("sidecar_path")
+    if isinstance(explicit, str) and explicit.strip():
+        return os.path.abspath(utils.normalize_path(explicit) or explicit)
+    if utils.coerce_manifest_bool(item, "write", item.get("path") or "", None) is False:
+        return None
+    return sidecar_path_for(item["path"])
+
+
 def write_markdown_sidecar(
     merged: dict[str, Any],
     item: dict[str, Any],
@@ -124,8 +146,8 @@ def write_markdown_sidecar(
 ) -> str | None:
     """Write the markdown sidecar for one file's analysis, beside its image.
 
-    The destination is :func:`sidecar_path_for`'s, which two files of one group
-    can share; the caller is responsible for not asking for the same
+    The destination is :func:`sidecar_destination`'s, which two files of one
+    group can share; the caller is responsible for not asking for the same
     destination twice (see the emit loop's collision guard).
 
     Mirrors ``core._write_sidecar_document``'s failure contract exactly: the
@@ -148,7 +170,9 @@ def write_markdown_sidecar(
         already been logged at WARNING.
     """
     image_path = item["path"]
-    md_path = sidecar_path_for(image_path)
+    md_path = sidecar_destination(item)
+    if md_path is None:
+        return None
 
     body, used_fallback = _build_body(merged, group_info.part_label, group_info.group_id)
     frontmatter_lines = _build_frontmatter_lines(merged, item, group_info, config, used_fallback)

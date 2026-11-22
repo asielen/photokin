@@ -41,10 +41,10 @@ Code map (public-facing entry points marked PUBLIC):
 - build_folder_manifest         PUBLIC: a folder as in-memory manifest items
 - build_single_photo_manifest   PUBLIC: image + --back + --meta as manifest items
 - analyze_folder                PUBLIC: batch a whole folder
-- _coerce_manifest_bool         read a tri-state boolean flag off a manifest item
 - _log_manifest_override        warn that an explicit flag beat the filename
 - _manifest_group_override      resolve an item's explicit bucket key
 - _resolve_manifest_entry       build one grouping entry, filename plus overrides
+- _item_record_fields           the manifest item's id, source_path and write flag, echoed
 - _item_part_marker             the per-file part keyword an entry earns, if any
 - _fold_out_of_order_variants   read a letter back into the name when earlier letters are missing
 - _album_reason / _split_album_pages  make each page of an album its own object
@@ -2599,10 +2599,6 @@ _GROUP_BY_VALUES = frozenset(utils.GROUP_BY_VALUES)
 _PAIR_KEY_SEPARATOR = "|"
 _PAIR_KEY_ESCAPE = "\\"
 
-# The plug-in writes manifests from Lua, which passes literal true/false strings.
-_MANIFEST_TRUE = frozenset({"true", "1", "yes"})
-_MANIFEST_FALSE = frozenset({"false", "0", "no"})
-
 # A grouping entry's variant letter as the filename spelled it, set only when
 # the filename alone decided both the letter and the group. Read and removed by
 # _fold_out_of_order_variants before an entry leaves build_manifest_buckets.
@@ -2618,39 +2614,6 @@ _ALBUM_WORD_RE = re.compile(r"(?<![a-z0-9])album(?![a-z0-9])", re.IGNORECASE)
 # Only a separator or a digit may precede the token, so 'feedback.jpg' is never
 # read as the back of 'feed'.
 _EXPLICIT_BACK_SUFFIX_RE = re.compile(r"(?:[-_. ]|(?<=\d))back$", re.IGNORECASE)
-
-
-def _coerce_manifest_bool(raw: dict, key: str, path: str, *, log: bool = True) -> bool | None:
-    """Read a tri-state boolean flag from a manifest item.
-
-    Args:
-        raw: One entry of the manifest's ``items`` array.
-        key: Flag name to read.
-        path: Normalized item path, used only for the warning message.
-        log: Whether to report an unreadable value. Off for a caller that is
-            resolving the same items a second time purely to count them.
-
-    Returns:
-        The flag value, or ``None`` when it is absent, null or unreadable -- all
-        of which mean "no override". Note that ``False`` is an override and must
-        therefore never be tested for truthiness by the caller.
-    """
-    value = raw.get(key)
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and value in (0, 1):
-        return bool(value)
-    if isinstance(value, str):
-        token = value.strip().lower()
-        if token in _MANIFEST_TRUE:
-            return True
-        if token in _MANIFEST_FALSE:
-            return False
-    if log:
-        logger.warning("Manifest item %s: ignoring unrecognized %s value %r", path, key, value)
-    return None
 
 
 def _log_manifest_override(path: str, key: str, value: object, field: str, derived: object) -> None:
@@ -2732,7 +2695,8 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
     version = parsed.variant_id
     is_crop = parsed.is_crop
 
-    explicit_back = _coerce_manifest_bool(raw, "is_back", path, log=log_overrides)
+    report_to = logger if log_overrides else None
+    explicit_back = utils.coerce_manifest_bool(raw, "is_back", path, report_to)
     if explicit_back is True and part_kind != "back":
         if log_overrides:
             _log_manifest_override(path, "is_back", raw.get("is_back"), "part_kind", part_kind)
@@ -2745,7 +2709,7 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
             _log_manifest_override(path, "is_back", raw.get("is_back"), "part_kind", part_kind)
         part_kind = "front"
 
-    explicit_crop = _coerce_manifest_bool(raw, "is_crop", path, log=log_overrides)
+    explicit_crop = utils.coerce_manifest_bool(raw, "is_crop", path, report_to)
     if explicit_crop is not None and explicit_crop != is_crop:
         if log_overrides:
             _log_manifest_override(path, "is_crop", raw.get("is_crop"), "is_crop", is_crop)
@@ -2793,6 +2757,14 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
             parsed.page_suffix if name_decides_group and part_kind == "page" else ""
         ),
         "preferred": bool(raw.get("preferred")),
+        # ``write: false`` -- analyzed and reported, but never written by
+        # ExifTool; the caller applies the result itself (a Lightroom virtual
+        # copy, whose crop is a temporary export).
+        "write": utils.coerce_manifest_bool(raw, "write", path, report_to) is not False,
+        "sidecar_path": raw["sidecar_path"]
+        if isinstance(raw.get("sidecar_path"), str) and raw["sidecar_path"].strip()
+        else None,
+        "echo": utils.item_echo(raw),
         "metadata": raw.get("metadata"),
         "metadata_path": raw.get("metadata_path"),
         # Set by the ExifTool hydrator (which runs before bucketing) when -r
@@ -2800,6 +2772,23 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
         # the changeset emitter proposes no writes for such a file.
         utils.HYDRATION_FAILED_KEY: bool(raw.get(utils.HYDRATION_FAILED_KEY)),
     }
+
+
+def _item_record_fields(entry: dict) -> dict[str, Any]:
+    """Return what a file's result and changeset records carry from its manifest item.
+
+    The caller's own ``id`` and ``source_path`` come back unchanged, so a caller
+    can match a record to its item when the path alone no longer identifies
+    it, and ``write: false`` is restated so the applier and the caller both
+    see it.
+
+    Args:
+        entry: One :func:`_resolve_manifest_entry` result.
+
+    Returns:
+        The fields to add; empty for an ordinary item.
+    """
+    return {**entry["echo"], **({} if entry["write"] else {"write": False})}
 
 
 def _item_part_marker(entry: dict) -> str | None:
@@ -3564,7 +3553,15 @@ def process_manifest_stream(
             # and safe to call from the same thread that is about to block on
             # that call, at the cost of no signal *within* one unusually slow
             # group.
-            run_event_writer({"group": stem, "index": group_index + 1, "of": len(group_keys)})
+            ids = [it["echo"]["id"] for it in buckets[stem] if "id" in it["echo"]]
+            run_event_writer(
+                {
+                    "group": stem,
+                    "index": group_index + 1,
+                    "of": len(group_keys),
+                    **({"ids": ids} if ids else {}),
+                }
+            )
         group = buckets[stem]
         # Bound before the try so the failure log always has a subject: a group
         # can fail well before primary selection has run.
@@ -4639,10 +4636,9 @@ def process_manifest_stream(
             if cfg.sidecar_md != utils.SIDECAR_MD_OFF:
                 ranked_group = sorted(group, key=_slot_rank_key)
                 for ranked_entry in ranked_group:
-                    sidecar_owner.setdefault(
-                        doc_sidecar.sidecar_path_for(ranked_entry["path"]),
-                        ranked_entry["path"],
-                    )
+                    ranked_destination = doc_sidecar.sidecar_destination(ranked_entry)
+                    if ranked_destination is not None:
+                        sidecar_owner.setdefault(ranked_destination, ranked_entry["path"])
                 sidecar_group_files = tuple(
                     os.path.basename(g["path"]) for g in ranked_group
                 )
@@ -4746,7 +4742,8 @@ def process_manifest_stream(
                 # would fail the entire group over a sidecar it could simply
                 # have declined to write.
                 merged_category = merged.get("category")
-                if not it["is_crop"] and (
+                destination = doc_sidecar.sidecar_destination(it)
+                if destination is not None and not it["is_crop"] and (
                     cfg.sidecar_md == utils.SIDECAR_MD_ALL
                     or (
                         cfg.sidecar_md == utils.SIDECAR_MD_AUTO
@@ -4758,7 +4755,6 @@ def process_manifest_stream(
                     # is never overwritten in silence. The owner was settled by
                     # rank before this loop began; anyone else pointing at the
                     # same destination says so and writes nothing.
-                    destination = doc_sidecar.sidecar_path_for(it["path"])
                     # Two guards, because a collision has two shapes. Within a
                     # group, rank settled the owner before this loop began.
                     # Across groups there is no rank to appeal to -- under
@@ -4826,6 +4822,7 @@ def process_manifest_stream(
                         sent_to_model=sent_to_model_snapshot,
                         file_metadata=decision.before_snapshot,
                         proposed_changes=decision.proposed_changes,
+                        item_fields=_item_record_fields(it),
                     )
 
                 results[it["path"]] = merged
@@ -4845,6 +4842,7 @@ def process_manifest_stream(
                     # Says why the patch is empty, so an integration reading
                     # the record can tell "nothing to write" from "unreadable".
                     item_payload[utils.HYDRATION_FAILED_KEY] = True
+                item_payload.update(_item_record_fields(it))
                 _emit(it["path"], "ok", item_payload)
                 emitted_ok.add(it["path"])
 
@@ -4874,10 +4872,9 @@ def process_manifest_stream(
                 error_payload["message"],
                 exc_info=error_payload["type"] not in SELF_EXPLANATORY_ERROR_TYPES,
             )
-            err_payload = {"error": error_payload}
             for it in group:
                 if it["path"] not in emitted_ok:
-                    _emit(it["path"], "error", err_payload)
+                    _emit(it["path"], "error", {"error": error_payload, **_item_record_fields(it)})
 
     if strict_run_failures and first_error is not None and not results:
         raise first_error

@@ -34,6 +34,12 @@ changeset now records enough to undo it.
 - **The `complete` and `cancelled` records carry `items_recorded`**
   beside `files_recorded`, since items that share a path (Lightroom
   virtual copies) count once as files.
+- **Manifest items take `id`, `source_path`, `read`, `write` and
+  `sidecar_path`,** for a caller that sends exports such as Lightroom
+  virtual-copy crops. `id` and `source_path` come back unchanged on the
+  item's records; `read: false` keeps `-r` off the file; `write: false`
+  reports the result without ExifTool writing it; `sidecar_path` places
+  the Markdown sidecar. Changeset `schema_version` is 6.
 - **Packaging:** the license is declared as an SPDX string, and the vocab
   backup goes to `~/.photokin/backups` instead of the package folder.
 
