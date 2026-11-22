@@ -198,7 +198,7 @@ def utf8_argfile(cmd: list[str]) -> tuple[list[str], str | None]:
 
 
 def _run_exiftool_batch(
-    exiftool_path: str, cmd: List[str], timeout_sec: int
+    exiftool_path: str, cmd: List[str], timeout_sec: int, numbers_as_text: bool = False
 ) -> List[Dict[str, Any]]:
     """Run one prepared ExifTool command line and return its parsed JSON list.
 
@@ -241,7 +241,9 @@ def _run_exiftool_batch(
         return []
 
     try:
-        data = json.loads(raw)
+        data = (
+            json.loads(raw, parse_int=str, parse_float=str) if numbers_as_text else json.loads(raw)
+        )
     except Exception as e:
         raise RuntimeError(
             "Failed to parse ExifTool JSON output.\n"
@@ -263,6 +265,7 @@ def run_exiftool_json(
     *,
     include_all_if_no_fields: bool = False,
     timeout_sec: int = 60,
+    numbers_as_text: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Run exiftool and return parsed JSON objects.
@@ -274,7 +277,9 @@ def run_exiftool_json(
     Large file lists are split across several invocations (see
     :data:`_ARGV_BUDGET`) and their records concatenated in input order; a list
     that fits one command line is still sent as exactly one.  ``timeout_sec``
-    applies per invocation.
+    applies per invocation. ``numbers_as_text`` keeps a value ExifTool prints
+    as a JSON number in its printed spelling, so a title of ``1950.10`` comes
+    back as that string rather than the float ``1950.1``.
     """
     files_n = _normalize_paths(files)
     if not files_n:
@@ -298,7 +303,9 @@ def run_exiftool_json(
     prefix_cost = sum(_argv_cost(part) for part in cmd)
     records: List[Dict[str, Any]] = []
     for batch in _batch_files(files_n, prefix_cost):
-        records.extend(_run_exiftool_batch(exiftool_path, cmd + batch, timeout_sec))
+        records.extend(
+            _run_exiftool_batch(exiftool_path, cmd + batch, timeout_sec, numbers_as_text)
+        )
     return records
 
 

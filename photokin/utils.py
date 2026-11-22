@@ -1778,6 +1778,24 @@ _VARIANT_SUFFIX_RE = re.compile(
 )
 
 
+def first_missing_variant(letter: str, present: set[str]) -> str | None:
+    """Return the first letter before *letter* that *present* lacks, if any.
+
+    A variant letter counts only in order: ``c`` is a variant only when the
+    group also has a ``b``, and so on; ``a`` is never required, since the
+    unlettered scan usually plays that part. The one rule both grouping and
+    the rename planner apply.
+
+    Args:
+        letter: The variant letter being judged, lowercase.
+        present: Every variant letter the group holds.
+
+    Returns:
+        The first missing letter, or ``None`` when *letter* is in order.
+    """
+    return next((chr(c) for c in range(ord("b"), ord(letter)) if chr(c) not in present), None)
+
+
 def parse_media_filename(path: str) -> ParsedName:
     """
     Parse media filenames that may include variant letters and part suffixes.
