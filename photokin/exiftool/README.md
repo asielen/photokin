@@ -44,6 +44,7 @@ layer entirely.
   it fills are derived from `manifest.DEFAULT_EXIFTOOL_FIELDS` and
   `manifest._TAG_TO_MANIFEST_KEY` rather than restated.
 - `apply.py` — `apply_changeset(changeset_path, cfg, ...)` and the CLI.
+- `revert.py` — `revert_changeset(changeset_path, cfg, options)`: put a run's files back (below).
 
 ## Configuration
 
@@ -135,7 +136,7 @@ runs with `--changeset true`) and for each record:
   are handled; unparseable dates become warnings, not writes);
 - invokes ExifTool with `-overwrite_original` (or `-o %d%f.xmp` when
   `write_sidecar_only`);
-- returns a summary dict: `files_seen`, `files_written`, `tags_written`,
+- returns a summary dict: `files_seen`, `files_written`, `files_left_to_caller`, `tags_written`,
   `errors`, `warnings`, `dry_run`. The main CLI appends this summary as a
   `{"run": "exiftool_apply", ...}` record to the results NDJSON when
   `--output-file` names one, and logs it to stderr otherwise — which is now the
@@ -143,6 +144,24 @@ runs with `--changeset true`) and for each record:
   rather than the manifest-mode fixture it used to be.
 
 `dry_run` counts what would be written without invoking ExifTool.
+
+A record marked `"write": false` (a manifest item the caller applies itself) is skipped and counted in `files_left_to_caller`. Any write that touches an IPTC tag also recomputes the Photoshop `IPTCDigest`, since ExifTool leaves it stale and Lightroom then distrusts the IPTC block. With `record_before=True` (the main CLI's `-w` and the standalone CLI pass it), the files' values are read in one batch before writing and saved into the changeset as `original_data.written_tags`.
+
+## Reverting a run
+
+This is a maintenance tool for an agent or a developer cleaning up after a bad run. It reads a run's changeset back and restores each file it wrote:
+
+```bash
+photokin --revert-changeset results_changeset.ndjson --dry-run --output-file revert.ndjson
+photokin --revert-changeset results_changeset.ndjson [--revert-paths P1,P2 | --revert-match GLOB] [--force]
+```
+
+- The first record per path is used; virtual copies of one file share one original, and `entries` says how many records there were. Records marked `write: false` are skipped.
+- Every tag the run wrote goes back to its value from `original_data.written_tags`, and a tag the file did not have is deleted. Keywords are restored as additions and removals against the file's current list. A tag the run never touched is never written.
+- Before restoring, the file must still hold what the run wrote. A tag that changed since means someone edited the file after the run: the file is reported as `conflict` and left alone, unless `--force`.
+- A changeset from before schema 5 has no `written_tags`. The revert then takes before-values from `original_data.file_metadata` and lists, under `inferred`, each tag it assumed the file did not have.
+- Output is NDJSON, one record per file with `status` (`reverted`, `unchanged`, `conflict`, `missing` or `error`) and the `tags` touched, then `{"summary": {...}, "dry_run": ...}`. It goes to `--output-file` or stdout, and the exit code is 1 when any file conflicted or failed.
+- `--dry-run` reads and judges every file and writes nothing. `--exiftool-path` works as it does for `-w`.
 
 ## Standalone CLI
 

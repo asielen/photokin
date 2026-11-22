@@ -526,6 +526,33 @@ def group_has_too_many_pages(group: str, pages: int, limit: int, others: int) ->
     )
 
 
+def revert_filters_together() -> UsageMessage:
+    """Both revert filters were given; they pick files two different ways.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        "--revert-paths and --revert-match both choose which files to revert.",
+        "use one of them",
+    )
+
+
+def revert_takes_no_input(display: str) -> UsageMessage:
+    """An input was given beside --revert-changeset, which reads only the changeset.
+
+    Args:
+        display: The input exactly as the user typed it.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"--revert-changeset takes no input, but `{display}` was given.",
+        "drop the input, and narrow the files with --revert-paths or --revert-match",
+    )
+
+
 def write_needs_changeset() -> UsageMessage:
     """Writing was asked for with no changeset to write from.
 

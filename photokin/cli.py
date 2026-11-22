@@ -49,6 +49,7 @@ Code map:
 - _run_rename_mode          --rename: plan a folder/manifest's rename, preview or apply it
 - _run_rename_finish        --rename-finish: companions only, images renamed elsewhere
 - _run_rename_undo_or_resume  --rename-undo / --rename-resume: read the journal back
+- _run_revert_changeset       --revert-changeset: put a run's files back
 - main                      PUBLIC: resolve the input, print the plan, run it
 """
 
@@ -60,12 +61,13 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
 import traceback
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any, NamedTuple, NoReturn
 
@@ -100,6 +102,7 @@ from .exiftool import (
 from .exiftool.config import parse_fields as exiftool_parse_fields
 from .exiftool.config import suggest_writable_spelling
 from .exiftool.manifest import DEFAULT_EXIFTOOL_FIELDS
+from .exiftool.revert import RevertOptions, revert_changeset
 from .rename import DEFAULT_COMPANION_EXTENSIONS, RenameItem, plan_rename
 
 # Named explicitly rather than via __name__: under ``python -m photokin.cli``
@@ -2817,6 +2820,55 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         _write_rename_changeset_records(changeset_path, plan)
 
 
+def _run_revert_changeset(args: argparse.Namespace) -> None:
+    """``--revert-changeset PATH``: restore a run's files to their values before it.
+
+    Args:
+        args: The parsed namespace.
+
+    Raises:
+        SystemExit: 2 for a usage error or a missing changeset or ExifTool, 1
+            when any file conflicted or failed, 0 otherwise.
+    """
+    if args.input_path:
+        _exit_with_usage_error(*cli_messages.revert_takes_no_input(args.input_path))
+    if args.revert_paths and args.revert_match:
+        _exit_with_usage_error(*cli_messages.revert_filters_together())
+    if not os.path.isfile(args.revert_changeset):
+        _exit_with_usage_error(*cli_messages.input_not_found(args.revert_changeset))
+    only = frozenset(
+        os.path.normcase(os.path.abspath(path.strip()))
+        for path in (args.revert_paths or "").split(",")
+        if path.strip()
+    )
+    cfg = replace(_resolve_exiftool_config(args), dry_run=args.dry_run)
+    try:
+        records = revert_changeset(
+            args.revert_changeset,
+            cfg,
+            RevertOptions(only_paths=only, match=args.revert_match, force=args.force),
+        )
+    except FileNotFoundError:
+        _exit_with_usage_error(*cli_messages.exiftool_not_found(args.exiftool_path or ""))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        logger.error("Could not read the files to revert: %s", exc)
+        sys.exit(1)
+    lines = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    if args.output_file:
+        with open(args.output_file, "w", encoding="utf-8") as handle:
+            handle.write(lines)
+    else:
+        sys.stdout.write(lines)
+    summary = records[-1]["summary"]
+    logger.info(
+        "Revert%s: %s.",
+        " (dry run)" if args.dry_run else "",
+        ", ".join(f"{count} {status}" for status, count in summary.items() if count),
+    )
+    if summary["conflict"] or summary["error"]:
+        sys.exit(1)
+
+
 def _run_rename_finish(plan_path: str) -> None:
     """``--rename-finish PLAN``: rename companions whose images are already renamed.
 
@@ -3318,6 +3370,32 @@ def main() -> None:
                  "named journal file, forward.",
         )
         ap.add_argument(
+            "--revert-changeset",
+            metavar="PATH",
+            default=None,
+            help="Developer/agent tool: restore every file a -w run wrote, from that run's "
+                 "changeset, to its values before the run. A file edited since is reported "
+                 "as a conflict and left alone unless --force. --dry-run judges without "
+                 "writing; results go to --output-file (.ndjson) or stdout.",
+        )
+        ap.add_argument(
+            "--revert-paths",
+            metavar="P1,P2",
+            default=None,
+            help="--revert-changeset: revert only these files.",
+        )
+        ap.add_argument(
+            "--revert-match",
+            metavar="GLOB",
+            default=None,
+            help="--revert-changeset: revert only files whose path or name matches GLOB.",
+        )
+        ap.add_argument(
+            "--force",
+            action="store_true",
+            help="--revert-changeset: restore a file even when it changed after the run.",
+        )
+        ap.add_argument(
             "--rename-finish",
             metavar="PLAN",
             default=None,
@@ -3393,6 +3471,9 @@ def main() -> None:
             return
         if args.rename is not None:
             _run_rename_mode(args)
+            return
+        if args.revert_changeset is not None:
+            _run_revert_changeset(args)
             return
 
         # The run envelope opens as early as physically possible -- right

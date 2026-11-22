@@ -115,6 +115,9 @@ _COMMAND_LENGTH_BUDGET = 30_000
 # arises.
 _DATFILE_READ_FAILURE_MARKER = "Error opening file"
 
+#: Recomputes the Photoshop IPTC digest from the IIM a command writes.
+_IPTC_DIGEST_ARG = "-Photoshop:IPTCDigest=new"
+
 
 def _normalize_exif_datetime(value: Any) -> tuple[str | None, str | None]:
     if value is None:
@@ -606,6 +609,13 @@ def _build_exiftool_command(
         else:
             cmd.append(f"-{tag}={value}")
     cmd.extend(write.keyword_args)
+    if any(tag.startswith("IPTC:") for tag in write.tags) or any(
+        arg.startswith("-IPTC:") for arg in write.keyword_args
+    ):
+        # ExifTool leaves the Photoshop IPTCDigest as it was, so after an IIM
+        # write Lightroom finds it stale and stops trusting which copy is
+        # current. "new" recomputes it from the IIM this command writes.
+        cmd.append(_IPTC_DIGEST_ARG)
     cmd.append(path)
     return cmd
 
