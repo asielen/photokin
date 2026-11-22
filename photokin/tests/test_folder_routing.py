@@ -64,9 +64,9 @@ _FOLDER_FIXTURE = os.path.join(_FIXTURES, "folder_routing")
 #: -- because the pipeline's per-file emission order and its ``all_variant_files``
 #: lists are deliberately input-ordered.
 _FIXTURE_IMAGES = (
-    "album-page1.jpg",
-    "album-page2-crop.jpg",
-    "album-page2.jpg",
+    "account-page1.jpg",
+    "account-page2-crop.jpg",
+    "account-page2.jpg",
     "box3_025-back.jpg",
     "box3_025-crop.jpg",
     "box3_025.jpg",
@@ -354,7 +354,7 @@ class TestAlbumPagesReachTheModel(_FolderRoutingTestCase):
     """The regression test for the CRITICAL finding that opened the whole plan.
 
     ``core.py:913`` skipped any group whose primary front was absent, which is
-    every album page set: ``album-page1.jpg`` and ``album-page2.jpg`` parse as
+    every album page set: ``account-page1.jpg`` and ``account-page2.jpg`` parse as
     pages, neither is a plain front, so the group was dropped and the completion
     line counted only what survived. The README documents album pages as a
     supported input. Phase A made the loss visible and left it; this is the test
@@ -374,7 +374,7 @@ class TestAlbumPagesReachTheModel(_FolderRoutingTestCase):
         # through ``analyze_photo``; retiring the primary in C1 is what puts the
         # rest of the document in front of the model, and it is the largest
         # single-file quality change of the phase.
-        folder = self.make_folder("album-page1.jpg", "album-page2.jpg")
+        folder = self.make_folder("account-page1.jpg", "account-page2.jpg")
 
         run = self.run_folder(folder)
 
@@ -383,7 +383,7 @@ class TestAlbumPagesReachTheModel(_FolderRoutingTestCase):
             [
                 (
                     "parts",
-                    (("Page 1", ("album-page1.jpg",)), ("Page 2", ("album-page2.jpg",))),
+                    (("Page 1", ("account-page1.jpg",)), ("Page 2", ("account-page2.jpg",))),
                     False,
                 )
             ],
@@ -392,29 +392,29 @@ class TestAlbumPagesReachTheModel(_FolderRoutingTestCase):
         self.assert_nothing_skipped(run)
 
     def test_both_pages_are_recorded_and_the_page_map_names_them(self) -> None:
-        folder = self.make_folder("album-page1.jpg", "album-page2.jpg")
+        folder = self.make_folder("account-page1.jpg", "account-page2.jpg")
 
         run = self.run_folder(folder)
 
         self.assertEqual(
             self.basenames(run.result["results"]),
-            ["album-page1.jpg", "album-page2.jpg"],
+            ["account-page1.jpg", "account-page2.jpg"],
             self._LOST,
         )
         self.assertEqual(run.result["errors"], {})
-        pages = run.result["results"][os.path.join(folder, "album-page1.jpg")][
+        pages = run.result["results"][os.path.join(folder, "account-page1.jpg")][
             "all_variant_files"
         ]["pages"]
         self.assertEqual(
             {num: [os.path.basename(p) for p in paths] for num, paths in pages.items()},
-            {"1": ["album-page1.jpg"], "2": ["album-page2.jpg"]},
+            {"1": ["account-page1.jpg"], "2": ["account-page2.jpg"]},
         )
 
     def test_an_album_beside_an_ordinary_photo_costs_the_ordinary_photo_nothing(self) -> None:
         # The old behavior was not "the album fails" but "the album is absent":
         # the run analyzed the ordinary photo, reported one group and exited 0.
         # Pinning both groups is what distinguishes the fix from a louder skip.
-        folder = self.make_folder("album-page1.jpg", "album-page2.jpg", "box3_025.jpg")
+        folder = self.make_folder("account-page1.jpg", "account-page2.jpg", "box3_025.jpg")
 
         run = self.run_folder(folder)
 
@@ -423,7 +423,7 @@ class TestAlbumPagesReachTheModel(_FolderRoutingTestCase):
             [
                 (
                     "parts",
-                    (("Page 1", ("album-page1.jpg",)), ("Page 2", ("album-page2.jpg",))),
+                    (("Page 1", ("account-page1.jpg",)), ("Page 2", ("account-page2.jpg",))),
                     False,
                 ),
                 ("photo", "box3_025.jpg", None, False),
@@ -432,7 +432,7 @@ class TestAlbumPagesReachTheModel(_FolderRoutingTestCase):
         )
         self.assertEqual(
             self.basenames(run.result["results"]),
-            ["album-page1.jpg", "album-page2.jpg", "box3_025.jpg"],
+            ["account-page1.jpg", "account-page2.jpg", "box3_025.jpg"],
         )
 
 
@@ -1027,8 +1027,8 @@ class TestGroupByChangesFolderGranularity(_FolderRoutingTestCase):
 
     def _mixed_folder(self) -> str:
         return self.make_folder(
-            "album-page1.jpg",
-            "album-page2.jpg",
+            "account-page1.jpg",
+            "account-page2.jpg",
             "box3_025.jpg",
             "box3_025-back.jpg",
             "box3_025b.jpg",
@@ -1062,7 +1062,7 @@ class TestGroupByChangesFolderGranularity(_FolderRoutingTestCase):
             [
                 (
                     "parts",
-                    (("Page 1", ("album-page1.jpg",)), ("Page 2", ("album-page2.jpg",))),
+                    (("Page 1", ("account-page1.jpg",)), ("Page 2", ("account-page2.jpg",))),
                     False,
                 ),
                 (
@@ -1086,7 +1086,7 @@ class TestGroupByChangesFolderGranularity(_FolderRoutingTestCase):
             [
                 (
                     "parts",
-                    (("Page 1", ("album-page1.jpg",)), ("Page 2", ("album-page2.jpg",))),
+                    (("Page 1", ("account-page1.jpg",)), ("Page 2", ("account-page2.jpg",))),
                     False,
                 ),
                 ("photo", "box3_025.jpg", "box3_025-back.jpg", False),
@@ -1106,8 +1106,8 @@ class TestGroupByChangesFolderGranularity(_FolderRoutingTestCase):
         self.assertEqual(
             _sent(run.calls),
             [
-                ("parts", (("Page 1", ("album-page1.jpg",)),), False),
-                ("parts", (("Page 2", ("album-page2.jpg",)),), False),
+                ("parts", (("Page 1", ("account-page1.jpg",)),), False),
+                ("parts", (("Page 2", ("account-page2.jpg",)),), False),
                 ("photo", "box3_025-back.jpg", None, False),
                 ("photo", "box3_025.jpg", None, False),
                 ("photo", "box3_025b.jpg", None, False),
@@ -1124,8 +1124,8 @@ class TestGroupByChangesFolderGranularity(_FolderRoutingTestCase):
                 self.assertEqual(
                     self.basenames(run.result["results"]),
                     [
-                        "album-page1.jpg",
-                        "album-page2.jpg",
+                        "account-page1.jpg",
+                        "account-page2.jpg",
                         "box3_025-back.jpg",
                         "box3_025.jpg",
                         "box3_025b.jpg",

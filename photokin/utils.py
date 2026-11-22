@@ -48,6 +48,7 @@ from __future__ import annotations
 # union_keywords,
 # merge_original_sources, dedupe_captions_with_source, extract_usage.
 import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -87,6 +88,18 @@ GROUP_BY_PAIR = "pair"
 GROUP_BY_NONE = "none"
 #: Coarsest first, which is also the order ``--help`` lists them in.
 GROUP_BY_VALUES: tuple[str, ...] = (GROUP_BY_OBJECT, GROUP_BY_PAIR, GROUP_BY_NONE)
+
+# How a set of ``-pageN`` files groups: ``document`` keeps the pages one object
+# (a letter, a memoir), ``album`` makes each page its own object, and ``auto``
+# decides per set from the name and the pages' keywords.
+PAGE_GROUPING_AUTO = "auto"
+PAGE_GROUPING_DOCUMENT = "document"
+PAGE_GROUPING_ALBUM = "album"
+PAGE_GROUPING_VALUES: tuple[str, ...] = (
+    PAGE_GROUPING_AUTO,
+    PAGE_GROUPING_DOCUMENT,
+    PAGE_GROUPING_ALBUM,
+)
 
 # The ``--sidecar-md`` mode axis. Named by format rather than by feature
 # (docs/document-mode-contract.md section 7): ``--sidecar-xmp`` and
@@ -191,6 +204,7 @@ class Config:
     fail_on_forbidden: bool = False
     max_edge: int | None = 1024
     group_by: str = GROUP_BY_OBJECT
+    page_grouping: str = PAGE_GROUPING_AUTO
     # Document mode (docs/document-mode-contract.md sections 7-8). "off" keeps
     # every existing run byte-for-byte; "all"/"auto" are wired in core.py's
     # per-file emit loop, gated on SIDECAR_AUTO_CATEGORIES in "auto".
@@ -198,6 +212,11 @@ class Config:
     # Payload-size trigger for Phase 3 chunking, not document-specific: any
     # oversized group of parts chunks the same way. 0 disables chunking.
     max_images_per_call: int = 8
+    # The most pages one document may hold before a run refuses to start; 0
+    # lifts the cap. A runaway set (an album named like a document) would
+    # otherwise go to the model as one object. Album pages are split off
+    # first, so only a document's pages count.
+    max_group_pages: int = 50
     # The two date gates are deliberately ordered: filling a date the file does
     # not have is cheap, because nothing is lost if the guess is poor and the
     # field was empty either way, while overwriting a date the file already
@@ -790,19 +809,42 @@ def insert_keyword_into_vocab_file(
     return True
 
 
-def safe_backup(path: str) -> None:
-    """Write a one-time ``<path>.bak`` copy before a file is mutated.
+def backup_path_for(path: str) -> Path:
+    """Return where :func:`safe_backup` keeps the backup of *path*.
 
-    Best-effort and idempotent: it never overwrites an existing ``.bak`` (so the
-    first backup wins) and only warns on failure rather than raising, so backup
-    trouble never blocks the primary operation.
+    Backups live under ``~/.photokin/backups`` rather than beside the file, so
+    backing up the default vocab never writes into the installed package. The
+    name carries a short hash of the absolute path, so two files that share a
+    basename never share a backup.
+
+    Args:
+        path: The file to be backed up.
+
+    Returns:
+        The backup's path; its directory may not exist yet.
     """
-    backup_path = path + ".bak"
+    absolute = os.path.abspath(path)
+    digest = hashlib.sha1(absolute.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    return Path.home() / ".photokin" / "backups" / f"{os.path.basename(absolute)}.{digest}.bak"
+
+
+def safe_backup(path: str) -> None:
+    """Write a one-time backup of *path* before it is mutated.
+
+    Best-effort and idempotent: it never overwrites an existing backup (so the
+    first backup wins) and only warns on failure rather than raising, so backup
+    trouble never blocks the primary operation. See :func:`backup_path_for`
+    for where the copy goes.
+
+    Args:
+        path: The file about to be changed.
+    """
+    backup_path = backup_path_for(path)
     try:
-        if not os.path.exists(backup_path):
-            with open(path, "rb") as src, open(backup_path, "wb") as dst:
-                dst.write(src.read())
-    except Exception as e:
+        if not backup_path.exists():
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, backup_path)
+    except OSError as e:
         logger.warning("Could not create backup for %s: %s", path, e)
 
 
@@ -1541,7 +1583,10 @@ class ParsedName:
     ``page_num`` is the page index for multipage docs; ``is_crop`` flags derived
     crop files; ``attachment`` is the role of an attached object or a
     black-and-white copy (``"cover"``, ``"envelope-back"``, ``"note-2"``,
-    ``"bw"``) when ``part_kind`` is ``"attached"``. The
+    ``"bw"``) when ``part_kind`` is ``"attached"``; ``variant_suffix`` is the
+    variant letter exactly as the name spelled it (``"-b"``, ``"_b"`` or a
+    digit-adjacent ``"b"``), empty when there is none; ``page_suffix`` is
+    the page tag as the name spelled it (``"-page-001"``, ``"_page3"``). The
     manifest bucket loop -- which every input mode now routes through -- keys off
     these fields.
     """
@@ -1552,6 +1597,8 @@ class ParsedName:
     page_num: int | None
     is_crop: bool = False
     attachment: str | None = None
+    variant_suffix: str = ""
+    page_suffix: str = ""
 
 
 #: One canonical ordering over :attr:`ParsedName.part_kind`, from "this is the
@@ -1606,12 +1653,39 @@ def attached_role_label(role: str) -> str:
 UNRANKED_PART = PART_RANK["none"]
 
 
+#: A trailing variant letter: ``-b``, or ``b``/``_b`` directly after a digit.
+#: ``suffix`` is the letter with its separator, as the name spelled it.
+_VARIANT_SUFFIX_RE = re.compile(
+    r"^.+?(?P<suffix>-[a-z]|(?<=\d)_?[a-z])?$", flags=re.IGNORECASE
+)
+
+
+def first_missing_variant(letter: str, present: set[str]) -> str | None:
+    """Return the first letter before *letter* that *present* lacks, if any.
+
+    A variant letter counts only in order: ``c`` is a variant only when the
+    group also has a ``b``, and so on; ``a`` is never required, since the
+    unlettered scan usually plays that part. The one rule both grouping and
+    the rename planner apply.
+
+    Args:
+        letter: The variant letter being judged, lowercase.
+        present: Every variant letter the group holds.
+
+    Returns:
+        The first missing letter, or ``None`` when *letter* is in order.
+    """
+    return next((chr(c) for c in range(ord("b"), ord(letter)) if chr(c) not in present), None)
+
+
 def parse_media_filename(path: str) -> ParsedName:
     """
     Parse media filenames that may include variant letters and part suffixes.
 
     Rules:
-    1) Strip extension.
+    1) Strip extension, then normalize a ``_``, ``.`` or space in front of a
+       crop or part word to ``-`` (:func:`canonicalize_stem`), so
+       ``017_back`` reads the same as ``017-back``.
     2) Strip -crop suffix first; it stacks on top of any other tag.
     3) Detect part suffix in priority order: -negative, -back / -front,
        -pageN / -page-N.
@@ -1619,12 +1693,19 @@ def parse_media_filename(path: str) -> ParsedName:
        (:data:`ATTACHED_OBJECT_RE`), the file is that object, and a -back
        stripped in step 3 is the object's own back: ``-envelope-back`` is the
        role ``envelope-back``, never the photo's back.
-    5) After removing the part suffix, detect a trailing single-letter variant ID.
+    5) After removing the part suffix, detect a trailing single-letter variant ID:
+       ``-b``, ``b`` directly after a digit, or ``_b`` directly after a digit.
        Variant letters appear before part suffixes (e.g., ...025b-back-crop).
+       Whether a letter really is a variant depends on its siblings, so the
+       grouping step may still read it back as part of the base id.
     6) The remaining stem is the base_id.
     """
-    stem = os.path.splitext(os.path.basename(path))[0]
+    name_stem = os.path.splitext(os.path.basename(path))[0]
+    # canonicalize_stem swaps one separator character for another, so an index
+    # into its result is an index into the name as written.
+    stem, _ = canonicalize_stem(name_stem)
     part_kind = "none"
+    page_suffix = ""
     page_num: int | None = None
     is_crop = False
     attachment: str | None = None
@@ -1651,6 +1732,7 @@ def parse_media_filename(path: str) -> ParsedName:
         m_page = PAGE_SUFFIX_RE.match(stem)
         if m_page:
             part_kind = "page"
+            page_suffix = name_stem[len(m_page.group(1)) : len(stem)]
             stem = m_page.group(1)
             page_num = int(m_page.group(2))
 
@@ -1666,16 +1748,11 @@ def parse_media_filename(path: str) -> ParsedName:
     # untagged file should be treated as Page 1 only when the group contains
     # other explicit -pageN files.
 
-    m_var = re.match(
-        r"^(?P<stem>.+?)(?:-(?P<variant>[a-z])|(?<=\d)(?P<variant2>[a-z]))?$",
-        stem,
-        flags=re.IGNORECASE,
-    )
-    if m_var:
-        stem = m_var.group("stem")
-        var = (m_var.group("variant") or m_var.group("variant2") or "").lower() or None
-    else:
-        var = None
+    m_var = _VARIANT_SUFFIX_RE.match(stem)
+    variant_suffix = (m_var.group("suffix") if m_var else None) or ""
+    if variant_suffix:
+        stem = stem[: -len(variant_suffix)]
+    var = variant_suffix[-1:].lower() or None
 
     return ParsedName(
         base_id=stem,
@@ -1684,6 +1761,8 @@ def parse_media_filename(path: str) -> ParsedName:
         page_num=page_num,
         is_crop=is_crop,
         attachment=attachment,
+        variant_suffix=variant_suffix,
+        page_suffix=page_suffix,
     )
 
 
@@ -1699,10 +1778,8 @@ def canonicalize_stem(stem: str) -> tuple[str, list[str]]:
     accepting those three separators. A separator that is already ``-`` is
     left alone, so an already-canonical stem comes back with no note.
 
-    This function does not touch the trailing variant letter. The grammar
-    reads only a dashed variant (``-b``) or a digit-adjacent one (``5b``,
-    see :func:`parse_media_filename`'s ``m_var``); a bare ``_b`` or ``.b`` is
-    not part of the grammar, and widening it is out of scope, so both regexes
+    This function does not touch the trailing variant letter, which
+    :data:`_VARIANT_SUFFIX_RE` reads in all of its spellings; both regexes
     below require the full word (``back``, not ``b``) and never match one.
 
     Args:

@@ -217,8 +217,8 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
             ``(label, [basenames])`` parts on the group one.
         """
         self._make_images(
-            "album-page1.jpg",
-            "album-page2.jpg",
+            "account-page1.jpg",
+            "account-page2.jpg",
             "neg-negative.jpg",
             "box3_025.jpg",
         )
@@ -248,7 +248,7 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
         # negative used to have no entry at all.
         self.assertEqual(
             self._basenames(result["results"]),
-            ["album-page1.jpg", "album-page2.jpg", "box3_025.jpg", "neg-negative.jpg"],
+            ["account-page1.jpg", "account-page2.jpg", "box3_025.jpg", "neg-negative.jpg"],
         )
         self.assertEqual(result["errors"], {})
 
@@ -265,7 +265,7 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
             [
                 "'box3_025.jpg'",
                 "[('Negative', ['neg-negative.jpg'])]",
-                "[('Page 1', ['album-page1.jpg']), ('Page 2', ['album-page2.jpg'])]",
+                "[('Page 1', ['account-page1.jpg']), ('Page 2', ['account-page2.jpg'])]",
             ],
         )
 
@@ -280,7 +280,7 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
         # showing it to the model. Retiring the primary is what puts the whole
         # document in the call, and it is the largest quality change of Phase C.
         self.assertIn(
-            [("Page 1", ["album-page1.jpg"]), ("Page 2", ["album-page2.jpg"])], sent
+            [("Page 1", ["account-page1.jpg"]), ("Page 2", ["account-page2.jpg"])], sent
         )
         self.assertIn([("Negative", ["neg-negative.jpg"])], sent)
         # The lone ordinary photo is still one image on ``analyze_photo``: one
@@ -304,7 +304,7 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
 
     def test_a_group_holding_pages_and_a_negative_places_every_file_it_can(self) -> None:
         self._make_images(
-            "album.jpg", "album-page1.jpg", "album-page2.jpg", "album-negative.jpg"
+            "account.jpg", "account-page1.jpg", "account-page2.jpg", "account-negative.jpg"
         )
 
         # A group holding pages and a negative is a group payload at every value
@@ -319,20 +319,20 @@ class TestFolderModeGroupCoverage(_FolderModeTestCase):
 
         self.assertEqual(
             self._basenames(result["results"]),
-            ["album-negative.jpg", "album-page1.jpg", "album-page2.jpg", "album.jpg"],
+            ["account-negative.jpg", "account-page1.jpg", "account-page2.jpg", "account.jpg"],
         )
         # The pages and the negative are analyzed and recorded. Only the
-        # untagged album.jpg loses out, because page 1 is the front side of this
-        # variant and album-page1.jpg holds it -- and it is named for that
+        # untagged account.jpg loses out, because page 1 is the front side of this
+        # variant and account-page1.jpg holds it -- and it is named for that
         # reason rather than reported as "not analyzed".
         warnings = _group_warnings(captured.records)
         self.assertEqual(len(warnings), 1, warnings)
-        self.assertIn("'album'", warnings[0])
-        self.assertIn("album.jpg", warnings[0])
-        self.assertIn("album-page1.jpg", warnings[0])
+        self.assertIn("'account'", warnings[0])
+        self.assertIn("account.jpg", warnings[0])
+        self.assertIn("account-page1.jpg", warnings[0])
         self.assertIn("both claim the front side", warnings[0])
 
-        album = os.path.join(self.folder, "album.jpg")
+        album = os.path.join(self.folder, "account.jpg")
         self.assertEqual(
             result["results"][album]["all_variant_files"]["displaced"], {":none": [album]}
         )
@@ -730,7 +730,7 @@ class TestFolderModeStdoutPurity(_FolderModeTestCase):
         Returns:
             ``(result, log records, stdout text, stderr text)``.
         """
-        self._make_images("box3_025.jpg", "album-page1.jpg", "album-page2.jpg")
+        self._make_images("box3_025.jpg", "account-page1.jpg", "account-page2.jpg")
         stdout, stderr = io.StringIO(), io.StringIO()
 
         with (
@@ -751,7 +751,7 @@ class TestFolderModeStdoutPurity(_FolderModeTestCase):
 
         self.assertEqual(
             self._basenames(result["results"]),
-            ["album-page1.jpg", "album-page2.jpg", "box3_025.jpg"],
+            ["account-page1.jpg", "account-page2.jpg", "box3_025.jpg"],
         )
         self.assertEqual(
             stdout,

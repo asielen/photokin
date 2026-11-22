@@ -1507,8 +1507,8 @@ class TestGroupingSurvivesEveryItemCarryingMetadata(_ReadFlagTestCase):
     def _folder(self) -> tuple[str, _ExifToolStub]:
         """Return a folder spanning pages, a variant pair and a back, all tagged."""
         names = (
-            "album-page1.jpg",
-            "album-page2.jpg",
+            "account-page1.jpg",
+            "account-page2.jpg",
             "box3_025-back.jpg",
             "box3_025.jpg",
             "box3_025b.jpg",

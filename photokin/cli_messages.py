@@ -501,6 +501,31 @@ def sidecar_bundle_contradiction(value: str) -> UsageMessage:
     )
 
 
+def group_has_too_many_pages(group: str, pages: int, limit: int, others: int) -> UsageMessage:
+    """A document holds more pages than one run will send as one object.
+
+    Refused before any model call: a set named like a document that is really
+    an album would otherwise put every page's answer on every page.
+
+    Args:
+        group: The largest offending group's key.
+        pages: How many pages it holds.
+        limit: The cap in force.
+        others: How many further groups are also over the cap.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    more = f"; {others} more are too" if others else ""
+    return (
+        f"`{group}` has {pages} pages, over the {limit}-page cap{more}.",
+        (
+            "if it is one document, add --max-group-pages 0; if each page is its own "
+            "photo, add --page-grouping album"
+        ),
+    )
+
+
 def write_needs_changeset() -> UsageMessage:
     """Writing was asked for with no changeset to write from.
 
@@ -997,6 +1022,9 @@ class RunPlan:
         provider: The provider's display name.
         model: The concrete model string the adapter will send.
         dry_run: Whether the run stops after printing this.
+        albums: One line per set of pages read as an album, from
+            ``core.album_plan_lines``; the row is left out when empty, so a
+            wrong guess shows before any model call.
         suggested_command: The ``-rw`` run to advise, from
             :func:`normal_run_command`, or None to print no advice. Held as the
             command rather than as the finished sentence so the wording around it
@@ -1017,6 +1045,7 @@ class RunPlan:
     dry_run: bool
     sidecars: str = "none (--sidecar-md off)"
     suggested_command: str | None = None
+    albums: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         """Return every field as a plain JSON-serializable dict.
@@ -1061,6 +1090,8 @@ class RunPlan:
             ("provider", self.provider),
             ("model", self.model),
         ]
+        if self.albums:
+            rows.append(("albums", "\n".join(self.albums)))
         if self.dry_run:
             rows.append(("--dry-run", "stopping here; no model call, and nothing written."))
         if self.suggested_command:

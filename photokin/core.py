@@ -46,6 +46,10 @@ Code map (public-facing entry points marked PUBLIC):
 - _manifest_group_override      resolve an item's explicit bucket key
 - _resolve_manifest_entry       build one grouping entry, filename plus overrides
 - _item_part_marker             the per-file part keyword an entry earns, if any
+- _fold_out_of_order_variants   read a letter back into the name when earlier letters are missing
+- _album_reason / _split_album_pages  make each page of an album its own object
+- album_plan_lines              PUBLIC: the plan's description of the sets read as albums
+- oversized_page_sets           PUBLIC: the documents over the --max-group-pages cap
 - _escape_pair_half             make one half of a pair key free of bare separators
 - _pair_bucket_key              the escaped group-key/variant join '--group-by pair' uses
 - build_manifest_buckets        PUBLIC: group items the way the stream will
@@ -1273,7 +1277,8 @@ def analyze_photo(
         except Exception as e:
             msg = (
                 "Vocabulary update failed TOML validation. "
-                f"Review {config.vocab_path} and restore {config.vocab_path}.bak if needed."
+                f"Review {config.vocab_path}; its earlier copy is "
+                f"{utils.backup_path_for(config.vocab_path)}."
             )
             logger.error("%s (%s)", msg, e)
             raise RuntimeError(msg) from e
@@ -2599,6 +2604,18 @@ _PAIR_KEY_ESCAPE = "\\"
 _MANIFEST_TRUE = frozenset({"true", "1", "yes"})
 _MANIFEST_FALSE = frozenset({"false", "0", "no"})
 
+# A grouping entry's variant letter as the filename spelled it, set only when
+# the filename alone decided both the letter and the group. Read and removed by
+# _fold_out_of_order_variants before an entry leaves build_manifest_buckets.
+_NAME_VARIANT_SUFFIX_KEY = "_name_variant_suffix"
+# The same for a page tag: set only on a page whose group the filename decided,
+# read and removed by _split_album_pages.
+_NAME_PAGE_SUFFIX_KEY = "_name_page_suffix"
+
+# A whole word, with '_' counted as a separator: 'photo_album' matches,
+# 'albumen' does not.
+_ALBUM_WORD_RE = re.compile(r"(?<![a-z0-9])albums?(?![a-z0-9])", re.IGNORECASE)
+
 # Only a separator or a digit may precede the token, so 'feedback.jpg' is never
 # read as the back of 'feed'.
 _EXPLICIT_BACK_SUFFIX_RE = re.compile(r"(?:[-_. ]|(?<=\d))back$", re.IGNORECASE)
@@ -2735,7 +2752,8 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
             _log_manifest_override(path, "is_crop", raw.get("is_crop"), "is_crop", is_crop)
         is_crop = explicit_crop
 
-    if raw.get("version") is not None:
+    explicit_version_given = raw.get("version") is not None
+    if explicit_version_given:
         explicit_version = str(raw["version"]).strip().lower() or None
         if explicit_version != version and log_overrides:
             _log_manifest_override(path, "version", raw.get("version"), "version", version)
@@ -2759,6 +2777,8 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
                 group_key = repaired
     elif group_key != parsed.base_id and log_overrides:
         _log_manifest_override(path, "group", group_key, "group", parsed.base_id)
+    name_decides_group = _manifest_group_override(raw, path, log=False) is None
+    name_decides_variant = name_decides_group and not explicit_version_given
 
     return {
         "path": path,
@@ -2769,6 +2789,10 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
         "attachment": parsed.attachment if part_kind == "attached" else None,
         "is_crop": is_crop,
         "group_key": group_key,
+        _NAME_VARIANT_SUFFIX_KEY: parsed.variant_suffix if name_decides_variant else "",
+        _NAME_PAGE_SUFFIX_KEY: (
+            parsed.page_suffix if name_decides_group and part_kind == "page" else ""
+        ),
         "preferred": bool(raw.get("preferred")),
         "metadata": raw.get("metadata"),
         "metadata_path": raw.get("metadata_path"),
@@ -2901,6 +2925,157 @@ def _file_write_instructions(
     return _WriteDecision(patch, False, before_snapshot, proposed)
 
 
+def _fold_out_of_order_variants(entries: list[dict], *, log: bool) -> None:
+    """Read a variant letter back into the name when the letters before it are missing.
+
+    A letter is a variant only when every letter from ``b`` up to it is also
+    among the group's variants; ``a`` is never required, since the unlettered
+    scan usually plays that part. So ``013``, ``013_b`` and ``013_c`` are three
+    scans of one object, while a lone ``013_z`` is an object of its own named
+    ``013_z``. Only a letter the filename decided is folded: an explicit
+    manifest ``version`` or ``group`` stands, though its letter still counts as
+    present for the others. Missing a letter makes every later letter invalid
+    too, so one pass over the original letters is exact.
+
+    Args:
+        entries: Resolved grouping entries; updated in place, and each loses
+            its ``_NAME_VARIANT_SUFFIX_KEY``.
+        log: Whether to report each letter read back into the name.
+    """
+    letters: dict[str, set[str]] = {}
+    for entry in entries:
+        if entry["version"]:
+            letters.setdefault(entry["group_key"], set()).add(entry["version"])
+    for entry in entries:
+        suffix = entry.pop(_NAME_VARIANT_SUFFIX_KEY)
+        if not suffix:
+            continue
+        present = letters[entry["group_key"]]
+        letter = entry["version"]
+        missing = utils.first_missing_variant(letter, present)
+        if missing is None:
+            continue
+        folded = entry["group_key"] + suffix
+        if log:
+            logger.warning(
+                "%s: no '%s' scan of %s, so '%s' is part of the name: object %s.",
+                os.path.basename(entry["path"]),
+                missing,
+                entry["group_key"],
+                letter,
+                folded,
+            )
+        entry["group_key"], entry["version"] = folded, None
+
+
+def _album_reason(set_key: str, members: list[dict]) -> str | None:
+    """Say why a set of pages reads as an album, or return ``None`` for a document.
+
+    Args:
+        set_key: The set's group key, the name before ``-pageN``.
+        members: Every grouping entry in the set.
+
+    Returns:
+        A short reason for the plan, or ``None`` when nothing marks an album.
+    """
+    if _ALBUM_WORD_RE.search(set_key):
+        return "the name says album"
+    for entry in members:
+        for keyword in _own_keywords(utils.load_item_metadata(entry) or {}):
+            if isinstance(keyword, str) and keyword.rsplit("|", 1)[-1].strip().lower() == "album":
+                return f"{os.path.basename(entry['path'])} has the keyword album"
+    return None
+
+
+def _split_album_pages(entries: list[dict], page_grouping: str, *, log: bool) -> None:
+    """Make each page of an album its own object.
+
+    A set of ``-pageN`` files is one document unless it reads as an album
+    (:func:`_album_reason`, or ``page_grouping`` forces it). An album page
+    takes its own name as its group key, the key its ``-back`` and crop scans
+    already carry, so they stay with it. A page whose group a manifest set
+    explicitly is never split.
+
+    Args:
+        entries: Resolved grouping entries; updated in place, and each loses
+            its ``_NAME_PAGE_SUFFIX_KEY``. A split page gains ``album``, the
+            set key and the reason, which :func:`album_plan_lines` reports.
+        page_grouping: One of :data:`utils.PAGE_GROUPING_VALUES`.
+        log: Whether to report each set read as an album.
+    """
+    sets: dict[str, list[dict]] = {}
+    for entry in entries:
+        sets.setdefault(entry["group_key"], []).append(entry)
+    for set_key, members in sets.items():
+        pages = [entry for entry in members if entry[_NAME_PAGE_SUFFIX_KEY]]
+        if not pages or page_grouping == utils.PAGE_GROUPING_DOCUMENT:
+            continue
+        reason = (
+            "--page-grouping album"
+            if page_grouping == utils.PAGE_GROUPING_ALBUM
+            else _album_reason(set_key, members)
+        )
+        if reason is None:
+            continue
+        if log:
+            logger.info(
+                "%s: %d page(s) read as album pages, one object each (%s).",
+                set_key,
+                len({entry["page_num"] for entry in pages}),
+                reason,
+            )
+        for entry in pages:
+            entry["group_key"] = set_key + entry[_NAME_PAGE_SUFFIX_KEY]
+            entry["part_kind"], entry["page_num"] = "none", None
+            entry["album"] = {"set": set_key, "reason": reason}
+    for entry in entries:
+        del entry[_NAME_PAGE_SUFFIX_KEY]
+
+
+def album_plan_lines(buckets: dict[str, list[dict]]) -> list[str]:
+    """Describe, one line per set, the page sets this grouping read as albums.
+
+    Args:
+        buckets: A :func:`build_manifest_buckets` result.
+
+    Returns:
+        Lines such as ``"photo-album: 46 page(s), one object each (the name
+        says album)"``, in first-seen order; empty when no set is an album.
+    """
+    pages: dict[tuple[str, str], set[str]] = {}
+    for entries in buckets.values():
+        for entry in entries:
+            album = entry.get("album")
+            if album:
+                pages.setdefault((album["set"], album["reason"]), set()).add(entry["group_key"])
+    return [
+        f"{set_key}: {len(keys)} page(s), one object each ({reason})"
+        for (set_key, reason), keys in pages.items()
+    ]
+
+
+def oversized_page_sets(buckets: dict[str, list[dict]], limit: int) -> list[tuple[str, int]]:
+    """Return the groups holding more than *limit* pages, largest first.
+
+    Args:
+        buckets: A :func:`build_manifest_buckets` result.
+        limit: The page cap; ``0`` or less means no cap.
+
+    Returns:
+        ``(group key, page count)`` pairs, most pages first; empty when every
+        group fits.
+    """
+    if limit <= 0:
+        return []
+    counts = (
+        (key, len({entry["page_num"] for entry in entries if entry["part_kind"] == "page"}))
+        for key, entries in buckets.items()
+    )
+    return sorted(
+        ((key, pages) for key, pages in counts if pages > limit), key=lambda pair: -pair[1]
+    )
+
+
 def _escape_pair_half(half: str) -> str:
     """Escape one half of a ``pair`` bucket key so its separators are inert.
 
@@ -2961,6 +3136,7 @@ def build_manifest_buckets(
     items: List[dict],
     *,
     group_by: str = utils.GROUP_BY_OBJECT,
+    page_grouping: str = utils.PAGE_GROUPING_AUTO,
     log_overrides: bool = True,
 ) -> Dict[str, List[dict]]:
     """Bucket manifest items by resolved group key, dropping items with no usable path.
@@ -2982,6 +3158,9 @@ def build_manifest_buckets(
         group_by: One of :data:`utils.GROUP_BY_VALUES`. ``object`` keys on the
             resolved group key, ``pair`` on the group key plus the variant
             letter, and ``none`` on the file itself.
+        page_grouping: One of :data:`utils.PAGE_GROUPING_VALUES`; whether a
+            set of ``-pageN`` files is one document or an album of pages
+            (see :func:`_split_album_pages`).
         log_overrides: Whether resolving the entries reports the overrides they
             apply. The CLI's plan summary buckets the same items a second time
             purely for a count and passes ``False``, so no diagnostic is
@@ -2998,11 +3177,18 @@ def build_manifest_buckets(
     """
     if group_by not in _GROUP_BY_VALUES:
         raise ValueError(f"Unknown group_by value: {group_by!r}")
+    entries = [
+        entry
+        for entry in (_resolve_manifest_entry(raw, log_overrides=log_overrides) for raw in items)
+        if entry is not None
+    ]
+    # Letters first: an album named for a decade ("smith-album-1940s") reads
+    # its "s" as a variant until the fold returns it to the name, and the
+    # split must build page keys from the name the page's back also carries.
+    _fold_out_of_order_variants(entries, log=log_overrides)
+    _split_album_pages(entries, page_grouping, log=log_overrides)
     buckets: Dict[str, List[dict]] = {}
-    for raw in items:
-        entry = _resolve_manifest_entry(raw, log_overrides=log_overrides)
-        if entry is None:
-            continue
+    for entry in entries:
         if group_by == utils.GROUP_BY_OBJECT:
             key = entry["group_key"]
         elif group_by == utils.GROUP_BY_PAIR:
@@ -3248,7 +3434,10 @@ def process_manifest_stream(
 
     Returns:
         ``{"results": {path: record}, "errors": {path: payload}, "groups_failed":
-        int, "files_unsent": int, "cancelled": bool}``. ``results``/``errors``
+        int, "files_unsent": int, "items_recorded": int, "cancelled": bool}``.
+        ``items_recorded`` counts the ``ok`` records, one per manifest item, so
+        it exceeds ``len(results)`` when items share a path (Lightroom virtual
+        copies of one file). ``results``/``errors``
         are one entry per file and disjoint -- every file of a failed group
         carries that group's error payload, bar one already banked when the
         group raised part-way through its per-file loop, since that record is
@@ -3309,13 +3498,23 @@ def process_manifest_stream(
     # as before.
     title_from_file_ids: set[int] | None = getattr(metadata_hydrator, "title_from_file", None)
     group_by = cfg.group_by
-    buckets = build_manifest_buckets(items, group_by=group_by)
+    buckets = build_manifest_buckets(items, group_by=group_by, page_grouping=cfg.page_grouping)
+    oversized = oversized_page_sets(buckets, cfg.max_group_pages)
+    if oversized:
+        key, pages = oversized[0]
+        raise ValueError(
+            f"Group {key!r} has {pages} pages, over max_group_pages={cfg.max_group_pages}; "
+            "no model call was made."
+        )
 
     results: dict[str, dict] = {}
     errors: dict[str, dict] = {}
     run_id = changeset_run_id or (make_run_id() if changeset_writer else None)
 
+    items_recorded = 0
+
     def _emit(path: str, status: str, payload: dict):
+        nonlocal items_recorded
         if ndjson_writer:
             rec = {"path": path, "status": status}
             rec.update(payload)
@@ -3323,6 +3522,7 @@ def process_manifest_stream(
                 rec["dry_run"] = True
             ndjson_writer(json.dumps(rec, ensure_ascii=False))
         if status == "ok":
+            items_recorded += 1
             results[path] = payload.get("result") or payload
         elif status == "error":
             errors[path] = payload.get("error") or payload
@@ -3355,6 +3555,7 @@ def process_manifest_stream(
                 "errors": errors,
                 "groups_failed": failed_groups,
                 "files_unsent": len(unsent_paths),
+                "items_recorded": items_recorded,
                 "cancelled": True,
             }
         if run_event_writer:
@@ -3903,20 +4104,28 @@ def process_manifest_stream(
                     base.append(kw)
                 return base, pc_only
 
-            keyword_bases: list[list[str]] = []
+            analysis_keyword_bases: list[list[str]] = []
             pc_codes: list[str] = []
             combined_base, _ = _split_keywords_for_merge(combined_meta.get("keywords"))
-            if combined_base:
-                keyword_bases.append(combined_base)
             for rec, _, _ver in analyses:
                 base_kw, pc_kw = _split_keywords_for_merge(rec.get("keywords"))
                 if base_kw:
-                    keyword_bases.append(base_kw)
+                    analysis_keyword_bases.append(base_kw)
                 if pc_kw:
                     pc_codes.extend(pc_kw)
+            model_keywords = utils.union_keywords(*analysis_keyword_bases)
             # Rule 1: union all shared keywords; "back" only applies when we later
-            # emit a back record.
-            shared_keywords = utils.union_keywords(*keyword_bases)
+            # emit a back record. The pages of a document are different files with
+            # their own originals, so a page's keywords, title, date and location
+            # never reach another page; each page gets its own (shared by that
+            # page's own rescans, below) plus the model's.
+            # The scans of one print share everything, which is how a back gets
+            # the title typed on its front.
+            shared_keywords = (
+                model_keywords
+                if multipage_present
+                else utils.union_keywords(combined_base, model_keywords)
+            )
             # A PC* code is a short identifier the model transcribes off the object
             # itself (image_rules.txt:97), so it describes the physical print rather
             # than the one scan that happened to be legible. Every variant in a group
@@ -4457,6 +4666,38 @@ def process_manifest_stream(
             }
             group_meta_signed_off = _group_meta_with_date_markers(combined_meta, signed_off)
             group_meta_unmarked = _group_meta_with_date_markers(combined_meta, set())
+            # In a document each page is its own file, but the scans of one
+            # page (a rescan, a crop) are still one page: they share that
+            # page's fields, and only that page's.
+            # A file's page is the label it was sent under, so an untagged
+            # file that became page 1 shares that slot with a "-page1" rescan,
+            # while one displaced by an explicit page 1 keeps its own. Date
+            # markers follow the print rule within a page.
+            def _page_slot(entry: dict) -> str:
+                return resolve_part_label(
+                    entry,
+                    multipage_present=multipage_present,
+                    relabelled_versions=relabelled_versions_frozen,
+                )
+
+            page_meta: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+            if multipage_present:
+                by_slot: dict[str, list[tuple[dict, dict]]] = {}
+                for entry, entry_meta in zip(group, own_metadata):
+                    by_slot.setdefault(_page_slot(entry), []).append((entry, entry_meta))
+                for slot, members in by_slot.items():
+                    slot_combined = utils.combine_group_metadata([e for e, _ in members])
+                    slot_signed_off = {
+                        kw.strip().lower()
+                        for kws in (_own_keywords(m) for _, m in members)
+                        if utils.has_reviewed_date_keyword(kws)
+                        for kw in kws
+                        if utils.is_date_keyword(kw)
+                    }
+                    page_meta[slot] = (
+                        _group_meta_with_date_markers(slot_combined, slot_signed_off),
+                        _group_meta_with_date_markers(slot_combined, set()),
+                    )
 
             # emit per-file (merged with per-file metadata)
             for it, own_meta, (file_caption, caption_scope) in zip(
@@ -4469,12 +4710,13 @@ def process_manifest_stream(
                 own_markers = utils.part_markers_in(
                     own_meta.get("keywords") or own_meta.get("tags")
                 )
-                per_meta = utils.merge_original_sources(
-                    own_meta,
-                    group_meta_unmarked
-                    if any(map(utils.is_date_marker, _own_keywords(own_meta)))
-                    else group_meta_signed_off,
-                )
+                own_marked = any(map(utils.is_date_marker, _own_keywords(own_meta)))
+                if multipage_present:
+                    slot_signed, slot_unmarked = page_meta[_page_slot(it)]
+                    fallback = slot_unmarked if own_marked else slot_signed
+                else:
+                    fallback = group_meta_unmarked if own_marked else group_meta_signed_off
+                per_meta = utils.merge_original_sources(own_meta, fallback)
 
                 # The one keyword that is a property of this file rather than of
                 # the object.
@@ -4701,5 +4943,6 @@ def process_manifest_stream(
         "errors": errors,
         "groups_failed": failed_groups,
         "files_unsent": len(unsent_paths),
+        "items_recorded": items_recorded,
         "cancelled": False,
     }

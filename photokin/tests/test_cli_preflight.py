@@ -2180,6 +2180,7 @@ class TestRunEnvelope(_CliTestCase):
         self.assertIsNone(code)
         records = _envelope_records(_ndjson_lines(out_path))
         self.assertEqual([r["run"] for r in records], ["start", "plan", "complete"])
+        self.assertEqual(records[-1]["items_recorded"], 0)
         self.assertEqual(records[-1]["files_recorded"], 0)
         self.assertEqual(records[-1]["groups_failed"], 0)
 

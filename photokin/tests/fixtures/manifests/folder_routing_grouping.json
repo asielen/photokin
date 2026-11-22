@@ -1,23 +1,23 @@
 [
   {
-    "group": "album",
+    "group": "account",
     "files": [
       {
-        "file": "album-page1.jpg",
+        "file": "account-page1.jpg",
         "part": "page",
         "page": 1,
         "version": null,
         "crop": false
       },
       {
-        "file": "album-page2-crop.jpg",
+        "file": "account-page2-crop.jpg",
         "part": "page",
         "page": 2,
         "version": null,
         "crop": true
       },
       {
-        "file": "album-page2.jpg",
+        "file": "account-page2.jpg",
         "part": "page",
         "page": 2,
         "version": null,

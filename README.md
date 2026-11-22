@@ -294,7 +294,8 @@ Point photokin at a folder and it works through every image in it (non-recursive
 
 Multipage documents are the one exception:
 
-* A group of page-numbered files (`letter-page1.jpg`, `letter-page2.jpg`, ...) is still analyzed together, but each page's caption gets only that page's own transcription — it doesn't make sense to write a 63-page story into the metadata of all 63 files. This is not configurable; the closest lever is `--group-by none`, which analyzes every file alone.
+* A group of page-numbered files (`letter-page1.jpg`, `letter-page2.jpg`, ...) is still analyzed together, but each page's caption gets only that page's own transcription — it doesn't make sense to write a 63-page story into the metadata of all 63 files. A page's own title, date, location and keywords stay on that page too; the other pages get the model's answer, not page 33's date. This is not configurable; the closest lever is `--group-by none`, which analyzes every file alone.
+* A photo album is not a document. When the name before `-pageN` holds the word `album` (`church-photo-album-page-001.tif`), or any page has the keyword `album`, each page is its own object, and its `-back` and crops stay with it. The plan lists every set it read this way and why, so check it before a long run; a keyword only `-r` can read is reported in the run's log instead, since the plan comes before the read. `--page-grouping document` or `--page-grouping album` decides for every set instead, and a manifest `group` always wins.
 * To get a full, readable transcript, add `-s` (short for `--sidecar-md auto`), which writes a Markdown transcript file beside each page when the model categorizes the object as a `Document` or `Postcard` — see [A readable transcript beside each scan](#a-readable-transcript-beside-each-scan). It combines with the other short flags, so the archival run with transcripts is `-rws`.
 
 **A run without `-w` still calls the model but writes nothing back.** `photokin C:\Scans` analyzes, prints the JSON to your terminal and touches nothing. Its plan summary ends with one extra row naming the next step:
@@ -322,15 +323,15 @@ Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-
 | Example | Meaning |
 |---|---|
 | `box3_025.jpg` | the photo itself (the print's front, no variant letter) |
-| `box3_025-b.jpg` or `box3_025b.jpg` | another scan of the same object (variant letter, with or without dash after a digit) |
-| `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
+| `box3_025-b.jpg`, `box3_025b.jpg` or `box3_025_b.jpg` | another scan of the same object (variant letter; without a dash it must follow a digit) |
+| `box3_025-back.jpg` or `box3_025_back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
 | `box3_025-bw.jpg`, `box3_025-bw-back.jpg` | a black-and-white copy of the same photo, and that copy's back |
-| `album-page1.jpg`, `album-page-2.jpg` | ordered pages of one document |
+| `letter-page1.jpg`, `letter-page-2.jpg` | ordered pages of one document; an album's pages are each their own object (see [Folders and batches](#folders-and-batches)) |
 | `box3_025-cover.jpg`, `box3_025-envelope-back.jpg` | something attached to the photo, scanned on its own: `-cover`, `-folder`, `-mount`, `-envelope`, `-sleeve`, `-note` or `-note-N`, optionally followed by `-back` for that object's own back. Only these words group; any other trailing word stays part of the name, so `smith-farm-01400.jpg` is photo `smith-farm-01400` |
 | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but not analyzed as its own object while its parent is present — a crop with no parent fills the missing slot, and `--group-by none` analyzes every crop alone |
 | `box3_025.tif` beside `box3_025.jpg` | the same scan in two formats — one object, not two photos |
 
-The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other numbered pages. Attached objects are analyzed in the same call as the photo, so a studio imprint on a cover counts as evidence for the portrait's date and place. The front or plain scan always stays the group's primary file.
+An `_`, `.` or space works in place of the `-` in front of a part or `crop` word. Variant letters count only in order: `c` is a variant only when the group also has a `b` scan, and so on up the alphabet (`a` is never required). A lone `box3_025_z.jpg` is its own photo, `box3_025_z`, and the run says so. The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other numbered pages. Attached objects are analyzed in the same call as the photo, so a studio imprint on a cover counts as evidence for the portrait's date and place. The front or plain scan always stays the group's primary file.
 
 Every file also gets at most one keyword naming its part — `back` on a reverse side, `negative` on a negative, nothing on a front — so you can always tell which file is which afterwards. A `back` or `Negative` keyword you applied yourself is left exactly where it is.
 
@@ -493,6 +494,8 @@ python -m photokin.exiftool --changeset results_changeset.ndjson --enabled      
 
 The standalone applier also takes `--fields` to narrow which tags may be written, `--write-sidecar-only` to write `.xmp` sidecars instead of touching the originals, `--no-overwrite-original` to keep ExifTool's `_original` backup files, and `--output summary.json` for a machine-readable result. Date tags (`EXIF:DateTimeOriginal`, `EXIF:CreateDate`) are normalized to EXIF's `YYYY:MM:DD HH:MM:SS` format on the way in; unparseable dates become warnings, not writes.
 
+Just before it writes, the applier reads every tag the write will touch, in one ExifTool call for the whole batch, and saves those values back into the changeset as `original_data.written_tags`, with `null` for a tag the file didn't have. That is the record a revert restores from. A dry run and `--write-sidecar-only` leave the changeset as it was.
+
 ### Manifest mode
 
 A manifest is a JSON file listing exactly what to process — an `items` array where each entry needs only a `path`. It is mainly how another program drives photokin (the Lightroom plug-in works this way; see [Integrating photokin as a subprocess](#integrating-photokin-as-a-subprocess)), and it also makes a big job repeatable and editable. `--generate-manifest` turns a folder into exactly that file:
@@ -503,7 +506,7 @@ photokin ./scans/ --generate-manifest scans-manifest.json
 
 It writes the manifest the folder run would have used — same files, same order — and exits without calling the model, so it costs nothing and doubles as a way to check the grouping before committing to a batch. Edit it (add `is_back`, `group`, existing `metadata`) and feed it straight back: `photokin scans-manifest.json`.
 
-The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. Note the underscore in `box3_017_back.jpg`: the filename grammar reads only the hyphenated `-back`, so it is the `is_back` flag that folds the two files into one group and one model call rather than two unrelated photos.
+The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. The filename grammar already reads `_back` as a back, so here `is_back` only confirms it; the flag earns its place on a name the grammar can't read.
 
 batch.json:
 ```json
@@ -524,7 +527,7 @@ Flags are optional when the filename already says the same thing; they exist so 
 
 | Key | Effect |
 |---|---|
-| `is_back` | `true` marks the reverse side, `false` marks the front. `true` also repairs the group key by stripping a trailing `back` token, which is what puts `box3_017_back.jpg` in the same group as `box3_017.jpg`. |
+| `is_back` | `true` marks the reverse side, `false` marks the front. `true` also repairs the group key by stripping a trailing `back` token, so `box3_017back.jpg` lands in the same group as `box3_017.jpg`. |
 | `is_crop` | `true` marks a cropped derivative, so the file is recorded with its group but not analyzed; `false` unmarks a file whose name ends in `-crop`. |
 | `version` | The variant id, replacing any letter read off the filename. Any string, not just one letter; empty means no variant. |
 | `group` | The group key outright, for names the grammar cannot parse at all. `base_id` is accepted as an alias and loses to `group` when both are given. |
@@ -534,7 +537,7 @@ Flags are optional when the filename already says the same thing; they exist so 
 
 `preferred` is the exception and does not read that grammar: it is plain truthiness, so any non-empty string sets it and `"preferred": "false"` means **true**. Write it as a JSON `true`, or leave the key out entirely. It also nominates the file the group's analysis is filed under.
 
-`preferred` chooses between candidates for a slot; it cannot create one. A crop always yields to its listed parent, and a file with no part left to claim (a plain `album.jpg` beside an explicit `album-page1.jpg`) cannot be promoted into one. Both cases log a warning naming the file and are listed in the result record under `all_variant_files.crops` / `all_variant_files.displaced`, so nothing disappears quietly.
+`preferred` chooses between candidates for a slot; it cannot create one. A crop always yields to its listed parent, and a file with no part left to claim (a plain `letter.jpg` beside an explicit `letter-page1.jpg`) cannot be promoted into one. Both cases log a warning naming the file and are listed in the result record under `all_variant_files.crops` / `all_variant_files.displaced`, so nothing disappears quietly.
 
 **Replaying a manifest.** A manifest run with `-r` also records what ExifTool read into the output document, so replaying that manifest later (`photokin scans-manifest.json`) needs no ExifTool at all. Replay *with* `-r` to reproduce the original result exactly.
 
@@ -585,7 +588,7 @@ A sidecar is derived output, the same as the JSON one `--output-sidecars` writes
 
 One model call ordinarily carries a whole group, however large — a 63-page memoir would be one call holding 63 images. `--max-images-per-call N` (default `8`) splits an oversized group into several calls. It never splits mid-page, a page's own rescans never straddle a block, and a front, back and negative always ride together in the first call. After the last chunk, one further **text-only** call consolidates the chunks' provisional keywords/title/category/date/location into the group's one final answer. It does not re-transcribe anything — the per-chunk transcriptions stand as written.
 
-A group at or under the cap is entirely unaffected, and `--max-images-per-call 0` disables chunking outright. Chunking sends the same number of images either way; it adds the repeated prompt on every chunk call plus the consolidation call's tokens, and buys per-page attention that doesn't thin out on long documents, payloads under provider size ceilings, and failures that name which chunk failed.
+A group at or under the cap is entirely unaffected, and `--max-images-per-call 0` disables chunking outright. A separate cap stops a runaway set before it costs anything: a run refuses to start when one document holds more than 50 pages, so a 63-page memoir needs `--max-group-pages 0` (or a higher number). Chunking sends the same number of images either way; it adds the repeated prompt on every chunk call plus the consolidation call's tokens, and buys per-page attention that doesn't thin out on long documents, payloads under provider size ceilings, and failures that name which chunk failed.
 
 The consolidation pass's page-order verdict is **recorded, never acted on**: when the pages read out of filename order, the corrected page number goes into the record and the sidecar's `page` field with a warning naming the group, but no file is renamed or renumbered — that stays a decision for a person.
 
@@ -638,6 +641,8 @@ If you are processing a large number of photos related to a single event, you ca
 | Flag                                               | What it does |
 |----------------------------------------------------|---|
 | `--group-by {object,pair,none}`                    | Grouping granularity, the one axis (default `object`). `object`: every scan of one print is one object and shares a single analysis. `pair`: each rescan — print plus variant letter — is analyzed on its own. `none`: every file alone. See below |
+| `--page-grouping {auto,document,album}`            | How a set of `-pageN` files groups (default `auto`). `document`: the pages are one object. `album`: each page is its own object. `auto`: album when the name holds the word `album` or a page has the keyword `album` |
+| `--max-group-pages N`                              | Refuse to start when one document holds more than N pages (default `50`, `0` lifts the cap). Album pages are their own objects and don't count |
 | `--date-confidence-threshold X`                    | Confidence at which a date guess fills a file that has no date without the `AI Inferred Date` keyword, 0-1 (default 0.6). See [Dates](#why-read-first) |
 | `--date-min-confidence X`                          | Lowest confidence at which a date guess is written at all, 0-1 (default 0.4); below it the guess is only a suggestion |
 | `--location-confidence-threshold X`                | Same, for location guesses (default 0.7) |
@@ -801,8 +806,8 @@ Whenever `--output-file` names a `.ndjson` destination, the file carries `run: .
 | `plan` | Once every pre-flight check has passed, right after the plan summary is logged | `plan`: the same fields as the stderr plan summary, as a dict (`input_kind`, `file_count`, `provider`, `model`, ... — see `RunPlan` in `cli_messages.py`) |
 | `progress` | Once per group, right before it starts | `group`, `index`, `of` — a liveness signal for a group whose single model call may run for minutes with nothing else on the stream to show it hasn't died |
 | `exiftool_apply` | After `-w` applies the changeset, if one was written | `summary`: files seen/written, tags written, errors, warnings |
-| `complete` | The run finished (whether or not every group succeeded — "every group failed" is not a fatal error in manifest mode; see [When calls fail](https://github.com/asielen/photokin/blob/v0.6.0/photokin/README.md#when-calls-fail)) | `files_recorded`, `groups_failed`, `files_unsent` |
-| `cancelled` | The run stopped early via `--cancel-file` (below) | Same three fields, counting only what completed before the stop |
+| `complete` | The run finished (whether or not every group succeeded — "every group failed" is not a fatal error in manifest mode; see [When calls fail](https://github.com/asielen/photokin/blob/v0.6.0/photokin/README.md#when-calls-fail)) | `items_recorded` (one per manifest item), `files_recorded` (one per file; fewer when items share a path), `groups_failed`, `files_unsent` |
+| `cancelled` | The run stopped early via `--cancel-file` (below) | Same fields, counting only what completed before the stop |
 | `fatal` | Any refusal or unrecoverable error, at any point after `start` | `error`: `{"type": ..., "message": ...}` |
 
 A run always ends with exactly one of `complete`, `cancelled`, or `fatal` — a caller can wait for any of the three as the definitive "done" signal, rather than inferring completion from the line count, which breaks the moment per-file emission ever changes shape (this happened once already, before the envelope existed).

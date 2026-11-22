@@ -1501,11 +1501,10 @@ class TestReadmeSampleManifest(ManifestGroupingTestCase):
 
     ``README.md`` (manifest mode, the ``batch.json`` sample) declares one
     physical object as ``scans/box3_017.jpg`` plus ``scans/box3_017_back.jpg``
-    with ``"is_back": true``, and the surrounding prose states that the flag is
-    what folds the two files "into one group and one model call rather than two
-    unrelated photos". Before Phase B1 the flag was read off the item and
+    with ``"is_back": true``. Before Phase B1 the flag was read off the item and
     discarded, the underscore form was not recognized by the filename grammar,
-    and the sample formed two groups and made two model calls.
+    and the sample formed two groups and made two model calls. The grammar now
+    reads ``_back`` itself, so the flag only agrees with it.
     """
 
     #: Copied verbatim from the README's ``batch.json`` block.
@@ -1529,9 +1528,9 @@ class TestReadmeSampleManifest(ManifestGroupingTestCase):
         )
         self.assertEqual(variant_map["front"], [_p("scans/box3_017.jpg")])
         self.assertEqual(variant_map["back"], [_p("scans/box3_017_back.jpg")])
-        self.assertTrue(
+        self.assertFalse(
             any("box3_017_back.jpg" in w and "is_back" in w for w in warnings),
-            f"the override that did the grouping was not logged: {warnings}",
+            f"the flag agrees with the filename, yet an override was logged: {warnings}",
         )
 
     def test_the_sample_is_one_group_under_pair_too(self):
