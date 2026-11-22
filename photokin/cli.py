@@ -1081,6 +1081,40 @@ _RENAME_MODE_FLAGS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: Flags that only one mode reads, each with the mode flag that reads it.
+#: Given without that mode they would be ignored without a word, so they are
+#: refused instead, as ``--back`` on a folder is.
+_MODE_ONLY_FLAGS: tuple[tuple[str, str, str, str], ...] = (
+    *((flag, dest, "--rename", "rename") for flag, dest in (
+        ("--plan-out", "plan_out"),
+        ("--digits", "digits"),
+        ("--order", "order"),
+        ("--undated", "undated"),
+        ("--today", "today"),
+        ("--companions", "companions"),
+    )),
+    *((flag, dest, "--revert-changeset", "revert_changeset") for flag, dest in (
+        ("--revert-paths", "revert_paths"),
+        ("--revert-match", "revert_match"),
+        ("--force", "force"),
+    )),
+)
+
+
+def _refuse_mode_only_flags(args: argparse.Namespace) -> None:
+    """Refuse a flag that only one mode reads when that mode was not given.
+
+    Args:
+        args: The parsed namespace.
+
+    Raises:
+        SystemExit: With code 2 for the first such flag.
+    """
+    for flag, dest, mode, mode_dest in _MODE_ONLY_FLAGS:
+        if getattr(args, dest) not in (None, False) and getattr(args, mode_dest) is None:
+            _exit_with_usage_error(*cli_messages.flag_needs_mode(flag, mode))
+
+
 def _given_rename_modes(args: argparse.Namespace) -> list[str]:
     """Return the rename-mode flags present on *args*, in report order.
 
@@ -2662,8 +2696,9 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         _exit_with_usage_error(*cli_messages.rename_with_exiftool_write(args.exiftool_write))
     if args.output_file:
         _exit_with_usage_error(*cli_messages.rename_with_output_file(args.output_file))
-    if args.digits < 1:
-        _exit_with_usage_error(*cli_messages.rename_digits_invalid(args.digits))
+    digits = 3 if args.digits is None else args.digits
+    if digits < 1:
+        _exit_with_usage_error(*cli_messages.rename_digits_invalid(digits))
 
     today: date | None = None
     if args.today:
@@ -2725,8 +2760,8 @@ def _run_rename_mode(args: argparse.Namespace) -> None:
         disk_files=disk_files,
         items=items,
         prefix_template=args.rename,
-        digits=args.digits,
-        order_mode=args.order,
+        digits=digits,
+        order_mode=args.order or "name",
         undated_literal=args.undated,
         today=today,
         companion_extensions=companions,
@@ -2933,6 +2968,10 @@ def _run_rename_undo_or_resume(args: argparse.Namespace, *, verb: str) -> None:
     flag = f"--rename-{verb}"
     raw = args.rename_undo if verb == "undo" else args.rename_resume
     journal_path = raw or None
+    if journal_path is not None and os.path.isdir(journal_path) and not args.input_path:
+        # ``--rename-undo ./scans``: argparse took the folder as the optional
+        # JOURNAL value. A folder is never a journal, so it is the folder.
+        args.input_path, journal_path = journal_path, None
 
     if journal_path is None:
         resolved = _resolve_input(args)
@@ -3050,6 +3089,12 @@ def main() -> None:
             "--manifest",
             default=None,
             help="Alias for a manifest INPUT; asserts the path is a .json manifest file.",
+        )
+        ap.add_argument(
+            "--version",
+            action="version",
+            version=f"photokin {_photokin_version()}",
+            help="Print photokin's version and exit.",
         )
         ap.add_argument(
             "--capabilities",
@@ -3310,16 +3355,16 @@ def main() -> None:
         ap.add_argument(
             "--digits",
             type=int,
-            default=3,
+            default=None,
             metavar="N",
-            help="Zero-padded number width for --rename (default: %(default)s).",
+            help="Zero-padded number width for --rename (default: 3).",
         )
         ap.add_argument(
             "--order",
             choices=["name", "natural"],
-            default="name",
+            default=None,
             help="--rename's fallback ordering when no item carries an explicit "
-                 "manifest order (default: %(default)s). natural compares digit runs "
+                 "manifest order (default: name). natural compares digit runs "
                  "numerically, so file9 precedes file10.",
         )
         ap.add_argument(
@@ -3458,6 +3503,7 @@ def main() -> None:
         # named two of these gets one clear refusal instead of whichever
         # branch happened to run first.
         _refuse_rename_mode_conflicts(args)
+        _refuse_mode_only_flags(args)
         _refuse_executor_dry_run(args)
         _refuse_rename_mode_sidecar_flags(args)
         if args.rename_finish is not None:

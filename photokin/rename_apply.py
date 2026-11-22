@@ -885,9 +885,21 @@ def read_journal(path: str) -> Journal:
             read, or if a segment is short of the records it declares.
     """
     path = os.path.realpath(path)
+    if os.path.isdir(path):
+        raise RenamePreflightError(
+            "This is a folder, not a rename journal.",
+            "Name the journal file, or give the folder as the input instead.",
+            [path],
+        )
     try:
         with open(path, "rb") as handle:
             raw = handle.read()
+    except FileNotFoundError as exc:
+        raise RenamePreflightError(
+            "This rename journal does not exist.",
+            "Check the path, or give the folder as the input to find its latest journal.",
+            [path],
+        ) from exc
     except OSError as exc:
         raise RenamePreflightError(
             "This rename journal cannot be read.",

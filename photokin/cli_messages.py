@@ -553,6 +553,22 @@ def revert_takes_no_input(display: str) -> UsageMessage:
     )
 
 
+def flag_needs_mode(flag: str, mode: str) -> UsageMessage:
+    """A flag that only one mode reads was given without that mode.
+
+    Args:
+        flag: The flag as typed, e.g. ``--plan-out``.
+        mode: The mode flag it belongs to, e.g. ``--rename``.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`{flag}` only works with {mode}, so this run would ignore it.",
+        f"add {mode}, or drop {flag}",
+    )
+
+
 def write_needs_changeset() -> UsageMessage:
     """Writing was asked for with no changeset to write from.
 
@@ -676,7 +692,7 @@ def output_dir_missing(role: str, out_dir: str) -> UsageMessage:
     """
     return (
         f"{role} directory does not exist: {out_dir}",
-        "create the directory first, or point --output-file at an existing one",
+        f"create the directory first, or point {role} at an existing one",
     )
 
 
@@ -708,7 +724,7 @@ def output_not_writable(role: str, out_path: str) -> UsageMessage:
     """
     return (
         f"{role} already exists and is not writable: {out_path}",
-        "clear the read-only flag on that file, or choose a different --output-file",
+        f"clear the read-only flag on that file, or choose a different {role}",
     )
 
 
@@ -728,7 +744,7 @@ def output_destination_not_writable(role: str, out_path: str, reason: str) -> Us
     # cannot push anything off the line.
     return (
         f"{role} cannot be written -- {_one_line(reason)}:\n  {out_path}",
-        "point --output-file at a writable directory",
+        f"point {role} at a writable directory",
     )
 
 

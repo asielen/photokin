@@ -39,15 +39,13 @@ _DOCS = (
     _PACKAGE / "exiftool" / "README.md",
 )
 
-#: Flags the documentation mentions that belong to other programs. The Quick
-#: Start tells a new user to run ``python --version``; that is not a photokin
-#: flag and must not be read as one. The ``claude-code`` provider section
+#: Flags the documentation mentions that belong to other programs. The
+#: ``claude-code`` provider section
 #: similarly documents the local ``claude`` CLI's own invocation (what
 #: ``api_claude_code.py`` actually shells out to) -- those are ``claude``'s
 #: flags, not photokin's.
 _FOREIGN_FLAGS = frozenset(
     {
-        "--version",
         "--bare",
         "--safe-mode",
         "--system-prompt",

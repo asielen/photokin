@@ -49,6 +49,13 @@ changeset now records enough to undo it.
 - **A write that touches an IPTC tag recomputes the Photoshop
   `IPTCDigest`**, which ExifTool left stale, so Lightroom stops warning
   that the XMP may be out of sync.
+- **CLI follow-ups.** `photokin --version` prints the version. A flag
+  only `--rename` reads (`--plan-out`, `--digits`, `--order`,
+  `--undated`, `--today`, `--companions`), or only `--revert-changeset`
+  reads, is refused without that mode instead of being ignored.
+  `--rename-undo ./scans` treats the folder as the folder, and a missing
+  journal says so rather than pointing at file permissions. A
+  `--plan-out` error names `--plan-out` in its remedy.
 - **Packaging:** the license is declared as an SPDX string, and the vocab
   backup goes to `~/.photokin/backups` instead of the package folder.
 
