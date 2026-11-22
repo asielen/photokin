@@ -71,7 +71,7 @@ from typing import Any
 
 from .changeset import make_run_id
 from .doc_sidecar import _yaml_string
-from .utils import casefold_filename, paths_are_same_file
+from .utils import casefold_filename, json_text, paths_are_same_file
 
 logger = logging.getLogger(__name__)
 
@@ -711,8 +711,8 @@ def _write_segment(
     if append:
         _drop_torn_tail(path)
     mode = "a" if append else "x"
-    lines = [json.dumps({**dict(header), "ops": len(ops)}, ensure_ascii=False)]
-    lines.extend(json.dumps(_op_record(op), ensure_ascii=False) for op in ops)
+    lines = [json_text({**dict(header), "ops": len(ops)})]
+    lines.extend(json_text(_op_record(op)) for op in ops)
     with open(path, mode, encoding="utf-8", newline="\n") as handle:
         handle.write("".join(f"{line}\n" for line in lines))
         handle.flush()
@@ -783,7 +783,7 @@ def _append_record(path: str, record: Mapping[str, Any]) -> None:
     """
     _drop_torn_tail(path)
     with open(path, "a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
+        handle.write(json_text(dict(record)) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
 

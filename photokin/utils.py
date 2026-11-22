@@ -2031,6 +2031,88 @@ def casefold_filename(name: str) -> str:
     return name.casefold()
 
 
+def json_text(value: Any, *, indent: int | None = None) -> str:
+    """Serialize *value* as JSON, keeping non-ASCII text readable where UTF-8 allows.
+
+    A POSIX file name holding a byte that is not UTF-8 reaches Python as a
+    lone surrogate, which no UTF-8 file can hold; such a document falls back
+    to ``\\uXXXX`` escapes, which read back to the same string.
+
+    Args:
+        value: The JSON-serializable value.
+        indent: As for ``json.dumps``.
+
+    Returns:
+        The JSON text, always encodable as UTF-8.
+    """
+    text = json.dumps(value, ensure_ascii=False, indent=indent)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(value, indent=indent)
+    return text
+
+
+def disk_spelling(path: str) -> str:
+    """Return *path* spelled the way the filesystem spells each of its parts.
+
+    On a case-insensitive volume ``C:\\PHOTOS\\a.tif`` opens the file stored
+    as ``C:\\Photos\\a.tif``; anything hashed from the path (a photo id)
+    must use the stored spelling, or one file gets two ids. Symlinks are not
+    resolved. A part that cannot be listed or matched is kept as written.
+
+    Args:
+        path: An absolute path.
+
+    Returns:
+        The same path with each existing part in its on-disk case.
+    """
+    drive, rest = os.path.splitdrive(os.path.normpath(path))
+    current = drive + os.sep if rest.startswith(os.sep) else drive
+    for part in [p for p in rest.split(os.sep) if p]:
+        try:
+            listed = os.listdir(current or ".")
+        except OSError:
+            listed = []
+        if part not in listed:
+            wanted = casefold_filename(part)
+            part = next(
+                (
+                    name
+                    for name in listed
+                    if casefold_filename(name) == wanted
+                    and paths_are_same_file(os.path.join(current, name), os.path.join(current, part))
+                ),
+                part,
+            )
+        current = os.path.join(current, part)
+    return current
+
+
+def destinations_may_collide(path_a: str, path_b: str) -> bool:
+    """Whether writing *path_a* and *path_b* could land in one file.
+
+    :func:`paths_are_same_file` can only compare spellings when a file does
+    not exist yet, so two destinations under different aliases of one folder
+    (a symlink and its target) would pass. Their folders exist, so the folders
+    are compared by identity and the names by their case-folded spelling,
+    which errs toward reporting a clash.
+
+    Args:
+        path_a: One destination.
+        path_b: The other.
+
+    Returns:
+        True when the two may be the same file.
+    """
+    a, b = os.path.abspath(path_a), os.path.abspath(path_b)
+    if os.path.lexists(a) and os.path.lexists(b):
+        return paths_are_same_file(a, b)
+    return casefold_filename(os.path.basename(a)) == casefold_filename(
+        os.path.basename(b)
+    ) and paths_are_same_file(os.path.dirname(a), os.path.dirname(b))
+
+
 def paths_are_same_file(path_a: str, path_b: str) -> bool:
     """Answer question (2): do *path_a* and *path_b* name the same file?
 

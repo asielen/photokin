@@ -86,10 +86,15 @@ def make_run_id() -> str:
 
 
 def make_photo_id(path: str) -> str:
-    """Return a stable ID for a file based on sha1(normalized absolute path)."""
+    """Return a stable ID for a file based on sha1(normalized absolute path).
+
+    The path is hashed as the filesystem's own bytes (``os.fsencode``), which
+    for any UTF-8 name are its UTF-8 bytes, so ordinary IDs are unchanged; a
+    POSIX name holding a byte that is not UTF-8 hashes too, instead of raising.
+    """
     normalized = normalize_path(path) or path
     normalized = os.path.abspath(os.path.normpath(normalized))
-    digest = hashlib.sha1(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()
+    digest = hashlib.sha1(os.fsencode(normalized), usedforsecurity=False).hexdigest()
     return f"sha1:{digest}"
 
 

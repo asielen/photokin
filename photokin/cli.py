@@ -1603,7 +1603,7 @@ def _preflight_destinations_are_distinct(destinations: Sequence[tuple[str, str]]
     """
     for index, (role_a, path_a) in enumerate(destinations):
         for role_b, path_b in destinations[index + 1:]:
-            if utils.paths_are_same_file(os.path.abspath(path_a), os.path.abspath(path_b)):
+            if utils.destinations_may_collide(path_a, path_b):
                 _exit_with_usage_error(
                     *cli_messages.output_destinations_alias(role_a, path_a, role_b, path_b)
                 )
@@ -1668,7 +1668,7 @@ def _preflight_output_file(
         # looking for their file against a working directory the message never
         # states, next to a destination they may have spelled a third way.
         needed = os.path.abspath(protected.path)
-        if utils.paths_are_same_file(destination, needed):
+        if utils.destinations_may_collide(destination, needed):
             _exit_with_usage_error(
                 *cli_messages.output_file_is_needed_by_the_run(
                     role, out_path, needed, protected.description
@@ -1798,8 +1798,7 @@ def _write_generated_manifest(manifest: dict, out_path: str) -> None:
     tmp_path = out_path + ".tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
+            handle.write(utils.json_text(manifest, indent=2) + "\n")
         os.replace(tmp_path, out_path)
     finally:
         if os.path.exists(tmp_path):
@@ -2290,7 +2289,9 @@ def _rename_folder_from_items(items: list[RenameItem], resolved: ResolvedInput) 
     directories = sorted(
         {os.path.dirname(os.path.abspath(item.path)) for item in items if item.path}
     )
-    return directories[0] if directories else resolved.directory
+    # The disk's spelling, since the planner hashes it into every target id
+    # and a later run of the same folder reads it off the disk.
+    return utils.disk_spelling(directories[0]) if directories else resolved.directory
 
 
 def _list_all_files(folder: str) -> list[str]:
@@ -2408,6 +2409,11 @@ def _build_rename_items_from_manifest(document: dict[str, Any]) -> list[RenameIt
         if not isinstance(raw, dict):
             continue
         path = normalize_path(raw.get("path") or "") or ""
+        if os.path.splitext(path)[1].lower() not in utils.VALID_EXTS:
+            # Rename mode renames images; anything else in a manifest is at
+            # most a companion, which the planner finds on disk by stem.
+            logger.warning("Not an image, so not renamed: %s", path)
+            continue
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None
         order = raw.get("order")
         order_value = order if isinstance(order, int) and not isinstance(order, bool) else None

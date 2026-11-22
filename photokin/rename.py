@@ -1078,6 +1078,29 @@ def plan_rename(
     }
 
 
+def _shares_stem(image_path: str, other_path: str) -> bool:
+    """Whether *other_path* has *image_path*'s stem, as the filesystem sees names.
+
+    The same spelling always does. A spelling that differs only in case does
+    when the folder folds case, which shows as the image's stem with the
+    other file's extension naming that very file; on a case-sensitive
+    filesystem ``PHOTO.md`` beside ``photo.tif`` is somebody else's file.
+
+    Args:
+        image_path: The image.
+        other_path: The candidate companion, absolute.
+
+    Returns:
+        True when the two share a stem.
+    """
+    image_stem = os.path.splitext(os.path.basename(image_path))[0]
+    other_stem, other_ext = os.path.splitext(os.path.basename(other_path))
+    if image_stem == other_stem:
+        return True
+    as_image_stem = os.path.join(os.path.dirname(other_path), image_stem + other_ext)
+    return os.path.lexists(as_image_stem) and utils.paths_are_same_file(as_image_stem, other_path)
+
+
 def _companion_owner_key(
     entry: dict[str, Any], preferred_paths: frozenset[str]
 ) -> tuple[int, int, int, int, int, str, int, str, str]:
@@ -1205,7 +1228,11 @@ def _attach_companions_and_bystanders(
             if not is_known:
                 bystander_names.add(utils.casefold_filename(name))
             continue
-        matches = entry_indices_by_stem.get(utils.casefold_filename(stem), [])
+        matches = [
+            i
+            for i in entry_indices_by_stem.get(utils.casefold_filename(stem), [])
+            if _shares_stem(entries[i]["path"], abs_disk_path)
+        ]
         if not matches:
             continue
         matched_groups = {entries[i]["group"] for i in matches}
