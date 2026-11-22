@@ -135,7 +135,6 @@ def test_off_by_default_for_library_callers(tmp_path: Path) -> None:
 def test_a_failed_read_still_writes_and_says_the_run_cannot_be_reverted(tmp_path: Path) -> None:
     # Arrange
     changeset = _changeset(tmp_path, _RECORD)
-    before = changeset.read_bytes()
     read = MagicMock(side_effect=RuntimeError("ExifTool failed."))
 
     # Act
@@ -144,4 +143,6 @@ def test_a_failed_read_still_writes_and_says_the_run_cannot_be_reverted(tmp_path
     # Assert
     assert summary["files_written"] == 1
     assert any("cannot be reverted exactly" in w["warning"] for w in summary["warnings"])
-    assert changeset.read_bytes() == before
+    original = _lines(changeset)[0]["original_data"]
+    assert original.get("written_tags_missing") is True
+    assert "written_tags" not in original
