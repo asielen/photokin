@@ -12,7 +12,7 @@ itself is faked.
 The fixture folder is ``photokin/tests/fixtures/folder_routing``, which already
 holds a front/back pair with a "b" variant rescan and a crop of the front
 (``box3_025*``), a negative-only group (``box3_026-negative.jpg``), a two-page
-album group (``album-page*``, with a crop of page 2) and one unrelated single
+album group (``account-page*``, with a crop of page 2) and one unrelated single
 file (``box3_027.png``) -- exactly the shapes ``docs/document-mode-contract.md``
 section 8's gate has to be tested against. It is copied into a scratch
 ``TemporaryDirectory`` before every test, never used in place.
@@ -38,9 +38,9 @@ _FOLDER_FIXTURE = os.path.join(_FIXTURES, "folder_routing")
 #: earn a sidecar). Listed here rather than derived from a listing call so the
 #: expectations below are independent of the code under test.
 _FIXTURE_IMAGES = (
-    "album-page1.jpg",
-    "album-page2-crop.jpg",
-    "album-page2.jpg",
+    "account-page1.jpg",
+    "account-page2-crop.jpg",
+    "account-page2.jpg",
     "box3_025-back.jpg",
     "box3_025-crop.jpg",
     "box3_025.jpg",
@@ -49,7 +49,7 @@ _FIXTURE_IMAGES = (
     "box3_026-negative.jpg",
     "box3_027.png",
 )
-_CROPS = frozenset({"album-page2-crop.jpg", "box3_025-crop.jpg"})
+_CROPS = frozenset({"account-page2-crop.jpg", "box3_025-crop.jpg"})
 
 
 def _stem(name: str) -> str:
@@ -62,7 +62,7 @@ class _StubAnalyzers:
 
     ``category_map`` and ``transcriptions_map`` are looked up by a substring of
     the basenames one call carries -- the fixture's family prefix, e.g.
-    ``"box3_025"`` or ``"album"`` -- so one instance can drive an entire folder
+    ``"box3_025"`` or ``"account"`` -- so one instance can drive an entire folder
     run while each group's category and transcriptions are set independently.
     That is exactly what auto mode's per-group gate needs to be tested against:
     one run, several groups, several verdicts.
@@ -280,10 +280,10 @@ class TestSidecarMdAuto(_SidecarMdTestCase):
             folder,
             sidecar_md=utils.SIDECAR_MD_AUTO,
             default_category="Portrait",
-            category_map={"album": "Postcard"},
+            category_map={"account": "Postcard"},
         )
 
-        self.assertEqual(self.md_files(folder), {"album-page1.md", "album-page2.md"})
+        self.assertEqual(self.md_files(folder), {"account-page1.md", "account-page2.md"})
 
     def test_a_photo_page_category_is_not_written(self) -> None:
         # D2: an album page of mounted photos stays photo-like, unlike Document
@@ -294,7 +294,7 @@ class TestSidecarMdAuto(_SidecarMdTestCase):
             folder,
             sidecar_md=utils.SIDECAR_MD_AUTO,
             default_category="Portrait",
-            category_map={"album": "Photo Page"},
+            category_map={"account": "Photo Page"},
         )
 
         self.assertEqual(self.md_files(folder), set())

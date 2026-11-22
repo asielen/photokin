@@ -997,6 +997,9 @@ class RunPlan:
         provider: The provider's display name.
         model: The concrete model string the adapter will send.
         dry_run: Whether the run stops after printing this.
+        albums: One line per set of pages read as an album, from
+            ``core.album_plan_lines``; the row is left out when empty, so a
+            wrong guess shows before any model call.
         suggested_command: The ``-rw`` run to advise, from
             :func:`normal_run_command`, or None to print no advice. Held as the
             command rather than as the finished sentence so the wording around it
@@ -1017,6 +1020,7 @@ class RunPlan:
     dry_run: bool
     sidecars: str = "none (--sidecar-md off)"
     suggested_command: str | None = None
+    albums: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         """Return every field as a plain JSON-serializable dict.
@@ -1061,6 +1065,8 @@ class RunPlan:
             ("provider", self.provider),
             ("model", self.model),
         ]
+        if self.albums:
+            rows.append(("albums", "\n".join(self.albums)))
         if self.dry_run:
             rows.append(("--dry-run", "stopping here; no model call, and nothing written."))
         if self.suggested_command:

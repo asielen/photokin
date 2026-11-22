@@ -82,6 +82,7 @@ from .canonical import (
 from .changeset import SCHEMA_VERSION as _CHANGESET_SCHEMA_VERSION
 from .core import (
     build_folder_manifest,
+    album_plan_lines,
     build_manifest_buckets,
     build_single_photo_manifest,
     process_manifest_stream,
@@ -1432,7 +1433,11 @@ def _build_show_config(args: argparse.Namespace) -> dict:
             "jpeg_quality": args.jpeg_quality,
             "max_edge": None if args.max_edge in (None, 0) else args.max_edge,
         },
-        "grouping": {"group_by": args.group_by, "max_images_per_call": args.max_images_per_call},
+        "grouping": {
+            "group_by": args.group_by,
+            "page_grouping": args.page_grouping,
+            "max_images_per_call": args.max_images_per_call,
+        },
         "confidence_thresholds": {
             "date": args.date_confidence_threshold,
             "date_min": args.date_min_confidence,
@@ -1835,8 +1840,8 @@ def _generate_manifest(resolved: ResolvedInput, args: argparse.Namespace, cfg: C
         # written and the grouping reported describe the same items. Under
         # --dry-run the pre-flight still runs -- matching the analysis path,
         # where --dry-run is deliberately not exempt -- but no subprocess starts
-        # and nothing is written; grouping does not read metadata, so the group
-        # count is unaffected either way.
+        # and nothing is written. Grouping reads only an album keyword from the
+        # metadata, so the group count can differ only for a page set.
         ecfg = _resolve_exiftool_config(args)
         _preflight_exiftool(ecfg, changeset_requested=False, read_requested=True)
         if not args.dry_run:
@@ -1846,7 +1851,9 @@ def _generate_manifest(resolved: ResolvedInput, args: argparse.Namespace, cfg: C
     # checking when they reach for this flag, and resolving the entries is also
     # what reports an explicit override that disagrees with a filename -- most
     # usefully a --back the grammar reads as a front.
-    buckets = build_manifest_buckets(manifest["items"], group_by=cfg.group_by)
+    buckets = build_manifest_buckets(
+        manifest["items"], group_by=cfg.group_by, page_grouping=cfg.page_grouping
+    )
     if args.dry_run:
         # The flag promises no destination is touched, and this branch's
         # destination is a file the user may well have hand edited. The grouping
@@ -3023,6 +3030,16 @@ def main() -> None:
                  "and every crop becomes its own object.",
         )
         ap.add_argument(
+            "--page-grouping",
+            choices=list(utils.PAGE_GROUPING_VALUES),
+            default=utils.PAGE_GROUPING_AUTO,
+            help="How a set of -pageN files groups (default: %(default)s). document: the "
+                 "pages are one object, such as a letter. album: each page is its own "
+                 "object, with its own back and crops. auto: album when the name holds "
+                 "the word album or a page has the keyword album, else document. A "
+                 "manifest group always wins.",
+        )
+        ap.add_argument(
             "--sidecar-md",
             choices=list(utils.SIDECAR_MD_VALUES),
             # None rather than "off" so _resolve_sidecar_bundle can tell an
@@ -3496,6 +3513,7 @@ def main() -> None:
             no_update_vocab=args.no_update_vocab,
             max_edge=(None if (args.max_edge in (None, 0)) else args.max_edge),
             group_by=args.group_by,
+            page_grouping=args.page_grouping,
             sidecar_md=args.sidecar_md,
             max_images_per_call=args.max_images_per_call,
             date_confidence_threshold=args.date_confidence_threshold,
@@ -3610,7 +3628,10 @@ def main() -> None:
         # items again, and reporting every explicit override twice would be
         # guaranteed on any --back run.
         buckets = build_manifest_buckets(
-            manifest_doc["items"], group_by=cfg.group_by, log_overrides=False
+            manifest_doc["items"],
+            group_by=cfg.group_by,
+            page_grouping=cfg.page_grouping,
+            log_overrides=False,
         )
         plan = cli_messages.RunPlan(
             input_location=os.path.abspath(resolved.path),
@@ -3632,6 +3653,7 @@ def main() -> None:
             dry_run=args.dry_run,
             sidecars=_render_sidecar_clause(cfg.sidecar_md),
             suggested_command=suggested_command,
+            albums=tuple(album_plan_lines(buckets)),
         )
         logger.info("%s", plan.render())
         if args.dry_run:

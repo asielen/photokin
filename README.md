@@ -295,6 +295,7 @@ Point photokin at a folder and it works through every image in it (non-recursive
 Multipage documents are the one exception:
 
 * A group of page-numbered files (`letter-page1.jpg`, `letter-page2.jpg`, ...) is still analyzed together, but each page's caption gets only that page's own transcription — it doesn't make sense to write a 63-page story into the metadata of all 63 files. This is not configurable; the closest lever is `--group-by none`, which analyzes every file alone.
+* A photo album is not a document. When the name before `-pageN` holds the word `album` (`church-photo-album-page-001.tif`), or any page has the keyword `album`, each page is its own object, and its `-back` and crops stay with it. The plan lists every set it read this way and why, so check it before a long run; a keyword only `-r` can read is reported in the run's log instead, since the plan comes before the read. `--page-grouping document` or `--page-grouping album` decides for every set instead, and a manifest `group` always wins.
 * To get a full, readable transcript, add `-s` (short for `--sidecar-md auto`), which writes a Markdown transcript file beside each page when the model categorizes the object as a `Document` or `Postcard` — see [A readable transcript beside each scan](#a-readable-transcript-beside-each-scan). It combines with the other short flags, so the archival run with transcripts is `-rws`.
 
 **A run without `-w` still calls the model but writes nothing back.** `photokin C:\Scans` analyzes, prints the JSON to your terminal and touches nothing. Its plan summary ends with one extra row naming the next step:
@@ -325,7 +326,7 @@ Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-
 | `box3_025-b.jpg`, `box3_025b.jpg` or `box3_025_b.jpg` | another scan of the same object (variant letter; without a dash it must follow a digit) |
 | `box3_025-back.jpg` or `box3_025_back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
 | `box3_025-bw.jpg`, `box3_025-bw-back.jpg` | a black-and-white copy of the same photo, and that copy's back |
-| `album-page1.jpg`, `album-page-2.jpg` | ordered pages of one document |
+| `letter-page1.jpg`, `letter-page-2.jpg` | ordered pages of one document; an album's pages are each their own object (see [Folders and batches](#folders-and-batches)) |
 | `box3_025-cover.jpg`, `box3_025-envelope-back.jpg` | something attached to the photo, scanned on its own: `-cover`, `-folder`, `-mount`, `-envelope`, `-sleeve`, `-note` or `-note-N`, optionally followed by `-back` for that object's own back. Only these words group; any other trailing word stays part of the name, so `smith-farm-01400.jpg` is photo `smith-farm-01400` |
 | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but not analyzed as its own object while its parent is present — a crop with no parent fills the missing slot, and `--group-by none` analyzes every crop alone |
 | `box3_025.tif` beside `box3_025.jpg` | the same scan in two formats — one object, not two photos |
@@ -534,7 +535,7 @@ Flags are optional when the filename already says the same thing; they exist so 
 
 `preferred` is the exception and does not read that grammar: it is plain truthiness, so any non-empty string sets it and `"preferred": "false"` means **true**. Write it as a JSON `true`, or leave the key out entirely. It also nominates the file the group's analysis is filed under.
 
-`preferred` chooses between candidates for a slot; it cannot create one. A crop always yields to its listed parent, and a file with no part left to claim (a plain `album.jpg` beside an explicit `album-page1.jpg`) cannot be promoted into one. Both cases log a warning naming the file and are listed in the result record under `all_variant_files.crops` / `all_variant_files.displaced`, so nothing disappears quietly.
+`preferred` chooses between candidates for a slot; it cannot create one. A crop always yields to its listed parent, and a file with no part left to claim (a plain `letter.jpg` beside an explicit `letter-page1.jpg`) cannot be promoted into one. Both cases log a warning naming the file and are listed in the result record under `all_variant_files.crops` / `all_variant_files.displaced`, so nothing disappears quietly.
 
 **Replaying a manifest.** A manifest run with `-r` also records what ExifTool read into the output document, so replaying that manifest later (`photokin scans-manifest.json`) needs no ExifTool at all. Replay *with* `-r` to reproduce the original result exactly.
 
@@ -638,6 +639,7 @@ If you are processing a large number of photos related to a single event, you ca
 | Flag                                               | What it does |
 |----------------------------------------------------|---|
 | `--group-by {object,pair,none}`                    | Grouping granularity, the one axis (default `object`). `object`: every scan of one print is one object and shares a single analysis. `pair`: each rescan — print plus variant letter — is analyzed on its own. `none`: every file alone. See below |
+| `--page-grouping {auto,document,album}`            | How a set of `-pageN` files groups (default `auto`). `document`: the pages are one object. `album`: each page is its own object. `auto`: album when the name holds the word `album` or a page has the keyword `album` |
 | `--date-confidence-threshold X`                    | Confidence at which a date guess fills a file that has no date without the `AI Inferred Date` keyword, 0-1 (default 0.6). See [Dates](#why-read-first) |
 | `--date-min-confidence X`                          | Lowest confidence at which a date guess is written at all, 0-1 (default 0.4); below it the guess is only a suggestion |
 | `--location-confidence-threshold X`                | Same, for location guesses (default 0.7) |

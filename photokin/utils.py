@@ -89,6 +89,18 @@ GROUP_BY_NONE = "none"
 #: Coarsest first, which is also the order ``--help`` lists them in.
 GROUP_BY_VALUES: tuple[str, ...] = (GROUP_BY_OBJECT, GROUP_BY_PAIR, GROUP_BY_NONE)
 
+# How a set of ``-pageN`` files groups: ``document`` keeps the pages one object
+# (a letter, a memoir), ``album`` makes each page its own object, and ``auto``
+# decides per set from the name and the pages' keywords.
+PAGE_GROUPING_AUTO = "auto"
+PAGE_GROUPING_DOCUMENT = "document"
+PAGE_GROUPING_ALBUM = "album"
+PAGE_GROUPING_VALUES: tuple[str, ...] = (
+    PAGE_GROUPING_AUTO,
+    PAGE_GROUPING_DOCUMENT,
+    PAGE_GROUPING_ALBUM,
+)
+
 # The ``--sidecar-md`` mode axis. Named by format rather than by feature
 # (docs/document-mode-contract.md section 7): ``--sidecar-xmp`` and
 # ``--sidecar-json`` are reserved spellings for the same three-value grammar,
@@ -192,6 +204,7 @@ class Config:
     fail_on_forbidden: bool = False
     max_edge: int | None = 1024
     group_by: str = GROUP_BY_OBJECT
+    page_grouping: str = PAGE_GROUPING_AUTO
     # Document mode (docs/document-mode-contract.md sections 7-8). "off" keeps
     # every existing run byte-for-byte; "all"/"auto" are wired in core.py's
     # per-file emit loop, gated on SIDECAR_AUTO_CATEGORIES in "auto".
@@ -1567,7 +1580,8 @@ class ParsedName:
     black-and-white copy (``"cover"``, ``"envelope-back"``, ``"note-2"``,
     ``"bw"``) when ``part_kind`` is ``"attached"``; ``variant_suffix`` is the
     variant letter exactly as the name spelled it (``"-b"``, ``"_b"`` or a
-    digit-adjacent ``"b"``), empty when there is none. The
+    digit-adjacent ``"b"``), empty when there is none; ``page_suffix`` is
+    the page tag as the name spelled it (``"-page-001"``, ``"_page3"``). The
     manifest bucket loop -- which every input mode now routes through -- keys off
     these fields.
     """
@@ -1579,6 +1593,7 @@ class ParsedName:
     is_crop: bool = False
     attachment: str | None = None
     variant_suffix: str = ""
+    page_suffix: str = ""
 
 
 #: One canonical ordering over :attr:`ParsedName.part_kind`, from "this is the
@@ -1662,8 +1677,12 @@ def parse_media_filename(path: str) -> ParsedName:
        grouping step may still read it back as part of the base id.
     6) The remaining stem is the base_id.
     """
-    stem, _ = canonicalize_stem(os.path.splitext(os.path.basename(path))[0])
+    name_stem = os.path.splitext(os.path.basename(path))[0]
+    # canonicalize_stem swaps one separator character for another, so an index
+    # into its result is an index into the name as written.
+    stem, _ = canonicalize_stem(name_stem)
     part_kind = "none"
+    page_suffix = ""
     page_num: int | None = None
     is_crop = False
     attachment: str | None = None
@@ -1690,6 +1709,7 @@ def parse_media_filename(path: str) -> ParsedName:
         m_page = PAGE_SUFFIX_RE.match(stem)
         if m_page:
             part_kind = "page"
+            page_suffix = name_stem[len(m_page.group(1)) : len(stem)]
             stem = m_page.group(1)
             page_num = int(m_page.group(2))
 
@@ -1719,6 +1739,7 @@ def parse_media_filename(path: str) -> ParsedName:
         is_crop=is_crop,
         attachment=attachment,
         variant_suffix=variant_suffix,
+        page_suffix=page_suffix,
     )
 
 
