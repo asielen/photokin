@@ -63,7 +63,11 @@ from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywor
 #        ``keywords_in_hierarchy``: the added keywords the file's hierarchy
 #        already holds as a level, which an applier must not add to
 #        HierarchicalSubject as flat entries.
-SCHEMA_VERSION = 4
+#   5 -- an applied record may carry ``original_data.written_tags``: the value
+#        each tag its write touched held just before the write, ``null`` where
+#        the file had none. The applier adds it, so it is absent from a
+#        changeset that was never applied.
+SCHEMA_VERSION = 5
 
 
 def make_run_id() -> str:

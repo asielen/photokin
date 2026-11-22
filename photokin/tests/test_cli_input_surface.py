@@ -217,16 +217,19 @@ class _FakeExifTool:
     construction, which is the failure mode the write-default regression needs
     ruled out. This one appends a marker to the file ExifTool was pointed at --
     the last argument of the command it builds -- so an unwanted write shows up
-    as changed bytes on disk.
+    as changed bytes on disk. A ``-json`` read (the applier's look at the files
+    before it writes) changes nothing and reports no values.
 
     Attributes:
-        commands: The argv of every invocation, in order.
+        commands: The argv of every write, in order.
+        reads: The argv of every read, in order.
     """
 
     _MARKER = b"EXIFTOOL WROTE HERE"
 
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
+        self.reads: list[list[str]] = []
 
     def __call__(self, cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess:
         """Record *cmd* and append the marker to the file it names.
@@ -236,8 +239,12 @@ class _FakeExifTool:
             _kwargs: ``capture_output``/``text``/``check``, ignored.
 
         Returns:
-            A successful :class:`subprocess.CompletedProcess`.
+            A successful :class:`subprocess.CompletedProcess`; a read's output
+            is bytes, as the reader asks for.
         """
+        if "-json" in cmd:
+            self.reads.append(list(cmd))
+            return subprocess.CompletedProcess(list(cmd), 0, b"[]", b"")
         self.commands.append(list(cmd))
         with open(cmd[-1], "ab") as handle:
             handle.write(self._MARKER)

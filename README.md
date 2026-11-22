@@ -494,6 +494,8 @@ python -m photokin.exiftool --changeset results_changeset.ndjson --enabled      
 
 The standalone applier also takes `--fields` to narrow which tags may be written, `--write-sidecar-only` to write `.xmp` sidecars instead of touching the originals, `--no-overwrite-original` to keep ExifTool's `_original` backup files, and `--output summary.json` for a machine-readable result. Date tags (`EXIF:DateTimeOriginal`, `EXIF:CreateDate`) are normalized to EXIF's `YYYY:MM:DD HH:MM:SS` format on the way in; unparseable dates become warnings, not writes.
 
+Just before it writes, the applier reads every tag the write will touch, in one ExifTool call for the whole batch, and saves those values back into the changeset as `original_data.written_tags`, with `null` for a tag the file didn't have. That is the record a revert restores from. A dry run and `--write-sidecar-only` leave the changeset as it was.
+
 ### Manifest mode
 
 A manifest is a JSON file listing exactly what to process — an `items` array where each entry needs only a `path`. It is mainly how another program drives photokin (the Lightroom plug-in works this way; see [Integrating photokin as a subprocess](#integrating-photokin-as-a-subprocess)), and it also makes a big job repeatable and editable. `--generate-manifest` turns a folder into exactly that file:

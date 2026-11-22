@@ -26,6 +26,8 @@ Code map:
 - _datfile_name               deterministic ASCII filename for one (file, tag) DATFILE
 - _select_datfile_routing     decide which tag values must move off the command line
 - _build_exiftool_command     assemble the ExifTool argv for one file's writes
+- _snapshot_value / _read_before_values / _fold_snapshots_into_changeset
+                              record each file's pre-write values in the changeset
 - apply_changeset             PUBLIC: read a changeset NDJSON and write via ExifTool
 - main                        PUBLIC: CLI entry (python -m photokin.exiftool)
 """
@@ -63,7 +65,7 @@ from ..canonical import (
 from ..changeset import WRITE_SUPPRESSED_KEY
 from .config import ExiftoolConfig, parse_fields, suggest_writable_spelling
 from .locate import resolve_exiftool_path
-from .manifest import utf8_argfile
+from .manifest import run_exiftool_json, utf8_argfile
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +224,112 @@ def _companion_tags(tags: dict[str, str], set_changes: dict[str, Any]) -> dict[s
             if full_date.group(2):
                 companions[CANONICAL_IPTC_TIME_TAG] = full_date.group(2)
     return {tag: value for tag, value in companions.items() if tag not in tags}
+
+
+#: The keyword tags a keyword delta touches (see :func:`_keyword_delta_args`).
+_KEYWORD_WRITE_TAGS: tuple[str, ...] = (
+    CANONICAL_KEYWORDS_TAG,
+    CANONICAL_HIERARCHICAL_KEYWORDS_TAG,
+    CANONICAL_IPTC_KEYWORDS_TAG,
+)
+
+#: Every tag a write can touch beyond the allow-list: the companions of
+#: :func:`_companion_tags` and the keyword mirrors.
+_SNAPSHOT_EXTRA_TAGS: tuple[str, ...] = (
+    *_LOCATION_XMP_TWIN.values(),
+    CANONICAL_DATE_CREATED_TAG,
+    CANONICAL_IPTC_DATE_TAG,
+    CANONICAL_IPTC_TIME_TAG,
+    *_KEYWORD_WRITE_TAGS,
+)
+
+#: The ``-G1`` groups ExifTool reports a family-0 ``EXIF:`` tag under.
+_EXIF_G1_GROUPS: tuple[str, ...] = ("ExifIFD", "IFD0")
+
+
+def _snapshot_value(record: dict[str, Any], tag: str) -> Any:
+    """Return *tag*'s value in a ``-G1`` ExifTool record, or ``None`` when absent.
+
+    Exact group matching only: a bare-name fallback would read
+    ``XMP-exif:DateTimeOriginal`` as ``EXIF:DateTimeOriginal`` and
+    ``IPTC:DateCreated`` as ``XMP-photoshop:DateCreated``. A keyword tag comes
+    back as a list, however many values the file held.
+
+    Args:
+        record: One file's ExifTool JSON record.
+        tag: A tag as this module writes it, e.g. ``EXIF:UserComment``.
+
+    Returns:
+        The value as ExifTool printed it, or ``None``.
+    """
+    group, _, name = tag.partition(":")
+    keys = [tag, *(f"{g1}:{name}" for g1 in _EXIF_G1_GROUPS)] if group == "EXIF" else [tag]
+    value = next((record[key] for key in keys if key in record), None)
+    if tag in _KEYWORD_WRITE_TAGS and value is not None and not isinstance(value, list):
+        return [value]
+    return value
+
+
+def _path_key(path: str) -> str:
+    """Return the key two spellings of one path share."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _read_before_values(
+    exiftool: str, changeset_path: str, allowed_fields: tuple[str, ...]
+) -> dict[str, dict[str, Any]]:
+    """Read every writable tag of every file a changeset names, in one batch.
+
+    Args:
+        exiftool: Path to the ExifTool executable.
+        changeset_path: The changeset about to be applied.
+        allowed_fields: The tags the apply may write.
+
+    Returns:
+        ``{path key: ExifTool record}`` for each file ExifTool could read.
+
+    Raises:
+        OSError, RuntimeError, subprocess.TimeoutExpired: When ExifTool cannot
+            run or its output cannot be read.
+    """
+    paths: list[str] = []
+    with open(changeset_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                path = json.loads(line).get("path") if line.strip() else None
+            except (JSONDecodeError, AttributeError):
+                continue
+            if isinstance(path, str) and path:
+                paths.append(path)
+    tags = list(dict.fromkeys((*allowed_fields, *_SNAPSHOT_EXTRA_TAGS)))
+    records = run_exiftool_json(exiftool, list(dict.fromkeys(paths)), tags)
+    return {
+        _path_key(rec["SourceFile"]): rec
+        for rec in records
+        if isinstance(rec.get("SourceFile"), str)
+    }
+
+
+def _fold_snapshots_into_changeset(changeset_path: str, snapshots: dict[int, dict]) -> None:
+    """Rewrite the changeset with each written record's ``original_data.written_tags``.
+
+    Written beside the changeset and moved over it, so a crash leaves either the
+    old file or the new one, never half of each.
+
+    Args:
+        changeset_path: The changeset that was applied.
+        snapshots: ``{line number: {tag: value before the write}}``.
+    """
+    with open(changeset_path, "r", encoding="utf-8") as handle:
+        lines = handle.readlines()
+    for line_number, snapshot in snapshots.items():
+        record = json.loads(lines[line_number - 1])
+        record.setdefault("original_data", {})["written_tags"] = snapshot
+        lines[line_number - 1] = json.dumps(record, ensure_ascii=False) + "\n"
+    staging_path = f"{changeset_path}.tmp"
+    with open(staging_path, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+    os.replace(staging_path, changeset_path)
 
 
 _TAG_FILENAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
@@ -507,6 +615,7 @@ def apply_changeset(
     *,
     enabled: bool | None = None,
     fields: Iterable[str] | None = None,
+    record_before: bool = False,
 ) -> dict[str, Any]:
     """Apply a changeset NDJSON file to photos via ExifTool, returning a summary.
 
@@ -515,6 +624,13 @@ def apply_changeset(
     a deliberately narrow archival-write path. Failures are collected per-file
     into ``summary["errors"]`` rather than raised, so one bad file never aborts a
     batch. Honors ``cfg.dry_run`` (preview without writing).
+
+    With ``record_before``, every file's current values are read in one batch
+    before anything is written, and each record a write was attempted for gains
+    ``original_data.written_tags``: the value of every tag that write touches,
+    ``null`` where the file had none, which is what a revert restores. The
+    changeset file is rewritten in place to carry them. Skipped for a dry run
+    and for ``write_sidecar_only``, which leaves the originals alone.
 
     Returns a summary dict: ``files_seen``, ``files_written``,
     ``files_with_proposals`` (records that proposed any write at all, before
@@ -596,6 +712,20 @@ def apply_changeset(
     # writable temporary root -- including on a dry run, whose whole promise is
     # that it touches nothing.
     tmp_dir_holder: list[str] = []
+
+    before_values: dict[str, dict[str, Any]] | None = None
+    if record_before and not cfg.dry_run and not cfg.write_sidecar_only:
+        try:
+            before_values = _read_before_values(exiftool, changeset_path, allowed_fields)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            summary["warnings"].append(
+                {
+                    "warning": "Could not read the files before writing, so this run "
+                    f"cannot be reverted exactly: {exc}",
+                    "changeset": changeset_path,
+                }
+            )
+    snapshots: dict[int, dict[str, Any]] = {}
 
     def _datfile_dir(stack: ExitStack) -> str:
         if not tmp_dir_holder:
@@ -776,6 +906,14 @@ def apply_changeset(
                 )
                 continue
 
+            if before_values is not None:
+                file_values = before_values.get(_path_key(path))
+                if file_values is not None:
+                    touched = (*tags_to_write, *(_KEYWORD_WRITE_TAGS if keyword_args else ()))
+                    snapshots[line_number] = {
+                        tag: _snapshot_value(file_values, tag) for tag in touched
+                    }
+
             try:
                 # stderr names files, so decode it as UTF-8 and never let a
                 # stray byte fail the decode and with it the whole batch.
@@ -837,6 +975,8 @@ def apply_changeset(
             summary["files_written"] += 1
             summary["tags_written"] += tags_count
 
+    if snapshots:
+        _fold_snapshots_into_changeset(changeset_path, snapshots)
     return summary
 
 
@@ -889,7 +1029,7 @@ def main() -> None:
     )
 
     fields = parse_fields(args.fields)
-    summary = apply_changeset(args.changeset, cfg, fields=fields)
+    summary = apply_changeset(args.changeset, cfg, fields=fields, record_before=True)
 
     output = json.dumps(summary, indent=2, ensure_ascii=False)
     if args.output:

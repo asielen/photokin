@@ -2074,6 +2074,7 @@ def _apply_exiftool_changeset(
             ecfg,
             enabled=True,
             fields=ecfg.fields,
+            record_before=True,
         )
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
         logger.warning("ExifTool apply failed: %s", exc)
