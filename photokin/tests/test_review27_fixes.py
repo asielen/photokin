@@ -150,12 +150,15 @@ def test_rename_keeps_letters_that_are_in_order() -> None:
     assert _entry_for(plan, "box3_013_b.jpg")["target"] == "smith-001b.jpg"
 
 
-class TestTheCapWaitsForMinusR(_CliTestCase):
-    """With -r a page keyword can still make a set an album, so preflight does not refuse it."""
+class TestTheCapRefusesBeforeAnythingIsTouched(_CliTestCase):
+    """Under -r too, the cap refuses at preflight, so the last changeset survives."""
 
-    def test_minus_r_leaves_the_cap_to_the_stream(self) -> None:
+    def test_minus_r_is_refused_and_the_previous_changeset_kept(self) -> None:
         # Arrange
         folder = self.make_folder("smith-page1.jpg", "smith-page2.jpg", "smith-page3.jpg")
+        out = os.path.join(folder, "run.ndjson")
+        changeset = os.path.join(folder, "run_changeset.ndjson")
+        Path(changeset).write_text('{"previous": true}\n', encoding="utf-8")
         stream = _StreamSpy()
 
         # Act
@@ -163,7 +166,57 @@ class TestTheCapWaitsForMinusR(_CliTestCase):
             patch("photokin.cli.process_manifest_stream", stream),
             patch("photokin.cli._preflight_exiftool"),
         ):
-            self.run_cli([folder, "-r", "--max-group-pages", "2"])
+            code, _stdout, stderr = self.run_cli(
+                [folder, "-rw", "--output-file", out, "--max-group-pages", "2"]
+            )
 
         # Assert
-        self.assertTrue(stream.called)
+        self.assertEqual(code, 2)
+        self.assertFalse(stream.called)
+        self.assertIn("--page-grouping album", stderr)
+        self.assertEqual(Path(changeset).read_text(encoding="utf-8"), '{"previous": true}\n')
+
+
+def _page_results(items: list[dict]) -> dict[str, dict]:
+    lines: list[str] = []
+    with _recording(["Letter"]):
+        core.process_manifest_stream(
+            manifest={"items": items}, cfg=utils.Config(dry_run=True), ndjson_writer=lines.append
+        )
+    return {os.path.basename(r["path"]): r["result"] for r in map(json.loads, lines)}
+
+
+def test_a_page_rescan_takes_the_pages_reviewed_date_sign_off() -> None:
+    # Arrange
+    signed = {
+        "dateTimeOriginal": "1916:08:17 00:00:00",
+        "keywords": ["DATE: 1916-08-17"],
+    }
+    items = [
+        {"path": "letter-page1.tif", "metadata": signed},
+        {"path": "letter-b-page1.tif", "metadata": {}},
+        {"path": "letter-page2.tif", "metadata": {}},
+    ]
+
+    # Act
+    results = _page_results(items)
+
+    # Assert
+    assert "DATE: 1916-08-17" in results["letter-b-page1.tif"]["keywords"]
+    assert "DATE: 1916-08-17" not in results["letter-page2.tif"]["keywords"]
+
+
+def test_an_untagged_page_one_shares_with_its_page1_rescan() -> None:
+    # Arrange
+    items = [
+        {"path": "memo.tif", "metadata": {"title": "Dear Mother"}},
+        {"path": "memo-b-page1.tif", "metadata": {}},
+        {"path": "memo-page2.tif", "metadata": {}},
+    ]
+
+    # Act
+    results = _page_results(items)
+
+    # Assert
+    assert results["memo-b-page1.tif"].get("title") == "Dear Mother"
+    assert results["memo-page2.tif"].get("title") != "Dear Mother"
