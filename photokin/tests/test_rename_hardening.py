@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -236,10 +237,25 @@ def test_a_linked_transcripts_real_folder_is_synced(
     assert synced == [str(outside)]
 
 
-def test_run_ids_from_one_second_sort_by_age() -> None:
+def test_run_ids_from_one_second_sort_by_age(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: two runs 1 ms apart within one second, whatever the OS timer resolution.
+    moments = iter(
+        [
+            datetime(2026, 11, 21, 12, 0, 0, 900_000, tzinfo=UTC),
+            datetime(2026, 11, 21, 12, 0, 0, 901_000, tzinfo=UTC),
+        ]
+    )
+
+    class _Clock:
+        @staticmethod
+        def now(tz: object) -> datetime:
+            return next(moments)
+
+    monkeypatch.setattr("photokin.changeset.datetime", _Clock)
+
     # Act
-    ids = [make_run_id() for _ in range(50)]
+    first, second = make_run_id(), make_run_id()
 
     # Assert
-    assert sorted(ids, key=lambda i: i.split("_")[0]) == ids
-    assert len({i.split("_")[0] for i in ids}) > 1
+    assert first.startswith("2026-11-21T12:00:00.900000Z_")
+    assert first.split("_")[0] < second.split("_")[0]
