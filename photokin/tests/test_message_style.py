@@ -47,6 +47,10 @@ _SAMPLE_ARGS: dict[str, object] = {
     "second": "--manifest",
     "index": 3,
     "tokens": ["photokin", r"C:\Users\YourName\Pictures\Scans", "-rw"],
+    "group": "church-edward-photo-album-of-the-hollister-avenue-years",
+    "pages": 146,
+    "limit": 50,
+    "others": 12,
 }
 
 #: The longest a problem line may be before it stops being skimmable. Set from

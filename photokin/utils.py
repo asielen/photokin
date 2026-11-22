@@ -212,6 +212,11 @@ class Config:
     # Payload-size trigger for Phase 3 chunking, not document-specific: any
     # oversized group of parts chunks the same way. 0 disables chunking.
     max_images_per_call: int = 8
+    # The most pages one document may hold before a run refuses to start; 0
+    # lifts the cap. A runaway set (an album named like a document) would
+    # otherwise go to the model as one object. Album pages are split off
+    # first, so only a document's pages count.
+    max_group_pages: int = 50
     # The two date gates are deliberately ordered: filling a date the file does
     # not have is cheap, because nothing is lost if the guess is poor and the
     # field was empty either way, while overwriting a date the file already

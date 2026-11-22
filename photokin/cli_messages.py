@@ -501,6 +501,31 @@ def sidecar_bundle_contradiction(value: str) -> UsageMessage:
     )
 
 
+def group_has_too_many_pages(group: str, pages: int, limit: int, others: int) -> UsageMessage:
+    """A document holds more pages than one run will send as one object.
+
+    Refused before any model call: a set named like a document that is really
+    an album would otherwise put every page's answer on every page.
+
+    Args:
+        group: The largest offending group's key.
+        pages: How many pages it holds.
+        limit: The cap in force.
+        others: How many further groups are also over the cap.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    more = f"; {others} more are too" if others else ""
+    return (
+        f"`{group}` has {pages} pages, over the {limit}-page cap{more}.",
+        (
+            "if it is one document, add --max-group-pages 0; if each page is its own "
+            "photo, add --page-grouping album"
+        ),
+    )
+
+
 def write_needs_changeset() -> UsageMessage:
     """Writing was asked for with no changeset to write from.
 

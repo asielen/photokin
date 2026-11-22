@@ -49,6 +49,7 @@ Code map (public-facing entry points marked PUBLIC):
 - _fold_out_of_order_variants   read a letter back into the name when earlier letters are missing
 - _album_reason / _split_album_pages  make each page of an album its own object
 - album_plan_lines              PUBLIC: the plan's description of the sets read as albums
+- oversized_page_sets           PUBLIC: the documents over the --max-group-pages cap
 - _escape_pair_half             make one half of a pair key free of bare separators
 - _pair_bucket_key              the escaped group-key/variant join '--group-by pair' uses
 - build_manifest_buckets        PUBLIC: group items the way the stream will
@@ -3052,6 +3053,28 @@ def album_plan_lines(buckets: dict[str, list[dict]]) -> list[str]:
     ]
 
 
+def oversized_page_sets(buckets: dict[str, list[dict]], limit: int) -> list[tuple[str, int]]:
+    """Return the groups holding more than *limit* pages, largest first.
+
+    Args:
+        buckets: A :func:`build_manifest_buckets` result.
+        limit: The page cap; ``0`` or less means no cap.
+
+    Returns:
+        ``(group key, page count)`` pairs, most pages first; empty when every
+        group fits.
+    """
+    if limit <= 0:
+        return []
+    counts = (
+        (key, len({entry["page_num"] for entry in entries if entry["part_kind"] == "page"}))
+        for key, entries in buckets.items()
+    )
+    return sorted(
+        ((key, pages) for key, pages in counts if pages > limit), key=lambda pair: -pair[1]
+    )
+
+
 def _escape_pair_half(half: str) -> str:
     """Escape one half of a ``pair`` bucket key so its separators are inert.
 
@@ -3472,6 +3495,13 @@ def process_manifest_stream(
     title_from_file_ids: set[int] | None = getattr(metadata_hydrator, "title_from_file", None)
     group_by = cfg.group_by
     buckets = build_manifest_buckets(items, group_by=group_by, page_grouping=cfg.page_grouping)
+    oversized = oversized_page_sets(buckets, cfg.max_group_pages)
+    if oversized:
+        key, pages = oversized[0]
+        raise ValueError(
+            f"Group {key!r} has {pages} pages, over max_group_pages={cfg.max_group_pages}; "
+            "no model call was made."
+        )
 
     results: dict[str, dict] = {}
     errors: dict[str, dict] = {}

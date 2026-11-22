@@ -84,6 +84,7 @@ from .core import (
     build_folder_manifest,
     album_plan_lines,
     build_manifest_buckets,
+    oversized_page_sets,
     build_single_photo_manifest,
     process_manifest_stream,
 )
@@ -1437,6 +1438,7 @@ def _build_show_config(args: argparse.Namespace) -> dict:
             "group_by": args.group_by,
             "page_grouping": args.page_grouping,
             "max_images_per_call": args.max_images_per_call,
+            "max_group_pages": args.max_group_pages,
         },
         "confidence_thresholds": {
             "date": args.date_confidence_threshold,
@@ -3041,6 +3043,15 @@ def main() -> None:
                  "manifest group always wins.",
         )
         ap.add_argument(
+            "--max-group-pages",
+            type=int,
+            default=defaults.max_group_pages,
+            metavar="N",
+            help="Refuse to start when one document holds more than N pages (default: "
+                 "%(default)s); 0 lifts the cap. Album pages are their own objects and "
+                 "do not count.",
+        )
+        ap.add_argument(
             "--sidecar-md",
             choices=list(utils.SIDECAR_MD_VALUES),
             # None rather than "off" so _resolve_sidecar_bundle can tell an
@@ -3517,6 +3528,7 @@ def main() -> None:
             page_grouping=args.page_grouping,
             sidecar_md=args.sidecar_md,
             max_images_per_call=args.max_images_per_call,
+            max_group_pages=args.max_group_pages,
             date_confidence_threshold=args.date_confidence_threshold,
             date_min_confidence=args.date_min_confidence,
             location_confidence_threshold=args.location_confidence_threshold,
@@ -3657,6 +3669,14 @@ def main() -> None:
             albums=tuple(album_plan_lines(buckets)),
         )
         logger.info("%s", plan.render())
+        oversized = oversized_page_sets(buckets, cfg.max_group_pages)
+        if oversized:
+            (group, pages), *others = oversized
+            _exit_with_usage_error(
+                *cli_messages.group_has_too_many_pages(
+                    group, pages, cfg.max_group_pages, len(others)
+                )
+            )
         if args.dry_run:
             # Nothing below this line has run, so no destination has been
             # truncated and the previous run's artifacts are byte-identical --
