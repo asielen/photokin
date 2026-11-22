@@ -1339,7 +1339,7 @@ def output_file_is_needed_by_the_run(
         The problem line and the remedy line, in that order.
     """
     lead = f"{role} names {description}, and would overwrite it:"
-    remedy = f"point {role} at a file this run does not touch"
+    remedy = f"point {_role_flag(role)} at a file this run does not touch"
     if out_path == needed_path:
         return (f"{lead}\n  {out_path}", remedy)
     width = max(len(role), len("that file")) + 2

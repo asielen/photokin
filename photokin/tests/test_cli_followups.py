@@ -124,3 +124,13 @@ class TestModeOnlyRefusalReachesTheEnvelope(_CliTestCase):
         self.assertEqual(code, 2)
         records = _envelope_records(_ndjson_lines(out))
         self.assertEqual([r["run"] for r in records], ["start", "fatal"])
+
+
+def test_a_needed_file_remedy_names_a_real_flag() -> None:
+    # Act
+    _problem, remedy = cli_messages.output_file_is_needed_by_the_run(
+        "--changeset output", "out/r_changeset.ndjson", "C:/x/r_changeset.ndjson", "the cancel sentinel"
+    )
+
+    # Assert
+    assert "--output-file" in remedy and "--changeset output" not in remedy
