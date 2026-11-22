@@ -153,14 +153,17 @@ This is a maintenance tool for an agent or a developer cleaning up after a bad r
 
 ```bash
 photokin --revert-changeset results_changeset.ndjson --dry-run --output-file revert.ndjson
-photokin --revert-changeset results_changeset.ndjson [--revert-paths P1,P2 | --revert-match GLOB] [--force]
+photokin --revert-changeset results_changeset.ndjson [--revert-paths PATH ... | --revert-match GLOB] [--force]
 ```
 
 - The first record per path is used; virtual copies of one file share one original, and `entries` says how many records there were. Records marked `write: false` are skipped.
 - Every tag the run wrote goes back to its value from `original_data.written_tags`, and a tag the file did not have is deleted. Keywords are restored as additions and removals against the file's current list. A tag the run never touched is never written.
 - Before restoring, the file must still hold what the run wrote. A tag that changed since means someone edited the file after the run: the file is reported as `conflict` and left alone, unless `--force`.
-- A changeset from before schema 5 has no `written_tags`. The revert then takes before-values from `original_data.file_metadata` and lists, under `inferred`, each tag it assumed the file did not have.
-- Output is NDJSON, one record per file with `status` (`reverted`, `unchanged`, `conflict`, `missing` or `error`) and the `tags` touched, then `{"summary": {...}, "dry_run": ...}`. It goes to `--output-file` or stdout, and the exit code is 1 when any file conflicted or failed.
+- `--revert-paths` takes one file per flag (repeat it), so a name with a comma works; a filter that matches nothing says so.
+- A changeset from before schema 5 has no `written_tags`, so it cannot say what the files held. Its files are reported `no_snapshot` and left alone; put them back by hand.
+- Every restore is read back. A file whose tags did not come back (ExifTool skips a value it refuses, such as a `0000:00:00` date, and still exits 0) is an `error` naming them, not `reverted`.
+- `--output-file` may not name the changeset itself.
+- Output is NDJSON, one record per file with `status` (`reverted`, `unchanged`, `conflict`, `missing`, `no_snapshot` or `error`) and the `tags` touched, then `{"summary": {...}, "dry_run": ...}`. It goes to `--output-file` or stdout, and the exit code is 1 when any file conflicted, failed or had no snapshot.
 - `--dry-run` reads and judges every file and writes nothing. `--exiftool-path` works as it does for `-w`.
 
 ## Standalone CLI

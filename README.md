@@ -868,7 +868,7 @@ Prints this build's contract as JSON and exits, before any input is required —
 {
   "version": "0.8.0",
   "ndjson_schema_version": 3,
-  "changeset_schema_version": 4,
+  "changeset_schema_version": 6,
   "canonical_tags": {
     "ai_caption": "EXIF:UserComment",
     "caption": "XMP-dc:Description",

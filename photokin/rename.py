@@ -37,7 +37,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Any
 
@@ -611,6 +611,35 @@ def _build_member(item: RenameItem, position: int) -> _Member:
     )
 
 
+def _fold_out_of_order_variants(members: list[_Member]) -> None:
+    """Read a filename's variant letter back into its name when earlier letters are missing.
+
+    The rule analysis grouping applies (:func:`utils.first_missing_variant`),
+    so a lone ``box3_013_z`` is numbered as its own photo here exactly as it
+    is analyzed as one. A manifest ``version`` override stands.
+
+    Args:
+        members: Every member of the plan; updated in place.
+    """
+    letters: dict[str, set[str]] = {}
+    for member in members:
+        if member.final_parsed.variant_id:
+            letters.setdefault(member.parsed.base_id.lower(), set()).add(
+                member.final_parsed.variant_id
+            )
+    for member in members:
+        parsed = member.parsed
+        if member.item.version is not None or not parsed.variant_suffix or not parsed.variant_id:
+            continue
+        if utils.first_missing_variant(parsed.variant_id, letters[parsed.base_id.lower()]) is None:
+            continue
+        folded = parsed.base_id + parsed.variant_suffix
+        member.parsed = replace(parsed, base_id=folded, variant_id=None, variant_suffix="")
+        member.final_parsed = replace(member.final_parsed, base_id=folded, variant_id=None)
+        if "variant form normalized" in member.notes:
+            member.notes.remove("variant form normalized")
+
+
 @dataclass
 class _GroupPlan:
     """One group: its members, in position order, plus its rendered prefix.
@@ -818,6 +847,7 @@ def plan_rename(
         if member.version_error is not None:
             errors.append(f"{os.path.basename(member.item.path)}: {member.version_error}")
 
+    _fold_out_of_order_variants(members)
     groups: dict[str, list[_Member]] = {}
     for member in members:
         groups.setdefault(member.parsed.base_id.lower(), []).append(member)

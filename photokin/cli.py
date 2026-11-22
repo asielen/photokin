@@ -2877,9 +2877,16 @@ def _run_revert_changeset(args: argparse.Namespace) -> None:
         _exit_with_usage_error(*cli_messages.revert_filters_together())
     if not os.path.isfile(args.revert_changeset):
         _exit_with_usage_error(*cli_messages.input_not_found(args.revert_changeset))
+    if args.output_file:
+        # The changeset is the only record of what the files held; a preview
+        # written over it would leave nothing to revert from.
+        _preflight_output_file(
+            args.output_file,
+            protects=[_ProtectedPath(args.revert_changeset, "the changeset this revert reads")],
+        )
     only = frozenset(
         os.path.normcase(os.path.abspath(path.strip()))
-        for path in (args.revert_paths or "").split(",")
+        for path in args.revert_paths or ()
         if path.strip()
     )
     cfg = replace(_resolve_exiftool_config(args), dry_run=args.dry_run)
@@ -2894,6 +2901,11 @@ def _run_revert_changeset(args: argparse.Namespace) -> None:
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         logger.error("Could not read the files to revert: %s", exc)
         sys.exit(1)
+    if (only or args.revert_match) and len(records) == 1:
+        logger.warning(
+            "No file in the changeset matched %s.",
+            "--revert-paths" if only else "--revert-match",
+        )
     lines = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
     if args.output_file:
         with open(args.output_file, "w", encoding="utf-8") as handle:
@@ -2906,7 +2918,7 @@ def _run_revert_changeset(args: argparse.Namespace) -> None:
         " (dry run)" if args.dry_run else "",
         ", ".join(f"{count} {status}" for status, count in summary.items() if count),
     )
-    if summary["conflict"] or summary["error"]:
+    if summary["conflict"] or summary["error"] or summary["no_snapshot"]:
         sys.exit(1)
 
 
@@ -3431,9 +3443,10 @@ def main() -> None:
         )
         ap.add_argument(
             "--revert-paths",
-            metavar="P1,P2",
+            metavar="PATH",
+            action="append",
             default=None,
-            help="--revert-changeset: revert only these files.",
+            help="--revert-changeset: revert only this file; repeat the flag for more.",
         )
         ap.add_argument(
             "--revert-match",
@@ -3509,7 +3522,11 @@ def main() -> None:
         # named two of these gets one clear refusal instead of whichever
         # branch happened to run first.
         _refuse_rename_mode_conflicts(args)
-        _refuse_mode_only_flags(args)
+        if _given_rename_modes(args) or args.revert_changeset is not None:
+            # A mode that returns below never reaches the envelope; an
+            # analysis run is checked once the envelope is open, so its
+            # refusal lands in the results file.
+            _refuse_mode_only_flags(args)
         _refuse_executor_dry_run(args)
         _refuse_rename_mode_sidecar_flags(args)
         if args.rename_finish is not None:
@@ -3541,6 +3558,7 @@ def main() -> None:
         # contract says can never exist.
         if not args.dry_run and not args.generate_manifest:
             _open_run_envelope_if_fresh(args.output_file, batch_id=args.batch_id)
+        _refuse_mode_only_flags(args)
 
         if args.process_all_variants:
             logger.warning(
