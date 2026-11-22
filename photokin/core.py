@@ -4669,15 +4669,31 @@ def process_manifest_stream(
             # In a document each page is its own file, but the scans of one
             # page (a rescan, a crop) are still one page: they share that
             # page's fields, and only that page's.
-            page_meta: dict[str, dict[str, Any]] = {}
+            # An untagged file in a document is its page 1, so it shares a
+            # slot with a "-page1" rescan. Date markers follow the print rule
+            # within a page: a reviewed sign-off reaches a bare rescan.
+            def _page_slot(entry: dict) -> str:
+                slot = _manifest_part_key(entry)
+                return "page:1" if slot == "none" else slot
+
+            page_meta: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
             if multipage_present:
-                by_slot: dict[str, list[dict]] = {}
-                for entry in group:
-                    by_slot.setdefault(_manifest_part_key(entry), []).append(entry)
-                page_meta = {
-                    slot: _group_meta_with_date_markers(utils.combine_group_metadata(members), set())
-                    for slot, members in by_slot.items()
-                }
+                by_slot: dict[str, list[tuple[dict, dict]]] = {}
+                for entry, entry_meta in zip(group, own_metadata):
+                    by_slot.setdefault(_page_slot(entry), []).append((entry, entry_meta))
+                for slot, members in by_slot.items():
+                    slot_combined = utils.combine_group_metadata([e for e, _ in members])
+                    slot_signed_off = {
+                        kw.strip().lower()
+                        for kws in (_own_keywords(m) for _, m in members)
+                        if utils.has_reviewed_date_keyword(kws)
+                        for kw in kws
+                        if utils.is_date_keyword(kw)
+                    }
+                    page_meta[slot] = (
+                        _group_meta_with_date_markers(slot_combined, slot_signed_off),
+                        _group_meta_with_date_markers(slot_combined, set()),
+                    )
 
             # emit per-file (merged with per-file metadata)
             for it, own_meta, (file_caption, caption_scope) in zip(
@@ -4690,15 +4706,13 @@ def process_manifest_stream(
                 own_markers = utils.part_markers_in(
                     own_meta.get("keywords") or own_meta.get("tags")
                 )
-                slot_meta = page_meta.get(_manifest_part_key(it))
-                per_meta = utils.merge_original_sources(
-                    own_meta,
-                    slot_meta
-                    if multipage_present
-                    else group_meta_unmarked
-                    if any(map(utils.is_date_marker, _own_keywords(own_meta)))
-                    else group_meta_signed_off,
-                )
+                own_marked = any(map(utils.is_date_marker, _own_keywords(own_meta)))
+                if multipage_present:
+                    slot_signed, slot_unmarked = page_meta[_page_slot(it)]
+                    fallback = slot_unmarked if own_marked else slot_signed
+                else:
+                    fallback = group_meta_unmarked if own_marked else group_meta_signed_off
+                per_meta = utils.merge_original_sources(own_meta, fallback)
 
                 # The one keyword that is a property of this file rather than of
                 # the object.
