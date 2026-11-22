@@ -48,6 +48,7 @@ from __future__ import annotations
 # union_keywords,
 # merge_original_sources, dedupe_captions_with_source, extract_usage.
 import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -790,19 +791,42 @@ def insert_keyword_into_vocab_file(
     return True
 
 
-def safe_backup(path: str) -> None:
-    """Write a one-time ``<path>.bak`` copy before a file is mutated.
+def backup_path_for(path: str) -> Path:
+    """Return where :func:`safe_backup` keeps the backup of *path*.
 
-    Best-effort and idempotent: it never overwrites an existing ``.bak`` (so the
-    first backup wins) and only warns on failure rather than raising, so backup
-    trouble never blocks the primary operation.
+    Backups live under ``~/.photokin/backups`` rather than beside the file, so
+    backing up the default vocab never writes into the installed package. The
+    name carries a short hash of the absolute path, so two files that share a
+    basename never share a backup.
+
+    Args:
+        path: The file to be backed up.
+
+    Returns:
+        The backup's path; its directory may not exist yet.
     """
-    backup_path = path + ".bak"
+    absolute = os.path.abspath(path)
+    digest = hashlib.sha1(absolute.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    return Path.home() / ".photokin" / "backups" / f"{os.path.basename(absolute)}.{digest}.bak"
+
+
+def safe_backup(path: str) -> None:
+    """Write a one-time backup of *path* before it is mutated.
+
+    Best-effort and idempotent: it never overwrites an existing backup (so the
+    first backup wins) and only warns on failure rather than raising, so backup
+    trouble never blocks the primary operation. See :func:`backup_path_for`
+    for where the copy goes.
+
+    Args:
+        path: The file about to be changed.
+    """
+    backup_path = backup_path_for(path)
     try:
-        if not os.path.exists(backup_path):
-            with open(path, "rb") as src, open(backup_path, "wb") as dst:
-                dst.write(src.read())
-    except Exception as e:
+        if not backup_path.exists():
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, backup_path)
+    except OSError as e:
         logger.warning("Could not create backup for %s: %s", path, e)
 
 
