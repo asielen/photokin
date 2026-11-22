@@ -25,7 +25,6 @@ Code map:
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import secrets
 from copy import deepcopy
@@ -38,7 +37,7 @@ from .canonical import (
     CANONICAL_KEYWORDS_TAG,
     hierarchy_levels,
 )
-from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywords
+from .utils import DEFAULT_METADATA_FORWARD_FIELDS, json_text, normalize_path, union_keywords
 
 # Bumped whenever a record's shape changes in a way a consumer could care
 # about -- a new top-level key, a renamed one, a changed meaning for an
@@ -255,4 +254,4 @@ def emit_changeset_record(
         **deepcopy(item_fields or {}),
     }
 
-    writer(json.dumps(record, ensure_ascii=False))
+    writer(json_text(record))

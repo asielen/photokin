@@ -7,14 +7,14 @@ import json
 import logging
 import os
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
 from photokin import cli, utils
 from photokin.changeset import make_photo_id
-from photokin.rename import RenameItem, _shares_stem
+from photokin.rename import _shares_stem
 from photokin.tests.test_rename_apply import _case_insensitive
+from photokin.tests.test_rename_planner import _plan
 
 
 def test_an_ordinary_photo_id_is_unchanged() -> None:
@@ -40,36 +40,6 @@ def test_json_text_falls_back_to_escapes_only_when_it_must() -> None:
     assert "Grand-mère.tif" in readable
     escaped.encode("utf-8")
     assert json.loads(escaped) == {"name": "bad\udcff.tif"}
-
-
-def test_disk_spelling_returns_the_stored_case(tmp_path: Path) -> None:
-    # Arrange
-    folder = tmp_path / "Photos"
-    folder.mkdir()
-    (folder / "Box3.tif").write_bytes(b"x")
-    if not _case_insensitive(tmp_path):
-        pytest.skip("needs a case-insensitive filesystem")
-
-    # Act
-    spelled = utils.disk_spelling(str(tmp_path / "PHOTOS" / "BOX3.TIF"))
-
-    # Assert
-    assert spelled.endswith(os.path.join("Photos", "Box3.tif"))
-
-
-def test_the_rename_folder_takes_the_disks_spelling(tmp_path: Path) -> None:
-    # Arrange
-    folder = tmp_path / "Photos"
-    folder.mkdir()
-    if not _case_insensitive(tmp_path):
-        pytest.skip("needs a case-insensitive filesystem")
-    item = RenameItem(path=str(tmp_path / "PHOTOS" / "a.tif"))
-
-    # Act
-    chosen = cli._rename_folder_from_items([item], MagicMock())
-
-    # Assert
-    assert os.path.basename(chosen) == "Photos"
 
 
 def test_two_new_destinations_in_one_folder_collide_by_name(tmp_path: Path) -> None:
@@ -126,3 +96,24 @@ def test_a_case_twin_is_a_companion_only_where_case_folds(tmp_path: Path) -> Non
     # Assert
     assert shares is _case_insensitive(tmp_path)
     assert _shares_stem(str(image), str(tmp_path / "photo.md"))
+
+
+def test_a_managed_plan_reports_a_swap_before_the_catalog_renames() -> None:
+    # Act
+    plan = _plan(
+        ["x-001.tif", "x-002.tif"],
+        "x-",
+        orders={"x-001.tif": 2, "x-002.tif": 1},
+        managed_by={"tool": "lightroom"},
+    )
+
+    # Assert
+    assert any("swap names in a cycle" in e for e in plan["errors"])
+
+
+def test_an_unmanaged_swap_plan_stays_valid() -> None:
+    # Act
+    plan = _plan(["x-001.tif", "x-002.tif"], "x-", orders={"x-001.tif": 2, "x-002.tif": 1})
+
+    # Assert
+    assert plan["errors"] == []

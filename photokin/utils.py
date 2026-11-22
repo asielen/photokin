@@ -2071,42 +2071,6 @@ def json_text(value: Any, *, indent: int | None = None) -> str:
     return text
 
 
-def disk_spelling(path: str) -> str:
-    """Return *path* spelled the way the filesystem spells each of its parts.
-
-    On a case-insensitive volume ``C:\\PHOTOS\\a.tif`` opens the file stored
-    as ``C:\\Photos\\a.tif``; anything hashed from the path (a photo id)
-    must use the stored spelling, or one file gets two ids. Symlinks are not
-    resolved. A part that cannot be listed or matched is kept as written.
-
-    Args:
-        path: An absolute path.
-
-    Returns:
-        The same path with each existing part in its on-disk case.
-    """
-    drive, rest = os.path.splitdrive(os.path.normpath(path))
-    current = drive + os.sep if rest.startswith(os.sep) else drive
-    for part in [p for p in rest.split(os.sep) if p]:
-        try:
-            listed = os.listdir(current or ".")
-        except OSError:
-            listed = []
-        if part not in listed:
-            wanted = casefold_filename(part)
-            part = next(
-                (
-                    name
-                    for name in listed
-                    if casefold_filename(name) == wanted
-                    and paths_are_same_file(os.path.join(current, name), os.path.join(current, part))
-                ),
-                part,
-            )
-        current = os.path.join(current, part)
-    return current
-
-
 def destinations_may_collide(path_a: str, path_b: str) -> bool:
     """Whether writing *path_a* and *path_b* could land in one file.
 

@@ -611,6 +611,41 @@ def _build_member(item: RenameItem, position: int) -> _Member:
     )
 
 
+def image_cycles(entries: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Return the images of a plan whose renames form a cycle.
+
+    In a swap (``a -> b``, ``b -> a``) both old names still exist after the
+    rename, so the folder alone cannot say whether a catalog applied it.
+    ``--rename-finish`` reads exactly that, so it refuses such a plan, and
+    the planner reports one in a plan a catalog will apply (``managed_by``),
+    before the catalog renames anything.
+
+    Args:
+        entries: The plan's entries.
+
+    Returns:
+        The old names of every image on a cycle, in plan order.
+    """
+    target_of: dict[str, str] = {}
+    for entry in entries:
+        name = os.path.basename(str(entry.get("path") or ""))
+        target = str(entry.get("target") or "")
+        if name and target and name != target:
+            target_of[name] = target
+    on_cycle: set[str] = set()
+    done: set[str] = set()
+    for start in target_of:
+        walk: dict[str, int] = {}
+        node = start
+        while node in target_of and node not in done and node not in walk:
+            walk[node] = len(walk)
+            node = target_of[node]
+        if node in walk:
+            on_cycle.update(list(walk)[walk[node] :])
+        done.update(walk)
+    return [name for name in target_of if name in on_cycle]
+
+
 def _fold_out_of_order_variants(members: list[_Member]) -> None:
     """Read a filename's variant letter back into its name when earlier letters are missing.
 
@@ -1079,6 +1114,13 @@ def plan_rename(
     _validate_targets(
         entries=entries, bystander_names=bystander_names, errors=errors
     )
+    if managed_by is not None:
+        cycles = image_cycles(entries)
+        if cycles:
+            errors.append(
+                "these images swap names in a cycle, which a catalog cannot apply and "
+                f"--rename-finish cannot verify: {', '.join(cycles)}"
+            )
 
     for entry in entries:
         if entry["target"] and len(entry["target"].encode("utf-8")) > 255:

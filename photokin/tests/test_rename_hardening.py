@@ -168,7 +168,13 @@ def test_an_escaped_link_is_decoded_before_it_is_matched(tmp_path: Path) -> None
 
 @pytest.mark.parametrize(
     "line",
-    ["  source_file:   old.tif", "source_file: 'old.tif'", 'source_file: "old.tif"'],
+    [
+        "  source_file:   old.tif",
+        "source_file: 'old.tif'",
+        'source_file: "old.tif"',
+        "source_file: Grandma's 1950 scan.tif",
+        "source_file: photo, 1950.tif",
+    ],
 )
 def test_apply_then_undo_gives_back_the_same_bytes(tmp_path: Path, line: str) -> None:
     # Arrange
@@ -176,12 +182,13 @@ def test_apply_then_undo_gives_back_the_same_bytes(tmp_path: Path, line: str) ->
     original = md.read_bytes()
 
     # Act
-    assert _rewrite_sidecar(str(md), "old.tif", "new-001.tif", str(tmp_path / "t.md")) is None
+    old = rename_apply._sidecar_link(line.strip())
+    assert _rewrite_sidecar(str(md), old, "M\u00fcller-001.tif", str(tmp_path / "t.md")) is None
     forward = md.read_text(encoding="utf-8")
-    assert _rewrite_sidecar(str(md), "new-001.tif", "old.tif", str(tmp_path / "t.md")) is None
+    assert _rewrite_sidecar(str(md), "M\u00fcller-001.tif", old, str(tmp_path / "t.md")) is None
 
     # Assert
-    assert "new-001.tif" in forward
+    assert "M\u00fcller-001.tif" in forward
     assert md.read_bytes() == original
 
 

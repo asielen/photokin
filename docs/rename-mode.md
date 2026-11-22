@@ -310,7 +310,7 @@ from photokin. Entries whose images are not yet renamed are reported and
 skipped, so the command is safe to run again. The journal it writes marks
 each image record `renamed_by: external`, and `--rename-undo` on such a
 journal reverses companions only, requiring each image to be back at `from`
-first (the catalog's own undo) and reporting the rest.
+first (the catalog's own undo) and reporting the rest. A companion whose size or mtime changed since the plan was made is skipped, as apply's preflight would refuse it. A plan whose images swap names in a cycle cannot be verified afterwards, since both old names still exist once a catalog has applied it: a plan with `managed_by` reports such a cycle in its `errors`, so the catalog stops before renaming, and `--rename-finish` refuses one.
 
 ### 5.6 Not for catalogued folders
 

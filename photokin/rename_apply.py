@@ -71,6 +71,7 @@ from typing import Any
 
 from .changeset import make_run_id
 from .doc_sidecar import _yaml_string
+from .rename import image_cycles
 from .utils import casefold_filename, json_text, paths_are_same_file
 
 logger = logging.getLogger(__name__)
@@ -159,8 +160,9 @@ _YAML_ESCAPE_RE = re.compile(r"\\(u[0-9a-fA-F]{4}|.)")
 #: The single-character escapes ``doc_sidecar._yaml_string`` emits, decoded.
 _YAML_UNESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\x00", "\\": "\\", '"': '"'}
 
-#: A filename YAML reads back unchanged without quotes.
-_YAML_PLAIN_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.()+-]*(?: [A-Za-z0-9_.()+-]+)*$")
+#: A filename YAML reads back unchanged without quotes: no leading
+#: indicator character, no ": " or " #", no edge whitespace or trailing ":".
+_YAML_PLAIN_RE = re.compile(r"""^(?![-?:,\[\]{}#&*!|>'"%@`\s])(?!.*(?:: | #))(?!.*[\s:]$).+$""")
 
 #: How much of a journal's tail is read at a time when the last record has to
 #: be checked for termination. The journal is one record per renamed file, so
@@ -1463,39 +1465,6 @@ def _changed_since_plan(record: Mapping[str, Any], size: int, mtime: float) -> b
     return resized or retouched
 
 
-def _image_cycles(entries: Sequence[Mapping[str, Any]]) -> list[str]:
-    """Return the images of a plan whose renames form a cycle.
-
-    In a swap (``a -> b``, ``b -> a``) both old names still exist after the
-    rename, so the folder alone cannot say whether a catalog applied it.
-    ``--rename-finish`` reads exactly that, so such a plan is refused.
-
-    Args:
-        entries: The plan's entries.
-
-    Returns:
-        The old names of every image on a cycle, in plan order.
-    """
-    target_of: dict[str, str] = {}
-    for entry in entries:
-        name = os.path.basename(str(entry.get("path") or ""))
-        target = str(entry.get("target") or "")
-        if name and target and name != target:
-            target_of[name] = target
-    on_cycle: set[str] = set()
-    done: set[str] = set()
-    for start in target_of:
-        walk: dict[str, int] = {}
-        node = start
-        while node in target_of and node not in done and node not in walk:
-            walk[node] = len(walk)
-            node = target_of[node]
-        if node in walk:
-            on_cycle.update(list(walk)[walk[node] :])
-        done.update(walk)
-    return [name for name in target_of if name in on_cycle]
-
-
 def preflight(plan: Mapping[str, Any]) -> list[str]:
     """Re-check a plan against the folder before anything is renamed.
 
@@ -1781,7 +1750,7 @@ def _render_link(name: str, style: str) -> str:
     Returns:
         The value text; double-quoted whenever the style cannot carry *name*.
     """
-    if style == "" and _YAML_PLAIN_RE.match(name):
+    if style == "" and name.isprintable() and _YAML_PLAIN_RE.match(name):
         return name
     if style == "'" and name.isprintable():
         return "'" + name.replace("'", "''") + "'"
@@ -2285,7 +2254,7 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
         _raise_preflight(problems)
 
     entries = [entry for entry in plan.get("entries") or [] if isinstance(entry, Mapping)]
-    cycles = _image_cycles(entries)
+    cycles = image_cycles(entries)
     if cycles:
         raise RenamePreflightError(
             "This plan swaps names in a cycle, so a catalog's rename cannot be "

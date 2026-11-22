@@ -162,7 +162,7 @@ def _append_ndjson_record(path: str, record: dict, *, batch_id: str | None = Non
     if batch_id:
         record.setdefault("batch_id", batch_id)
     record.setdefault("schema_version", _NDJSON_SCHEMA_VERSION)
-    line = json.dumps(record, ensure_ascii=False) + "\n"
+    line = utils.json_text(record) + "\n"
     with _ndjson_write_lock, open(path, "a", encoding="utf-8") as handle:
         handle.write(line)
 
@@ -1822,7 +1822,7 @@ def _write_aggregate_json(data: dict, out_path: str, *, pretty: bool) -> None:
     tmp_path = out_path + ".tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2 if pretty else None, ensure_ascii=False)
+            handle.write(utils.json_text(data, indent=2 if pretty else None))
         os.replace(tmp_path, out_path)
     finally:
         if os.path.exists(tmp_path):
@@ -2289,9 +2289,7 @@ def _rename_folder_from_items(items: list[RenameItem], resolved: ResolvedInput) 
     directories = sorted(
         {os.path.dirname(os.path.abspath(item.path)) for item in items if item.path}
     )
-    # The disk's spelling, since the planner hashes it into every target id
-    # and a later run of the same folder reads it off the disk.
-    return utils.disk_spelling(directories[0]) if directories else resolved.directory
+    return directories[0] if directories else resolved.directory
 
 
 def _list_all_files(folder: str) -> list[str]:
@@ -2678,7 +2676,7 @@ def _write_rename_changeset_records(changeset_path: str, plan: dict[str, Any]) -
                     for companion in entry.get("companions") or []
                 ],
             }
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.write(utils.json_text(record) + "\n")
 
 
 def _run_rename_mode(args: argparse.Namespace) -> None:
@@ -2906,7 +2904,7 @@ def _run_revert_changeset(args: argparse.Namespace) -> None:
             "No file in the changeset matched %s.",
             "--revert-paths" if only else "--revert-match",
         )
-    lines = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    lines = "".join(utils.json_text(record) + "\n" for record in records)
     if args.output_file:
         with open(args.output_file, "w", encoding="utf-8") as handle:
             handle.write(lines)
