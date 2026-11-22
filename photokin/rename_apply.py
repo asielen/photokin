@@ -1261,7 +1261,9 @@ def _is_bare_filename(name: str) -> bool:
     (``docs/rename-mode.md`` section 11), so the answer may not depend on the
     running OS. ``ntpath`` knows every separator POSIX knows and the ones it
     does not, and ``.``/``..`` are spelled out because ``basename`` returns
-    them unchanged.
+    them unchanged. A NUL byte is refused too: no filesystem takes one, and
+    ``os.rename`` raises on it only after phase A has already staged every
+    file under a temporary name, which a resume then cannot get past.
 
     Args:
         name: The candidate filename.
@@ -1269,7 +1271,12 @@ def _is_bare_filename(name: str) -> bool:
     Returns:
         ``True`` when *name* is a bare filename.
     """
-    return bool(name) and name not in (".", "..") and ntpath.basename(name) == name
+    return (
+        bool(name)
+        and name not in (".", "..")
+        and "\x00" not in name
+        and ntpath.basename(name) == name
+    )
 
 
 def _target_refusals(plan: Mapping[str, Any]) -> list[str]:
@@ -1408,7 +1415,7 @@ def _source_problems(
         problems.append("a plan entry has no path")
         return problems
     directory = os.path.dirname(source)
-    if directory and os.path.abspath(directory) != folder:
+    if directory and not _same_folder(os.path.abspath(directory), folder):
         problems.append(f"outside the plan's folder: {source}")
     if not target:
         problems.append(f"no target planned for: {name}")
@@ -1418,6 +1425,27 @@ def _source_problems(
         problems.append(f"gone since the plan was made: {name}")
         return problems
     _disk_name, size, mtime = found
+    if _changed_since_plan(record, size, mtime):
+        problems.append(f"changed since the plan was made: {name}")
+    return problems
+
+
+def _same_folder(directory: str, folder: str) -> bool:
+    """Whether two spellings name one folder; exact first, then by filesystem identity."""
+    return directory == folder or paths_are_same_file(directory, folder)
+
+
+def _changed_since_plan(record: Mapping[str, Any], size: int, mtime: float) -> bool:
+    """Whether a file's size or mtime differs from what its plan record measured.
+
+    Args:
+        record: The plan entry or companion record, read for ``size``/``mtime``.
+        size: The file's size now.
+        mtime: The file's mtime now.
+
+    Returns:
+        True when either recorded value is present and differs.
+    """
     planned_size = record.get("size")
     planned_mtime = record.get("mtime")
     resized = isinstance(planned_size, int) and planned_size != size
@@ -1425,9 +1453,40 @@ def _source_problems(
         isinstance(planned_mtime, (int, float))
         and abs(float(planned_mtime) - mtime) > _MTIME_TOLERANCE_S
     )
-    if resized or retouched:
-        problems.append(f"changed since the plan was made: {name}")
-    return problems
+    return resized or retouched
+
+
+def _image_cycles(entries: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Return the images of a plan whose renames form a cycle.
+
+    In a swap (``a -> b``, ``b -> a``) both old names still exist after the
+    rename, so the folder alone cannot say whether a catalog applied it.
+    ``--rename-finish`` reads exactly that, so such a plan is refused.
+
+    Args:
+        entries: The plan's entries.
+
+    Returns:
+        The old names of every image on a cycle, in plan order.
+    """
+    target_of: dict[str, str] = {}
+    for entry in entries:
+        name = os.path.basename(str(entry.get("path") or ""))
+        target = str(entry.get("target") or "")
+        if name and target and name != target:
+            target_of[name] = target
+    on_cycle: set[str] = set()
+    done: set[str] = set()
+    for start in target_of:
+        walk: dict[str, int] = {}
+        node = start
+        while node in target_of and node not in done and node not in walk:
+            walk[node] = len(walk)
+            node = target_of[node]
+        if node in walk:
+            on_cycle.update(list(walk)[walk[node] :])
+        done.update(walk)
+    return [name for name in target_of if name in on_cycle]
 
 
 def preflight(plan: Mapping[str, Any]) -> list[str]:
@@ -2135,7 +2194,17 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
     if problems:
         _raise_preflight(problems)
 
-    names = _list_names(folder)
+    entries = [entry for entry in plan.get("entries") or [] if isinstance(entry, Mapping)]
+    cycles = _image_cycles(entries)
+    if cycles:
+        raise RenamePreflightError(
+            "This plan swaps names in a cycle, so a catalog's rename cannot be "
+            "told from no rename.",
+            "Rename these with photokin (--rename -w) instead of a catalog.",
+            cycles,
+        )
+
+    names, stats = _scan(folder)
     plan_run_id = str(plan.get("run_id") or "")
     run_id, journal = _fresh_journal(folder, plan_run_id)
     safe = _safe_run_id(run_id)
@@ -2143,7 +2212,6 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
     skipped: list[str] = []
     renamed_images = 0
 
-    entries = [entry for entry in plan.get("entries") or [] if isinstance(entry, Mapping)]
     files_by_entry = [_entry_files(entry) for entry in entries]
     # Every question below -- has the catalog renamed this image yet, is this
     # companion already across, is that name held by a stranger -- is asked of
@@ -2175,8 +2243,9 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
             continue
 
         entry_ops: list[RenameOp] = []
-        for (companion_source, companion_target, _companion_kind), location in zip(
-            image_files[1:], placed_at[1:], strict=True
+        companion_records = [c for c in entry.get("companions") or [] if isinstance(c, Mapping)]
+        for (companion_source, companion_target, _companion_kind), location, record in zip(
+            image_files[1:], placed_at[1:], companion_records, strict=True
         ):
             companion_name = os.path.basename(companion_source)
             if not companion_name or not companion_target:
@@ -2186,6 +2255,10 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
                 continue
             if location == _GONE:
                 skipped.append(f"companion gone: {companion_name}")
+                continue
+            if companion_name in stats and _changed_since_plan(record, *stats[companion_name]):
+                # The same staleness check apply runs on every planned file.
+                skipped.append(f"companion changed since the plan was made: {companion_name}")
                 continue
             if companion_target in names and companion_target not in accounted:
                 # Two files claim one name and only one of them is in this
@@ -2372,8 +2445,10 @@ def _without_blocked(
     renaming onto it is the one thing this module may never do.
 
     Asking it once is not enough: dropping a reversal means the name it was
-    going to vacate stays held, which can block another. The question is
-    re-asked until the answer stops changing.
+    going to vacate stays held, which can block another. That is followed
+    through the chain in one pass, each blocked reversal blocking the one
+    that wanted its name, so a long renumber blocked at one end costs linear
+    time rather than a rescan per file.
 
     Args:
         ops: The reversals built so far, in the direction they will run.
@@ -2383,15 +2458,21 @@ def _without_blocked(
     Returns:
         The reversals that may go ahead.
     """
-    while True:
-        freed = {op.src for op in ops if not op.external}
-        blocked = {
-            op for op in ops if not op.external and op.dst in names and op.dst not in freed
-        }
-        if not blocked:
-            return ops
-        skipped.extend(f"something is already called that: {op.dst}" for op in ops if op in blocked)
-        ops = [op for op in ops if op not in blocked]
+    local = [op for op in ops if not op.external]
+    freed = {op.src for op in local}
+    wanting: dict[str, list[RenameOp]] = {}
+    for op in local:
+        wanting.setdefault(op.dst, []).append(op)
+    pending = [op for op in local if op.dst in names and op.dst not in freed]
+    blocked = set(pending)
+    while pending:
+        held = pending.pop().src
+        for op in wanting.get(held, ()):
+            if op not in blocked and op.dst in names:
+                blocked.add(op)
+                pending.append(op)
+    skipped.extend(f"something is already called that: {op.dst}" for op in ops if op in blocked)
+    return [op for op in ops if op not in blocked]
 
 
 def _reverse_ops(
@@ -2544,6 +2625,19 @@ def undo_run(journal_path: str) -> ApplyReport:
         0,
     )
     if not any(not op.external for op in ops):
+        if not deferred and segment.mode == MODE_FINISH:
+            # The catalog put everything back itself. Nothing is left to move,
+            # but the run is undone, and the journal has to say so: left
+            # ``applied`` (or partial) it stays the run every folder undo
+            # picks, and a partial one blocks every later apply.
+            _write_segment(
+                journal.path,
+                _header(run_id, folder, segment.header, MODE_UNDO, {"undoes": segment.run_id}),
+                ops,
+                append=True,
+            )
+            _append_footer(journal.path, _footer(STATUS_UNDONE, counts, []))
+            return ApplyReport(STATUS_UNDONE, journal.path, *counts, skipped=tuple(skipped))
         return ApplyReport(STATUS_NOTHING_TO_DO, journal.path, *counts, skipped=tuple(skipped))
 
     header = _header(
