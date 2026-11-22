@@ -26,7 +26,6 @@ Code map:
 - _tokenize_prefix_template    split a prefix template into literal/token pieces
 - _validate_literal_text       Windows-illegal-character/reserved-name check on literals
 - _render_template              render one group's prefix from the tokenized template
-- _variant_was_dashed           did the parser's dashed or digit-adjacent alternative match?
 - _Member                      one parsed, override-applied planner item
 - _GroupPlan                   one group's members plus its rendered prefix
 - _build_unplannable_entry     an entry for a group that could not be rendered
@@ -464,67 +463,6 @@ def _render_template(
 
 _ORIG_STRIP_RE = re.compile(r"-?\d+$")
 
-# The same variant regex parse_media_filename matches against, re-run here on
-# the already crop/part-stripped stem so the planner can tell which
-# alternative matched -- see the module docstring and the phase 1a interface
-# note this satisfies. Widening parse_media_filename's own return value to
-# expose this was out of scope for that phase (utils.py changes were
-# restricted to functions added beside the parser, not the parser itself).
-_VARIANT_RE = re.compile(
-    r"^(?P<stem>.+?)(?:-(?P<variant>[a-z])|(?<=\d)(?P<variant2>[a-z]))?$",
-    re.IGNORECASE,
-)
-
-# The exact page regex parse_media_filename matches against, re-run here so
-# _variant_was_dashed can strip a page suffix by its REAL text length rather
-# than reconstructing one from the parsed page number: parse_media_filename
-# reads that number with int(), which drops leading zeros ("007" -> 7), so a
-# length computed from the integer is wrong for any zero-padded page number.
-_PAGE_SUFFIX_RE = utils.PAGE_SUFFIX_RE
-
-
-def _variant_was_dashed(canonical_stem: str, parsed: utils.ParsedName) -> bool:
-    """Return whether *canonical_stem*'s variant letter, if any, was dashed.
-
-    Reconstructs the exact intermediate stem :func:`utils.parse_media_filename`
-    would have matched its variant regex against, using the crop/part fields
-    it already derived from this same *canonical_stem* -- so this never
-    re-detects crop/part itself, only slices known-length suffixes off. The
-    dashed alternative (``-b``) is exactly the form
-    :func:`utils.render_media_filename` always rewrites to digit-adjacent
-    (``b``), so this is the "variant form normalized" note's trigger.
-
-    Args:
-        canonical_stem: The stem after :func:`utils.canonicalize_stem`, the
-            same string that was fed to :func:`utils.parse_media_filename`.
-        parsed: That call's result.
-
-    Returns:
-        ``True`` if a variant letter is present and was written after a
-        ``-`` rather than directly after a digit.
-    """
-    tail = canonical_stem
-    if parsed.is_crop:
-        tail = tail[: -len("-crop")]
-    if parsed.part_kind == "back":
-        tail = tail[: -len("-back")]
-    elif parsed.part_kind == "front":
-        tail = tail[: -len("-front")]
-    elif parsed.part_kind == "negative":
-        tail = tail[: -len("-negative")]
-    elif parsed.part_kind == "attached" and parsed.attachment:
-        tail = tail[: -len(f"-{parsed.attachment}")]
-    elif parsed.part_kind == "page" and parsed.page_num is not None:
-        # Re-run the same page regex parse_media_filename used and take its
-        # own group(1), rather than slicing by a length rebuilt from the
-        # parsed (leading-zero-stripped) integer -- see _PAGE_SUFFIX_RE.
-        page_match = _PAGE_SUFFIX_RE.match(tail)
-        if page_match:
-            tail = page_match.group(1)
-    match = _VARIANT_RE.match(tail)
-    return bool(match and match.group("variant") is not None)
-
-
 # === Grouping ===
 
 
@@ -572,7 +510,7 @@ def _natural_sort_key(name: str) -> tuple[int | str, ...]:
 
 # The exact character class parse_media_filename's own variant regex
 # matches (`[a-z]` under re.IGNORECASE, i.e. ASCII a-z/A-Z only -- see
-# _VARIANT_RE above). str.isalpha() accepts any Unicode letter (Cyrillic,
+# utils._VARIANT_SUFFIX_RE). str.isalpha() accepts any Unicode letter (Cyrillic,
 # Greek, ...), which the grammar does not, so validating an override with it
 # let a non-ASCII "letter" through: render_media_filename would write it
 # into the filename, and parse_media_filename reads that back as an
@@ -623,11 +561,9 @@ def _build_member(item: RenameItem, position: int) -> _Member:
     notes = list(notes)
     parsed = utils.parse_media_filename(canonical_stem + ext)
 
-    if (
-        item.version is None
-        and parsed.variant_id is not None
-        and _variant_was_dashed(canonical_stem, parsed)
-    ):
+    # The renderer always writes the letter straight after the digits, so a
+    # letter that had a separator in front of it changes spelling.
+    if item.version is None and parsed.variant_suffix[:1] in ("-", "_"):
         notes.append("variant form normalized")
 
     final_part_kind = parsed.part_kind

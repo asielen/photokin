@@ -322,15 +322,15 @@ Grouping is driven entirely by filename suffixes. The grammar is `name[letter][-
 | Example | Meaning |
 |---|---|
 | `box3_025.jpg` | the photo itself (the print's front, no variant letter) |
-| `box3_025-b.jpg` or `box3_025b.jpg` | another scan of the same object (variant letter, with or without dash after a digit) |
-| `box3_025-back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
+| `box3_025-b.jpg`, `box3_025b.jpg` or `box3_025_b.jpg` | another scan of the same object (variant letter; without a dash it must follow a digit) |
+| `box3_025-back.jpg` or `box3_025_back.jpg` | the reverse side (`-front` and `-negative` work the same way) |
 | `box3_025-bw.jpg`, `box3_025-bw-back.jpg` | a black-and-white copy of the same photo, and that copy's back |
 | `album-page1.jpg`, `album-page-2.jpg` | ordered pages of one document |
 | `box3_025-cover.jpg`, `box3_025-envelope-back.jpg` | something attached to the photo, scanned on its own: `-cover`, `-folder`, `-mount`, `-envelope`, `-sleeve`, `-note` or `-note-N`, optionally followed by `-back` for that object's own back. Only these words group; any other trailing word stays part of the name, so `smith-farm-01400.jpg` is photo `smith-farm-01400` |
 | `box3_025-back-crop.jpg` | a cropped detail of its parent, recorded with the group but not analyzed as its own object while its parent is present — a crop with no parent fills the missing slot, and `--group-by none` analyzes every crop alone |
 | `box3_025.tif` beside `box3_025.jpg` | the same scan in two formats — one object, not two photos |
 
-The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other numbered pages. Attached objects are analyzed in the same call as the photo, so a studio imprint on a cover counts as evidence for the portrait's date and place. The front or plain scan always stays the group's primary file.
+An `_`, `.` or space works in place of the `-` in front of a part or `crop` word. Variant letters count only in order: `c` is a variant only when the group also has a `b` scan, and so on up the alphabet (`a` is never required). A lone `box3_025_z.jpg` is its own photo, `box3_025_z`, and the run says so. The variant letter comes before the part suffix (`025b-back-crop.jpg`), and a file with no explicit `-pageN` is only treated as page 1 if its group contains other numbered pages. Attached objects are analyzed in the same call as the photo, so a studio imprint on a cover counts as evidence for the portrait's date and place. The front or plain scan always stays the group's primary file.
 
 Every file also gets at most one keyword naming its part — `back` on a reverse side, `negative` on a negative, nothing on a front — so you can always tell which file is which afterwards. A `back` or `Negative` keyword you applied yourself is left exactly where it is.
 
@@ -503,7 +503,7 @@ photokin ./scans/ --generate-manifest scans-manifest.json
 
 It writes the manifest the folder run would have used — same files, same order — and exits without calling the model, so it costs nothing and doubles as a way to check the grouping before committing to a batch. Edit it (add `is_back`, `group`, existing `metadata`) and feed it straight back: `photokin scans-manifest.json`.
 
-The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. Note the underscore in `box3_017_back.jpg`: the filename grammar reads only the hyphenated `-back`, so it is the `is_back` flag that folds the two files into one group and one model call rather than two unrelated photos.
+The sample below declares one physical object, a front scan and its back, and one line of batch-wide background context. The filename grammar already reads `_back` as a back, so here `is_back` only confirms it; the flag earns its place on a name the grammar can't read.
 
 batch.json:
 ```json
@@ -524,7 +524,7 @@ Flags are optional when the filename already says the same thing; they exist so 
 
 | Key | Effect |
 |---|---|
-| `is_back` | `true` marks the reverse side, `false` marks the front. `true` also repairs the group key by stripping a trailing `back` token, which is what puts `box3_017_back.jpg` in the same group as `box3_017.jpg`. |
+| `is_back` | `true` marks the reverse side, `false` marks the front. `true` also repairs the group key by stripping a trailing `back` token, so `box3_017back.jpg` lands in the same group as `box3_017.jpg`. |
 | `is_crop` | `true` marks a cropped derivative, so the file is recorded with its group but not analyzed; `false` unmarks a file whose name ends in `-crop`. |
 | `version` | The variant id, replacing any letter read off the filename. Any string, not just one letter; empty means no variant. |
 | `group` | The group key outright, for names the grammar cannot parse at all. `base_id` is accepted as an alias and loses to `group` when both are given. |

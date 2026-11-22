@@ -1565,7 +1565,9 @@ class ParsedName:
     ``page_num`` is the page index for multipage docs; ``is_crop`` flags derived
     crop files; ``attachment`` is the role of an attached object or a
     black-and-white copy (``"cover"``, ``"envelope-back"``, ``"note-2"``,
-    ``"bw"``) when ``part_kind`` is ``"attached"``. The
+    ``"bw"``) when ``part_kind`` is ``"attached"``; ``variant_suffix`` is the
+    variant letter exactly as the name spelled it (``"-b"``, ``"_b"`` or a
+    digit-adjacent ``"b"``), empty when there is none. The
     manifest bucket loop -- which every input mode now routes through -- keys off
     these fields.
     """
@@ -1576,6 +1578,7 @@ class ParsedName:
     page_num: int | None
     is_crop: bool = False
     attachment: str | None = None
+    variant_suffix: str = ""
 
 
 #: One canonical ordering over :attr:`ParsedName.part_kind`, from "this is the
@@ -1630,12 +1633,21 @@ def attached_role_label(role: str) -> str:
 UNRANKED_PART = PART_RANK["none"]
 
 
+#: A trailing variant letter: ``-b``, or ``b``/``_b`` directly after a digit.
+#: ``suffix`` is the letter with its separator, as the name spelled it.
+_VARIANT_SUFFIX_RE = re.compile(
+    r"^.+?(?P<suffix>-[a-z]|(?<=\d)_?[a-z])?$", flags=re.IGNORECASE
+)
+
+
 def parse_media_filename(path: str) -> ParsedName:
     """
     Parse media filenames that may include variant letters and part suffixes.
 
     Rules:
-    1) Strip extension.
+    1) Strip extension, then normalize a ``_``, ``.`` or space in front of a
+       crop or part word to ``-`` (:func:`canonicalize_stem`), so
+       ``017_back`` reads the same as ``017-back``.
     2) Strip -crop suffix first; it stacks on top of any other tag.
     3) Detect part suffix in priority order: -negative, -back / -front,
        -pageN / -page-N.
@@ -1643,11 +1655,14 @@ def parse_media_filename(path: str) -> ParsedName:
        (:data:`ATTACHED_OBJECT_RE`), the file is that object, and a -back
        stripped in step 3 is the object's own back: ``-envelope-back`` is the
        role ``envelope-back``, never the photo's back.
-    5) After removing the part suffix, detect a trailing single-letter variant ID.
+    5) After removing the part suffix, detect a trailing single-letter variant ID:
+       ``-b``, ``b`` directly after a digit, or ``_b`` directly after a digit.
        Variant letters appear before part suffixes (e.g., ...025b-back-crop).
+       Whether a letter really is a variant depends on its siblings, so the
+       grouping step may still read it back as part of the base id.
     6) The remaining stem is the base_id.
     """
-    stem = os.path.splitext(os.path.basename(path))[0]
+    stem, _ = canonicalize_stem(os.path.splitext(os.path.basename(path))[0])
     part_kind = "none"
     page_num: int | None = None
     is_crop = False
@@ -1690,16 +1705,11 @@ def parse_media_filename(path: str) -> ParsedName:
     # untagged file should be treated as Page 1 only when the group contains
     # other explicit -pageN files.
 
-    m_var = re.match(
-        r"^(?P<stem>.+?)(?:-(?P<variant>[a-z])|(?<=\d)(?P<variant2>[a-z]))?$",
-        stem,
-        flags=re.IGNORECASE,
-    )
-    if m_var:
-        stem = m_var.group("stem")
-        var = (m_var.group("variant") or m_var.group("variant2") or "").lower() or None
-    else:
-        var = None
+    m_var = _VARIANT_SUFFIX_RE.match(stem)
+    variant_suffix = (m_var.group("suffix") if m_var else None) or ""
+    if variant_suffix:
+        stem = stem[: -len(variant_suffix)]
+    var = variant_suffix[-1:].lower() or None
 
     return ParsedName(
         base_id=stem,
@@ -1708,6 +1718,7 @@ def parse_media_filename(path: str) -> ParsedName:
         page_num=page_num,
         is_crop=is_crop,
         attachment=attachment,
+        variant_suffix=variant_suffix,
     )
 
 
@@ -1723,10 +1734,8 @@ def canonicalize_stem(stem: str) -> tuple[str, list[str]]:
     accepting those three separators. A separator that is already ``-`` is
     left alone, so an already-canonical stem comes back with no note.
 
-    This function does not touch the trailing variant letter. The grammar
-    reads only a dashed variant (``-b``) or a digit-adjacent one (``5b``,
-    see :func:`parse_media_filename`'s ``m_var``); a bare ``_b`` or ``.b`` is
-    not part of the grammar, and widening it is out of scope, so both regexes
+    This function does not touch the trailing variant letter, which
+    :data:`_VARIANT_SUFFIX_RE` reads in all of its spellings; both regexes
     below require the full word (``back``, not ``b``) and never match one.
 
     Args:

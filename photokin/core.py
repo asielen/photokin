@@ -46,6 +46,7 @@ Code map (public-facing entry points marked PUBLIC):
 - _manifest_group_override      resolve an item's explicit bucket key
 - _resolve_manifest_entry       build one grouping entry, filename plus overrides
 - _item_part_marker             the per-file part keyword an entry earns, if any
+- _fold_out_of_order_variants   read a letter back into the name when earlier letters are missing
 - _escape_pair_half             make one half of a pair key free of bare separators
 - _pair_bucket_key              the escaped group-key/variant join '--group-by pair' uses
 - build_manifest_buckets        PUBLIC: group items the way the stream will
@@ -2599,6 +2600,11 @@ _PAIR_KEY_ESCAPE = "\\"
 _MANIFEST_TRUE = frozenset({"true", "1", "yes"})
 _MANIFEST_FALSE = frozenset({"false", "0", "no"})
 
+# A grouping entry's variant letter as the filename spelled it, set only when
+# the filename alone decided both the letter and the group. Read and removed by
+# _fold_out_of_order_variants before an entry leaves build_manifest_buckets.
+_NAME_VARIANT_SUFFIX_KEY = "_name_variant_suffix"
+
 # Only a separator or a digit may precede the token, so 'feedback.jpg' is never
 # read as the back of 'feed'.
 _EXPLICIT_BACK_SUFFIX_RE = re.compile(r"(?:[-_. ]|(?<=\d))back$", re.IGNORECASE)
@@ -2735,7 +2741,8 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
             _log_manifest_override(path, "is_crop", raw.get("is_crop"), "is_crop", is_crop)
         is_crop = explicit_crop
 
-    if raw.get("version") is not None:
+    explicit_version_given = raw.get("version") is not None
+    if explicit_version_given:
         explicit_version = str(raw["version"]).strip().lower() or None
         if explicit_version != version and log_overrides:
             _log_manifest_override(path, "version", raw.get("version"), "version", version)
@@ -2759,6 +2766,9 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
                 group_key = repaired
     elif group_key != parsed.base_id and log_overrides:
         _log_manifest_override(path, "group", group_key, "group", parsed.base_id)
+    name_decides_variant = not explicit_version_given and (
+        _manifest_group_override(raw, path, log=False) is None
+    )
 
     return {
         "path": path,
@@ -2769,6 +2779,7 @@ def _resolve_manifest_entry(raw: dict, *, log_overrides: bool = True) -> dict | 
         "attachment": parsed.attachment if part_kind == "attached" else None,
         "is_crop": is_crop,
         "group_key": group_key,
+        _NAME_VARIANT_SUFFIX_KEY: parsed.variant_suffix if name_decides_variant else "",
         "preferred": bool(raw.get("preferred")),
         "metadata": raw.get("metadata"),
         "metadata_path": raw.get("metadata_path"),
@@ -2901,6 +2912,49 @@ def _file_write_instructions(
     return _WriteDecision(patch, False, before_snapshot, proposed)
 
 
+def _fold_out_of_order_variants(entries: list[dict], *, log: bool) -> None:
+    """Read a variant letter back into the name when the letters before it are missing.
+
+    A letter is a variant only when every letter from ``b`` up to it is also
+    among the group's variants; ``a`` is never required, since the unlettered
+    scan usually plays that part. So ``013``, ``013_b`` and ``013_c`` are three
+    scans of one object, while a lone ``013_z`` is an object of its own named
+    ``013_z``. Only a letter the filename decided is folded: an explicit
+    manifest ``version`` or ``group`` stands, though its letter still counts as
+    present for the others. Missing a letter makes every later letter invalid
+    too, so one pass over the original letters is exact.
+
+    Args:
+        entries: Resolved grouping entries; updated in place, and each loses
+            its ``_NAME_VARIANT_SUFFIX_KEY``.
+        log: Whether to report each letter read back into the name.
+    """
+    letters: dict[str, set[str]] = {}
+    for entry in entries:
+        if entry["version"]:
+            letters.setdefault(entry["group_key"], set()).add(entry["version"])
+    for entry in entries:
+        suffix = entry.pop(_NAME_VARIANT_SUFFIX_KEY)
+        if not suffix:
+            continue
+        present = letters[entry["group_key"]]
+        letter = entry["version"]
+        missing = [chr(c) for c in range(ord("b"), ord(letter)) if chr(c) not in present]
+        if not missing:
+            continue
+        folded = entry["group_key"] + suffix
+        if log:
+            logger.warning(
+                "%s: no '%s' scan of %s, so '%s' is part of the name: object %s.",
+                os.path.basename(entry["path"]),
+                missing[0],
+                entry["group_key"],
+                letter,
+                folded,
+            )
+        entry["group_key"], entry["version"] = folded, None
+
+
 def _escape_pair_half(half: str) -> str:
     """Escape one half of a ``pair`` bucket key so its separators are inert.
 
@@ -2998,11 +3052,14 @@ def build_manifest_buckets(
     """
     if group_by not in _GROUP_BY_VALUES:
         raise ValueError(f"Unknown group_by value: {group_by!r}")
+    entries = [
+        entry
+        for entry in (_resolve_manifest_entry(raw, log_overrides=log_overrides) for raw in items)
+        if entry is not None
+    ]
+    _fold_out_of_order_variants(entries, log=log_overrides)
     buckets: Dict[str, List[dict]] = {}
-    for raw in items:
-        entry = _resolve_manifest_entry(raw, log_overrides=log_overrides)
-        if entry is None:
-            continue
+    for entry in entries:
         if group_by == utils.GROUP_BY_OBJECT:
             key = entry["group_key"]
         elif group_by == utils.GROUP_BY_PAIR:
