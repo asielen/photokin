@@ -665,7 +665,7 @@ def plan_rename(
     undated_literal: str | None = None,
     today: date | None = None,
     companion_extensions: frozenset[str] | None = None,
-    managed_by: dict[str, Any] | None = None,
+    managed_by: object = None,
     photokin_version: str = "",
     run_id: str | None = None,
     disk_file_stats: Mapping[str, tuple[int | None, float | None]] | None = None,
@@ -1078,32 +1078,14 @@ def plan_rename(
     }
 
 
-#: Fidelity order for same-stem files that differ only by extension, and the
-#: rank an extension outside it takes. A verbatim copy of ``core._FORMAT_RANK``
-#: / ``core._UNRANKED_FORMAT``, because the two halves of photokin have to
-#: answer "which of these twins is the object" identically: ANALYSIS writes one
-#: ``<stem>.md`` transcript per group and gives it to the file this order ranks
-#: first (``core``'s ``sidecar_owner``, built from ``_slot_rank_key``), so a
-#: planner that picked the other twin would carry the transcript along under
-#: that twin's identity and the executor would then find a ``source_file:``
-#: line naming a file its op knows nothing about, leave it alone, and warn
-#: ("it names another file") -- on the commonest shape in an archive, a TIFF
-#: master beside its JPEG derivative. Copied rather than imported because a
-#: pure planner does not import ``core``; see the module docstring.
-_FORMAT_RANK: dict[str, int] = {".tif": 0, ".tiff": 0, ".png": 1, ".jpg": 2, ".jpeg": 2}
-_UNRANKED_FORMAT = 3
-
-
 def _companion_owner_key(
     entry: dict[str, Any], preferred_paths: frozenset[str]
 ) -> tuple[int, int, int, int, int, str, int, str, str]:
     """Rank one entry as a candidate owner of a companion sharing its stem.
 
-    Component for component the key ``core._slot_rank_key`` ranks the same
-    group's files by, read off the plan entry's already-override-resolved
-    fields instead of a grouping entry's: crop-ness first, then ``preferred``,
-    then part kind, page, unversioned-before-versioned, then format fidelity,
-    then the path. Only the last three ever separate two files sharing a stem
+    :func:`utils.slot_rank_key`, the key ``core`` ranks the same group's files
+    by, read off the plan entry's already-override-resolved fields instead of
+    a grouping entry's. Only the last three ever separate two files sharing a stem
     on disk today -- the rest are equal by construction unless the caller's
     ``is_back``/``version``/``preferred`` overrides pull the two apart, which
     is exactly the case ``core`` resolves by this same order.
@@ -1116,17 +1098,15 @@ def _companion_owner_key(
     Returns:
         A sort key; the smallest among the candidates owns the companion.
     """
-    extension = os.path.splitext(entry["path"])[1].lower()
-    return (
-        1 if entry["crop"] else 0,
-        0 if entry["path"] in preferred_paths else 1,
-        utils.PART_RANK.get(entry["part"] or "none", utils.UNRANKED_PART),
-        0 if entry["page"] is None else entry["page"],
-        0 if entry["variant"] is None else 1,
-        entry["variant"] or "",
-        _FORMAT_RANK.get(extension, _UNRANKED_FORMAT),
-        entry["path"].lower(),
-        entry["path"],
+    return utils.slot_rank_key(
+        utils.SlotFacts(
+            entry["crop"],
+            entry["path"] in preferred_paths,
+            entry["part"],
+            entry["page"],
+            entry["variant"],
+            entry["path"],
+        )
     )
 
 

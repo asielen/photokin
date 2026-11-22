@@ -2581,16 +2581,6 @@ def analyze_folder(
 # by the same order, so which file stands for the object is decided once.
 _PART_RANK = utils.PART_RANK
 
-# Fidelity order for same-stem files that differ only by extension, e.g. a TIFF
-# master beside the JPEG derivative an archivist keeps for browsing. Only one of
-# them is sent to the model, so send the one that lost the least: lossless first,
-# then PNG, then the lossy formats. Alphabetical order -- the fallback this sits
-# in front of -- picks the opposite, since ".jpg" sorts before ".tif", and the
-# compression artifacts it hands the model are exactly what costs a transcription
-# of faint pencil on the back of a card.
-_FORMAT_RANK = {".tif": 0, ".tiff": 0, ".png": 1, ".jpg": 2, ".jpeg": 2}
-_UNRANKED_FORMAT = 3
-
 _GROUP_BY_VALUES = frozenset(utils.GROUP_BY_VALUES)
 
 # Joins the two halves of a ``pair`` bucket key. Illegal in a Windows filename,
@@ -3294,33 +3284,18 @@ def _slot_address_rank(version: str | None, part_key: str) -> tuple[int, int, in
 
 
 def _slot_rank_key(entry: dict) -> tuple[int, int, int, int, int, str, int, str, str]:
-    """Order grouping entries so no choice in the bucket loop depends on manifest order.
-
-    Crop-ness leads, so a real scan beats a crop of it unconditionally -- including
-    a crop the caller marked ``preferred``, since a derivative cannot stand in for
-    the original listed beside it. ``preferred`` comes next, so an explicit choice
-    takes any slot it is actually allowed to take. Then part kind, page number and
-    unversioned-before-versioned.
-
-    Format fidelity comes after those and before the path, so it settles only the
-    case the path would otherwise settle alphabetically: two files of the same
-    stem and part differing by extension. The path itself stays last, so even two
-    indistinguishable candidates resolve the same way every run.
-    """
-    page_num = entry["page_num"]
-    extension = os.path.splitext(entry["path"])[1].lower()
-    return (
-        1 if entry["is_crop"] else 0,
-        0 if entry["preferred"] else 1,
-        _PART_RANK[entry["part_kind"]],
-        0 if page_num is None else page_num,
-        0 if entry["version"] is None else 1,
-        entry["version"] or "",
-        _FORMAT_RANK.get(extension, _UNRANKED_FORMAT),
-        entry["path"].lower(),
-        entry["path"],
+    """Rank one grouping entry by :func:`utils.slot_rank_key`, so no choice in the
+    bucket loop depends on manifest order."""
+    return utils.slot_rank_key(
+        utils.SlotFacts(
+            entry["is_crop"],
+            entry["preferred"],
+            entry["part_kind"],
+            entry["page_num"],
+            entry["version"],
+            entry["path"],
+        )
     )
-
 
 def analyze_manifest(
     manifest: dict | str,
