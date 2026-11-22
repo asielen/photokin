@@ -12,6 +12,7 @@ from photokin.rename_apply import (
     RenameOp,
     RenamePreflightError,
     _is_bare_filename,
+    _rewrite_sidecar,
     _without_blocked,
     apply_plan,
     finish_plan,
@@ -146,3 +147,82 @@ def test_finish_still_carries_a_plain_renumber(tmp_path: Path) -> None:
 
     # Assert
     assert report.status == rename_apply.STATUS_NOTHING_TO_DO
+
+
+def _md(path: Path, line: str) -> Path:
+    return _write(path, f"---\n{line}\ngroup: \"g1\"\n---\n\nDear Mother,\n")
+
+
+def test_an_escaped_link_is_decoded_before_it_is_matched(tmp_path: Path) -> None:
+    # Arrange
+    md = _md(tmp_path / "new.md", r'source_file: "a\tb\\c\u0007.tif"')
+
+    # Act
+    warning = _rewrite_sidecar(str(md), "a\tb\\c\x07.tif", "new.tif", str(tmp_path / "t.md"))
+
+    # Assert
+    assert warning is None
+    assert 'source_file: "new.tif"\n' in md.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["  source_file:   old.tif", "source_file: 'old.tif'", 'source_file: "old.tif"'],
+)
+def test_apply_then_undo_gives_back_the_same_bytes(tmp_path: Path, line: str) -> None:
+    # Arrange
+    md = _md(tmp_path / "x.md", line)
+    original = md.read_bytes()
+
+    # Act
+    assert _rewrite_sidecar(str(md), "old.tif", "new-001.tif", str(tmp_path / "t.md")) is None
+    forward = md.read_text(encoding="utf-8")
+    assert _rewrite_sidecar(str(md), "new-001.tif", "old.tif", str(tmp_path / "t.md")) is None
+
+    # Assert
+    assert "new-001.tif" in forward
+    assert md.read_bytes() == original
+
+
+def test_a_case_twin_link_is_left_alone_only_when_it_is_a_different_file(tmp_path: Path) -> None:
+    # Arrange: photo.tif was renamed away; PHOTO.TIF is whatever the folder holds.
+    md = _md(tmp_path / "new.md", 'source_file: "PHOTO.TIF"')
+    folder_folds_case = _case_insensitive(tmp_path)
+    if not folder_folds_case:
+        _write(tmp_path / "PHOTO.TIF", "a bystander")
+
+    # Act
+    warning = _rewrite_sidecar(str(md), "photo.tif", "new.tif", str(tmp_path / "t.md"))
+
+    # Assert
+    if folder_folds_case:
+        assert warning is None
+    else:
+        assert warning is not None and "names another file" in warning
+
+
+def test_a_linked_transcripts_real_folder_is_synced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    real = _write(outside / "real.md", "old")
+    link = tmp_path / "scans" / "link.md"
+    link.parent.mkdir()
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(
+        rename_apply.os.path,
+        "realpath",
+        lambda p: str(real) if p == str(link) else real_realpath(p),
+    )
+    synced: list[str] = []
+    monkeypatch.setattr(rename_apply, "_fsync_directory", synced.append)
+
+    # Act
+    warning = rename_apply._swap_in(str(link), str(link.parent / "t.md"), b"new")
+
+    # Assert
+    assert warning is None
+    assert real.read_bytes() == b"new"
+    assert synced == [str(outside)]

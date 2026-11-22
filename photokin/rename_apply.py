@@ -154,7 +154,13 @@ _MTIME_TOLERANCE_S = 1e-6
 
 #: One backslash escape inside a double-quoted YAML scalar, the shape
 #: ``doc_sidecar._yaml_string`` writes.
-_YAML_ESCAPE_RE = re.compile(r"\\(.)")
+_YAML_ESCAPE_RE = re.compile(r"\\(u[0-9a-fA-F]{4}|.)")
+
+#: The single-character escapes ``doc_sidecar._yaml_string`` emits, decoded.
+_YAML_UNESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\x00", "\\": "\\", '"': '"'}
+
+#: A filename YAML reads back unchanged without quotes.
+_YAML_PLAIN_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.()+-]*(?: [A-Za-z0-9_.()+-]+)*$")
 
 #: How much of a journal's tail is read at a time when the last record has to
 #: be checked for termination. The journal is one record per renamed file, so
@@ -1700,6 +1706,12 @@ def _swap_in(path: str, tmp_path: str, payload: bytes) -> str | None:
             os.fsync(handle.fileno())
         _carry_protection(resolved, tmp_path)
         os.replace(tmp_path, resolved)
+        if resolved != path:
+            # The run's own folder is synced before the journal closes; a
+            # linked transcript's real folder is not that folder, and without
+            # this a power loss could keep the "applied" footer and lose the
+            # rewrite it vouches for.
+            _fsync_directory(os.path.dirname(resolved))
     except OSError as exc:
         if os.path.lexists(tmp_path):
             try:
@@ -1728,8 +1740,78 @@ def _sidecar_link(line: str) -> str:
     value = line.partition(":")[2].strip()
     if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
         inner = value[1:-1]
-        return _YAML_ESCAPE_RE.sub(r"\1", inner) if value[0] == '"' else inner.replace("''", "'")
+        return _yaml_unescape(inner) if value[0] == '"' else inner.replace("''", "'")
     return value
+
+
+def _yaml_unescape(inner: str) -> str:
+    """Decode the escapes of a double-quoted YAML scalar's body.
+
+    ``\\n``, ``\\t``, ``\\r`` and ``\\uXXXX`` are what the sidecar writer
+    emits for a name holding a newline, tab or other control character, so
+    they decode to that character; any other escaped character is itself.
+
+    Args:
+        inner: The text between the quotes.
+
+    Returns:
+        The string the scalar holds.
+    """
+
+    def _decode(match: re.Match[str]) -> str:
+        escape = match.group(1)
+        if len(escape) == 5:
+            return chr(int(escape[1:], 16))
+        return _YAML_UNESCAPES.get(escape, escape)
+
+    return _YAML_ESCAPE_RE.sub(_decode, inner)
+
+
+def _render_link(name: str, style: str) -> str:
+    """Render *name* as a ``source_file`` value in the quoting style it was found in.
+
+    Keeping the style is what lets an undo give back the bytes the apply
+    found: a bare ``source_file: old.tif`` comes back bare, not quoted.
+
+    Args:
+        name: The file name to write.
+        style: ``'"'``, ``"'"`` or ``""`` (bare), as the line had it.
+
+    Returns:
+        The value text; double-quoted whenever the style cannot carry *name*.
+    """
+    if style == "" and _YAML_PLAIN_RE.match(name):
+        return name
+    if style == "'" and name.isprintable():
+        return "'" + name.replace("'", "''") + "'"
+    return _yaml_string(name)
+
+
+def _names_link(folder: str, link: str, name: str) -> bool:
+    """Whether a ``source_file`` value names the file called *name* in *folder*.
+
+    Exact spelling always matches. A spelling that differs only in case
+    matches only when the folder holds no other file under it: on a
+    case-sensitive filesystem ``PHOTO.TIF`` beside ``photo.tif`` is a
+    different file, while on a case-insensitive one the two names are one
+    file.
+
+    Args:
+        folder: The sidecar's folder.
+        link: The value the sidecar carries.
+        name: The image name being matched.
+
+    Returns:
+        True when the link is to *name*.
+    """
+    if link == name:
+        return True
+    if casefold_filename(link) != casefold_filename(name):
+        return False
+    link_path, name_path = os.path.join(folder, link), os.path.join(folder, name)
+    if not os.path.lexists(link_path):
+        return True
+    return os.path.lexists(name_path) and paths_are_same_file(link_path, name_path)
 
 
 def _rewrite_sidecar(md_path: str, was: str, now: str, tmp_path: str) -> str | None:
@@ -1737,10 +1819,10 @@ def _rewrite_sidecar(md_path: str, was: str, now: str, tmp_path: str) -> str | N
 
     Only the leading frontmatter block is touched, and only its first
     ``source_file`` line; every other byte of the file is written back exactly
-    as it was read, line endings included, so an undo restores the file the
-    apply started from byte for byte. The value is rendered by the sidecar
-    writer's own string emitter rather than a second one here, so the line is
-    identical to what a re-analysis would produce.
+    as it was read, line endings included. The line keeps its own indent,
+    spacing and quoting style (:func:`_render_link`), so an undo restores the
+    file the apply started from byte for byte; a double-quoted value is
+    rendered by the sidecar writer's own string emitter.
 
     The line is rewritten only when it names the image this op renamed. A
     same-stem ``.md`` whose ``source_file`` points somewhere else is either
@@ -1780,19 +1862,26 @@ def _rewrite_sidecar(md_path: str, was: str, now: str, tmp_path: str) -> str | N
     if not lines or lines[0].strip() != "---":
         return f"sidecar not updated (no frontmatter): {os.path.basename(md_path)}"
 
+    folder = os.path.dirname(md_path)
     for index in range(1, len(lines)):
         stripped = lines[index].strip()
         if stripped == "---":
             break
         if not stripped.startswith("source_file:"):
             continue
-        current = casefold_filename(_sidecar_link(stripped))
-        if current == casefold_filename(now):
+        current = _sidecar_link(stripped)
+        if _names_link(folder, current, now):
             return None
-        if current != casefold_filename(was):
+        if not _names_link(folder, current, was):
             return f"sidecar not updated (it names another file): {os.path.basename(md_path)}"
-        terminator = lines[index][len(lines[index].rstrip("\r\n")) :]
-        lines[index] = f"source_file: {_yaml_string(now)}{terminator}"
+        line = lines[index]
+        body = line.rstrip("\r\n")
+        terminator = line[len(body) :]
+        head, _colon, value = body.partition(":")
+        spacing = value[: len(value) - len(value.lstrip())]
+        quoted = value.strip()[:1]
+        style = quoted if quoted in ("'", '"') else ""
+        lines[index] = f"{head}:{spacing}{_render_link(now, style)}{terminator}"
         return _swap_in(md_path, tmp_path, "".join(lines).encode("utf-8"))
     return f"sidecar not updated (no source_file line): {os.path.basename(md_path)}"
 
