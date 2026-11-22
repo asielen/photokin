@@ -13,7 +13,11 @@ All notable changes to this project are documented here, in the style of
   Lightroom plug-in refused the whole folder. A manifest with `managed_by`
   now plans every item. Another manifest plans every photo, raw and video
   type, and still leaves out a hand-listed `document.pdf`, which the plan
-  now reports in `left_behind` instead of only logging it.
+  now reports in `left_behind` (with a plan warning) instead of only
+  logging it.
+- **An uncatalogued PSD, raw or video file holds its name.** A plan that
+  would rename onto one is refused like a plan that would rename onto an
+  uncatalogued TIFF, so Lightroom is never handed a target that is taken.
 
 ## [0.9.0]
 

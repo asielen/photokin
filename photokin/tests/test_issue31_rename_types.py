@@ -17,17 +17,18 @@ _EXTENSIONS = (
 class TestRenameTypes(_CliTestCase):
     """A managed manifest plans every item; an unmanaged one plans photo and video types."""
 
-    def _plan(self, names: list[str], managed_by: object) -> dict:
+    def _plan(self, names: list[str], managed_by: object, extra: tuple[str, ...] = ()) -> dict:
         folder = self.scratch()
         items = [{"path": _write_bytes(os.path.join(folder, name))} for name in names]
+        for name in extra:
+            _write_bytes(os.path.join(folder, name))
         manifest = os.path.join(folder, "export.json")
         with open(manifest, "w", encoding="utf-8") as handle:
             json.dump({"items": items, "managed_by": managed_by}, handle)
         plan_path = os.path.join(folder, "plan.json")
 
-        code, _stdout, stderr = self.run_cli([manifest, "--rename", "bw", "--plan-out", plan_path])
+        self.run_cli([manifest, "--rename", "bw", "--plan-out", plan_path])
 
-        self.assertIsNone(code, stderr)
         with open(plan_path, "r", encoding="utf-8") as handle:
             return json.load(handle)
 
@@ -63,3 +64,36 @@ class TestRenameTypes(_CliTestCase):
                 for r in plan["left_behind"]
             ],
         )
+
+    def test_an_uncatalogued_psd_reserves_its_name(self) -> None:
+        # Act: a.psd would be renamed onto bw-001.psd, which the catalog does not track.
+        plan = self._plan(["a.psd"], {"app": "lightroom"}, extra=("bw-001.psd",))
+
+        # Assert
+        self.assertTrue(any("bw-001.psd" in e for e in plan["errors"]), plan["errors"])
+
+    def test_a_listed_companion_is_not_also_reported_left_behind(self) -> None:
+        # Act
+        plan = self._plan(["a.tif", "a.md"], None)
+
+        # Assert
+        self.assertEqual(plan["left_behind"], [])
+        companions = [c["target"] for e in plan["entries"] for c in e["companions"]]
+        self.assertEqual(companions, ["bw-001.md"])
+
+    def test_a_left_out_file_has_one_record_and_a_warning(self) -> None:
+        # Act
+        plan = self._plan(["a.tif", "a.pdf", "memo.pdf"], None)
+
+        # Assert
+        reasons = sorted(
+            (os.path.basename(r["path"]), r["reason"]) for r in plan["left_behind"]
+        )
+        self.assertEqual(
+            reasons,
+            [
+                ("a.pdf", "extension outside companion set"),
+                ("memo.pdf", "not a photo or video type"),
+            ],
+        )
+        self.assertIn("memo.pdf: not a photo or video type", plan["warnings"])

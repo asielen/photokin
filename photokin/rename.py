@@ -1292,13 +1292,18 @@ def _attach_companions_and_bystanders(
             continue
         name = os.path.basename(norm_disk_path)
         stem, ext = os.path.splitext(name)
-        if ext.lower() in utils.VALID_EXTS:
+        # Any photo or video the plan does not rename holds its name: a
+        # catalog renames PSD, raw and video files too, and would rename onto
+        # an uncatalogued one. Only the analysis types stop here; the others
+        # are still matched by stem below, as they always were.
+        if ext.lower() in utils.RENAMABLE_EXTS:
             candidates = known_by_casefold.get(utils.casefold_filename(abs_disk_path), ())
             is_known = abs_disk_path in known_exact or any(
                 utils.paths_are_same_file(abs_disk_path, candidate) for candidate in candidates
             )
             if not is_known:
                 bystander_names.add(utils.casefold_filename(name))
+        if ext.lower() in utils.VALID_EXTS:
             continue
         matches = [
             i
