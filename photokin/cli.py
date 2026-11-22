@@ -2877,7 +2877,7 @@ def _run_revert_changeset(args: argparse.Namespace) -> None:
         " (dry run)" if args.dry_run else "",
         ", ".join(f"{count} {status}" for status, count in summary.items() if count),
     )
-    if summary["conflict"] or summary["error"]:
+    if summary["conflict"] or summary["error"] or summary["no_snapshot"]:
         sys.exit(1)
 
 

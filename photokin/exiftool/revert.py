@@ -13,9 +13,9 @@ touched is never written.
 The before-values come from ``original_data.written_tags``, which the applier
 records just before each write (changeset schema 5). An older changeset has
 only ``original_data.file_metadata``, the canonical values ``-r`` read, which
-is not a record of the file's tags: the revert restores from it only the main
-tags it holds a value for, never deletes anything on its say-so, and lists
-under ``not_restored`` each tag the run wrote that it left as it is.
+is not a record of the file's tags: guessing from it both deleted tags the
+file had and left the run's values on files it had blanked. Its files are
+reported ``no_snapshot`` and left alone.
 
 Every restore is read back. ExifTool skips a value it will not write (a
 ``0000:00:00`` date) with a warning and exits 0, so a file is ``reverted``
@@ -49,11 +49,7 @@ from json import JSONDecodeError
 from typing import Any
 
 from ..canonical import (
-    CANONICAL_HIERARCHICAL_KEYWORDS_TAG,
-    CANONICAL_IPTC_KEYWORDS_TAG,
     CANONICAL_KEYWORDS_TAG,
-    hierarchy_levels,
-    iim_holds_keyword,
 )
 from ..changeset import WRITE_SUPPRESSED_KEY
 from .apply import (
@@ -72,7 +68,14 @@ from .locate import resolve_exiftool_path
 from .manifest import run_exiftool_json
 
 #: Every status a per-file record can carry.
-REVERT_STATUSES: tuple[str, ...] = ("reverted", "unchanged", "conflict", "missing", "error")
+REVERT_STATUSES: tuple[str, ...] = (
+    "reverted",
+    "unchanged",
+    "conflict",
+    "missing",
+    "no_snapshot",
+    "error",
+)
 
 _DIGITS_RE = re.compile(r"\D")
 #: A trailing zone, which ExifTool adds to an IPTC time it reads back.
@@ -121,14 +124,11 @@ class _FilePlan:
         entries: How many changeset records named it; the first one is used.
         before: ``{tag: value before the run}`` for each scalar tag, ``None``
             where the file had none.
-        before_keywords: ``{keyword tag: list or None}`` from the snapshot;
-            empty for an old changeset, which restores keywords from
-            ``keyword_delta`` instead.
+        before_keywords: ``{keyword tag: list or None}`` from the snapshot.
         expected: ``{tag: value the run wrote}``, what the file should still
             hold if nothing edited it since.
-        keyword_delta: ``(added, removed)`` keywords, for an old changeset.
-        not_restored: Tags the run wrote that an old changeset gives no
-            trustworthy before-value for, so they are left as they are.
+        no_snapshot: The record has no ``written_tags``, so the file is left
+            alone.
     """
 
     path: str
@@ -136,14 +136,12 @@ class _FilePlan:
     before: dict[str, Any] = field(default_factory=dict)
     before_keywords: dict[str, list[str] | None] = field(default_factory=dict)
     expected: dict[str, Any] = field(default_factory=dict)
-    keyword_delta: tuple[list[str], list[str]] | None = None
-    not_restored: list[str] = field(default_factory=list)
+    no_snapshot: bool = False
 
     @property
     def tags(self) -> list[str]:
         """Every tag this revert reads or writes."""
-        delta = _KEYWORD_WRITE_TAGS if self.keyword_delta is not None else ()
-        return list(dict.fromkeys((*self.before, *self.before_keywords, *self.expected, *delta)))
+        return list(dict.fromkeys((*self.before, *self.before_keywords, *self.expected)))
 
 
 def _first_records(changeset_path: str) -> tuple[list[tuple[dict, int]], list[dict]]:
@@ -193,63 +191,43 @@ def _expected_values(proposed: dict[str, Any]) -> dict[str, Any]:
     return {**written, **_companion_tags(written, set_changes)}
 
 
-def _plan_file(record: dict, entries: int, allowed: tuple[str, ...]) -> _FilePlan:
+def _plan_file(record: dict, entries: int) -> _FilePlan:
     """Work out one file's before-values and the values the run left on it.
 
     Args:
         record: The file's first changeset record.
         entries: How many records named the file.
-        allowed: The tags the run's apply could write, for an old changeset
-            that does not say which it did.
 
     Returns:
-        The plan; empty ``before`` and ``before_keywords`` when the run wrote
-        nothing to the file.
+        The plan; empty when the run wrote nothing to the file, and marked
+        ``no_snapshot`` when the record carries no before-values.
     """
     plan = _FilePlan(record["path"], entries)
     proposed = record.get("proposed_changes") or {}
     if not isinstance(proposed, dict) or proposed.get(WRITE_SUPPRESSED_KEY):
         return plan
-    original = record.get("original_data") or {}
-    snapshot = original.get("written_tags")
+    snapshot = (record.get("original_data") or {}).get("written_tags")
+    if not isinstance(snapshot, dict):
+        plan.no_snapshot = bool(
+            proposed.get("set") or proposed.get("keywords_add") or proposed.get("keywords_remove")
+        )
+        return plan
+    for tag, value in snapshot.items():
+        if tag in _KEYWORD_WRITE_TAGS:
+            plan.before_keywords[tag] = value
+        else:
+            plan.before[tag] = value
+    expected = _expected_values(proposed)
+    plan.expected = {tag: expected[tag] for tag in plan.before if tag in expected}
     added = [k for k in proposed.get("keywords_add") or [] if isinstance(k, str)]
     removed = [k for k in proposed.get("keywords_remove") or [] if isinstance(k, str)]
-    expected = _expected_values(proposed)
-
-    if isinstance(snapshot, dict):
-        for tag, value in snapshot.items():
-            if tag in _KEYWORD_WRITE_TAGS:
-                plan.before_keywords[tag] = value
-            else:
-                plan.before[tag] = value
-        plan.expected = {tag: expected[tag] for tag in plan.before if tag in expected}
-        before_subject = snapshot.get(CANONICAL_KEYWORDS_TAG)
-        keywords_written = CANONICAL_KEYWORDS_TAG in snapshot
-    else:
-        file_metadata = original.get("file_metadata") or {}
-        set_changes = proposed.get("set") or {}
-        for tag in expected:
-            value = file_metadata.get(tag)
-            if tag in set_changes and tag in allowed and value is not None:
-                plan.before[tag] = value
-                plan.expected[tag] = expected[tag]
-            elif tag in set_changes and tag in allowed or tag not in set_changes:
-                plan.not_restored.append(tag)
-        keywords_written = CANONICAL_KEYWORDS_TAG in allowed
-        if keywords_written and (added or removed):
-            plan.keyword_delta = (added, removed)
-        before_subject = file_metadata.get(CANONICAL_KEYWORDS_TAG)
-
-    if keywords_written and (added or removed):
-        held = {k.casefold() for k in _as_list(before_subject)}
-        kept = [
-            k
-            for k in _as_list(before_subject)
-            if k.casefold() not in {r.casefold() for r in removed}
-        ]
-        plan.expected[CANONICAL_KEYWORDS_TAG] = kept + [
-            k for k in added if k.casefold() not in held
-        ]
+    if CANONICAL_KEYWORDS_TAG in snapshot and (added or removed):
+        before_subject = _as_list(snapshot.get(CANONICAL_KEYWORDS_TAG))
+        held = {k.casefold() for k in before_subject}
+        removed_cf = {r.casefold() for r in removed}
+        plan.expected[CANONICAL_KEYWORDS_TAG] = [
+            k for k in before_subject if k.casefold() not in removed_cf
+        ] + [k for k in added if k.casefold() not in held]
     return plan
 
 
@@ -332,57 +310,10 @@ def _restore_write(plan: _FilePlan, current: dict[str, Any]) -> tuple[_FileWrite
         if ops:
             keyword_args.extend(ops)
             touched_keywords.append(tag)
-    if plan.keyword_delta is not None:
-        delta_args, delta_tags = _keyword_delta_restore(plan.keyword_delta, current)
-        keyword_args += delta_args
-        touched_keywords += [t for t in delta_tags if t not in touched_keywords]
     via_argfile = not all(
         text.isascii() for text in (plan.path, tempfile.gettempdir(), *tags.values(), *keyword_args)
     )
     return _FileWrite(tags, keyword_args, via_argfile), [*tags, *touched_keywords]
-
-
-def _keyword_delta_restore(
-    delta: tuple[list[str], list[str]], current: dict[str, Any]
-) -> tuple[list[str], list[str]]:
-    """Undo an old changeset's keyword additions and removals, against the file now.
-
-    An added keyword comes off every keyword tag still holding it; a removed
-    one goes back on each tag that lacks it. Lightroom's hierarchy only gets a
-    flat copy back when no entry there already holds it as a level, since
-    ``Places|Church`` already is the keyword ``Church``.
-
-    Args:
-        delta: ``(added, removed)`` from the record.
-        current: The file's current values, keyword tags included.
-
-    Returns:
-        The ExifTool arguments, and the tags they touch.
-    """
-    added, removed = delta
-    removed_cf = {k.casefold() for k in removed}
-    held = {tag: {k.casefold() for k in _as_list(current.get(tag))} for tag in _KEYWORD_WRITE_TAGS}
-    levels = hierarchy_levels(_as_list(current.get(CANONICAL_HIERARCHICAL_KEYWORDS_TAG)))
-    args: list[str] = []
-    touched: list[str] = []
-    for keyword in added:
-        if keyword.casefold() in removed_cf:
-            continue
-        for tag in _KEYWORD_WRITE_TAGS:
-            if keyword.casefold() in held[tag]:
-                args.append(f"-{tag}-={keyword}")
-                touched.append(tag)
-    for keyword in removed:
-        targets = [CANONICAL_KEYWORDS_TAG]
-        if keyword.casefold() not in levels:
-            targets.append(CANONICAL_HIERARCHICAL_KEYWORDS_TAG)
-        if iim_holds_keyword(keyword):
-            targets.append(CANONICAL_IPTC_KEYWORDS_TAG)
-        for tag in targets:
-            if keyword.casefold() not in held[tag]:
-                args.append(f"-{tag}+={keyword}")
-                touched.append(tag)
-    return args, list(dict.fromkeys(touched))
 
 
 def _verify(exiftool: str, plans: list[_FilePlan], records: list[dict[str, Any]]) -> None:
@@ -408,7 +339,7 @@ def _verify(exiftool: str, plans: list[_FilePlan], records: list[dict[str, Any]]
         if left:
             rec.update(
                 status="error",
-                not_restored=[*rec.get("not_restored", []), *left],
+                not_restored=left,
                 error="ExifTool did not write these tags back.",
             )
 
@@ -441,11 +372,8 @@ def revert_changeset(
     """
     exiftool = resolve_exiftool_path(cfg)
     first, out = _first_records(changeset_path)
-    allowed = tuple(cfg.fields)
     plans = [
-        _plan_file(record, entries, allowed)
-        for record, entries in first
-        if options.wants(record["path"])
+        _plan_file(record, entries) for record, entries in first if options.wants(record["path"])
     ]
     present = [plan for plan in plans if os.path.isfile(plan.path)]
     tags = list(dict.fromkeys(tag for plan in present for tag in plan.tags))
@@ -513,12 +441,12 @@ def _revert_one(
     """
     exiftool, cfg, options = run
     record: dict[str, Any] = {"path": plan.path, "entries": plan.entries}
-    if plan.not_restored:
-        record["not_restored"] = plan.not_restored
     if cfg.dry_run:
         record["dry_run"] = True
     if not os.path.isfile(plan.path):
         return {**record, "status": "missing", "tags": []}
+    if plan.no_snapshot:
+        return {**record, "status": "no_snapshot", "tags": []}
     if not plan.tags:
         return {**record, "status": "unchanged", "tags": []}
     file_values = current_by_path.get(_path_key(plan.path))
