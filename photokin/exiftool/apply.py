@@ -316,7 +316,9 @@ def _read_before_values(
     }
 
 
-def _fold_snapshots_into_changeset(changeset_path: str, snapshots: dict[int, dict]) -> None:
+def _fold_snapshots_into_changeset(
+    changeset_path: str, snapshots: dict[int, dict[str, Any] | None]
+) -> None:
     """Rewrite the changeset with each written record's ``original_data.written_tags``.
 
     Written beside the changeset and moved over it, so a crash leaves either the
@@ -324,13 +326,19 @@ def _fold_snapshots_into_changeset(changeset_path: str, snapshots: dict[int, dic
 
     Args:
         changeset_path: The changeset that was applied.
-        snapshots: ``{line number: {tag: value before the write}}``.
+        snapshots: ``{line number: {tag: value before the write}}``; ``None``
+            for a file written without them, recorded as
+            ``original_data.written_tags_missing``.
     """
     with open(changeset_path, "r", encoding="utf-8") as handle:
         lines = handle.readlines()
     for line_number, snapshot in snapshots.items():
         record = json.loads(lines[line_number - 1])
-        record.setdefault("original_data", {})["written_tags"] = snapshot
+        original = record.setdefault("original_data", {})
+        if snapshot is None:
+            original["written_tags_missing"] = True
+        else:
+            original["written_tags"] = snapshot
         lines[line_number - 1] = json.dumps(record, ensure_ascii=False) + "\n"
     staging_path = f"{changeset_path}.tmp"
     with open(staging_path, "w", encoding="utf-8") as handle:
@@ -856,7 +864,8 @@ def apply_changeset(
     tmp_dir_holder: list[str] = []
 
     before_values: dict[str, dict[str, Any]] | None = None
-    if record_before and not cfg.dry_run and not cfg.write_sidecar_only:
+    taking_snapshots = record_before and not cfg.dry_run and not cfg.write_sidecar_only
+    if taking_snapshots:
         try:
             before_values = _read_before_values(exiftool, changeset_path, allowed_fields)
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
@@ -867,7 +876,7 @@ def apply_changeset(
                     "changeset": changeset_path,
                 }
             )
-    snapshots: dict[int, dict[str, Any]] = {}
+    snapshots: dict[int, dict[str, Any] | None] = {}
 
     def _datfile_dir(stack: ExitStack) -> str:
         if not tmp_dir_holder:
@@ -994,13 +1003,17 @@ def apply_changeset(
                         )
                     return os.path.join(_datfile_dir(tmp_stack), _datfile_name(_line, tag))
 
-                if before_values is not None:
-                    file_values = before_values.get(_path_key(path))
-                    if file_values is not None:
-                        touched = (*tags_to_write, *(_KEYWORD_WRITE_TAGS if keyword_args else ()))
-                        snapshots[line_number] = {
-                            tag: _snapshot_value(file_values, tag) for tag in touched
-                        }
+                if taking_snapshots:
+                    # None marks a file written without its before-values (the
+                    # read failed, or missed it), so a revert can tell it from
+                    # one the apply never wrote.
+                    file_values = (before_values or {}).get(_path_key(path))
+                    touched = (*tags_to_write, *(_KEYWORD_WRITE_TAGS if keyword_args else ()))
+                    snapshots[line_number] = (
+                        None
+                        if file_values is None
+                        else {tag: _snapshot_value(file_values, tag) for tag in touched}
+                    )
 
                 error = _run_file_write(exiftool, cfg, write, path, _datfile_path_for)
                 if error is not None:

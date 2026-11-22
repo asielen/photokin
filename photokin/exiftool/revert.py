@@ -77,6 +77,9 @@ REVERT_STATUSES: tuple[str, ...] = (
     "error",
 )
 
+#: The first changeset schema whose applied records carry ``written_tags``.
+_FIRST_SNAPSHOT_SCHEMA = 5
+
 _DIGITS_RE = re.compile(r"\D")
 #: A trailing zone, which ExifTool adds to an IPTC time it reads back.
 _ZONE_RE = re.compile(r"(?:[+-]\d{2}:?\d{2}|Z)$")
@@ -206,9 +209,16 @@ def _plan_file(record: dict, entries: int) -> _FilePlan:
     proposed = record.get("proposed_changes") or {}
     if not isinstance(proposed, dict) or proposed.get(WRITE_SUPPRESSED_KEY):
         return plan
-    snapshot = (record.get("original_data") or {}).get("written_tags")
+    original = record.get("original_data") or {}
+    snapshot = original.get("written_tags")
     if not isinstance(snapshot, dict):
-        plan.no_snapshot = bool(
+        # From schema 5 the applier records a snapshot for every file it
+        # writes, so a newer record without one is a file it never wrote
+        # (every proposal outside the allow-list). Only an older record
+        # leaves the question open.
+        version = record.get("schema_version")
+        predates = not isinstance(version, int) or version < _FIRST_SNAPSHOT_SCHEMA
+        plan.no_snapshot = (predates or bool(original.get("written_tags_missing"))) and bool(
             proposed.get("set") or proposed.get("keywords_add") or proposed.get("keywords_remove")
         )
         return plan
