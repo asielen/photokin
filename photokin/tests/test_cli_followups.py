@@ -9,6 +9,7 @@ import pytest
 
 from photokin import cli_messages, rename_apply
 from photokin.tests.test_cli_input_surface import _CliTestCase, _StreamSpy
+from photokin.tests.test_cli_preflight import _envelope_records, _ndjson_lines
 
 
 class TestModeOnlyFlags(_CliTestCase):
@@ -94,3 +95,32 @@ def test_destination_remedies_name_the_flag_that_failed() -> None:
 
     # Assert
     assert all("--plan-out" in r and "--output-file" not in r for r in remedies)
+
+
+@pytest.mark.parametrize(
+    ("role", "flag"), [("--changeset output", "--output-file"), ("-v's log file", "--log-file")]
+)
+def test_a_derived_destinations_remedy_names_the_flag_that_moves_it(role: str, flag: str) -> None:
+    # Act
+    remedy = cli_messages.output_not_writable(role, "C:/x/y")[1]
+
+    # Assert
+    assert flag in remedy and role not in remedy
+
+
+class TestModeOnlyRefusalReachesTheEnvelope(_CliTestCase):
+    """A launcher watching the results file sees the refusal."""
+
+    def test_the_refusal_is_recorded_as_fatal(self) -> None:
+        # Arrange
+        folder = self.make_folder()
+        out = os.path.join(folder, "out.ndjson")
+
+        # Act
+        with patch("photokin.cli.process_manifest_stream", _StreamSpy()):
+            code, _stdout, _stderr = self.run_cli([folder, "--output-file", out, "--digits", "4"])
+
+        # Assert
+        self.assertEqual(code, 2)
+        records = _envelope_records(_ndjson_lines(out))
+        self.assertEqual([r["run"] for r in records], ["start", "fatal"])

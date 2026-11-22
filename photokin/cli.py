@@ -3503,7 +3503,11 @@ def main() -> None:
         # named two of these gets one clear refusal instead of whichever
         # branch happened to run first.
         _refuse_rename_mode_conflicts(args)
-        _refuse_mode_only_flags(args)
+        if _given_rename_modes(args) or args.revert_changeset is not None:
+            # A mode that returns below never reaches the envelope; an
+            # analysis run is checked once the envelope is open, so its
+            # refusal lands in the results file.
+            _refuse_mode_only_flags(args)
         _refuse_executor_dry_run(args)
         _refuse_rename_mode_sidecar_flags(args)
         if args.rename_finish is not None:
@@ -3535,6 +3539,7 @@ def main() -> None:
         # contract says can never exist.
         if not args.dry_run and not args.generate_manifest:
             _open_run_envelope_if_fresh(args.output_file, batch_id=args.batch_id)
+        _refuse_mode_only_flags(args)
 
         if args.process_all_variants:
             logger.warning(
