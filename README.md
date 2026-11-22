@@ -533,7 +533,19 @@ Flags are optional when the filename already says the same thing; they exist so 
 | `group` | The group key outright, for names the grammar cannot parse at all. `base_id` is accepted as an alias and loses to `group` when both are given. |
 | `preferred` | Breaks a tie between two files claiming the same slot — the same side of the same variant — so the one you name is the one sent and the other is recorded and warned about. It chooses between candidates; it cannot create a place for one. See below. |
 
-`is_back` and `is_crop` may be written as JSON `true`/`false`, as `0`/`1`, or as the strings `"true"`, `"false"`, `"yes"`, `"no"`. A `null` value means "not specified" and leaves the filename in charge.
+Five more keys don't affect grouping. They are for a caller such as the Lightroom plug-in that sends exports, like a crop of one virtual copy, rather than the scans themselves:
+
+| Key | Effect |
+|---|---|
+| `id` | Any value. Returned unchanged on the item's result record, its changeset record and the `ids` list of its group's progress record, for when the path no longer identifies the photo. |
+| `source_path` | The file the export was made from. Returned unchanged on the result and changeset records. |
+| `read` | `false` keeps `-r` off this file, so the item's `metadata` is its original. Use it for an export that carries no metadata of its own. |
+| `write` | `false` analyzes the item and reports its patch and changeset record, but ExifTool never writes it and it is not counted in `files_written`; the record carries `"write": false` for the caller to apply itself. It also gets no Markdown sidecar unless `sidecar_path` names one. |
+| `sidecar_path` | Where this item's Markdown sidecar goes, instead of `<stem>.md` beside the image. |
+
+`group` decides only which object an item belongs to. Its part still comes from the filename, so an export named `page-006-back.jpg` is still a back; name exports without the grammar's suffixes, or set `is_back`, `is_crop` and `version` explicitly. Giving each crop its own `group` makes each one its own object.
+
+`is_back`, `is_crop`, `read` and `write` may be written as JSON `true`/`false`, as `0`/`1`, or as the strings `"true"`, `"false"`, `"yes"`, `"no"`. A `null` value means "not specified" and leaves the filename in charge.
 
 `preferred` is the exception and does not read that grammar: it is plain truthiness, so any non-empty string sets it and `"preferred": "false"` means **true**. Write it as a JSON `true`, or leave the key out entirely. It also nominates the file the group's analysis is filed under.
 
@@ -854,7 +866,7 @@ Prints this build's contract as JSON and exits, before any input is required —
 {
   "version": "0.8.0",
   "ndjson_schema_version": 3,
-  "changeset_schema_version": 4,
+  "changeset_schema_version": 6,
   "canonical_tags": {
     "ai_caption": "EXIF:UserComment",
     "caption": "XMP-dc:Description",

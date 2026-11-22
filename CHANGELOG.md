@@ -34,6 +34,21 @@ changeset now records enough to undo it.
 - **The `complete` and `cancelled` records carry `items_recorded`**
   beside `files_recorded`, since items that share a path (Lightroom
   virtual copies) count once as files.
+- **Manifest items take `id`, `source_path`, `read`, `write` and
+  `sidecar_path`,** for a caller that sends exports such as Lightroom
+  virtual-copy crops. `id` and `source_path` come back unchanged on the
+  item's records; `read: false` keeps `-r` off the file; `write: false`
+  reports the result without ExifTool writing it; `sidecar_path` places
+  the Markdown sidecar. Changeset `schema_version` is 6.
+- **`photokin --revert-changeset PATH` puts a run's files back**, for an
+  agent or developer cleaning up a bad run. Each file's tags go back to
+  their `written_tags` values; a file edited since the run is a conflict
+  and left alone unless `--force`. `--revert-paths` or `--revert-match`
+  narrow it, and `--dry-run` judges without writing. See
+  `photokin/exiftool/README.md`.
+- **A write that touches an IPTC tag recomputes the Photoshop
+  `IPTCDigest`**, which ExifTool left stale, so Lightroom stops warning
+  that the XMP may be out of sync.
 - **Packaging:** the license is declared as an SPDX string, and the vocab
   backup goes to `~/.photokin/backups` instead of the package folder.
 

@@ -7,6 +7,7 @@ from typing import Callable
 
 from ..utils import (
     HYDRATION_FAILED_KEY,
+    coerce_manifest_bool,
     is_date_keyword,
     is_date_marker,
     normalize_path,
@@ -94,6 +95,10 @@ def hydrate_item_metadata(
     paths_needing: list[str] = []
     wanted_by_path: dict[str, list[tuple[dict, set[str], bool]]] = {}
     for raw in items:
+        if coerce_manifest_bool(raw, "read", raw.get("path") or "", logger) is False:
+            # The caller's metadata is this item's original; its file (an
+            # export carrying none) is not read.
+            continue
         meta = raw.get("metadata")
         if not isinstance(meta, dict):
             if raw.get("metadata_path"):
