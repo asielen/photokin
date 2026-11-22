@@ -856,6 +856,8 @@ All three dumps land in `--debug-dump-dir` (default `./debug`, or `<manifest/out
 
 ### Checking compatibility: `--capabilities`
 
+`photokin --version` prints just the version. For everything a launcher might check, use:
+
 ```bash
 photokin --capabilities
 ```

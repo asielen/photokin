@@ -553,6 +553,22 @@ def revert_takes_no_input(display: str) -> UsageMessage:
     )
 
 
+def flag_needs_mode(flag: str, mode: str) -> UsageMessage:
+    """A flag that only one mode reads was given without that mode.
+
+    Args:
+        flag: The flag as typed, e.g. ``--plan-out``.
+        mode: The mode flag it belongs to, e.g. ``--rename``.
+
+    Returns:
+        The problem line and the remedy line, in that order.
+    """
+    return (
+        f"`{flag}` only works with {mode}, so this run would ignore it.",
+        f"add {mode}, or drop {flag}",
+    )
+
+
 def write_needs_changeset() -> UsageMessage:
     """Writing was asked for with no changeset to write from.
 
@@ -664,6 +680,15 @@ def generate_manifest_with_write_flag(flag: str, verb: str, replay: str) -> Usag
 
 # === Pre-flight, moved verbatim from Phase A ===
 
+#: The flag that moves a destination whose role is not itself a flag.
+_ROLE_FLAGS = {"--changeset output": "--output-file", "-v's log file": "--log-file"}
+
+
+def _role_flag(role: str) -> str:
+    """The flag a user changes to move the destination *role* names."""
+    return _ROLE_FLAGS.get(role, role)
+
+
 def output_dir_missing(role: str, out_dir: str) -> UsageMessage:
     """The destination's parent directory does not exist.
 
@@ -676,7 +701,7 @@ def output_dir_missing(role: str, out_dir: str) -> UsageMessage:
     """
     return (
         f"{role} directory does not exist: {out_dir}",
-        "create the directory first, or point --output-file at an existing one",
+        f"create the directory first, or point {_role_flag(role)} at an existing one",
     )
 
 
@@ -708,7 +733,7 @@ def output_not_writable(role: str, out_path: str) -> UsageMessage:
     """
     return (
         f"{role} already exists and is not writable: {out_path}",
-        "clear the read-only flag on that file, or choose a different --output-file",
+        f"clear the read-only flag on that file, or choose a different {_role_flag(role)}",
     )
 
 
@@ -728,7 +753,7 @@ def output_destination_not_writable(role: str, out_path: str, reason: str) -> Us
     # cannot push anything off the line.
     return (
         f"{role} cannot be written -- {_one_line(reason)}:\n  {out_path}",
-        "point --output-file at a writable directory",
+        f"point {_role_flag(role)} at a writable directory",
     )
 
 
@@ -1314,7 +1339,7 @@ def output_file_is_needed_by_the_run(
         The problem line and the remedy line, in that order.
     """
     lead = f"{role} names {description}, and would overwrite it:"
-    remedy = f"point {role} at a file this run does not touch"
+    remedy = f"point {_role_flag(role)} at a file this run does not touch"
     if out_path == needed_path:
         return (f"{lead}\n  {out_path}", remedy)
     width = max(len(role), len("that file")) + 2

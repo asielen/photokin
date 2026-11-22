@@ -63,7 +63,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from json import JSONDecodeError
-from typing import Any, Dict, List, Set, Tuple, Optional
+from typing import Any, Dict, List, NamedTuple, Set, Tuple, Optional
 
 from photokin.face_utils import face_tags_to_llm_block
 from photokin.errors import ProviderApiError, extract_provider_message, extract_retry_after
@@ -1710,6 +1710,65 @@ def attached_role_label(role: str) -> str:
 #: Where an entry with no recognized ``part_kind`` sorts: alongside an untagged
 #: file, which is what an unparsed one effectively is.
 UNRANKED_PART = PART_RANK["none"]
+
+#: Fidelity order for same-stem files that differ only by extension, e.g. a
+#: TIFF master beside the JPEG derivative an archivist keeps for browsing. Only
+#: one of them is sent to the model, so send the one that lost the least:
+#: lossless first, then PNG, then the lossy formats. Alphabetical order -- the
+#: fallback this sits in front of -- picks the opposite, since ".jpg" sorts
+#: before ".tif", and its compression artifacts are exactly what costs a
+#: transcription of faint pencil on the back of a card.
+FORMAT_RANK: dict[str, int] = {".tif": 0, ".tiff": 0, ".png": 1, ".jpg": 2, ".jpeg": 2}
+
+#: Where an extension outside :data:`FORMAT_RANK` sorts: after all of them.
+UNRANKED_FORMAT = 3
+
+
+class SlotFacts(NamedTuple):
+    """What :func:`slot_rank_key` ranks a file by."""
+
+    crop: bool
+    preferred: bool
+    part_kind: str | None
+    page_num: int | None
+    version: str | None
+    path: str
+
+
+def slot_rank_key(facts: SlotFacts) -> tuple[int, int, int, int, int, str, int, str, str]:
+    """Order the files of one group, most "the object" first.
+
+    The one rule for which of a group's files stands for it. Analysis uses it
+    to pick the file sent to the model and the one a ``<stem>.md`` transcript
+    belongs to; the rename planner uses it to pick which of two same-stem
+    files owns that transcript. Two copies of it drifted apart once, and a
+    rename then left a transcript naming a file it had moved.
+
+    Crop-ness leads, so a real scan beats a crop of it unconditionally,
+    including a crop marked ``preferred``. ``preferred`` comes next, then part
+    kind, page number and unversioned-before-versioned. Format fidelity
+    settles two files of one stem and part that differ only by extension, and
+    the path comes last, so even two indistinguishable files resolve the same
+    way every run.
+
+    Args:
+        facts: The file's ranking facts.
+
+    Returns:
+        A sort key; the smallest is the object.
+    """
+    extension = os.path.splitext(facts.path)[1].lower()
+    return (
+        1 if facts.crop else 0,
+        0 if facts.preferred else 1,
+        PART_RANK.get(facts.part_kind or "none", UNRANKED_PART),
+        0 if facts.page_num is None else facts.page_num,
+        0 if facts.version is None else 1,
+        facts.version or "",
+        FORMAT_RANK.get(extension, UNRANKED_FORMAT),
+        facts.path.lower(),
+        facts.path,
+    )
 
 
 #: A trailing variant letter: ``-b``, or ``b``/``_b`` directly after a digit.
