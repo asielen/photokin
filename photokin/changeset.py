@@ -25,7 +25,6 @@ Code map:
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import secrets
 from copy import deepcopy
@@ -38,7 +37,7 @@ from .canonical import (
     CANONICAL_KEYWORDS_TAG,
     hierarchy_levels,
 )
-from .utils import DEFAULT_METADATA_FORWARD_FIELDS, normalize_path, union_keywords
+from .utils import DEFAULT_METADATA_FORWARD_FIELDS, json_text, normalize_path, union_keywords
 
 # Bumped whenever a record's shape changes in a way a consumer could care
 # about -- a new top-level key, a renamed one, a changed meaning for an
@@ -73,17 +72,28 @@ SCHEMA_VERSION = 6
 
 
 def make_run_id() -> str:
-    """Generate a run id from a UTC timestamp plus a short random token."""
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Generate a run id from a UTC timestamp plus a short random token.
+
+    The timestamp carries microseconds, so two runs started in the same
+    second still sort by age: a folder's rename journals are ordered by run
+    id, and with whole seconds the random token decided which of two
+    same-second runs an undo picked.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     token = secrets.token_hex(4)
     return f"{stamp}_{token}"
 
 
 def make_photo_id(path: str) -> str:
-    """Return a stable ID for a file based on sha1(normalized absolute path)."""
+    """Return a stable ID for a file based on sha1(normalized absolute path).
+
+    The path is hashed as the filesystem's own bytes (``os.fsencode``), which
+    for any UTF-8 name are its UTF-8 bytes, so ordinary IDs are unchanged; a
+    POSIX name holding a byte that is not UTF-8 hashes too, instead of raising.
+    """
     normalized = normalize_path(path) or path
     normalized = os.path.abspath(os.path.normpath(normalized))
-    digest = hashlib.sha1(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()
+    digest = hashlib.sha1(os.fsencode(normalized), usedforsecurity=False).hexdigest()
     return f"sha1:{digest}"
 
 
@@ -244,4 +254,4 @@ def emit_changeset_record(
         **deepcopy(item_fields or {}),
     }
 
-    writer(json.dumps(record, ensure_ascii=False))
+    writer(json_text(record))

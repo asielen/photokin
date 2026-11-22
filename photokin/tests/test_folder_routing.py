@@ -945,12 +945,13 @@ class TestGeneratedManifestAtomicWrite(_CliTestCase):
     def test_a_write_that_fails_while_serializing_keeps_the_previous_manifest(self) -> None:
         out_path = self._with_a_previous_manifest()
 
-        def _dump_then_fail(obj: object, handle: object, **kwargs: object) -> None:
+        def _dump_then_fail(obj: object, **kwargs: object) -> str:
             """Write a truncated fragment, then fail the way a full disk does."""
-            handle.write('{"items": [')  # type: ignore[attr-defined]
+            with open(out_path + ".tmp", "w", encoding="utf-8") as handle:
+                handle.write('{"items": [')
             raise OSError(28, "No space left on device")
 
-        with patch("photokin.cli.json.dump", _dump_then_fail), self.assertRaises(OSError):
+        with patch("photokin.cli.utils.json_text", _dump_then_fail), self.assertRaises(OSError):
             cli._write_generated_manifest({"items": []}, out_path)
 
         self.assertEqual(

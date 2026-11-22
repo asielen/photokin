@@ -71,7 +71,8 @@ from typing import Any
 
 from .changeset import make_run_id
 from .doc_sidecar import _yaml_string
-from .utils import casefold_filename, paths_are_same_file
+from .rename import image_cycles
+from .utils import casefold_filename, json_text, paths_are_same_file
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +155,14 @@ _MTIME_TOLERANCE_S = 1e-6
 
 #: One backslash escape inside a double-quoted YAML scalar, the shape
 #: ``doc_sidecar._yaml_string`` writes.
-_YAML_ESCAPE_RE = re.compile(r"\\(.)")
+_YAML_ESCAPE_RE = re.compile(r"\\(u[0-9a-fA-F]{4}|.)")
+
+#: The single-character escapes ``doc_sidecar._yaml_string`` emits, decoded.
+_YAML_UNESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\x00", "\\": "\\", '"': '"'}
+
+#: A filename YAML reads back unchanged without quotes: no leading
+#: indicator character, no ": " or " #", no edge whitespace or trailing ":".
+_YAML_PLAIN_RE = re.compile(r"""^(?![-?:,\[\]{}#&*!|>'"%@`\s])(?!.*(?:: | #))(?!.*[\s:]$).+$""")
 
 #: How much of a journal's tail is read at a time when the last record has to
 #: be checked for termination. The journal is one record per renamed file, so
@@ -705,8 +713,8 @@ def _write_segment(
     if append:
         _drop_torn_tail(path)
     mode = "a" if append else "x"
-    lines = [json.dumps({**dict(header), "ops": len(ops)}, ensure_ascii=False)]
-    lines.extend(json.dumps(_op_record(op), ensure_ascii=False) for op in ops)
+    lines = [json_text({**dict(header), "ops": len(ops)})]
+    lines.extend(json_text(_op_record(op)) for op in ops)
     with open(path, mode, encoding="utf-8", newline="\n") as handle:
         handle.write("".join(f"{line}\n" for line in lines))
         handle.flush()
@@ -777,7 +785,7 @@ def _append_record(path: str, record: Mapping[str, Any]) -> None:
     """
     _drop_torn_tail(path)
     with open(path, "a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
+        handle.write(json_text(dict(record)) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -1018,9 +1026,10 @@ def _journal_candidates(folder: str) -> list[str]:
     guard that stops a second run trampling a half-finished one, with the
     journal sitting right there.
 
-    A run id starts with a UTC ISO timestamp, so the token after the marker
-    sorts by age on its own; the whole name is the tie-break, which only
-    matters for two runs that started in the same second.
+    A run id starts with a UTC ISO timestamp to the microsecond, so the token
+    after the marker sorts by age on its own; the whole name is the
+    tie-break, which only matters for two runs started in the same
+    microsecond.
 
     Args:
         folder: The folder to look in.
@@ -1261,7 +1270,9 @@ def _is_bare_filename(name: str) -> bool:
     (``docs/rename-mode.md`` section 11), so the answer may not depend on the
     running OS. ``ntpath`` knows every separator POSIX knows and the ones it
     does not, and ``.``/``..`` are spelled out because ``basename`` returns
-    them unchanged.
+    them unchanged. A NUL byte is refused too: no filesystem takes one, and
+    ``os.rename`` raises on it only after phase A has already staged every
+    file under a temporary name, which a resume then cannot get past.
 
     Args:
         name: The candidate filename.
@@ -1269,7 +1280,12 @@ def _is_bare_filename(name: str) -> bool:
     Returns:
         ``True`` when *name* is a bare filename.
     """
-    return bool(name) and name not in (".", "..") and ntpath.basename(name) == name
+    return (
+        bool(name)
+        and name not in (".", "..")
+        and "\x00" not in name
+        and ntpath.basename(name) == name
+    )
 
 
 def _target_refusals(plan: Mapping[str, Any]) -> list[str]:
@@ -1408,7 +1424,7 @@ def _source_problems(
         problems.append("a plan entry has no path")
         return problems
     directory = os.path.dirname(source)
-    if directory and os.path.abspath(directory) != folder:
+    if directory and not _same_folder(os.path.abspath(directory), folder):
         problems.append(f"outside the plan's folder: {source}")
     if not target:
         problems.append(f"no target planned for: {name}")
@@ -1418,6 +1434,27 @@ def _source_problems(
         problems.append(f"gone since the plan was made: {name}")
         return problems
     _disk_name, size, mtime = found
+    if _changed_since_plan(record, size, mtime):
+        problems.append(f"changed since the plan was made: {name}")
+    return problems
+
+
+def _same_folder(directory: str, folder: str) -> bool:
+    """Whether two spellings name one folder; exact first, then by filesystem identity."""
+    return directory == folder or paths_are_same_file(directory, folder)
+
+
+def _changed_since_plan(record: Mapping[str, Any], size: int, mtime: float) -> bool:
+    """Whether a file's size or mtime differs from what its plan record measured.
+
+    Args:
+        record: The plan entry or companion record, read for ``size``/``mtime``.
+        size: The file's size now.
+        mtime: The file's mtime now.
+
+    Returns:
+        True when either recorded value is present and differs.
+    """
     planned_size = record.get("size")
     planned_mtime = record.get("mtime")
     resized = isinstance(planned_size, int) and planned_size != size
@@ -1425,9 +1462,7 @@ def _source_problems(
         isinstance(planned_mtime, (int, float))
         and abs(float(planned_mtime) - mtime) > _MTIME_TOLERANCE_S
     )
-    if resized or retouched:
-        problems.append(f"changed since the plan was made: {name}")
-    return problems
+    return resized or retouched
 
 
 def preflight(plan: Mapping[str, Any]) -> list[str]:
@@ -1641,6 +1676,12 @@ def _swap_in(path: str, tmp_path: str, payload: bytes) -> str | None:
             os.fsync(handle.fileno())
         _carry_protection(resolved, tmp_path)
         os.replace(tmp_path, resolved)
+        if resolved != path:
+            # The run's own folder is synced before the journal closes; a
+            # linked transcript's real folder is not that folder, and without
+            # this a power loss could keep the "applied" footer and lose the
+            # rewrite it vouches for.
+            _fsync_directory(os.path.dirname(resolved))
     except OSError as exc:
         if os.path.lexists(tmp_path):
             try:
@@ -1669,8 +1710,78 @@ def _sidecar_link(line: str) -> str:
     value = line.partition(":")[2].strip()
     if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
         inner = value[1:-1]
-        return _YAML_ESCAPE_RE.sub(r"\1", inner) if value[0] == '"' else inner.replace("''", "'")
+        return _yaml_unescape(inner) if value[0] == '"' else inner.replace("''", "'")
     return value
+
+
+def _yaml_unescape(inner: str) -> str:
+    """Decode the escapes of a double-quoted YAML scalar's body.
+
+    ``\\n``, ``\\t``, ``\\r`` and ``\\uXXXX`` are what the sidecar writer
+    emits for a name holding a newline, tab or other control character, so
+    they decode to that character; any other escaped character is itself.
+
+    Args:
+        inner: The text between the quotes.
+
+    Returns:
+        The string the scalar holds.
+    """
+
+    def _decode(match: re.Match[str]) -> str:
+        escape = match.group(1)
+        if len(escape) == 5:
+            return chr(int(escape[1:], 16))
+        return _YAML_UNESCAPES.get(escape, escape)
+
+    return _YAML_ESCAPE_RE.sub(_decode, inner)
+
+
+def _render_link(name: str, style: str) -> str:
+    """Render *name* as a ``source_file`` value in the quoting style it was found in.
+
+    Keeping the style is what lets an undo give back the bytes the apply
+    found: a bare ``source_file: old.tif`` comes back bare, not quoted.
+
+    Args:
+        name: The file name to write.
+        style: ``'"'``, ``"'"`` or ``""`` (bare), as the line had it.
+
+    Returns:
+        The value text; double-quoted whenever the style cannot carry *name*.
+    """
+    if style == "" and name.isprintable() and _YAML_PLAIN_RE.match(name):
+        return name
+    if style == "'" and name.isprintable():
+        return "'" + name.replace("'", "''") + "'"
+    return _yaml_string(name)
+
+
+def _names_link(folder: str, link: str, name: str) -> bool:
+    """Whether a ``source_file`` value names the file called *name* in *folder*.
+
+    Exact spelling always matches. A spelling that differs only in case
+    matches only when the folder holds no other file under it: on a
+    case-sensitive filesystem ``PHOTO.TIF`` beside ``photo.tif`` is a
+    different file, while on a case-insensitive one the two names are one
+    file.
+
+    Args:
+        folder: The sidecar's folder.
+        link: The value the sidecar carries.
+        name: The image name being matched.
+
+    Returns:
+        True when the link is to *name*.
+    """
+    if link == name:
+        return True
+    if casefold_filename(link) != casefold_filename(name):
+        return False
+    link_path, name_path = os.path.join(folder, link), os.path.join(folder, name)
+    if not os.path.lexists(link_path):
+        return True
+    return os.path.lexists(name_path) and paths_are_same_file(link_path, name_path)
 
 
 def _rewrite_sidecar(md_path: str, was: str, now: str, tmp_path: str) -> str | None:
@@ -1678,10 +1789,10 @@ def _rewrite_sidecar(md_path: str, was: str, now: str, tmp_path: str) -> str | N
 
     Only the leading frontmatter block is touched, and only its first
     ``source_file`` line; every other byte of the file is written back exactly
-    as it was read, line endings included, so an undo restores the file the
-    apply started from byte for byte. The value is rendered by the sidecar
-    writer's own string emitter rather than a second one here, so the line is
-    identical to what a re-analysis would produce.
+    as it was read, line endings included. The line keeps its own indent,
+    spacing and quoting style (:func:`_render_link`), so an undo restores the
+    file the apply started from byte for byte; a double-quoted value is
+    rendered by the sidecar writer's own string emitter.
 
     The line is rewritten only when it names the image this op renamed. A
     same-stem ``.md`` whose ``source_file`` points somewhere else is either
@@ -1721,19 +1832,26 @@ def _rewrite_sidecar(md_path: str, was: str, now: str, tmp_path: str) -> str | N
     if not lines or lines[0].strip() != "---":
         return f"sidecar not updated (no frontmatter): {os.path.basename(md_path)}"
 
+    folder = os.path.dirname(md_path)
     for index in range(1, len(lines)):
         stripped = lines[index].strip()
         if stripped == "---":
             break
         if not stripped.startswith("source_file:"):
             continue
-        current = casefold_filename(_sidecar_link(stripped))
-        if current == casefold_filename(now):
+        current = _sidecar_link(stripped)
+        if _names_link(folder, current, now):
             return None
-        if current != casefold_filename(was):
+        if not _names_link(folder, current, was):
             return f"sidecar not updated (it names another file): {os.path.basename(md_path)}"
-        terminator = lines[index][len(lines[index].rstrip("\r\n")) :]
-        lines[index] = f"source_file: {_yaml_string(now)}{terminator}"
+        line = lines[index]
+        body = line.rstrip("\r\n")
+        terminator = line[len(body) :]
+        head, _colon, value = body.partition(":")
+        spacing = value[: len(value) - len(value.lstrip())]
+        quoted = value.strip()[:1]
+        style = quoted if quoted in ("'", '"') else ""
+        lines[index] = f"{head}:{spacing}{_render_link(now, style)}{terminator}"
         return _swap_in(md_path, tmp_path, "".join(lines).encode("utf-8"))
     return f"sidecar not updated (no source_file line): {os.path.basename(md_path)}"
 
@@ -2135,7 +2253,17 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
     if problems:
         _raise_preflight(problems)
 
-    names = _list_names(folder)
+    entries = [entry for entry in plan.get("entries") or [] if isinstance(entry, Mapping)]
+    cycles = image_cycles(entries)
+    if cycles:
+        raise RenamePreflightError(
+            "This plan swaps names in a cycle, so a catalog's rename cannot be "
+            "told from no rename.",
+            "Rename these with photokin (--rename -w) instead of a catalog.",
+            cycles,
+        )
+
+    names, stats = _scan(folder)
     plan_run_id = str(plan.get("run_id") or "")
     run_id, journal = _fresh_journal(folder, plan_run_id)
     safe = _safe_run_id(run_id)
@@ -2143,7 +2271,6 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
     skipped: list[str] = []
     renamed_images = 0
 
-    entries = [entry for entry in plan.get("entries") or [] if isinstance(entry, Mapping)]
     files_by_entry = [_entry_files(entry) for entry in entries]
     # Every question below -- has the catalog renamed this image yet, is this
     # companion already across, is that name held by a stranger -- is asked of
@@ -2175,8 +2302,9 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
             continue
 
         entry_ops: list[RenameOp] = []
-        for (companion_source, companion_target, _companion_kind), location in zip(
-            image_files[1:], placed_at[1:], strict=True
+        companion_records = [c for c in entry.get("companions") or [] if isinstance(c, Mapping)]
+        for (companion_source, companion_target, _companion_kind), location, record in zip(
+            image_files[1:], placed_at[1:], companion_records, strict=True
         ):
             companion_name = os.path.basename(companion_source)
             if not companion_name or not companion_target:
@@ -2186,6 +2314,10 @@ def finish_plan(plan: Mapping[str, Any]) -> ApplyReport:
                 continue
             if location == _GONE:
                 skipped.append(f"companion gone: {companion_name}")
+                continue
+            if companion_name in stats and _changed_since_plan(record, *stats[companion_name]):
+                # The same staleness check apply runs on every planned file.
+                skipped.append(f"companion changed since the plan was made: {companion_name}")
                 continue
             if companion_target in names and companion_target not in accounted:
                 # Two files claim one name and only one of them is in this
@@ -2372,8 +2504,10 @@ def _without_blocked(
     renaming onto it is the one thing this module may never do.
 
     Asking it once is not enough: dropping a reversal means the name it was
-    going to vacate stays held, which can block another. The question is
-    re-asked until the answer stops changing.
+    going to vacate stays held, which can block another. That is followed
+    through the chain in one pass, each blocked reversal blocking the one
+    that wanted its name, so a long renumber blocked at one end costs linear
+    time rather than a rescan per file.
 
     Args:
         ops: The reversals built so far, in the direction they will run.
@@ -2383,15 +2517,21 @@ def _without_blocked(
     Returns:
         The reversals that may go ahead.
     """
-    while True:
-        freed = {op.src for op in ops if not op.external}
-        blocked = {
-            op for op in ops if not op.external and op.dst in names and op.dst not in freed
-        }
-        if not blocked:
-            return ops
-        skipped.extend(f"something is already called that: {op.dst}" for op in ops if op in blocked)
-        ops = [op for op in ops if op not in blocked]
+    local = [op for op in ops if not op.external]
+    freed = {op.src for op in local}
+    wanting: dict[str, list[RenameOp]] = {}
+    for op in local:
+        wanting.setdefault(op.dst, []).append(op)
+    pending = [op for op in local if op.dst in names and op.dst not in freed]
+    blocked = set(pending)
+    while pending:
+        held = pending.pop().src
+        for op in wanting.get(held, ()):
+            if op not in blocked and op.dst in names:
+                blocked.add(op)
+                pending.append(op)
+    skipped.extend(f"something is already called that: {op.dst}" for op in ops if op in blocked)
+    return [op for op in ops if op not in blocked]
 
 
 def _reverse_ops(
@@ -2544,6 +2684,19 @@ def undo_run(journal_path: str) -> ApplyReport:
         0,
     )
     if not any(not op.external for op in ops):
+        if not deferred and segment.mode == MODE_FINISH:
+            # The catalog put everything back itself. Nothing is left to move,
+            # but the run is undone, and the journal has to say so: left
+            # ``applied`` (or partial) it stays the run every folder undo
+            # picks, and a partial one blocks every later apply.
+            _write_segment(
+                journal.path,
+                _header(run_id, folder, segment.header, MODE_UNDO, {"undoes": segment.run_id}),
+                ops,
+                append=True,
+            )
+            _append_footer(journal.path, _footer(STATUS_UNDONE, counts, []))
+            return ApplyReport(STATUS_UNDONE, journal.path, *counts, skipped=tuple(skipped))
         return ApplyReport(STATUS_NOTHING_TO_DO, journal.path, *counts, skipped=tuple(skipped))
 
     header = _header(

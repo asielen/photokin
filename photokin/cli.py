@@ -162,7 +162,7 @@ def _append_ndjson_record(path: str, record: dict, *, batch_id: str | None = Non
     if batch_id:
         record.setdefault("batch_id", batch_id)
     record.setdefault("schema_version", _NDJSON_SCHEMA_VERSION)
-    line = json.dumps(record, ensure_ascii=False) + "\n"
+    line = utils.json_text(record) + "\n"
     with _ndjson_write_lock, open(path, "a", encoding="utf-8") as handle:
         handle.write(line)
 
@@ -1603,7 +1603,7 @@ def _preflight_destinations_are_distinct(destinations: Sequence[tuple[str, str]]
     """
     for index, (role_a, path_a) in enumerate(destinations):
         for role_b, path_b in destinations[index + 1:]:
-            if utils.paths_are_same_file(os.path.abspath(path_a), os.path.abspath(path_b)):
+            if utils.destinations_may_collide(path_a, path_b):
                 _exit_with_usage_error(
                     *cli_messages.output_destinations_alias(role_a, path_a, role_b, path_b)
                 )
@@ -1668,7 +1668,7 @@ def _preflight_output_file(
         # looking for their file against a working directory the message never
         # states, next to a destination they may have spelled a third way.
         needed = os.path.abspath(protected.path)
-        if utils.paths_are_same_file(destination, needed):
+        if utils.destinations_may_collide(destination, needed):
             _exit_with_usage_error(
                 *cli_messages.output_file_is_needed_by_the_run(
                     role, out_path, needed, protected.description
@@ -1798,8 +1798,7 @@ def _write_generated_manifest(manifest: dict, out_path: str) -> None:
     tmp_path = out_path + ".tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
+            handle.write(utils.json_text(manifest, indent=2) + "\n")
         os.replace(tmp_path, out_path)
     finally:
         if os.path.exists(tmp_path):
@@ -1823,7 +1822,7 @@ def _write_aggregate_json(data: dict, out_path: str, *, pretty: bool) -> None:
     tmp_path = out_path + ".tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2 if pretty else None, ensure_ascii=False)
+            handle.write(utils.json_text(data, indent=2 if pretty else None))
         os.replace(tmp_path, out_path)
     finally:
         if os.path.exists(tmp_path):
@@ -2408,6 +2407,11 @@ def _build_rename_items_from_manifest(document: dict[str, Any]) -> list[RenameIt
         if not isinstance(raw, dict):
             continue
         path = normalize_path(raw.get("path") or "") or ""
+        if os.path.splitext(path)[1].lower() not in utils.VALID_EXTS:
+            # Rename mode renames images; anything else in a manifest is at
+            # most a companion, which the planner finds on disk by stem.
+            logger.warning("Not an image, so not renamed: %s", path)
+            continue
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None
         order = raw.get("order")
         order_value = order if isinstance(order, int) and not isinstance(order, bool) else None
@@ -2672,7 +2676,7 @@ def _write_rename_changeset_records(changeset_path: str, plan: dict[str, Any]) -
                     for companion in entry.get("companions") or []
                 ],
             }
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.write(utils.json_text(record) + "\n")
 
 
 def _run_rename_mode(args: argparse.Namespace) -> None:
@@ -2900,7 +2904,7 @@ def _run_revert_changeset(args: argparse.Namespace) -> None:
             "No file in the changeset matched %s.",
             "--revert-paths" if only else "--revert-match",
         )
-    lines = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    lines = "".join(utils.json_text(record) + "\n" for record in records)
     if args.output_file:
         with open(args.output_file, "w", encoding="utf-8") as handle:
             handle.write(lines)

@@ -3,7 +3,7 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.9.0]
 
 An album's pages are no longer read as one document, and a run's
 changeset now records enough to undo it.
@@ -56,6 +56,15 @@ changeset now records enough to undo it.
   `--rename-undo ./scans` treats the folder as the folder, and a missing
   journal says so rather than pointing at file permissions. A
   `--plan-out` error names `--plan-out` in its remedy.
+- **Rename mode is harder to wedge.** A NUL byte in a name is refused
+  before anything moves; a catalog undo with nothing left to move closes
+  its journal; `--rename-finish` refuses a swap it cannot verify and
+  skips a companion edited since the plan; a sidecar's `source_file` is
+  YAML-decoded before matching and keeps its quoting style, so undo
+  restores it byte for byte; run ids carry microseconds so same-second
+  journals sort by age; a manifest's non-image entries are left out; and
+  case, symlinked folders and non-UTF-8 names are compared by filesystem
+  identity throughout.
 - **Packaging:** the license is declared as an SPDX string, and the vocab
   backup goes to `~/.photokin/backups` instead of the package folder.
 
