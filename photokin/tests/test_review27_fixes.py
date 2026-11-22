@@ -220,3 +220,19 @@ def test_an_untagged_page_one_shares_with_its_page1_rescan() -> None:
     # Assert
     assert results["memo-b-page1.tif"].get("title") == "Dear Mother"
     assert results["memo-page2.tif"].get("title") != "Dear Mother"
+
+
+def test_a_displaced_cover_keeps_its_fields_off_page_one() -> None:
+    # Arrange
+    items = [
+        {"path": "diary.tif", "metadata": {"title": "Cover", "keywords": ["Cover art"]}},
+        {"path": "diary-page1.tif", "metadata": {"title": "Page one", "keywords": ["Ruth"]}},
+        {"path": "diary-page2.tif", "metadata": {}},
+    ]
+
+    # Act
+    results = _page_results(items)
+
+    # Assert
+    assert "Cover art" not in results["diary-page1.tif"]["keywords"]
+    assert "Ruth" not in results["diary.tif"]["keywords"]
