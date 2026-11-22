@@ -3,7 +3,7 @@
 All notable changes to this project are documented here, in the style of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.9.0]
 
 An album's pages are no longer read as one document, and a run's
 changeset now records enough to undo it.
