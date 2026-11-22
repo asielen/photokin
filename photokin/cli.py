@@ -3669,7 +3669,9 @@ def main() -> None:
             albums=tuple(album_plan_lines(buckets)),
         )
         logger.info("%s", plan.render())
-        oversized = oversized_page_sets(buckets, cfg.max_group_pages)
+        # With -r a page's keywords can still make its set an album, which
+        # only the stream sees after reading; it applies the cap itself then.
+        oversized = [] if args.read else oversized_page_sets(buckets, cfg.max_group_pages)
         if oversized:
             (group, pages), *others = oversized
             _exit_with_usage_error(

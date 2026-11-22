@@ -302,7 +302,9 @@ def _read_before_values(
             if isinstance(path, str) and path:
                 paths.append(path)
     tags = list(dict.fromkeys((*allowed_fields, *_SNAPSHOT_EXTRA_TAGS)))
-    records = run_exiftool_json(exiftool, list(dict.fromkeys(paths)), tags)
+    records = run_exiftool_json(
+        exiftool, list(dict.fromkeys(paths)), tags, numbers_as_text=True
+    )
     return {
         _path_key(rec["SourceFile"]): rec
         for rec in records
@@ -747,236 +749,250 @@ def apply_changeset(
             )
         return tmp_dir_holder[0]
 
-    with (
-        ExitStack() as tmp_stack,
-        open(changeset_path, "r", encoding="utf-8") as handle,
-    ):
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
+    try:
+        with (
+            ExitStack() as tmp_stack,
+            open(changeset_path, "r", encoding="utf-8") as handle,
+        ):
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except JSONDecodeError as exc:
+                    summary["errors"].append(
+                        {
+                            "line": line_number,
+                            "error": f"JSON parse failed: {exc}",
+                            "changeset": changeset_path,
+                        }
+                    )
+                    continue
+
+                summary["files_seen"] += 1
+                path = record.get("path")
+                if not isinstance(path, str) or not path:
+                    summary["warnings"].append({"line": line_number, "warning": "Missing path in record."})
+                    continue
+
+                proposed = record.get("proposed_changes") or {}
+                if not isinstance(proposed, dict):
+                    # A malformed payload still asked for something: counted as a
+                    # proposal so a changeset of nothing but rejects fails the
+                    # strict verdict instead of passing as an empty changeset.
+                    summary["files_with_proposals"] += 1
+                    summary["warnings"].append({"path": path, "warning": "Invalid proposed_changes payload."})
+                    continue
+
+                set_changes = proposed.get("set") or {}
+                if not isinstance(set_changes, dict):
+                    summary["files_with_proposals"] += 1
+                    summary["warnings"].append({"path": path, "warning": "Invalid proposed_changes.set payload."})
+                    continue
+
+                # Counted before allow-list filtering: a record that proposed
+                # writes which then all get filtered away is precisely the
+                # "setting wrong for every file" shape the strict verdict must
+                # see, and it leaves neither errors nor warnings of its own.
+                if proposed.get(WRITE_SUPPRESSED_KEY):
+                    summary["files_suppressed"] += 1
+                if (
+                    set_changes
+                    or proposed.get("keywords_add")
+                    or proposed.get("keywords_remove")
+                ):
+                    summary["files_with_proposals"] += 1
+
+                tags_to_write: dict[str, str] = {}
+                for tag in allowed_fields:
+                    if tag not in set_changes:
+                        continue
+                    value = _normalize_tag_value(tag, set_changes.get(tag), summary["warnings"])
+                    if value is None:
+                        continue
+                    tags_to_write[tag] = value
+
+                # Keywords ride the record as add/remove deltas rather than in
+                # ``set`` (see _keyword_delta_args), so the keywords tag in the
+                # allow-list is honored here or not at all.
+                keyword_args: list[str] = []
+                if CANONICAL_KEYWORDS_TAG in allowed_fields:
+                    keyword_args = _keyword_delta_args(proposed, path, summary["warnings"])
+
+                if not tags_to_write and not keyword_args:
+                    continue
+                # Computed once, before companions join, so the dry-run preview and
+                # the real write count the same tags: the ones the caller allowed.
+                tags_count = len(tags_to_write) + (1 if keyword_args else 0)
+                tags_to_write.update(_companion_tags(tags_to_write, set_changes))
+                # Decided before routing, because an argument file cannot carry a
+                # multi-line value inline. The temporary root counts: a DATFILE
+                # path under it is an argument too.
+                via_argfile = not all(
+                    text.isascii()
+                    for text in (path, tempfile.gettempdir(), *tags_to_write.values(), *keyword_args)
+                )
+                write = _FileWrite(tags_to_write, keyword_args, via_argfile)
+
+                def _datfile_path_for(tag: str, _line: int = line_number) -> str:
+                    if cfg.dry_run:
+                        # A path for measurement only: a dry run creates neither
+                        # the batch temporary directory nor any file (C3). The 12
+                        # padding characters stay past mkdtemp's 8-character
+                        # random suffix, so the preview never measures a routed
+                        # argument shorter than the real run would build.
+                        return os.path.join(
+                            tempfile.gettempdir(),
+                            _TMP_DIR_PREFIX + "M" * 12,
+                            _datfile_name(_line, tag),
+                        )
+                    return os.path.join(_datfile_dir(tmp_stack), _datfile_name(_line, tag))
+
+                try:
+                    datfile_paths = _select_datfile_routing(
+                        exiftool, cfg, write, path, _datfile_path_for
+                    )
+                except OSError as exc:
+                    # Only reachable when a value needed a DATFILE and the
+                    # temporary directory could not be created; a run with nothing
+                    # to route never asks for one.
+                    summary["errors"].append(
+                        {"path": path, "error": f"Could not create a DATFILE directory: {exc}"}
+                    )
+                    continue
+
+                cmd = _build_exiftool_command(exiftool, cfg, write, path, datfile_paths)
+                if _command_length_units(cmd) > _COMMAND_LENGTH_BUDGET:
+                    # Only reachable when the keyword operations alone exceed the
+                    # budget: every routable ``set`` value has already moved to a
+                    # DATFILE, and keyword args cannot. Failing here is a named
+                    # per-file error instead of ExifTool failing to start with an
+                    # error that looks like a missing binary -- and it is checked
+                    # before the dry-run branch below, so a preview errors exactly
+                    # where the real run would rather than counting the file as
+                    # writable.
+                    summary["errors"].append(
+                        {
+                            "path": path,
+                            "error": "Keyword operations exceed the command-line length "
+                            "budget; nothing on this file was written.",
+                        }
+                    )
+                    continue
+
+                if cfg.dry_run:
+                    summary["files_written"] += 1
+                    summary["tags_written"] += tags_count
+                    continue
+
+                try:
+                    for tag, datfile_path in datfile_paths.items():
+                        # newline="" is load-bearing: Python's text-mode write
+                        # translates a bare "\n" to "\r\n" on Windows, which
+                        # would corrupt every transcription's line breaks
+                        # before ExifTool ever reads the file. No BOM either --
+                        # ExifTool's default value charset is already UTF-8.
+                        with open(datfile_path, "w", encoding="utf-8", newline="") as datfile:
+                            datfile.write(tags_to_write[tag])
+                except (OSError, UnicodeError) as exc:
+                    # ``UnicodeError`` beside ``OSError`` because the value being
+                    # written is model-authored text: a lone surrogate reaching
+                    # here from a valid JSON ``\ud800`` escape raises
+                    # UnicodeEncodeError, which is a ValueError and would sail past
+                    # an OSError-only guard and out of ``apply_changeset``
+                    # entirely, aborting every remaining file in the batch. The
+                    # same value written inline is caught as a ValueError around
+                    # ``subprocess.run`` below, so routing it must not be the thing
+                    # that turns a per-file failure into a whole-batch one.
+                    summary["errors"].append(
+                        {"path": path, "error": f"Failed to write DATFILE for ExifTool: {exc}"}
+                    )
+                    continue
+
+                if before_values is not None:
+                    file_values = before_values.get(_path_key(path))
+                    if file_values is not None:
+                        touched = (*tags_to_write, *(_KEYWORD_WRITE_TAGS if keyword_args else ()))
+                        snapshots[line_number] = {
+                            tag: _snapshot_value(file_values, tag) for tag in touched
+                        }
+
+                try:
+                    # stderr names files, so decode it as UTF-8 and never let a
+                    # stray byte fail the decode and with it the whole batch.
+                    argv, stdin = utf8_argfile(cmd)
+                    if stdin is not None:
+                        # Strict, unlike the stderr decode: a value UTF-8 cannot
+                        # carry (a lone surrogate from a JSON escape) fails this
+                        # file here, rather than reaching the photo as "?".
+                        stdin.encode("utf-8")
+                    result = subprocess.run(
+                        argv,
+                        input=stdin,
+                        capture_output=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                except (OSError, ValueError) as exc:
+                    # OSError covers FileNotFoundError (binary went missing
+                    # mid-batch) and PermissionError (an unexecutable binary, a
+                    # locked file) alike; ValueError covers subprocess's own
+                    # argument validation (an embedded NUL byte in a bad path).
+                    # Per-file, like every other failure in this loop: a batch of
+                    # 500 does not abort on file 3, and the files already written
+                    # before it stay written and stay reported.
+                    summary["errors"].append({"path": path, "error": f"ExifTool failed to start: {exc}"})
+                    continue
+
+                if result.returncode != 0:
+                    summary["errors"].append(
+                        {
+                            "path": path,
+                            "error": f"ExifTool failed with code {result.returncode}.",
+                            "stderr": result.stderr.strip(),
+                        }
+                    )
+                    continue
+
+                if datfile_paths and _DATFILE_READ_FAILURE_MARKER in result.stderr:
+                    # E5: a corrupted or dropped write must never pass as
+                    # success just because the process exited 0. Measured
+                    # against the real binary -- when one DATFILE among
+                    # several tag writes cannot be opened (e.g. it vanished
+                    # mid-batch), ExifTool still reports "N image files
+                    # updated" and exits 0, because the *other* tags on that
+                    # same command did get written; only stderr names the
+                    # miss. Trusting the exit code alone would let that file's
+                    # skipped tag pass silently as written.
+                    summary["errors"].append(
+                        {
+                            "path": path,
+                            "error": "ExifTool could not read a DATFILE for this write; nothing on this "
+                            "file was confirmed written.",
+                            "stderr": result.stderr.strip(),
+                        }
+                    )
+                    continue
+
+                summary["files_written"] += 1
+                summary["tags_written"] += tags_count
+
+    finally:
+        # On every exit, an interrupted one included: the files written so far
+        # are written, and their before-values are what a revert needs.
+        if snapshots:
             try:
-                record = json.loads(line)
-            except JSONDecodeError as exc:
-                summary["errors"].append(
+                _fold_snapshots_into_changeset(changeset_path, snapshots)
+            except OSError as exc:
+                summary["warnings"].append(
                     {
-                        "line": line_number,
-                        "error": f"JSON parse failed: {exc}",
+                        "warning": "The files were written, but their earlier values could "
+                        f"not be saved into the changeset, so this run cannot be reverted "
+                        f"exactly: {exc}",
                         "changeset": changeset_path,
                     }
                 )
-                continue
-
-            summary["files_seen"] += 1
-            path = record.get("path")
-            if not isinstance(path, str) or not path:
-                summary["warnings"].append({"line": line_number, "warning": "Missing path in record."})
-                continue
-
-            proposed = record.get("proposed_changes") or {}
-            if not isinstance(proposed, dict):
-                # A malformed payload still asked for something: counted as a
-                # proposal so a changeset of nothing but rejects fails the
-                # strict verdict instead of passing as an empty changeset.
-                summary["files_with_proposals"] += 1
-                summary["warnings"].append({"path": path, "warning": "Invalid proposed_changes payload."})
-                continue
-
-            set_changes = proposed.get("set") or {}
-            if not isinstance(set_changes, dict):
-                summary["files_with_proposals"] += 1
-                summary["warnings"].append({"path": path, "warning": "Invalid proposed_changes.set payload."})
-                continue
-
-            # Counted before allow-list filtering: a record that proposed
-            # writes which then all get filtered away is precisely the
-            # "setting wrong for every file" shape the strict verdict must
-            # see, and it leaves neither errors nor warnings of its own.
-            if proposed.get(WRITE_SUPPRESSED_KEY):
-                summary["files_suppressed"] += 1
-            if (
-                set_changes
-                or proposed.get("keywords_add")
-                or proposed.get("keywords_remove")
-            ):
-                summary["files_with_proposals"] += 1
-
-            tags_to_write: dict[str, str] = {}
-            for tag in allowed_fields:
-                if tag not in set_changes:
-                    continue
-                value = _normalize_tag_value(tag, set_changes.get(tag), summary["warnings"])
-                if value is None:
-                    continue
-                tags_to_write[tag] = value
-
-            # Keywords ride the record as add/remove deltas rather than in
-            # ``set`` (see _keyword_delta_args), so the keywords tag in the
-            # allow-list is honored here or not at all.
-            keyword_args: list[str] = []
-            if CANONICAL_KEYWORDS_TAG in allowed_fields:
-                keyword_args = _keyword_delta_args(proposed, path, summary["warnings"])
-
-            if not tags_to_write and not keyword_args:
-                continue
-            # Computed once, before companions join, so the dry-run preview and
-            # the real write count the same tags: the ones the caller allowed.
-            tags_count = len(tags_to_write) + (1 if keyword_args else 0)
-            tags_to_write.update(_companion_tags(tags_to_write, set_changes))
-            # Decided before routing, because an argument file cannot carry a
-            # multi-line value inline. The temporary root counts: a DATFILE
-            # path under it is an argument too.
-            via_argfile = not all(
-                text.isascii()
-                for text in (path, tempfile.gettempdir(), *tags_to_write.values(), *keyword_args)
-            )
-            write = _FileWrite(tags_to_write, keyword_args, via_argfile)
-
-            def _datfile_path_for(tag: str, _line: int = line_number) -> str:
-                if cfg.dry_run:
-                    # A path for measurement only: a dry run creates neither
-                    # the batch temporary directory nor any file (C3). The 12
-                    # padding characters stay past mkdtemp's 8-character
-                    # random suffix, so the preview never measures a routed
-                    # argument shorter than the real run would build.
-                    return os.path.join(
-                        tempfile.gettempdir(),
-                        _TMP_DIR_PREFIX + "M" * 12,
-                        _datfile_name(_line, tag),
-                    )
-                return os.path.join(_datfile_dir(tmp_stack), _datfile_name(_line, tag))
-
-            try:
-                datfile_paths = _select_datfile_routing(
-                    exiftool, cfg, write, path, _datfile_path_for
-                )
-            except OSError as exc:
-                # Only reachable when a value needed a DATFILE and the
-                # temporary directory could not be created; a run with nothing
-                # to route never asks for one.
-                summary["errors"].append(
-                    {"path": path, "error": f"Could not create a DATFILE directory: {exc}"}
-                )
-                continue
-
-            cmd = _build_exiftool_command(exiftool, cfg, write, path, datfile_paths)
-            if _command_length_units(cmd) > _COMMAND_LENGTH_BUDGET:
-                # Only reachable when the keyword operations alone exceed the
-                # budget: every routable ``set`` value has already moved to a
-                # DATFILE, and keyword args cannot. Failing here is a named
-                # per-file error instead of ExifTool failing to start with an
-                # error that looks like a missing binary -- and it is checked
-                # before the dry-run branch below, so a preview errors exactly
-                # where the real run would rather than counting the file as
-                # writable.
-                summary["errors"].append(
-                    {
-                        "path": path,
-                        "error": "Keyword operations exceed the command-line length "
-                        "budget; nothing on this file was written.",
-                    }
-                )
-                continue
-
-            if cfg.dry_run:
-                summary["files_written"] += 1
-                summary["tags_written"] += tags_count
-                continue
-
-            try:
-                for tag, datfile_path in datfile_paths.items():
-                    # newline="" is load-bearing: Python's text-mode write
-                    # translates a bare "\n" to "\r\n" on Windows, which
-                    # would corrupt every transcription's line breaks
-                    # before ExifTool ever reads the file. No BOM either --
-                    # ExifTool's default value charset is already UTF-8.
-                    with open(datfile_path, "w", encoding="utf-8", newline="") as datfile:
-                        datfile.write(tags_to_write[tag])
-            except (OSError, UnicodeError) as exc:
-                # ``UnicodeError`` beside ``OSError`` because the value being
-                # written is model-authored text: a lone surrogate reaching
-                # here from a valid JSON ``\ud800`` escape raises
-                # UnicodeEncodeError, which is a ValueError and would sail past
-                # an OSError-only guard and out of ``apply_changeset``
-                # entirely, aborting every remaining file in the batch. The
-                # same value written inline is caught as a ValueError around
-                # ``subprocess.run`` below, so routing it must not be the thing
-                # that turns a per-file failure into a whole-batch one.
-                summary["errors"].append(
-                    {"path": path, "error": f"Failed to write DATFILE for ExifTool: {exc}"}
-                )
-                continue
-
-            if before_values is not None:
-                file_values = before_values.get(_path_key(path))
-                if file_values is not None:
-                    touched = (*tags_to_write, *(_KEYWORD_WRITE_TAGS if keyword_args else ()))
-                    snapshots[line_number] = {
-                        tag: _snapshot_value(file_values, tag) for tag in touched
-                    }
-
-            try:
-                # stderr names files, so decode it as UTF-8 and never let a
-                # stray byte fail the decode and with it the whole batch.
-                argv, stdin = utf8_argfile(cmd)
-                if stdin is not None:
-                    # Strict, unlike the stderr decode: a value UTF-8 cannot
-                    # carry (a lone surrogate from a JSON escape) fails this
-                    # file here, rather than reaching the photo as "?".
-                    stdin.encode("utf-8")
-                result = subprocess.run(
-                    argv,
-                    input=stdin,
-                    capture_output=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-            except (OSError, ValueError) as exc:
-                # OSError covers FileNotFoundError (binary went missing
-                # mid-batch) and PermissionError (an unexecutable binary, a
-                # locked file) alike; ValueError covers subprocess's own
-                # argument validation (an embedded NUL byte in a bad path).
-                # Per-file, like every other failure in this loop: a batch of
-                # 500 does not abort on file 3, and the files already written
-                # before it stay written and stay reported.
-                summary["errors"].append({"path": path, "error": f"ExifTool failed to start: {exc}"})
-                continue
-
-            if result.returncode != 0:
-                summary["errors"].append(
-                    {
-                        "path": path,
-                        "error": f"ExifTool failed with code {result.returncode}.",
-                        "stderr": result.stderr.strip(),
-                    }
-                )
-                continue
-
-            if datfile_paths and _DATFILE_READ_FAILURE_MARKER in result.stderr:
-                # E5: a corrupted or dropped write must never pass as
-                # success just because the process exited 0. Measured
-                # against the real binary -- when one DATFILE among
-                # several tag writes cannot be opened (e.g. it vanished
-                # mid-batch), ExifTool still reports "N image files
-                # updated" and exits 0, because the *other* tags on that
-                # same command did get written; only stderr names the
-                # miss. Trusting the exit code alone would let that file's
-                # skipped tag pass silently as written.
-                summary["errors"].append(
-                    {
-                        "path": path,
-                        "error": "ExifTool could not read a DATFILE for this write; nothing on this "
-                        "file was confirmed written.",
-                        "stderr": result.stderr.strip(),
-                    }
-                )
-                continue
-
-            summary["files_written"] += 1
-            summary["tags_written"] += tags_count
-
-    if snapshots:
-        _fold_snapshots_into_changeset(changeset_path, snapshots)
     return summary
 
 

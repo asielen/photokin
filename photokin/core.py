@@ -1277,7 +1277,8 @@ def analyze_photo(
         except Exception as e:
             msg = (
                 "Vocabulary update failed TOML validation. "
-                f"Review {config.vocab_path} and restore {config.vocab_path}.bak if needed."
+                f"Review {config.vocab_path}; its earlier copy is "
+                f"{utils.backup_path_for(config.vocab_path)}."
             )
             logger.error("%s (%s)", msg, e)
             raise RuntimeError(msg) from e
@@ -2613,7 +2614,7 @@ _NAME_PAGE_SUFFIX_KEY = "_name_page_suffix"
 
 # A whole word, with '_' counted as a separator: 'photo_album' matches,
 # 'albumen' does not.
-_ALBUM_WORD_RE = re.compile(r"(?<![a-z0-9])album(?![a-z0-9])", re.IGNORECASE)
+_ALBUM_WORD_RE = re.compile(r"(?<![a-z0-9])albums?(?![a-z0-9])", re.IGNORECASE)
 
 # Only a separator or a digit may precede the token, so 'feedback.jpg' is never
 # read as the back of 'feed'.
@@ -2951,15 +2952,15 @@ def _fold_out_of_order_variants(entries: list[dict], *, log: bool) -> None:
             continue
         present = letters[entry["group_key"]]
         letter = entry["version"]
-        missing = [chr(c) for c in range(ord("b"), ord(letter)) if chr(c) not in present]
-        if not missing:
+        missing = utils.first_missing_variant(letter, present)
+        if missing is None:
             continue
         folded = entry["group_key"] + suffix
         if log:
             logger.warning(
                 "%s: no '%s' scan of %s, so '%s' is part of the name: object %s.",
                 os.path.basename(entry["path"]),
-                missing[0],
+                missing,
                 entry["group_key"],
                 letter,
                 folded,
@@ -3181,8 +3182,11 @@ def build_manifest_buckets(
         for entry in (_resolve_manifest_entry(raw, log_overrides=log_overrides) for raw in items)
         if entry is not None
     ]
-    _split_album_pages(entries, page_grouping, log=log_overrides)
+    # Letters first: an album named for a decade ("smith-album-1940s") reads
+    # its "s" as a variant until the fold returns it to the name, and the
+    # split must build page keys from the name the page's back also carries.
     _fold_out_of_order_variants(entries, log=log_overrides)
+    _split_album_pages(entries, page_grouping, log=log_overrides)
     buckets: Dict[str, List[dict]] = {}
     for entry in entries:
         if group_by == utils.GROUP_BY_OBJECT:
@@ -4113,7 +4117,8 @@ def process_manifest_stream(
             # Rule 1: union all shared keywords; "back" only applies when we later
             # emit a back record. The pages of a document are different files with
             # their own originals, so a page's keywords, title, date and location
-            # never reach another page; each page gets its own plus the model's.
+            # never reach another page; each page gets its own (shared by that
+            # page's own rescans, below) plus the model's.
             # The scans of one print share everything, which is how a back gets
             # the title typed on its front.
             shared_keywords = (
@@ -4661,6 +4666,18 @@ def process_manifest_stream(
             }
             group_meta_signed_off = _group_meta_with_date_markers(combined_meta, signed_off)
             group_meta_unmarked = _group_meta_with_date_markers(combined_meta, set())
+            # In a document each page is its own file, but the scans of one
+            # page (a rescan, a crop) are still one page: they share that
+            # page's fields, and only that page's.
+            page_meta: dict[str, dict[str, Any]] = {}
+            if multipage_present:
+                by_slot: dict[str, list[dict]] = {}
+                for entry in group:
+                    by_slot.setdefault(_manifest_part_key(entry), []).append(entry)
+                page_meta = {
+                    slot: _group_meta_with_date_markers(utils.combine_group_metadata(members), set())
+                    for slot, members in by_slot.items()
+                }
 
             # emit per-file (merged with per-file metadata)
             for it, own_meta, (file_caption, caption_scope) in zip(
@@ -4673,9 +4690,10 @@ def process_manifest_stream(
                 own_markers = utils.part_markers_in(
                     own_meta.get("keywords") or own_meta.get("tags")
                 )
+                slot_meta = page_meta.get(_manifest_part_key(it))
                 per_meta = utils.merge_original_sources(
                     own_meta,
-                    None
+                    slot_meta
                     if multipage_present
                     else group_meta_unmarked
                     if any(map(utils.is_date_marker, _own_keywords(own_meta)))
