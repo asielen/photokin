@@ -803,8 +803,8 @@ Whenever `--output-file` names a `.ndjson` destination, the file carries `run: .
 | `plan` | Once every pre-flight check has passed, right after the plan summary is logged | `plan`: the same fields as the stderr plan summary, as a dict (`input_kind`, `file_count`, `provider`, `model`, ... — see `RunPlan` in `cli_messages.py`) |
 | `progress` | Once per group, right before it starts | `group`, `index`, `of` — a liveness signal for a group whose single model call may run for minutes with nothing else on the stream to show it hasn't died |
 | `exiftool_apply` | After `-w` applies the changeset, if one was written | `summary`: files seen/written, tags written, errors, warnings |
-| `complete` | The run finished (whether or not every group succeeded — "every group failed" is not a fatal error in manifest mode; see [When calls fail](https://github.com/asielen/photokin/blob/v0.6.0/photokin/README.md#when-calls-fail)) | `files_recorded`, `groups_failed`, `files_unsent` |
-| `cancelled` | The run stopped early via `--cancel-file` (below) | Same three fields, counting only what completed before the stop |
+| `complete` | The run finished (whether or not every group succeeded — "every group failed" is not a fatal error in manifest mode; see [When calls fail](https://github.com/asielen/photokin/blob/v0.6.0/photokin/README.md#when-calls-fail)) | `items_recorded` (one per manifest item), `files_recorded` (one per file; fewer when items share a path), `groups_failed`, `files_unsent` |
+| `cancelled` | The run stopped early via `--cancel-file` (below) | Same fields, counting only what completed before the stop |
 | `fatal` | Any refusal or unrecoverable error, at any point after `start` | `error`: `{"type": ..., "message": ...}` |
 
 A run always ends with exactly one of `complete`, `cancelled`, or `fatal` — a caller can wait for any of the three as the definitive "done" signal, rather than inferring completion from the line count, which breaks the moment per-file emission ever changes shape (this happened once already, before the envelope existed).

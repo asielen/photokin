@@ -47,7 +47,7 @@ class TestHydratorInjection(unittest.TestCase):
         result = core.process_manifest_stream(manifest=manifest, cfg=cfg)
         self.assertEqual(
             result,
-            {"results": {}, "errors": {}, "groups_failed": 0, "files_unsent": 0, "cancelled": False},
+            {"results": {}, "errors": {}, "groups_failed": 0, "files_unsent": 0, "items_recorded": 0, "cancelled": False},
         )
 
 

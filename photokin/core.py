@@ -3407,7 +3407,10 @@ def process_manifest_stream(
 
     Returns:
         ``{"results": {path: record}, "errors": {path: payload}, "groups_failed":
-        int, "files_unsent": int, "cancelled": bool}``. ``results``/``errors``
+        int, "files_unsent": int, "items_recorded": int, "cancelled": bool}``.
+        ``items_recorded`` counts the ``ok`` records, one per manifest item, so
+        it exceeds ``len(results)`` when items share a path (Lightroom virtual
+        copies of one file). ``results``/``errors``
         are one entry per file and disjoint -- every file of a failed group
         carries that group's error payload, bar one already banked when the
         group raised part-way through its per-file loop, since that record is
@@ -3474,7 +3477,10 @@ def process_manifest_stream(
     errors: dict[str, dict] = {}
     run_id = changeset_run_id or (make_run_id() if changeset_writer else None)
 
+    items_recorded = 0
+
     def _emit(path: str, status: str, payload: dict):
+        nonlocal items_recorded
         if ndjson_writer:
             rec = {"path": path, "status": status}
             rec.update(payload)
@@ -3482,6 +3488,7 @@ def process_manifest_stream(
                 rec["dry_run"] = True
             ndjson_writer(json.dumps(rec, ensure_ascii=False))
         if status == "ok":
+            items_recorded += 1
             results[path] = payload.get("result") or payload
         elif status == "error":
             errors[path] = payload.get("error") or payload
@@ -3514,6 +3521,7 @@ def process_manifest_stream(
                 "errors": errors,
                 "groups_failed": failed_groups,
                 "files_unsent": len(unsent_paths),
+                "items_recorded": items_recorded,
                 "cancelled": True,
             }
         if run_event_writer:
@@ -4860,5 +4868,6 @@ def process_manifest_stream(
         "errors": errors,
         "groups_failed": failed_groups,
         "files_unsent": len(unsent_paths),
+        "items_recorded": items_recorded,
         "cancelled": False,
     }

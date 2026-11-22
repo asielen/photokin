@@ -3749,6 +3749,7 @@ def main() -> None:
             _active_run_envelope.append(
                 {
                     "run": "cancelled" if data.get("cancelled") else "complete",
+                    "items_recorded": data.get("items_recorded", 0),
                     "files_recorded": len(data.get("results") or {}),
                     "groups_failed": data.get("groups_failed", 0),
                     "files_unsent": data.get("files_unsent", 0),
